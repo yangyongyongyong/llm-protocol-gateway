@@ -20,6 +20,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -120,23 +122,41 @@ type Manager struct {
 	startedAt   time.Time
 	pid         int
 
+	// lastSettings is retained so a dead/zombie tunnel can be restarted after
+	// macOS proxy toggles (Shadowrocket etc.) drop the edge connection while
+	// the local cloudflared process is still alive.
+	lastSettings Settings
+	wantRunning  bool
+
+	healCancel context.CancelFunc
+	healDone   chan struct{}
+
 	// lookPath resolves the cloudflared binary; overridable in tests.
 	lookPath func(string) (string, error)
 	// run launches cloudflared; overridable in tests.
 	run runnerFunc
+	// probePublic checks whether a public tunnel URL still reaches this gateway.
+	// Overridable in tests. Default uses a direct (no-proxy) HTTP client.
+	probePublic func(ctx context.Context, publicURL string) error
+	// healInterval / healFailThreshold control the background health loop.
+	healInterval      time.Duration
+	healFailThreshold int
 }
 
 // NewManager creates a manager that will forward public traffic to
 // http://127.0.0.1:<localPort>.
 func NewManager(localPort int) *Manager {
 	m := &Manager{
-		localPort: localPort,
-		status:    StatusStopped,
-		message:   "Public access is stopped.",
-		lookPath:  lookPathCloudflared,
-		setup:     NewCloudflareSetup(),
+		localPort:         localPort,
+		status:            StatusStopped,
+		message:           "Public access is stopped.",
+		lookPath:          lookPathCloudflared,
+		setup:             NewCloudflareSetup(),
+		healInterval:      15 * time.Second,
+		healFailThreshold: 2,
 	}
 	m.run = m.defaultRun
+	m.probePublic = m.defaultProbePublic
 	return m
 }
 
@@ -202,6 +222,11 @@ func (m *Manager) defaultRun(ctx context.Context, args ...string) (*exec.Cmd, io
 		return nil, nil, fmt.Errorf("cloudflared not found on PATH: install it (brew install cloudflared) and retry: %w", err)
 	}
 	cmd := exec.CommandContext(ctx, bin, args...)
+	// Never inherit macOS / Shadowrocket HTTP(S)/SOCKS proxies. cloudflared must
+	// dial Cloudflare edge directly; routing QUIC/HTTP2 through a local proxy
+	// commonly leaves a zombie process that still looks "running" while public
+	// hostnames return Cloudflare 530.
+	cmd.Env = scrubProxyEnv(os.Environ())
 	// cloudflared logs (including the quick-tunnel URL) go to stderr.
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -219,6 +244,29 @@ func (m *Manager) defaultRun(ctx context.Context, args ...string) (*exec.Cmd, io
 		io.Reader
 		io.Closer
 	}{io.MultiReader(stderr, stdout), stderr}, nil
+}
+
+// scrubProxyEnv removes proxy-related variables so child processes (cloudflared)
+// ignore system / app proxies such as Shadowrocket on 127.0.0.1:7890.
+func scrubProxyEnv(environ []string) []string {
+	out := make([]string, 0, len(environ)+1)
+	for _, entry := range environ {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(key) {
+		case "http_proxy", "https_proxy", "all_proxy", "ftp_proxy", "no_proxy",
+			"socks_proxy", "socks5_proxy", "socks5h_proxy":
+			continue
+		default:
+			out = append(out, entry)
+		}
+	}
+	// Belt-and-suspenders: even if a library reads proxy settings elsewhere,
+	// force "no proxy" for anything that still honors NO_PROXY.
+	out = append(out, "NO_PROXY=*", "no_proxy=*")
+	return out
 }
 
 // Available reports whether the cloudflared binary can be located.
@@ -259,6 +307,19 @@ func (m *Manager) Start(settings Settings) (State, error) {
 		return m.Snapshot(), err
 	}
 
+	m.mu.Lock()
+	m.lastSettings = settings
+	m.wantRunning = true
+	m.mu.Unlock()
+
+	state, err := m.startWithSettings(settings)
+	if err == nil && state.Status == StatusRunning {
+		m.startHealLoop()
+	}
+	return state, err
+}
+
+func (m *Manager) startWithSettings(settings Settings) (State, error) {
 	mode := settings.Mode
 	if mode == "" {
 		mode = ModeQuick
@@ -301,7 +362,7 @@ func (m *Manager) startQuick() (State, error) {
 }
 
 func (m *Manager) startQuickWithProtocol(baseArgs []string, protocol string) (State, error) {
-	m.Stop()
+	m.stopProcess()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	args := withCloudflaredProtocol(baseArgs, protocol)
@@ -352,7 +413,7 @@ func (m *Manager) startQuickWithProtocol(baseArgs []string, protocol string) (St
 		m.mu.Unlock()
 		return m.Snapshot(), nil
 	case waitOutcomeQUICFail:
-		m.Stop()
+		m.stopProcess()
 		err := fmt.Errorf("%w: %s", errQUICEdgeDial, payload)
 		m.setError(err.Error())
 		return m.Snapshot(), err
@@ -362,7 +423,7 @@ func (m *Manager) startQuickWithProtocol(baseArgs []string, protocol string) (St
 		return m.Snapshot(), err
 	default:
 		err := fmt.Errorf("%s", quickTunnelTimeoutMessage(payload))
-		m.Stop()
+		m.stopProcess()
 		m.setError(err.Error())
 		return m.Snapshot(), err
 	}
@@ -487,7 +548,7 @@ func (m *Manager) startTokenTunnel(settings Settings, domain, uiDomain, token st
 }
 
 func (m *Manager) startNamedWithProtocol(domain, uiDomain string, baseArgs []string, protocol, exitMsg string) (State, error) {
-	m.Stop()
+	m.stopProcess()
 
 	publicURL := customPublicURL(domain)
 	uiPublicURL := ""
@@ -550,7 +611,7 @@ func (m *Manager) startNamedWithProtocol(domain, uiDomain string, baseArgs []str
 		m.mu.Unlock()
 		return m.Snapshot(), nil
 	case waitOutcomeQUICFail:
-		m.Stop()
+		m.stopProcess()
 		err := fmt.Errorf("%w: %s", errQUICEdgeDial, diag)
 		m.setError(err.Error())
 		return m.Snapshot(), err
@@ -564,7 +625,7 @@ func (m *Manager) startNamedWithProtocol(domain, uiDomain string, baseArgs []str
 		return m.Snapshot(), fmt.Errorf("named tunnel failed to start")
 	default:
 		err := fmt.Errorf("%s", namedTunnelTimeoutMessage(diag))
-		m.Stop()
+		m.stopProcess()
 		m.setError(err.Error())
 		return m.Snapshot(), err
 	}
@@ -733,10 +794,9 @@ func (m *Manager) waitForExit(cmd *exec.Cmd, cancel context.CancelFunc, done cha
 	m.pid = 0
 }
 
-// Stop terminates the running cloudflared process, if any. The waitForExit
-// goroutine is the sole caller of cmd.Wait(); Stop signals it via cancel/Kill
-// and waits for it to finish reaping so state is consistent on return.
-func (m *Manager) Stop() State {
+// stopProcess kills the current cloudflared child without clearing wantRunning
+// or stopping the heal loop. Used for in-place restarts and protocol fallbacks.
+func (m *Manager) stopProcess() {
 	m.mu.Lock()
 	cmd := m.cmd
 	cancel := m.cancel
@@ -767,7 +827,172 @@ func (m *Manager) Stop() State {
 	m.cancel = nil
 	m.done = nil
 	m.mu.Unlock()
+}
+
+// Stop terminates the running cloudflared process, if any. The waitForExit
+// goroutine is the sole caller of cmd.Wait(); Stop signals it via cancel/Kill
+// and waits for it to finish reaping so state is consistent on return.
+func (m *Manager) Stop() State {
+	m.stopHealLoop()
+	m.mu.Lock()
+	m.wantRunning = false
+	m.mu.Unlock()
+	m.stopProcess()
 	return m.Snapshot()
+}
+
+// RestartIfWanted restarts the tunnel using the last successful Start settings.
+// Used by the health loop when the public hostname becomes unreachable while
+// the local cloudflared process is still alive (common after proxy toggles).
+func (m *Manager) RestartIfWanted() (State, error) {
+	m.mu.Lock()
+	want := m.wantRunning
+	settings := m.lastSettings
+	m.mu.Unlock()
+	if !want {
+		return m.Snapshot(), fmt.Errorf("tunnel restart skipped: not wanted")
+	}
+	// Reuse startWithSettings so we do not tear down / recreate the heal loop
+	// from inside healLoop itself.
+	return m.startWithSettings(settings)
+}
+
+func (m *Manager) startHealLoop() {
+	m.stopHealLoop()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	m.mu.Lock()
+	m.healCancel = cancel
+	m.healDone = done
+	interval := m.healInterval
+	threshold := m.healFailThreshold
+	m.mu.Unlock()
+	if interval <= 0 {
+		interval = 15 * time.Second
+	}
+	if threshold <= 0 {
+		threshold = 2
+	}
+	go m.healLoop(ctx, done, interval, threshold)
+}
+
+func (m *Manager) stopHealLoop() {
+	m.mu.Lock()
+	cancel := m.healCancel
+	done := m.healDone
+	m.healCancel = nil
+	m.healDone = nil
+	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+func (m *Manager) healLoop(ctx context.Context, done chan struct{}, interval time.Duration, threshold int) {
+	defer close(done)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	failures := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.mu.Lock()
+			want := m.wantRunning
+			status := m.status
+			publicURL := m.publicURL
+			uiPublicURL := m.uiPublicURL
+			m.mu.Unlock()
+			if !want {
+				failures = 0
+				continue
+			}
+			// Process died (or never came back) while public access is still enabled.
+			if status != StatusRunning && status != StatusStarting {
+				failures = 0
+				m.mu.Lock()
+				m.message = "cloudflared 已退出，正在自动重连…"
+				m.mu.Unlock()
+				_, _ = m.RestartIfWanted()
+				continue
+			}
+			if status != StatusRunning {
+				continue
+			}
+			probeURL := strings.TrimSpace(uiPublicURL)
+			if probeURL == "" {
+				probeURL = strings.TrimSpace(publicURL)
+			}
+			if probeURL == "" {
+				continue
+			}
+			probeCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+			err := m.probePublic(probeCtx, probeURL)
+			cancel()
+			if err == nil {
+				failures = 0
+				continue
+			}
+			failures++
+			if failures < threshold {
+				continue
+			}
+			failures = 0
+			m.mu.Lock()
+			m.message = fmt.Sprintf("公网隧道不可达（%v），正在自动重连…", err)
+			m.mu.Unlock()
+			_, _ = m.RestartIfWanted()
+		}
+	}
+}
+
+func (m *Manager) defaultProbePublic(ctx context.Context, publicURL string) error {
+	healthURL := strings.TrimRight(strings.TrimSpace(publicURL), "/") + "/__health"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+	if err != nil {
+		return err
+	}
+	client := &http.Client{
+		Timeout: 8 * time.Second,
+		Transport: &http.Transport{
+			Proxy: nil, // never use system / env proxy for tunnel health checks
+			DialContext: (&net.Dialer{
+				Timeout:   5 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          4,
+			IdleConnTimeout:       30 * time.Second,
+			TLSHandshakeTimeout:   5 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	// Cloudflare 530 / 502 / 1033-style origin-down responses mean the named
+	// tunnel process is alive locally but no longer registered with edge.
+	if resp.StatusCode == http.StatusOK {
+		return nil
+	}
+	if resp.StatusCode == 530 || resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusServiceUnavailable {
+		return fmt.Errorf("public health returned HTTP %d", resp.StatusCode)
+	}
+	// Other non-OK codes (auth redirects, etc.) still prove edge connectivity.
+	if resp.StatusCode < 500 {
+		return nil
+	}
+	return fmt.Errorf("public health returned HTTP %d", resp.StatusCode)
 }
 
 func (m *Manager) setError(message string) {

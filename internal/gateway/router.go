@@ -507,6 +507,8 @@ func (r *Router) AddAPIKey(key domain.APIKey) (domain.APIKey, error) {
 	if key.CreatedAt == "" {
 		key.CreatedAt = nowRFC3339()
 	}
+	// StreamEnabled default is handled by the HTTP handler (absent field => true);
+	// the value passed here is authoritative.
 
 	r.state.APIKeys = append(r.state.APIKeys, key)
 	return key, nil
@@ -536,6 +538,7 @@ func (r *Router) UpdateAPIKey(keyID string, patch domain.APIKey) (domain.APIKey,
 		}
 		updated.ThinkingDepthOverride = strings.TrimSpace(patch.ThinkingDepthOverride)
 		updated.Enabled = patch.Enabled
+		updated.StreamEnabled = patch.StreamEnabled
 		r.state.APIKeys[index] = updated
 		return updated, nil
 	}

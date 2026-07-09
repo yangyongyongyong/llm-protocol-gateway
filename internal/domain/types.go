@@ -193,9 +193,14 @@ type APIKey struct {
 	ModelOverride         string            `json:"modelOverride,omitempty"`
 	ModelAliases          map[string]string `json:"modelAliases,omitempty"`
 	ThinkingDepthOverride string            `json:"thinkingDepthOverride,omitempty"`
-	Enabled               bool              `json:"enabled"`
-	CreatedAt             string            `json:"createdAt"`
-	LastUsedAt            string            `json:"lastUsedAt,omitempty"`
+	// StreamEnabled controls whether requests authenticated with this API key
+	// may use SSE streaming. Default true; when false, stream:true requests are
+	// rejected. Bound to the API key (not the output endpoint) so streaming can
+	// be toggled per consumer.
+	StreamEnabled bool   `json:"streamEnabled"`
+	Enabled       bool   `json:"enabled"`
+	CreatedAt     string `json:"createdAt"`
+	LastUsedAt    string `json:"lastUsedAt,omitempty"`
 }
 
 type RouteDecision struct {

@@ -277,6 +277,7 @@ type APIKey = {
   modelOverride?: string;
   modelAliases?: Record<string, string>;
   thinkingDepthOverride?: string;
+  streamEnabled?: boolean;
   enabled: boolean;
   createdAt: string;
   lastUsedAt?: string;
@@ -820,6 +821,7 @@ function buildApiKeyPatchBody(key: APIKey, patch: Partial<APIKey> = {}) {
     modelOverride: patch.modelOverride ?? key.modelOverride ?? '',
     modelAliases: patch.modelAliases ?? key.modelAliases ?? {},
     thinkingDepthOverride: patch.thinkingDepthOverride ?? key.thinkingDepthOverride ?? '',
+    streamEnabled: patch.streamEnabled ?? key.streamEnabled ?? true,
     enabled: patch.enabled ?? key.enabled,
   };
 }
@@ -1492,6 +1494,7 @@ function App() {
     modelOverride: '',
     modelAliases: {} as Record<string, string>,
     thinkingDepthOverride: '',
+    streamEnabled: true,
   });
   const [modelsProviderFilter, setModelsProviderFilter] = useState('__all__');
 
@@ -2009,24 +2012,6 @@ function App() {
       showToast(`日志级别已切换为：${data.level}`);
     } catch (error) {
       showToast(`切换日志级别失败：${String(error)}`);
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function updateEndpointStreamEnabled(endpointID: string, streamEnabled: boolean) {
-    setSaving(true);
-    try {
-      const response = await fetch(`${API_BASE}/__endpoints/${encodeURIComponent(endpointID)}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ streamEnabled }),
-      });
-      if (!response.ok) throw new Error(await response.text());
-      await refreshState(false);
-      showToast(streamEnabled ? '已开启流式响应' : '已关闭流式响应；stream:true 请求将被拒绝');
-    } catch (error) {
-      showToast(`更新流式开关失败：${String(error)}`);
     } finally {
       setSaving(false);
     }
@@ -2631,6 +2616,7 @@ function App() {
       modelOverride: '',
       modelAliases: {},
       thinkingDepthOverride: '',
+      streamEnabled: true,
     });
     setApiKeyModalOpen(true);
   }
@@ -2644,6 +2630,7 @@ function App() {
       modelOverride: key.modelOverride || '',
       modelAliases: { ...(key.modelAliases || {}) },
       thinkingDepthOverride: key.thinkingDepthOverride || '',
+      streamEnabled: key.streamEnabled !== false,
     });
     setApiKeyModalOpen(true);
   }
@@ -3123,6 +3110,7 @@ function App() {
           modelOverride: apiKeyDraft.modelOverride,
           modelAliases: apiKeyDraft.modelAliases,
           thinkingDepthOverride: apiKeyDraft.thinkingDepthOverride,
+          streamEnabled: apiKeyDraft.streamEnabled,
           enabled: true,
         }),
       });
@@ -3176,7 +3164,7 @@ function App() {
     await fetchProviderModels(provider.id, providerName || provider.name);
   }
 
-  async function updateApiKeyField(key: APIKey, field: 'name' | 'routeId' | 'modelOverride' | 'thinkingDepthOverride' | 'enabled', value: string | boolean) {
+  async function updateApiKeyField(key: APIKey, field: 'name' | 'routeId' | 'modelOverride' | 'thinkingDepthOverride' | 'streamEnabled' | 'enabled', value: string | boolean) {
     setSaving(true);
     try {
       const patch: Partial<APIKey> = {};
@@ -3184,6 +3172,7 @@ function App() {
       if (field === 'routeId') patch.routeId = String(value);
       if (field === 'modelOverride') patch.modelOverride = String(value);
       if (field === 'thinkingDepthOverride') patch.thinkingDepthOverride = String(value);
+      if (field === 'streamEnabled') patch.streamEnabled = Boolean(value);
       if (field === 'enabled') patch.enabled = Boolean(value);
       const response = await fetch(`${API_BASE}/__apikeys/${encodeURIComponent(key.id)}`, {
         method: 'PATCH',
@@ -3700,27 +3689,17 @@ function App() {
               <div className="panel-header">
                 <div>
                   <h2 className="panel-title">固定输出 Provider</h2>
-                  <p className="panel-desc">应用固定提供三种输出协议入口；公网访问在「公网访问」页统一配置。关闭流式后，客户端 stream:true 请求将被拒绝。</p>
+                  <p className="panel-desc">应用固定提供三种输出协议入口；公网访问在「公网访问」页统一配置。流式开关已移至 API Key（与 Key 绑定）。</p>
                 </div>
                 <Badge tone={publicStatusTone(publicAccess.status)}>{publicAccessStatusLabel(publicAccess.status)}</Badge>
               </div>
               {state.endpoints.map((endpoint) => {
                 const url = endpointURL(endpoint);
                 const publicEndpointURL = publicAccessURL(endpoint, tunnelRunning);
-                const streamOn = endpoint.streamEnabled !== false;
                 return (
                   <div className="endpoint-pair" key={endpoint.id}>
                     <URLRow label={`${protocolLabel(endpoint.protocol)} 局域网`} value={url} onCopy={() => copy(url)} />
                     <URLRow label={`${protocolLabel(endpoint.protocol)} 公网`} value={publicEndpointURL} onCopy={tunnelRunning && endpoint.publicUrl ? () => copy(publicEndpointURL) : undefined} />
-                    <label className="hint-line" style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 }}>
-                      <input
-                        type="checkbox"
-                        checked={streamOn}
-                        disabled={saving}
-                        onChange={(event) => void updateEndpointStreamEnabled(endpoint.id, event.target.checked)}
-                      />
-                      允许流式响应（SSE）
-                    </label>
                   </div>
                 );
               })}
@@ -4807,6 +4786,17 @@ function App() {
                 <option value="high">high</option>
               </select>
             </div>
+            <div className="field field-full">
+              <label>流式响应（SSE）</label>
+              <label className="hint-line" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <input
+                  type="checkbox"
+                  checked={apiKeyDraft.streamEnabled}
+                  onChange={(event) => setApiKeyDraft((current) => ({ ...current, streamEnabled: event.target.checked }))}
+                />
+                允许流式响应（关闭后该 Key 的 stream:true 请求将被拒绝）
+              </label>
+            </div>
             <ApiKeyModelMappingControl
               aliases={apiKeyDraft.modelAliases}
               models={apiKeyDraftModels}
@@ -5088,7 +5078,7 @@ function ApiKeyDetailPanel({
   tunnelRunning: boolean;
   livePublicURL: string;
   fixedOutputLabels: string[];
-  onUpdateField: (key: APIKey, field: 'name' | 'routeId' | 'modelOverride' | 'thinkingDepthOverride' | 'enabled', value: string | boolean) => Promise<void>;
+  onUpdateField: (key: APIKey, field: 'name' | 'routeId' | 'modelOverride' | 'thinkingDepthOverride' | 'streamEnabled' | 'enabled', value: string | boolean) => Promise<void>;
   onUpdateBinding: (key: APIKey, providerId: string, outputProtocol: Protocol) => Promise<void>;
   onUpdateModelAliases: (key: APIKey, modelAliases: Record<string, string>) => Promise<void>;
   onDelete: (key: APIKey) => Promise<void>;
@@ -5164,6 +5154,18 @@ function ApiKeyDetailPanel({
             <option value="medium">medium</option>
             <option value="high">high</option>
           </select>
+        </div>
+        <div className="field">
+          <label>流式响应（SSE）</label>
+          <label className="hint-line" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <input
+              type="checkbox"
+              checked={keyItem.streamEnabled !== false}
+              disabled={saving}
+              onChange={(event) => void onUpdateField(keyItem, 'streamEnabled', event.target.checked)}
+            />
+            允许流式响应（关闭后该 Key 的 stream:true 请求将被拒绝）
+          </label>
         </div>
         <ApiKeyModelMappingControl
           aliases={keyItem.modelAliases || {}}

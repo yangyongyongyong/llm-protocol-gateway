@@ -552,13 +552,25 @@ func (s *Server) handleUpdateEndpoint(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, updated)
 }
 
-// rejectIfStreamDisabled returns true when the client asked for streaming but
-// the output protocol has streamEnabled=false. It writes a clear 400 response.
-func (s *Server) rejectIfStreamDisabled(w http.ResponseWriter, protocol domain.Protocol, stream bool, clientProtocol domain.Protocol) bool {
-	if !stream || s.router.StreamEnabledForProtocol(protocol) {
+// jsonHasKey reports whether the top-level JSON object in body contains key.
+// Used to distinguish an explicitly-provided false from an omitted field.
+func jsonHasKey(body []byte, key string) bool {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
 		return false
 	}
-	message := fmt.Sprintf("该输出协议（%s）已关闭流式响应；请将 stream 设为 false，或在「输出 Provider」中开启流式", protocol.DisplayName())
+	_, ok := raw[key]
+	return ok
+}
+
+// rejectIfStreamDisabledForKey returns true when the client asked for streaming
+// but the matched API key has streamEnabled=false. Streaming is bound to the
+// API key; requests without a matched key (e.g. internal tests) are allowed.
+func (s *Server) rejectIfStreamDisabledForKey(w http.ResponseWriter, keyMatched bool, key domain.APIKey, stream bool, clientProtocol domain.Protocol) bool {
+	if !stream || !keyMatched || key.StreamEnabled {
+		return false
+	}
+	message := "该 API Key 已关闭流式响应；请将 stream 设为 false，或在 API Key 设置中开启「允许流式响应」"
 	switch clientProtocol {
 	case domain.ProtocolClaude:
 		writeClaudeError(w, http.StatusBadRequest, message)
@@ -1750,10 +1762,19 @@ func (s *Server) handleListAPIKeys(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid api key body: "+err.Error())
+		return
+	}
 	var key domain.APIKey
-	if err := json.NewDecoder(r.Body).Decode(&key); err != nil {
+	if err := json.Unmarshal(body, &key); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid api key json: "+err.Error())
 		return
+	}
+	// Absent streamEnabled defaults to true (streaming on by default).
+	if !jsonHasKey(body, "streamEnabled") {
+		key.StreamEnabled = true
 	}
 	created, err := s.router.AddAPIKey(key)
 	if err != nil {
@@ -1771,10 +1792,19 @@ func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpdateAPIKey(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid api key body: "+err.Error())
+		return
+	}
 	var patch domain.APIKey
-	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+	if err := json.Unmarshal(body, &patch); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid api key json: "+err.Error())
 		return
+	}
+	// Absent streamEnabled defaults to true (streaming on by default).
+	if !jsonHasKey(body, "streamEnabled") {
+		patch.StreamEnabled = true
 	}
 	updated, err := s.router.UpdateAPIKey(r.PathValue("id"), patch)
 	if err != nil {
@@ -1946,7 +1976,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	stream, _ := req["stream"].(bool)
-	if s.rejectIfStreamDisabled(w, route.OutputProtocol, stream, domain.ProtocolOpenAIChat) {
+	if s.rejectIfStreamDisabledForKey(w, gatewayKeyMatched, matchedKey, stream, domain.ProtocolOpenAIChat) {
 		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, logModel, "rejected", "stream disabled", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, []byte(`stream disabled`))
 		return
 	}
@@ -2034,7 +2064,7 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	stream, _ := req["stream"].(bool)
-	if s.rejectIfStreamDisabled(w, route.OutputProtocol, stream, domain.ProtocolOpenAIResponses) {
+	if s.rejectIfStreamDisabledForKey(w, gatewayKeyMatched, matchedKey, stream, domain.ProtocolOpenAIResponses) {
 		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, logModel, "rejected", "stream disabled", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, []byte(`stream disabled`))
 		return
 	}
@@ -2123,7 +2153,7 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 	model, logModel := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
 
 	stream, _ := req["stream"].(bool)
-	if s.rejectIfStreamDisabled(w, route.OutputProtocol, stream, domain.ProtocolClaude) {
+	if s.rejectIfStreamDisabledForKey(w, gatewayKeyMatched, matchedKey, stream, domain.ProtocolClaude) {
 		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, logModel, "rejected", "stream disabled", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, []byte(`stream disabled`))
 		return
 	}

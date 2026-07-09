@@ -2,10 +2,13 @@ package tunnel
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestStartQuickParsesURL(t *testing.T) {
@@ -223,6 +226,84 @@ func TestSnapshotReflectsRunningProcess(t *testing.T) {
 	}
 	if snap.StartedAt == "" {
 		t.Fatal("expected startedAt to be set while running")
+	}
+	m.Stop()
+}
+
+func TestScrubProxyEnvRemovesProxyVars(t *testing.T) {
+	got := scrubProxyEnv([]string{
+		"PATH=/usr/bin",
+		"HTTP_PROXY=http://127.0.0.1:7890",
+		"https_proxy=http://127.0.0.1:7890",
+		"ALL_PROXY=socks5://127.0.0.1:7890",
+		"NO_PROXY=localhost",
+		"HOME=/Users/me",
+	})
+	joined := strings.Join(got, "\n")
+	for _, banned := range []string{"HTTP_PROXY=", "https_proxy=", "ALL_PROXY=", "NO_PROXY=localhost"} {
+		if strings.Contains(joined, banned) {
+			t.Fatalf("expected %q scrubbed from env, got %v", banned, got)
+		}
+	}
+	if !strings.Contains(joined, "PATH=/usr/bin") || !strings.Contains(joined, "HOME=/Users/me") {
+		t.Fatalf("expected non-proxy vars preserved, got %v", got)
+	}
+	if !strings.Contains(joined, "NO_PROXY=*") {
+		t.Fatalf("expected NO_PROXY=* override, got %v", got)
+	}
+}
+
+func TestHealLoopRestartsOnPublicProbeFailure(t *testing.T) {
+	m := NewManager(18093)
+	m.lookPath = func(string) (string, error) { return "/usr/bin/true", nil }
+	m.healInterval = 40 * time.Millisecond
+	m.healFailThreshold = 1
+
+	var mu sync.Mutex
+	starts := 0
+	m.run = func(ctx context.Context, args ...string) (*exec.Cmd, io.ReadCloser, error) {
+		mu.Lock()
+		starts++
+		mu.Unlock()
+		output := "2026-07-10 INF Registered tunnel connection connIndex=0 location=SJC\n"
+		cmd := exec.CommandContext(ctx, "/bin/sh", "-c", "sleep 5")
+		if err := cmd.Start(); err != nil {
+			return nil, nil, err
+		}
+		return cmd, io.NopCloser(strings.NewReader(output)), nil
+	}
+	m.probePublic = func(ctx context.Context, publicURL string) error {
+		return fmt.Errorf("public health returned HTTP 530")
+	}
+
+	state, err := m.Start(Settings{
+		Mode:         ModeCustom,
+		CustomDomain: "api.lucadesign.uk",
+		UIDomain:     "user.lucadesign.uk",
+		ConfigFile:   "/tmp/tunnel-config.yml",
+	})
+	if err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+	if state.Status != StatusRunning {
+		t.Fatalf("expected running, got %q", state.Status)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := starts
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	mu.Lock()
+	n := starts
+	mu.Unlock()
+	if n < 2 {
+		t.Fatalf("expected heal loop to restart tunnel, starts=%d", n)
 	}
 	m.Stop()
 }
