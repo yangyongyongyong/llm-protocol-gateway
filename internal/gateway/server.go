@@ -1,0 +1,3206 @@
+package gateway
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/luca/llm-protocol-gateway/internal/cursor"
+	"github.com/luca/llm-protocol-gateway/internal/domain"
+	"github.com/luca/llm-protocol-gateway/internal/monitor"
+	"github.com/luca/llm-protocol-gateway/internal/tunnel"
+)
+
+const (
+	headerGatewayRouteID      = "X-Gateway-Route-Id"
+	headerGatewayInternalTest = "X-Gateway-Internal-Test"
+)
+
+type StateSaver interface {
+	Save(domain.GatewayState) error
+}
+
+type APIKeyStore interface {
+	CreateAPIKey(domain.APIKey) error
+	UpdateAPIKey(domain.APIKey) error
+	DeleteAPIKey(id string) error
+	TouchAPIKey(id string, lastUsedAt string) error
+}
+
+type RequestLogStore interface {
+	AppendRequestLog(monitor.RequestLog) error
+	AppendRequestLogWithRetention(monitor.RequestLog, int) error
+	ListRequestLogs(int) ([]monitor.RequestLog, error)
+	QueryRequestLogs(monitor.RequestLogQuery) (monitor.RequestLogPage, error)
+	PruneRequestLogs(int) error
+}
+
+type Server struct {
+	router                  *Router
+	logs                    *monitor.Store
+	stateSaver              StateSaver
+	apiKeyStore             APIKeyStore
+	requestLogStore         RequestLogStore
+	tunnels                 *tunnel.Manager
+	pendingClaudeOAuth      *claudeOAuthPendingStore
+	pendingCursorOAuth      *cursorOAuthPendingStore
+	cursorBridge            *cursor.Bridge
+	listenAddr              string
+	requestLogRetentionDays int
+	adminAuth               AdminAuthStore
+	// webExposedChange is invoked when the UI toggles LAN/Web exposure so the
+	// process owner (CLI runtime / desktop app) can rebind the HTTP listener.
+	webExposedChange func(enabled bool) error
+}
+
+func NewServer(router *Router, logs *monitor.Store, stateSaver ...StateSaver) *Server {
+	server := &Server{
+		router:                  router,
+		logs:                    logs,
+		pendingClaudeOAuth:      newClaudeOAuthPendingStore(),
+		pendingCursorOAuth:      newCursorOAuthPendingStore(),
+		requestLogRetentionDays: 7,
+	}
+	if days := router.State().RequestLogRetentionDays; days > 0 {
+		server.requestLogRetentionDays = days
+	}
+	if len(stateSaver) > 0 {
+		server.stateSaver = stateSaver[0]
+		if store, ok := stateSaver[0].(APIKeyStore); ok {
+			server.apiKeyStore = store
+		}
+		if rls, ok := stateSaver[0].(RequestLogStore); ok {
+			server.requestLogStore = rls
+		}
+		if auth, ok := stateSaver[0].(AdminAuthStore); ok {
+			server.adminAuth = auth
+		}
+	}
+	return server
+}
+
+func (s *Server) RequestLogRetentionDays() int {
+	if s.requestLogRetentionDays <= 0 {
+		return 7
+	}
+	return s.requestLogRetentionDays
+}
+
+func (s *Server) SetRequestLogRetentionDays(days int) int {
+	if days <= 0 {
+		days = 7
+	}
+	if days > 365 {
+		days = 365
+	}
+	s.requestLogRetentionDays = days
+	return days
+}
+
+// SetTunnelManager attaches the cloudflared lifecycle manager used by the
+// /__public endpoints. It is optional so tests can construct a Server without one.
+func (s *Server) SetTunnelManager(manager *tunnel.Manager) {
+	s.tunnels = manager
+}
+
+// SetListenAddr records the gateway's HTTP listen address (host:port) so OAuth
+// callbacks can target the Claude Code-compatible /callback route.
+func (s *Server) SetListenAddr(addr string) {
+	s.listenAddr = strings.TrimSpace(addr)
+}
+
+// SetWebExposedChangeHandler registers a callback used by PATCH /__settings/web-exposed
+// to rebind the process listen address (127.0.0.1 vs 0.0.0.0).
+func (s *Server) SetWebExposedChangeHandler(fn func(enabled bool) error) {
+	s.webExposedChange = fn
+}
+
+// SaveState persists the current router state (including webExposed).
+func (s *Server) SaveState() error {
+	return s.saveState()
+}
+
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /__health", s.handleHealth)
+	mux.HandleFunc("GET /__auth/status", s.handleAuthStatus)
+	mux.HandleFunc("POST /__auth/setup", s.handleAuthSetup)
+	mux.HandleFunc("POST /__auth/login", s.handleAuthLogin)
+	mux.HandleFunc("POST /__auth/logout", s.handleAuthLogout)
+	mux.HandleFunc("POST /__auth/password", s.handleAuthPassword)
+	mux.HandleFunc("GET /__state", s.handleState)
+	mux.HandleFunc("GET /__settings/paths", s.handleSettingsPaths)
+	mux.HandleFunc("GET /__logs", s.handleLogs)
+	mux.HandleFunc("GET /__request-stats", s.handleRequestStats)
+	mux.HandleFunc("GET /__app/logs", s.handleAppLogs)
+	mux.HandleFunc("PATCH /__app/log-level", s.handleSetLogLevel)
+	mux.HandleFunc("PATCH /__settings/request-log-retention", s.handleSetRequestLogRetention)
+	mux.HandleFunc("PATCH /__settings/web-exposed", s.handleSetWebExposed)
+	mux.HandleFunc("PATCH /__public-access", s.handleUpdatePublicAccess)
+	mux.HandleFunc("PATCH /__endpoints/{id}", s.handleUpdateEndpoint)
+	mux.HandleFunc("GET /__public", s.handlePublicStatus)
+	mux.HandleFunc("POST /__public/start", s.handlePublicStart)
+	mux.HandleFunc("POST /__public/stop", s.handlePublicStop)
+	mux.HandleFunc("POST /__public/cloudflare/login/start", s.handleCloudflareLoginStart)
+	mux.HandleFunc("GET /__public/cloudflare/login/status", s.handleCloudflareLoginStatus)
+	mux.HandleFunc("GET /__public/cloudflare/zones", s.handleCloudflareZones)
+	mux.HandleFunc("POST /__public/cloudflare/bind", s.handleCloudflareBind)
+	mux.HandleFunc("POST /__providers", s.handleCreateProvider)
+	mux.HandleFunc("PATCH /__providers/{id}", s.handleUpdateProvider)
+	mux.HandleFunc("GET /__providers/export", s.handleExportProviders)
+	mux.HandleFunc("POST /__providers/export", s.handleExportProviders)
+	mux.HandleFunc("POST /__providers/import", s.handleImportProviders)
+	mux.HandleFunc("POST /__providers/{id}/test", s.handleTestProvider)
+	mux.HandleFunc("GET /__providers/{id}/auth-preview", s.handleProviderAuthPreview)
+	mux.HandleFunc("POST /__providers/{id}/chat-test", s.handleProviderChatTest)
+	mux.HandleFunc("POST /__providers/{id}/cache-test", s.handleProviderCacheTest)
+	mux.HandleFunc("POST /__providers/{id}/thinking-test", s.handleProviderThinkingTest)
+	mux.HandleFunc("POST /__providers/{id}/claude-oauth/start", s.handleClaudeOAuthStart)
+	mux.HandleFunc("GET /__providers/{id}/claude-oauth/status", s.handleClaudeOAuthStatus)
+	// Claude Code OAuth client allowlists http://localhost:<port>/callback only.
+	mux.HandleFunc("GET /callback", s.handleClaudeOAuthCallback)
+	mux.HandleFunc("GET /__claude-oauth/callback", s.handleClaudeOAuthCallback) // legacy alias
+	mux.HandleFunc("POST /__providers/{id}/claude-oauth/complete", s.handleClaudeOAuthComplete)
+	mux.HandleFunc("POST /__providers/{id}/claude-oauth/disconnect", s.handleClaudeOAuthDisconnect)
+	mux.HandleFunc("GET /__providers/{id}/claude-oauth/usage", s.handleClaudeOAuthUsage)
+	mux.HandleFunc("POST /__providers/{id}/cursor-oauth/start", s.handleCursorOAuthStart)
+	mux.HandleFunc("GET /__providers/{id}/cursor-oauth/status", s.handleCursorOAuthStatus)
+	mux.HandleFunc("POST /__providers/{id}/cursor-oauth/disconnect", s.handleCursorOAuthDisconnect)
+	mux.HandleFunc("GET /__providers/{id}/cursor-oauth/usage", s.handleCursorOAuthUsage)
+	mux.HandleFunc("DELETE /__providers/{id}", s.handleDeleteProvider)
+	mux.HandleFunc("POST /__routes", s.handleCreateRoute)
+	mux.HandleFunc("PATCH /__routes/{id}", s.handleUpdateRoute)
+	mux.HandleFunc("DELETE /__routes/{id}", s.handleDeleteRoute)
+	mux.HandleFunc("POST /__routes/{id}/test", s.handleTestRoute)
+	mux.HandleFunc("GET /__apikeys", s.handleListAPIKeys)
+	mux.HandleFunc("POST /__apikeys", s.handleCreateAPIKey)
+	mux.HandleFunc("PATCH /__apikeys/{id}", s.handleUpdateAPIKey)
+	mux.HandleFunc("DELETE /__apikeys/{id}", s.handleDeleteAPIKey)
+	mux.HandleFunc("GET /v1/models", s.handleOpenAIModels)
+	mux.HandleFunc("GET /anthropic/v1/models", s.handleClaudeModels)
+	mux.HandleFunc("POST /v1/chat/completions", s.handleOpenAIChat)
+	mux.HandleFunc("POST /chat/completions", s.handleOpenAIChat)
+	mux.HandleFunc("POST /openai/v1/responses", s.handleOpenAIResponses)
+	mux.HandleFunc("POST /anthropic/v1/messages", s.handleClaudeMessages)
+	mux.HandleFunc("POST /anthropic/v1/messages/count_tokens", s.handleClaudeCountTokens)
+	api := withCORS(mux)
+	return s.withAdminAuth(withHostSeparatedServing(api, findWebDistDir(), s.publicHostRole))
+}
+
+// publicHostRole returns "api" / "ui" when the request Host matches the
+// dedicated custom-domain hostnames; otherwise "" (combined local/LAN mode).
+func (s *Server) publicHostRole(host string) string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		return ""
+	}
+	settings := s.router.State().PublicAccess
+	apiHost := ""
+	uiHost := ""
+	if settings.ExposeAPI {
+		apiHost = cleanPublicHost(settings.CustomDomain)
+	}
+	if settings.ExposeUI {
+		uiHost = cleanPublicHost(settings.UIDomain)
+	}
+	if apiHost != "" && strings.EqualFold(host, apiHost) {
+		return "api"
+	}
+	if uiHost != "" && strings.EqualFold(host, uiHost) {
+		return "ui"
+	}
+	return ""
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "time": time.Now().Format(time.RFC3339)})
+}
+
+func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
+	state := s.router.State()
+	state.Providers = redactProvidersForClient(state.Providers)
+	for index := range state.Providers {
+		enrichProviderAdapterCurl(&state.Providers[index])
+	}
+	state.PublicAccess = s.withTunnelRuntime(state.PublicAccess)
+	state.RequestLogRetentionDays = s.RequestLogRetentionDays()
+	state.WebExposed = s.router.WebExposed()
+	paths := ResolveDataPaths()
+	state.DataPaths = &paths
+	writeJSON(w, http.StatusOK, state)
+}
+
+func (s *Server) handleSettingsPaths(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, ResolveDataPaths())
+}
+
+// redactProvidersForClient deep-copies providers and scrubs secret fields
+// (currently the Claude OAuth access/refresh tokens) before they are sent to
+// the frontend. Internal code paths (SQLite save/load, OAuth handlers) must
+// keep using the router's real domain.Provider values, never this copy.
+func redactProvidersForClient(providers []domain.Provider) []domain.Provider {
+	redacted := make([]domain.Provider, len(providers))
+	for index, provider := range providers {
+		redacted[index] = redactProviderForClient(provider)
+	}
+	return redacted
+}
+
+func redactProviderForClient(provider domain.Provider) domain.Provider {
+	if provider.ClaudeOAuth != nil {
+		original := provider.ClaudeOAuth
+		provider.ClaudeOAuth = &domain.ClaudeOAuthCredential{
+			ExpiresAt:    original.ExpiresAt,
+			Scope:        original.Scope,
+			AccountLabel: original.AccountLabel,
+			Connected:    strings.TrimSpace(original.AccessToken) != "" && strings.TrimSpace(original.RefreshToken) != "",
+		}
+	}
+	if provider.CursorOAuth != nil {
+		original := provider.CursorOAuth
+		provider.CursorOAuth = &domain.CursorOAuthCredential{
+			ExpiresAt:    original.ExpiresAt,
+			AccountLabel: original.AccountLabel,
+			Connected:    strings.TrimSpace(original.AccessToken) != "" && strings.TrimSpace(original.RefreshToken) != "",
+		}
+	}
+	// Regenerate curl against the real BaseURL for UI display.
+	enrichProviderAdapterCurl(&provider)
+	return provider
+}
+
+func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
+	query := monitor.RequestLogQuery{
+		Status:     strings.TrimSpace(r.URL.Query().Get("status")),
+		APIKeyName: strings.TrimSpace(r.URL.Query().Get("apiKeyName")),
+		Page:       atoiDefault(r.URL.Query().Get("page"), 1),
+		PageSize:   atoiDefault(r.URL.Query().Get("pageSize"), 100),
+	}
+	if from := strings.TrimSpace(r.URL.Query().Get("from")); from != "" {
+		if parsed, err := time.Parse(time.RFC3339, from); err == nil {
+			query.From = parsed
+		} else if parsed, err := time.ParseInLocation("2006-01-02", from, time.Local); err == nil {
+			query.From = parsed
+		}
+	}
+	if to := strings.TrimSpace(r.URL.Query().Get("to")); to != "" {
+		if parsed, err := time.Parse(time.RFC3339, to); err == nil {
+			query.To = parsed
+		} else if parsed, err := time.ParseInLocation("2006-01-02", to, time.Local); err == nil {
+			query.To = parsed.Add(24 * time.Hour)
+		}
+	}
+	if s.requestLogStore != nil {
+		page, err := s.requestLogStore.QueryRequestLogs(query)
+		if err == nil {
+			writeJSON(w, http.StatusOK, page)
+			return
+		}
+		s.logs.AddApp("warn", "query request logs failed", err.Error())
+	}
+	writeJSON(w, http.StatusOK, s.logs.Query(query))
+}
+
+func atoiDefault(raw string, fallback int) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return value
+}
+
+func (s *Server) handleRequestStats(w http.ResponseWriter, r *http.Request) {
+	now := time.Now()
+	localNow := now.Local()
+	from := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, localNow.Location())
+	to := from.Add(24 * time.Hour)
+	if raw := strings.TrimSpace(r.URL.Query().Get("from")); raw != "" {
+		if parsed, err := time.Parse(time.RFC3339, raw); err == nil {
+			from = parsed
+		} else if parsed, err := time.ParseInLocation("2006-01-02", raw, localNow.Location()); err == nil {
+			from = parsed
+		}
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("to")); raw != "" {
+		if parsed, err := time.Parse(time.RFC3339, raw); err == nil {
+			to = parsed
+		} else if parsed, err := time.ParseInLocation("2006-01-02", raw, localNow.Location()); err == nil {
+			to = parsed.Add(24 * time.Hour)
+		}
+	}
+	logs := s.logs.List(5000)
+	if s.requestLogStore != nil {
+		if page, err := s.requestLogStore.QueryRequestLogs(monitor.RequestLogQuery{
+			From: from.AddDate(0, 0, -31), To: to, Page: 1, PageSize: 500, Status: "all",
+		}); err == nil && len(page.Items) > 0 {
+			// Prefer a broader window for month/daily charts; fall back to memory.
+			if all, listErr := s.requestLogStore.ListRequestLogs(5000); listErr == nil && len(all) > 0 {
+				logs = all
+			} else {
+				logs = page.Items
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, s.logs.UsageStatsRange(logs, now, from, to))
+}
+
+func (s *Server) recordRequestLog(started time.Time, matchedKey domain.APIKey, gatewayKeyMatched bool, routeID, providerID, model, action, protocolFlow, path string, status int, usage TokenUsage, requestBody, responseBody []byte) {
+	s.recordRequestLogEx(started, matchedKey, gatewayKeyMatched, routeID, providerID, model, action, protocolFlow, path, status, usage, 0, "", "", requestBody, responseBody)
+}
+
+func (s *Server) recordRequestLogFromRequest(r *http.Request, started time.Time, matchedKey domain.APIKey, gatewayKeyMatched bool, routeID, providerID, model, action, protocolFlow, path string, status int, usage TokenUsage, requestBody, responseBody []byte) {
+	s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, routeID, providerID, model, action, protocolFlow, path, status, usage, 0, requestBody, responseBody)
+}
+
+func (s *Server) recordRequestLogFromRequestTTFT(r *http.Request, started time.Time, matchedKey domain.APIKey, gatewayKeyMatched bool, routeID, providerID, model, action, protocolFlow, path string, status int, usage TokenUsage, ttftMs int64, requestBody, responseBody []byte) {
+	clientHost := ""
+	accessSource := monitor.AccessSourceLocal
+	if r != nil {
+		clientHost = requestClientHost(r)
+		accessSource = classifyAccessSource(clientHost, s.router.State().PublicAccess.PublicBaseURL)
+	}
+	s.recordRequestLogEx(started, matchedKey, gatewayKeyMatched, routeID, providerID, model, action, protocolFlow, path, status, usage, ttftMs, clientHost, accessSource, requestBody, responseBody)
+}
+
+func (s *Server) recordRequestLogEx(started time.Time, matchedKey domain.APIKey, gatewayKeyMatched bool, routeID, providerID, model, action, protocolFlow, path string, status int, usage TokenUsage, ttftMs int64, clientHost, accessSource string, requestBody, responseBody []byte) {
+	if usage.InputTokens == 0 && usage.OutputTokens == 0 {
+		usage = EstimateTokenUsage(requestBody, responseBody)
+	}
+	latency := time.Since(started).Milliseconds()
+	if ttftMs <= 0 {
+		// Non-stream (or unknown TTFT): treat total latency as a coarse TTFT.
+		ttftMs = latency
+	}
+	entry := monitor.RequestLog{
+		Time:          started,
+		RouteID:       routeID,
+		ProviderID:    providerID,
+		Model:         model,
+		Action:        action,
+		ProtocolFlow:  protocolFlow,
+		Path:          path,
+		Status:        status,
+		InputTokens:   usage.InputTokens,
+		OutputTokens:  usage.OutputTokens,
+		CacheTokens:   usage.CacheTokens,
+		LatencyMillis: latency,
+		TTFTMillis:    ttftMs,
+		ClientHost:    clientHost,
+		AccessSource:  accessSource,
+		RequestBody:   truncateForLog(requestBody, 8192),
+	}
+	if gatewayKeyMatched {
+		entry.APIKeyID = matchedKey.ID
+		entry.APIKeyName = matchedKey.Name
+	} else if strings.HasPrefix(action, "test_") {
+		entry.APIKeyName = "Route Test"
+	}
+	if status >= 400 || extractResponseErrorMessage(responseBody) != "" {
+		entry.ResponseBody = truncateForLog(responseBody, 16384)
+		entry.ErrorDescription = extractResponseErrorMessage(responseBody)
+		if entry.ErrorDescription == "" && status >= 400 {
+			entry.ErrorDescription = summarizeUpstreamHTTPError(status, responseBody)
+		}
+	}
+	s.logs.Add(entry)
+	if s.requestLogStore != nil {
+		if err := s.requestLogStore.AppendRequestLogWithRetention(entry, s.RequestLogRetentionDays()); err != nil {
+			s.logs.AddApp("warn", "failed to persist request log", err.Error())
+		}
+	}
+}
+
+func truncateForLog(data []byte, limit int) string {
+	if len(data) == 0 {
+		return ""
+	}
+	if len(data) <= limit {
+		return string(data)
+	}
+	return string(data[:limit]) + "…(truncated)"
+}
+
+func (s *Server) handleAppLogs(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"level": s.logs.Level(), "logs": s.logs.ListApp(200)})
+}
+
+func (s *Server) handleSetLogLevel(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		Level string `json:"level"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid log level json: "+err.Error())
+		return
+	}
+	level := s.logs.SetLevel(payload.Level)
+	if err := s.saveState(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+		return
+	}
+	s.logs.AddApp("info", "log level changed", level)
+	writeJSON(w, http.StatusOK, map[string]any{"level": level})
+}
+
+func (s *Server) handleSetRequestLogRetention(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		Days int `json:"days"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid retention json: "+err.Error())
+		return
+	}
+	days := s.SetRequestLogRetentionDays(payload.Days)
+	s.router.SetRequestLogRetentionDays(days)
+	if err := s.saveState(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+		return
+	}
+	if s.requestLogStore != nil {
+		_ = s.requestLogStore.PruneRequestLogs(days)
+	}
+	s.logs.AddApp("info", "request log retention updated", fmt.Sprintf("days=%d", days))
+	writeJSON(w, http.StatusOK, map[string]any{"requestLogRetentionDays": days})
+}
+
+func (s *Server) handleSetWebExposed(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid webExposed json: "+err.Error())
+		return
+	}
+	if payload.Enabled == nil {
+		writeOpenAIError(w, http.StatusBadRequest, "enabled is required")
+		return
+	}
+	enabled := *payload.Enabled
+	if s.webExposedChange != nil {
+		if err := s.webExposedChange(enabled); err != nil {
+			// Still report current preference; rebind may require restart when GATEWAY_ADDR is set.
+			s.router.SetWebExposed(enabled)
+			_ = s.saveState()
+			writeJSON(w, http.StatusOK, map[string]any{
+				"webExposed": enabled,
+				"warning":    err.Error(),
+			})
+			return
+		}
+	} else {
+		s.router.SetWebExposed(enabled)
+		if err := s.saveState(); err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+			return
+		}
+	}
+	s.logs.AddApp("info", "web exposure updated", fmt.Sprintf("webExposed=%v", enabled))
+	writeJSON(w, http.StatusOK, map[string]any{"webExposed": s.router.WebExposed()})
+}
+
+func (s *Server) handleUpdatePublicAccess(w http.ResponseWriter, r *http.Request) {
+	var settings domain.PublicAccessSettings
+	if err := json.NewDecoder(r.Body).Decode(&settings); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid public access json: "+err.Error())
+		return
+	}
+	updated := s.router.UpdatePublicAccess(settings)
+	if err := s.saveState(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+		return
+	}
+	s.logs.AddApp("info", "public access settings updated", fmt.Sprintf("mode=%s status=%s domain=%s", updated.Mode, updated.Status, updated.CustomDomain))
+	writeJSON(w, http.StatusOK, s.withTunnelRuntime(updated))
+}
+
+func (s *Server) handleUpdateEndpoint(w http.ResponseWriter, r *http.Request) {
+	endpointID := r.PathValue("id")
+	var payload struct {
+		StreamEnabled *bool `json:"streamEnabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid endpoint json: "+err.Error())
+		return
+	}
+	if payload.StreamEnabled == nil {
+		writeOpenAIError(w, http.StatusBadRequest, "streamEnabled is required")
+		return
+	}
+	updated, err := s.router.UpdateEndpointStreamEnabled(endpointID, *payload.StreamEnabled)
+	if err != nil {
+		writeOpenAIError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err := s.saveState(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+		return
+	}
+	s.logs.AddApp("info", "endpoint stream setting updated", fmt.Sprintf("endpoint=%s streamEnabled=%v", updated.ID, updated.StreamEnabled))
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// rejectIfStreamDisabled returns true when the client asked for streaming but
+// the output protocol has streamEnabled=false. It writes a clear 400 response.
+func (s *Server) rejectIfStreamDisabled(w http.ResponseWriter, protocol domain.Protocol, stream bool, clientProtocol domain.Protocol) bool {
+	if !stream || s.router.StreamEnabledForProtocol(protocol) {
+		return false
+	}
+	message := fmt.Sprintf("该输出协议（%s）已关闭流式响应；请将 stream 设为 false，或在「输出 Provider」中开启流式", protocol.DisplayName())
+	switch clientProtocol {
+	case domain.ProtocolClaude:
+		writeClaudeError(w, http.StatusBadRequest, message)
+	default:
+		writeOpenAIError(w, http.StatusBadRequest, message)
+	}
+	return true
+}
+
+// handlePublicStatus returns the persisted public-access settings plus the live
+// cloudflared tunnel runtime state.
+func (s *Server) handlePublicStatus(w http.ResponseWriter, r *http.Request) {
+	settings := s.router.State().PublicAccess
+	writeJSON(w, http.StatusOK, s.withTunnelRuntime(settings))
+}
+
+// handlePublicStart starts a cloudflared tunnel using the current (or provided)
+// public-access settings and returns the updated status.
+func (s *Server) handlePublicStart(w http.ResponseWriter, r *http.Request) {
+	if s.tunnels == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "tunnel manager is not configured")
+		return
+	}
+	// Optionally accept a settings body to update-then-start in one call.
+	if r.Body != nil {
+		var incoming domain.PublicAccessSettings
+		if err := json.NewDecoder(r.Body).Decode(&incoming); err == nil && (incoming.Mode != "" || incoming.CustomDomain != "" || incoming.Enabled) {
+			incoming.Enabled = true
+			s.router.UpdatePublicAccess(incoming)
+			_ = s.saveState()
+		}
+	}
+
+	settings := s.ensureSplitCustomDomains(r.Context())
+	tunnelSettings := s.tunnelSettingsFromPublicAccess(settings)
+
+	state, err := s.tunnels.Start(tunnelSettings)
+	s.applyTunnelURL(state)
+	settings = s.router.State().PublicAccess
+	if err != nil {
+		s.logs.AddApp("warn", "public access start failed", err.Error())
+		writeJSON(w, http.StatusOK, s.withTunnelRuntime(settings))
+		return
+	}
+	s.logs.AddApp("info", "public access started", fmt.Sprintf("mode=%s url=%s", state.Mode, state.PublicURL))
+	writeJSON(w, http.StatusOK, s.withTunnelRuntime(settings))
+}
+
+// RestorePublicAccess restarts the cloudflared tunnel when persisted settings
+// indicate public access was left enabled (e.g. after a gateway restart).
+func (s *Server) RestorePublicAccess() {
+	if s.tunnels == nil {
+		return
+	}
+	settings := s.router.State().PublicAccess
+	if !settings.Enabled {
+		return
+	}
+	settings = s.ensureSplitCustomDomains(context.Background())
+	tunnelSettings := s.tunnelSettingsFromPublicAccess(settings)
+	state, err := s.tunnels.Start(tunnelSettings)
+	s.applyTunnelURL(state)
+	if err != nil {
+		s.logs.AddApp("warn", "public access auto-restore failed", err.Error())
+		slog.Warn("public access auto-restore failed", "error", err)
+		return
+	}
+	s.logs.AddApp("info", "public access auto-restored", fmt.Sprintf("mode=%s api=%s ui=%s", state.Mode, settings.CustomDomain, settings.UIDomain))
+	slog.Info("public access auto-restored", "mode", state.Mode, "api", settings.CustomDomain, "ui", settings.UIDomain)
+}
+
+func (s *Server) tunnelSettingsFromPublicAccess(settings domain.PublicAccessSettings) tunnel.Settings {
+	apiDomain := ""
+	uiDomain := ""
+	if settings.Mode == domain.PublicAccessModeCustomDomain {
+		if settings.ExposeAPI {
+			apiDomain = cleanPublicHost(settings.CustomDomain)
+		}
+		if settings.ExposeUI {
+			uiDomain = cleanPublicHost(settings.UIDomain)
+		}
+	} else {
+		apiDomain = cleanPublicHost(settings.CustomDomain)
+		uiDomain = cleanPublicHost(settings.UIDomain)
+	}
+	return tunnel.Settings{
+		Enabled:         true,
+		Mode:            tunnelModeFromDomain(settings.Mode),
+		CustomDomain:    apiDomain,
+		UIDomain:        uiDomain,
+		TunnelName:      settings.TunnelName,
+		TunnelToken:     settings.TunnelToken,
+		CredentialsFile: settings.CredentialsFile,
+		ConfigFile:      settings.TunnelConfigFile,
+	}
+}
+
+// ensureSplitCustomDomains re-provisions the named-tunnel config for the
+// currently enabled public surfaces (API and/or UI).
+func (s *Server) ensureSplitCustomDomains(ctx context.Context) domain.PublicAccessSettings {
+	settings := s.router.State().PublicAccess
+	if settings.Mode != domain.PublicAccessModeCustomDomain {
+		return settings
+	}
+	apiDomain := ""
+	uiDomain := ""
+	if settings.ExposeAPI {
+		apiDomain = cleanPublicHost(settings.CustomDomain)
+	}
+	if settings.ExposeUI {
+		uiDomain = cleanPublicHost(settings.UIDomain)
+	}
+	if apiDomain == "" && uiDomain == "" {
+		return settings
+	}
+	if apiDomain != "" && uiDomain != "" && strings.EqualFold(apiDomain, uiDomain) {
+		return settings
+	}
+	if s.tunnels == nil {
+		return settings
+	}
+	setup := s.tunnels.Cloudflare()
+	if !setup.IsAuthorized() {
+		return settings
+	}
+	provisioned, err := setup.Provision(ctx, apiDomain, uiDomain, settings.TunnelName, s.localGatewayPort())
+	if err != nil {
+		s.logs.AddApp("warn", "custom-domain reprovision skipped", err.Error())
+		return settings
+	}
+	settings.TunnelName = provisioned.TunnelName
+	settings.CredentialsFile = provisioned.CredentialsFile
+	settings.TunnelConfigFile = provisioned.ConfigFile
+	s.router.UpdatePublicAccess(settings)
+	_ = s.saveState()
+	return s.router.State().PublicAccess
+}
+
+// handlePublicStop stops the running cloudflared tunnel.
+func (s *Server) handlePublicStop(w http.ResponseWriter, r *http.Request) {
+	if s.tunnels == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "tunnel manager is not configured")
+		return
+	}
+	state := s.tunnels.Stop()
+	// Mark public access as intentionally stopped so it is not auto-restored on
+	// the next gateway restart. Preserve mode/domain/token/config for re-enable.
+	current := s.router.State().PublicAccess
+	current.Enabled = false
+	current.RuntimeURL = ""
+	s.router.UpdatePublicAccess(current)
+	_ = s.saveState()
+	settings := s.router.State().PublicAccess
+	s.logs.AddApp("info", "public access stopped", fmt.Sprintf("status=%s", state.Status))
+	writeJSON(w, http.StatusOK, s.withTunnelRuntime(settings))
+}
+
+// applyTunnelURL records a live tunnel URL into the router settings so that
+// endpoint public URLs are derived from it.
+func (s *Server) applyTunnelURL(state tunnel.State) {
+	if state.PublicURL == "" && state.UIPublicURL == "" {
+		return
+	}
+	current := s.router.State().PublicAccess
+	current.Enabled = true
+	if state.PublicURL != "" {
+		current.RuntimeURL = state.PublicURL
+	} else if state.UIPublicURL != "" {
+		current.RuntimeURL = state.UIPublicURL
+	}
+	s.router.UpdatePublicAccess(current)
+	_ = s.saveState()
+}
+
+// withTunnelRuntime attaches the live tunnel manager snapshot to a settings copy.
+func (s *Server) withTunnelRuntime(settings domain.PublicAccessSettings) domain.PublicAccessSettings {
+	if s.tunnels == nil {
+		return settings
+	}
+	snap := s.tunnels.Snapshot()
+	settings.Tunnel = &domain.TunnelRuntime{
+		Status:      string(snap.Status),
+		Mode:        string(snap.Mode),
+		PublicURL:   snap.PublicURL,
+		UIPublicURL: snap.UIPublicURL,
+		Message:     snap.Message,
+		StartedAt:   snap.StartedAt,
+		PID:         snap.PID,
+	}
+	// Keep persisted status aligned with the live tunnel so UI badges don't
+	// stay on "configured_pending_tunnel" after RestorePublicAccess succeeds.
+	switch snap.Status {
+	case tunnel.StatusRunning:
+		settings.Status = "runtime_url_recorded"
+		settings.StatusMessage = snap.Message
+		settings.PublicBaseURL = ""
+		settings.UIPublicBaseURL = ""
+		if settings.Mode == domain.PublicAccessModeCustomDomain {
+			if settings.ExposeAPI && settings.CustomDomain != "" {
+				settings.PublicBaseURL = "https://" + cleanPublicHost(settings.CustomDomain)
+			}
+			if settings.ExposeUI && settings.UIDomain != "" {
+				settings.UIPublicBaseURL = "https://" + cleanPublicHost(settings.UIDomain)
+			}
+			if settings.PublicBaseURL != "" {
+				settings.RuntimeURL = settings.PublicBaseURL
+			} else if settings.UIPublicBaseURL != "" {
+				settings.RuntimeURL = settings.UIPublicBaseURL
+			}
+		} else if snap.PublicURL != "" {
+			settings.PublicBaseURL = snap.PublicURL
+			settings.RuntimeURL = snap.PublicURL
+		}
+	case tunnel.StatusStarting:
+		if settings.Status == "" || settings.Status == "disabled" || settings.Status == "configured_pending_tunnel" {
+			settings.Status = "waiting_for_tunnel"
+		}
+	case tunnel.StatusError:
+		settings.Status = "error"
+		if snap.Message != "" {
+			settings.StatusMessage = snap.Message
+		}
+	}
+	return settings
+}
+
+// tunnelModeFromDomain maps the domain public-access mode to a tunnel mode.
+func tunnelModeFromDomain(mode domain.PublicAccessMode) tunnel.Mode {
+	if mode == domain.PublicAccessModeCustomDomain {
+		return tunnel.ModeCustom
+	}
+	return tunnel.ModeQuick
+}
+
+func (s *Server) localGatewayPort() int {
+	addr := strings.TrimSpace(s.listenAddr)
+	if addr == "" {
+		return 18093
+	}
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 18093
+	}
+	parsed, err := strconv.Atoi(port)
+	if err != nil || parsed <= 0 {
+		return 18093
+	}
+	return parsed
+}
+
+// handleCloudflareLoginStart opens the official Cloudflare tunnel authorization
+// page via cloudflared and returns a fallback URL for the browser.
+func (s *Server) handleCloudflareLoginStart(w http.ResponseWriter, r *http.Request) {
+	if s.tunnels == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "tunnel manager is not configured")
+		return
+	}
+	setup := s.tunnels.Cloudflare()
+	if setup.IsAuthorized() {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":   "connected",
+			"loginUrl": tunnel.CloudflareLoginURL(),
+		})
+		return
+	}
+	loginURL, err := setup.StartLogin(r.Context())
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":   "pending",
+		"loginUrl": loginURL,
+	})
+}
+
+// handleCloudflareLoginStatus reports whether cloudflared origin cert exists.
+func (s *Server) handleCloudflareLoginStatus(w http.ResponseWriter, r *http.Request) {
+	if s.tunnels == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "tunnel manager is not configured")
+		return
+	}
+	authorized := s.tunnels.Cloudflare().IsAuthorized()
+	status := "pending"
+	if authorized {
+		status = "connected"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":     status,
+		"authorized": authorized,
+	})
+}
+
+// handleCloudflareZones lists root domains authorized via the local origin cert.
+func (s *Server) handleCloudflareZones(w http.ResponseWriter, r *http.Request) {
+	if s.tunnels == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "tunnel manager is not configured")
+		return
+	}
+	setup := s.tunnels.Cloudflare()
+	if !setup.IsAuthorized() {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"authorized": false,
+			"zones":      []tunnel.CloudflareZone{},
+		})
+		return
+	}
+	zones, err := setup.ListZones(r.Context())
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"authorized": true,
+		"zones":      zones,
+	})
+}
+
+// handleCloudflareBind provisions a named tunnel after browser login, persists
+// the config, and starts the custom-domain tunnel.
+func (s *Server) handleCloudflareBind(w http.ResponseWriter, r *http.Request) {
+	if s.tunnels == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "tunnel manager is not configured")
+		return
+	}
+	var payload struct {
+		CustomDomain string `json:"customDomain"`
+		UIDomain     string `json:"uiDomain"`
+		ExposeAPI    *bool  `json:"exposeApi"`
+		ExposeUI     *bool  `json:"exposeUi"`
+		TunnelName   string `json:"tunnelName"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	customDomain := cleanPublicHost(payload.CustomDomain)
+	uiDomain := cleanPublicHost(payload.UIDomain)
+	exposeAPI := payload.ExposeAPI == nil || *payload.ExposeAPI
+	exposeUI := payload.ExposeUI == nil || *payload.ExposeUI
+	if !exposeAPI {
+		customDomain = ""
+	}
+	if !exposeUI {
+		uiDomain = ""
+	}
+	if exposeAPI && customDomain == "" {
+		writeOpenAIError(w, http.StatusBadRequest, "customDomain is required when exposeApi is enabled")
+		return
+	}
+	if exposeUI && uiDomain == "" {
+		writeOpenAIError(w, http.StatusBadRequest, "uiDomain is required when exposeUi is enabled")
+		return
+	}
+	if !exposeAPI && !exposeUI {
+		writeOpenAIError(w, http.StatusBadRequest, "enable at least one of exposeApi or exposeUi")
+		return
+	}
+	if customDomain != "" && uiDomain != "" && strings.EqualFold(customDomain, uiDomain) {
+		writeOpenAIError(w, http.StatusBadRequest, "api domain and ui domain must be different")
+		return
+	}
+	setup := s.tunnels.Cloudflare()
+	if !setup.IsAuthorized() {
+		writeOpenAIError(w, http.StatusBadRequest, "cloudflare is not authorized yet; complete browser login first")
+		return
+	}
+	provisioned, err := setup.Provision(r.Context(), customDomain, uiDomain, strings.TrimSpace(payload.TunnelName), s.localGatewayPort())
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	current := s.router.State().PublicAccess
+	current.Enabled = true
+	current.Provider = "cloudflare"
+	current.Mode = domain.PublicAccessModeCustomDomain
+	current.ExposeAPI = exposeAPI
+	current.ExposeUI = exposeUI
+	if customDomain != "" {
+		current.CustomDomain = customDomain
+	}
+	if uiDomain != "" {
+		current.UIDomain = uiDomain
+	}
+	current.TunnelName = provisioned.TunnelName
+	current.CredentialsFile = provisioned.CredentialsFile
+	current.TunnelConfigFile = provisioned.ConfigFile
+	current.TunnelToken = ""
+	s.router.UpdatePublicAccess(current)
+	_ = s.saveState()
+
+	settings := s.router.State().PublicAccess
+	tunnelSettings := tunnel.Settings{
+		Enabled:         true,
+		Mode:            tunnel.ModeCustom,
+		CustomDomain:    customDomain,
+		UIDomain:        uiDomain,
+		TunnelName:      provisioned.TunnelName,
+		CredentialsFile: provisioned.CredentialsFile,
+		ConfigFile:      provisioned.ConfigFile,
+	}
+	state, err := s.tunnels.Start(tunnelSettings)
+	s.applyTunnelURL(state)
+	settings = s.router.State().PublicAccess
+	if err != nil {
+		s.logs.AddApp("warn", "cloudflare bind start failed", err.Error())
+		writeJSON(w, http.StatusOK, map[string]any{
+			"provisioned":  provisioned,
+			"publicAccess": s.withTunnelRuntime(settings),
+			"error":        err.Error(),
+		})
+		return
+	}
+	s.logs.AddApp("info", "cloudflare domain bound", fmt.Sprintf("api=%s ui=%s url=%s", customDomain, uiDomain, state.PublicURL))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"provisioned":  provisioned,
+		"publicAccess": s.withTunnelRuntime(settings),
+	})
+}
+
+// deriveUIDomain picks a management hostname that never collides with the API
+// hostname. Prefer console.<root>; if the API host is already console.*, use
+// admin.<root>; if neither works, return empty so the caller can reject.
+func deriveUIDomain(apiDomain string) string {
+	apiDomain = cleanPublicHost(apiDomain)
+	if apiDomain == "" {
+		return ""
+	}
+	parts := strings.Split(apiDomain, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	root := strings.Join(parts[1:], ".")
+	prefix := strings.ToLower(parts[0])
+	candidates := []string{"console", "admin", "panel"}
+	for _, candidate := range candidates {
+		host := candidate + "." + root
+		if !strings.EqualFold(host, apiDomain) && !strings.EqualFold(candidate, prefix) {
+			return host
+		}
+	}
+	for _, candidate := range candidates {
+		host := candidate + "." + root
+		if !strings.EqualFold(host, apiDomain) {
+			return host
+		}
+	}
+	return ""
+}
+
+func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
+	var provider domain.Provider
+	if err := json.NewDecoder(r.Body).Decode(&provider); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid provider json: "+err.Error())
+		return
+	}
+	created, err := s.router.AddProvider(provider)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.saveState(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+		return
+	}
+	s.logs.AddApp("info", "provider created", created.ID)
+	writeJSON(w, http.StatusCreated, redactProviderForClient(created))
+}
+
+func (s *Server) handleExportProviders(w http.ResponseWriter, r *http.Request) {
+	ids := ParseProviderExportIDs(r.URL.Query().Get("ids"))
+	if r.Method == http.MethodPost {
+		var payload struct {
+			IDs []string `json:"ids"`
+		}
+		if r.Body != nil {
+			decoder := json.NewDecoder(r.Body)
+			if err := decoder.Decode(&payload); err != nil {
+				if err != io.EOF {
+					writeOpenAIError(w, http.StatusBadRequest, "invalid export json: "+err.Error())
+					return
+				}
+			} else if payload.IDs != nil {
+				ids = payload.IDs
+			}
+		}
+	}
+	bundle, exportErrors := s.router.ExportProviders(ids)
+	if len(ids) > 0 && len(bundle.Providers) == 0 {
+		writeOpenAIError(w, http.StatusNotFound, "no matching providers to export")
+		return
+	}
+	s.logs.AddApp("info", "providers exported", fmt.Sprintf("count=%d errors=%d", len(bundle.Providers), len(exportErrors)))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"version":    bundle.Version,
+		"exportedAt": bundle.ExportedAt,
+		"providers":  bundle.Providers,
+		"errors":     exportErrors,
+	})
+}
+
+func (s *Server) handleImportProviders(w http.ResponseWriter, r *http.Request) {
+	var bundle ProvidersExportBundle
+	// Allow unknown fields (e.g. export "errors") so downloaded bundles round-trip cleanly.
+	if err := json.NewDecoder(r.Body).Decode(&bundle); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid import json: "+err.Error())
+		return
+	}
+	result := s.router.ImportProviders(bundle)
+	if len(result.Created) == 0 && len(result.Updated) == 0 && len(result.Errors) > 0 {
+		writeJSON(w, http.StatusBadRequest, result)
+		return
+	}
+	if len(result.Created) > 0 || len(result.Updated) > 0 {
+		if err := s.saveState(); err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+			return
+		}
+	}
+	s.logs.AddApp("info", "providers imported", fmt.Sprintf("created=%d updated=%d skipped=%d errors=%d", len(result.Created), len(result.Updated), len(result.Skipped), len(result.Errors)))
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
+	var provider domain.Provider
+	if err := json.NewDecoder(r.Body).Decode(&provider); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid provider json: "+err.Error())
+		return
+	}
+	updated, err := s.router.UpdateProvider(r.PathValue("id"), provider)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.saveState(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+		return
+	}
+	s.logs.AddApp("info", "provider updated", updated.ID)
+	writeJSON(w, http.StatusOK, redactProviderForClient(updated))
+}
+
+func (s *Server) handleTestProvider(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	providerID := r.PathValue("id")
+	provider, err := s.router.ProviderByID(providerID)
+	if err != nil {
+		writeOpenAIError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	result := s.fetchProviderModels(r, provider, started)
+	if result.Success {
+		_, _ = s.router.UpdateProviderModels(provider.ID, result.Models, "healthy")
+		if err := s.saveState(); err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+			return
+		}
+		s.logs.AddApp("info", "provider test succeeded", fmt.Sprintf("provider=%s models=%d", provider.ID, len(result.Models)))
+	} else {
+		fallback := make([]domain.Model, 0)
+		if strings.TrimSpace(provider.DefaultModel) != "" {
+			fallback = append(fallback, domain.Model{ID: strings.TrimSpace(provider.DefaultModel), ProviderID: provider.ID, Protocol: provider.Protocol, ContextLength: 128000, InMenu: true})
+		}
+		healthStatus := "failed"
+		if len(fallback) > 0 {
+			healthStatus = "degraded"
+		}
+		_, _ = s.router.UpdateProviderModels(provider.ID, fallback, healthStatus)
+		if err := s.saveState(); err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+			return
+		}
+		s.logs.AddApp("warn", "provider test failed", fmt.Sprintf("provider=%s error=%s", provider.ID, result.Error))
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleProviderAuthPreview(w http.ResponseWriter, r *http.Request) {
+	provider, err := s.router.ProviderByID(r.PathValue("id"))
+	if err != nil {
+		writeOpenAIError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	header := provider.AuthHeader
+	if header == "" {
+		header = "Authorization"
+	}
+	authValue := resolveProviderAuth(provider)
+	if authValue != "" && strings.EqualFold(header, "Authorization") && !strings.HasPrefix(strings.ToLower(authValue), "bearer ") {
+		authValue = "Bearer " + authValue
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"header": header, "value": authValue})
+}
+
+// handleClaudeOAuthStart begins a Claude.ai OAuth login for the given provider.
+// By default it uses a localhost callback server (same as Claude Code desktop).
+// Pass {"mode":"manual"} to fall back to the platform.claude.com copy/paste flow.
+func (s *Server) handleClaudeOAuthStart(w http.ResponseWriter, r *http.Request) {
+	providerID := r.PathValue("id")
+	if _, err := s.router.ProviderByID(providerID); err != nil {
+		writeOpenAIError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	var payload struct {
+		Mode string `json:"mode"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&payload)
+	mode := strings.TrimSpace(strings.ToLower(payload.Mode))
+	if mode == "" {
+		mode = "localhost"
+	}
+
+	verifier, challenge, err := generateClaudePKCE()
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to generate pkce: "+err.Error())
+		return
+	}
+	state, err := generateClaudeOAuthState()
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to generate oauth state: "+err.Error())
+		return
+	}
+	pending := claudeOAuthPending{Verifier: verifier, State: state, CreatedAt: time.Now()}
+
+	if mode == "manual" {
+		pending.Mode = "manual"
+		pending.RedirectURI = claudeOAuthRedirectURI
+		s.pendingClaudeOAuth.put(providerID, pending)
+		authURL := buildClaudeManualAuthorizeURL(challenge, state)
+		s.logs.AddApp("info", "claude oauth manual flow started", providerID)
+		writeJSON(w, http.StatusOK, map[string]any{"authUrl": authURL, "state": state, "mode": "manual"})
+		return
+	}
+
+	authURL, flowID, err := s.startClaudeOAuthLocalFlow(providerID, challenge, pending)
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to start claude oauth flow: "+err.Error())
+		return
+	}
+	s.logs.AddApp("info", "claude oauth localhost flow started", providerID)
+	writeJSON(w, http.StatusOK, map[string]any{"authUrl": authURL, "state": state, "flowId": flowID, "mode": "localhost"})
+}
+
+// handleClaudeOAuthStatus reports the progress of a localhost OAuth flow.
+func (s *Server) handleClaudeOAuthStatus(w http.ResponseWriter, r *http.Request) {
+	flowID := strings.TrimSpace(r.URL.Query().Get("flowId"))
+	if flowID == "" {
+		writeOpenAIError(w, http.StatusBadRequest, "flowId is required")
+		return
+	}
+	status, ok := s.pendingClaudeOAuth.status(flowID)
+	if !ok {
+		writeOpenAIError(w, http.StatusNotFound, "unknown or expired oauth flow")
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+// handleClaudeOAuthCallback completes a localhost OAuth flow when Anthropic
+// redirects back to the gateway's stable callback route.
+func (s *Server) handleClaudeOAuthCallback(w http.ResponseWriter, r *http.Request) {
+	callbackState := strings.TrimSpace(r.URL.Query().Get("state"))
+	if oauthError := strings.TrimSpace(r.URL.Query().Get("error")); oauthError != "" {
+		desc := strings.TrimSpace(r.URL.Query().Get("error_description"))
+		message := oauthError
+		if desc != "" {
+			message += ": " + desc
+		}
+		s.pendingClaudeOAuth.setStatusByState(callbackState, "error", message)
+		http.Error(w, message, http.StatusBadRequest)
+		return
+	}
+
+	code := strings.TrimSpace(r.URL.Query().Get("code"))
+	if code == "" {
+		http.Error(w, "missing code", http.StatusBadRequest)
+		return
+	}
+	if callbackState == "" {
+		http.Error(w, "missing state", http.StatusBadRequest)
+		return
+	}
+
+	providerID, pending, ok := s.pendingClaudeOAuth.getByState(callbackState)
+	if !ok {
+		http.Error(w, "oauth flow expired or unknown state; start again from Protocol Gateway", http.StatusBadRequest)
+		return
+	}
+	if err := s.finishClaudeOAuthExchange(providerID, pending.FlowID, pending, code, callbackState); err != nil {
+		s.logs.AddApp("error", "claude oauth callback exchange failed", err.Error())
+		http.Error(w, "failed to exchange oauth code", http.StatusBadGateway)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte("<!doctype html><html><body style='font-family:sans-serif;padding:32px'><h2>Claude 账号已连接</h2><p>可以关闭此页面并返回 Protocol Gateway。</p></body></html>"))
+}
+
+// handleClaudeOAuthComplete exchanges a pasted authorization code (optionally
+// in "code#state" fragment form) for a Claude OAuth token pair, persists it
+// onto the provider, and returns the redacted provider.
+func (s *Server) handleClaudeOAuthComplete(w http.ResponseWriter, r *http.Request) {
+	providerID := r.PathValue("id")
+	if _, err := s.router.ProviderByID(providerID); err != nil {
+		writeOpenAIError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	var payload struct {
+		Code  string `json:"code"`
+		State string `json:"state"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	code, embeddedState := parseClaudeOAuthCode(payload.Code)
+	if code == "" {
+		writeOpenAIError(w, http.StatusBadRequest, "code is required")
+		return
+	}
+	state := strings.TrimSpace(payload.State)
+	if state == "" {
+		state = embeddedState
+	}
+
+	pending, ok := s.pendingClaudeOAuth.take(providerID)
+	if !ok {
+		writeOpenAIError(w, http.StatusBadRequest, "no pending claude oauth flow for this provider (it may have expired); start again")
+		return
+	}
+	if state == "" {
+		state = pending.State
+	}
+	if state != pending.State {
+		writeOpenAIError(w, http.StatusBadRequest, "oauth state mismatch; start the flow again")
+		return
+	}
+
+	tokenState := embeddedState
+	if tokenState == "" {
+		tokenState = state
+	}
+	if err := s.finishClaudeOAuthExchange(providerID, "", pending, code, tokenState); err != nil {
+		s.logs.AddApp("error", "claude oauth code exchange failed", err.Error())
+		writeOpenAIError(w, http.StatusBadGateway, "failed to exchange claude oauth code: "+err.Error())
+		return
+	}
+
+	updated, err := s.router.ProviderByID(providerID)
+	if err != nil {
+		writeOpenAIError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, redactProviderForClient(updated))
+}
+
+// handleClaudeOAuthDisconnect clears a provider's stored Claude OAuth
+// credential (logout), keeping the provider itself intact.
+func (s *Server) handleClaudeOAuthDisconnect(w http.ResponseWriter, r *http.Request) {
+	providerID := r.PathValue("id")
+	updated, err := s.router.ClearProviderClaudeOAuth(providerID)
+	if err != nil {
+		writeOpenAIError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err := s.saveState(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+		return
+	}
+	s.logs.AddApp("info", "claude oauth disconnected", providerID)
+	writeJSON(w, http.StatusOK, redactProviderForClient(updated))
+}
+
+// handleClaudeOAuthUsage returns Claude.ai subscription usage buckets (5h / 7d)
+// for a connected claude_oauth provider by calling Anthropic's undocumented
+// OAuth usage endpoint.
+func (s *Server) handleClaudeOAuthUsage(w http.ResponseWriter, r *http.Request) {
+	providerID := r.PathValue("id")
+	provider, err := s.router.ProviderByID(providerID)
+	if err != nil {
+		writeOpenAIError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if provider.AuthType != domain.AuthTypeClaudeOAuth {
+		writeJSON(w, http.StatusOK, ClaudeOAuthUsageReport{Available: false, Error: "provider is not using Claude OAuth"})
+		return
+	}
+	if provider.ClaudeOAuth == nil || strings.TrimSpace(provider.ClaudeOAuth.RefreshToken) == "" {
+		writeJSON(w, http.StatusOK, ClaudeOAuthUsageReport{Available: false, Error: "Claude OAuth 未连接"})
+		return
+	}
+
+	refreshed, err := s.ensureFreshClaudeToken(provider)
+	if err != nil {
+		writeJSON(w, http.StatusOK, ClaudeOAuthUsageReport{Available: false, Error: err.Error()})
+		return
+	}
+	report, err := fetchClaudeOAuthUsage(r.Context(), refreshed.ClaudeOAuth.AccessToken)
+	if err != nil {
+		writeJSON(w, http.StatusOK, ClaudeOAuthUsageReport{Available: false, Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
+}
+
+// handleCursorOAuthUsage returns Cursor subscription usage (plan spend / request
+// buckets) for a connected cursor_oauth provider.
+func (s *Server) handleCursorOAuthUsage(w http.ResponseWriter, r *http.Request) {
+	providerID := r.PathValue("id")
+	provider, err := s.router.ProviderByID(providerID)
+	if err != nil {
+		writeOpenAIError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if provider.AuthType != domain.AuthTypeCursorOAuth {
+		writeJSON(w, http.StatusOK, CursorOAuthUsageReport{Available: false, Error: "provider is not using Cursor OAuth"})
+		return
+	}
+	if provider.CursorOAuth == nil || strings.TrimSpace(provider.CursorOAuth.RefreshToken) == "" {
+		writeJSON(w, http.StatusOK, CursorOAuthUsageReport{Available: false, Error: "Cursor OAuth 未连接"})
+		return
+	}
+
+	refreshed, err := s.ensureFreshCursorToken(provider)
+	if err != nil {
+		writeJSON(w, http.StatusOK, CursorOAuthUsageReport{Available: false, Error: err.Error()})
+		return
+	}
+	report, err := fetchCursorOAuthUsage(r.Context(), refreshed.CursorOAuth.AccessToken)
+	if err != nil {
+		writeJSON(w, http.StatusOK, CursorOAuthUsageReport{Available: false, Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
+}
+
+func (s *Server) handleProviderChatTest(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	providerID := r.PathValue("id")
+	var payload providerChatTestRequest
+	_ = json.NewDecoder(r.Body).Decode(&payload)
+	result, status := s.testProviderChat(r, providerID, payload, started)
+	writeJSON(w, status, result)
+}
+
+func (s *Server) handleProviderCacheTest(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	providerID := r.PathValue("id")
+	var payload providerChatTestRequest
+	_ = json.NewDecoder(r.Body).Decode(&payload)
+	result, status := s.testProviderCacheChat(r, providerID, payload, started)
+	writeJSON(w, status, result)
+}
+
+func (s *Server) handleProviderThinkingTest(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	providerID := r.PathValue("id")
+	var payload providerChatTestRequest
+	_ = json.NewDecoder(r.Body).Decode(&payload)
+	result, status := s.testProviderThinkingChat(r, providerID, payload, started)
+	writeJSON(w, status, result)
+}
+
+func resolveProviderChatURL(provider domain.Provider, model string) string {
+	resolvedModel := strings.TrimSpace(model)
+	if resolvedModel == "" {
+		resolvedModel = strings.TrimSpace(provider.DefaultModel)
+	}
+	if resolvedModel == "" {
+		resolvedModel = "request-model-not-set"
+	}
+	upstreamURL := strings.ReplaceAll(strings.TrimSpace(provider.BaseURL), "{model}", resolvedModel)
+	lowerURL := strings.ToLower(upstreamURL)
+	if provider.Protocol == domain.ProtocolOpenAIChat && !strings.Contains(lowerURL, "/chat/completions") && !strings.Contains(provider.BaseURL, "{model}") {
+		upstreamURL = strings.TrimRight(upstreamURL, "/") + "/chat/completions"
+	}
+	return upstreamURL
+}
+
+type providerChatHTTPResult struct {
+	Status       int
+	LatencyMs    int64
+	ResponseBody string
+	RequestBody  string
+	TargetURL    string
+	Error        string
+}
+
+func (s *Server) executeProviderChatHTTP(r *http.Request, provider domain.Provider, model string, payload map[string]any, started time.Time) providerChatHTTPResult {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return providerChatHTTPResult{Error: err.Error(), LatencyMs: time.Since(started).Milliseconds()}
+	}
+	resolvedModel, _ := payload["model"].(string)
+	if provider.AuthType == domain.AuthTypeCursorOAuth {
+		baseURL, refreshed, bridgeErr := s.resolveCursorBridgeBaseURL(provider)
+		if bridgeErr != nil {
+			return providerChatHTTPResult{Error: bridgeErr.Error(), LatencyMs: time.Since(started).Milliseconds()}
+		}
+		provider = refreshed
+		upstreamURL := strings.TrimRight(baseURL, "/") + "/chat/completions"
+		request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
+		if err != nil {
+			return providerChatHTTPResult{Error: err.Error(), TargetURL: upstreamURL, RequestBody: string(body), LatencyMs: time.Since(started).Milliseconds()}
+		}
+		request.Header.Set("Content-Type", "application/json")
+		client := &http.Client{Timeout: 120 * time.Second}
+		response, err := client.Do(request)
+		if err != nil {
+			return providerChatHTTPResult{
+				Error:       err.Error(),
+				TargetURL:   upstreamURL,
+				RequestBody: string(body),
+				LatencyMs:   time.Since(started).Milliseconds(),
+			}
+		}
+		defer response.Body.Close()
+		responseBody, _ := io.ReadAll(io.LimitReader(response.Body, 16384))
+		return providerChatHTTPResult{
+			Status:       response.StatusCode,
+			LatencyMs:    time.Since(started).Milliseconds(),
+			ResponseBody: string(responseBody),
+			RequestBody:  string(body),
+			TargetURL:    upstreamURL,
+		}
+	}
+	upstreamURL := resolveProviderChatURLWithAdapter(provider, resolvedModel)
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
+	if err != nil {
+		return providerChatHTTPResult{Error: err.Error(), TargetURL: upstreamURL, RequestBody: string(body), LatencyMs: time.Since(started).Milliseconds()}
+	}
+	request.Header.Set("Content-Type", "application/json")
+	if authValue := resolveProviderAuth(provider); authValue != "" {
+		header := provider.AuthHeader
+		if header == "" {
+			header = "Authorization"
+		}
+		if strings.EqualFold(header, "Authorization") && !strings.HasPrefix(strings.ToLower(authValue), "bearer ") {
+			authValue = "Bearer " + authValue
+		}
+		request.Header.Set(header, authValue)
+	} else if incomingAuth := r.Header.Get("Authorization"); incomingAuth != "" {
+		request.Header.Set("Authorization", incomingAuth)
+	}
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	response, err := client.Do(request)
+	if err != nil {
+		return providerChatHTTPResult{
+			Error:       err.Error(),
+			TargetURL:   upstreamURL,
+			RequestBody: string(body),
+			LatencyMs:   time.Since(started).Milliseconds(),
+		}
+	}
+	defer response.Body.Close()
+	responseBody, _ := io.ReadAll(io.LimitReader(response.Body, 16384))
+	return providerChatHTTPResult{
+		Status:       response.StatusCode,
+		LatencyMs:    time.Since(started).Milliseconds(),
+		ResponseBody: string(responseBody),
+		RequestBody:  string(body),
+		TargetURL:    upstreamURL,
+	}
+}
+
+func extractAssistantContent(responseBody []byte) string {
+	var payload struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(responseBody, &payload); err != nil || len(payload.Choices) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(payload.Choices[0].Message.Content)
+}
+
+func extractClaudeAssistantContent(responseBody []byte) string {
+	var payload struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(responseBody, &payload); err != nil {
+		return ""
+	}
+	parts := make([]string, 0, len(payload.Content))
+	for _, block := range payload.Content {
+		if block.Type == "text" && strings.TrimSpace(block.Text) != "" {
+			parts = append(parts, block.Text)
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func (s *Server) executeClaudeMessagesHTTP(r *http.Request, provider domain.Provider, payload map[string]any, started time.Time) claudeOAuthHTTPResult {
+	if provider.AuthType == domain.AuthTypeClaudeOAuth {
+		return s.sendClaudeOAuthMessagesRequest(r.Context(), provider, payload, started)
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return claudeOAuthHTTPResult{Error: err.Error(), LatencyMs: time.Since(started).Milliseconds()}
+	}
+	upstreamURL := strings.TrimSpace(provider.BaseURL)
+	lowerURL := strings.ToLower(upstreamURL)
+	if upstreamURL == "" || strings.Contains(lowerURL, "anthropic.com") {
+		upstreamURL = claudeMessagesURL
+	} else if !strings.Contains(lowerURL, "/messages") {
+		upstreamURL = strings.TrimRight(upstreamURL, "/") + "/messages"
+	}
+
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
+	if err != nil {
+		return claudeOAuthHTTPResult{Error: err.Error(), TargetURL: upstreamURL, RequestBody: string(body), LatencyMs: time.Since(started).Milliseconds()}
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("anthropic-version", "2023-06-01")
+	applyProviderAuth(request, provider, r.Header.Get("Authorization"))
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	response, err := client.Do(request)
+	if err != nil {
+		return claudeOAuthHTTPResult{Error: err.Error(), TargetURL: upstreamURL, RequestBody: string(body), LatencyMs: time.Since(started).Milliseconds()}
+	}
+	defer response.Body.Close()
+	responseBody, _ := io.ReadAll(io.LimitReader(response.Body, 16384))
+	return claudeOAuthHTTPResult{
+		Status:       response.StatusCode,
+		LatencyMs:    time.Since(started).Milliseconds(),
+		ResponseBody: string(responseBody),
+		RequestBody:  string(body),
+		TargetURL:    upstreamURL,
+	}
+}
+
+// testClaudeOAuthProviderChat handles the provider chat-test flow for
+// claude_oauth providers: it builds a native Anthropic Messages API payload
+// instead of the OpenAI-shaped one, reusing ensureFreshClaudeToken + the same
+// billing-header-injection/anthropic-beta logic as the real pass-through path.
+func (s *Server) testClaudeOAuthProviderChat(r *http.Request, provider domain.Provider, req providerChatTestRequest, started time.Time) (map[string]any, int) {
+	model := strings.TrimSpace(req.Model)
+	if model == "" {
+		model = strings.TrimSpace(provider.DefaultModel)
+	}
+	if model == "" {
+		model = "request-model-not-set"
+	}
+
+	systemPrompt := strings.TrimSpace(req.SystemPrompt)
+	userPrompt := strings.TrimSpace(req.UserPrompt)
+	if userPrompt == "" {
+		userPrompt = strings.TrimSpace(req.Message)
+	}
+	if userPrompt == "" {
+		userPrompt = "1+1等于几"
+	}
+
+	payload := map[string]any{
+		"model":      model,
+		"max_tokens": 4096,
+		"stream":     false,
+		"messages":   []map[string]any{{"role": "user", "content": userPrompt}},
+	}
+	if systemPrompt != "" {
+		payload["system"] = systemPrompt
+	}
+
+	round := s.sendClaudeOAuthMessagesRequest(r.Context(), provider, payload, started)
+	if round.Error != "" {
+		s.logs.AddApp("error", "provider chat test failed", round.Error)
+		return map[string]any{
+			"success":     false,
+			"providerId":  provider.ID,
+			"model":       model,
+			"targetUrl":   round.TargetURL,
+			"requestBody": round.RequestBody,
+			"error":       round.Error,
+			"latencyMs":   round.LatencyMs,
+		}, http.StatusOK
+	}
+
+	preview := strings.TrimSpace(strings.ReplaceAll(round.ResponseBody, "\n", " "))
+	if len(preview) > 900 {
+		preview = preview[:900]
+	}
+	success := round.Status >= 200 && round.Status < 300
+	s.logs.AddApp("info", "provider chat test completed", fmt.Sprintf("provider=%s status=%d latency=%dms", provider.ID, round.Status, round.LatencyMs))
+	return map[string]any{
+		"success":      success,
+		"providerId":   provider.ID,
+		"model":        model,
+		"status":       round.Status,
+		"latencyMs":    round.LatencyMs,
+		"preview":      preview,
+		"responseBody": round.ResponseBody,
+		"targetUrl":    round.TargetURL,
+		"requestBody":  round.RequestBody,
+	}, http.StatusOK
+}
+
+func (s *Server) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
+	providerID := r.PathValue("id")
+	if err := s.router.DeleteProvider(providerID); err != nil {
+		s.logs.AddApp("warn", "provider delete blocked", err.Error())
+		writeOpenAIError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if err := s.saveState(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+		return
+	}
+	s.logs.AddApp("info", "provider deleted", providerID)
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
+}
+
+func (s *Server) handleCreateRoute(w http.ResponseWriter, r *http.Request) {
+	var route domain.Route
+	if err := json.NewDecoder(r.Body).Decode(&route); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid route json: "+err.Error())
+		return
+	}
+	created, err := s.router.AddRoute(route)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.saveState(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+		return
+	}
+	s.logs.AddApp("info", "route created", created.ID)
+	writeJSON(w, http.StatusCreated, created)
+}
+
+func (s *Server) handleUpdateRoute(w http.ResponseWriter, r *http.Request) {
+	routeID := r.PathValue("id")
+	var patch domain.Route
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid route json: "+err.Error())
+		return
+	}
+	updated, err := s.router.UpdateRoute(routeID, patch)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.saveState(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+		return
+	}
+	s.logs.AddApp("info", "route updated", updated.ID)
+	writeJSON(w, http.StatusOK, updated)
+}
+
+func (s *Server) handleDeleteRoute(w http.ResponseWriter, r *http.Request) {
+	routeID := r.PathValue("id")
+	if err := s.router.DeleteRoute(routeID); err != nil {
+		writeOpenAIError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err := s.saveState(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+		return
+	}
+	s.logs.AddApp("info", "route deleted", routeID)
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
+}
+
+func (s *Server) handleTestRoute(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	routeID := r.PathValue("id")
+	var payload struct {
+		Model   string `json:"model"`
+		Message string `json:"message"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&payload)
+	result, status := s.testRoute(r, routeID, payload.Model, payload.Message, started)
+	writeJSON(w, status, result)
+}
+
+func (s *Server) handleListAPIKeys(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.router.State().APIKeys)
+}
+
+func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
+	var key domain.APIKey
+	if err := json.NewDecoder(r.Body).Decode(&key); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid api key json: "+err.Error())
+		return
+	}
+	created, err := s.router.AddAPIKey(key)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if s.apiKeyStore != nil {
+		if err := s.apiKeyStore.CreateAPIKey(created); err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "failed to save api key: "+err.Error())
+			return
+		}
+	}
+	s.logs.AddApp("info", "api key created", created.ID)
+	writeJSON(w, http.StatusCreated, created)
+}
+
+func (s *Server) handleUpdateAPIKey(w http.ResponseWriter, r *http.Request) {
+	var patch domain.APIKey
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid api key json: "+err.Error())
+		return
+	}
+	updated, err := s.router.UpdateAPIKey(r.PathValue("id"), patch)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if s.apiKeyStore != nil {
+		if err := s.apiKeyStore.UpdateAPIKey(updated); err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "failed to save api key: "+err.Error())
+			return
+		}
+	}
+	s.logs.AddApp("info", "api key updated", updated.ID)
+	writeJSON(w, http.StatusOK, updated)
+}
+
+func (s *Server) handleDeleteAPIKey(w http.ResponseWriter, r *http.Request) {
+	keyID := r.PathValue("id")
+	if err := s.router.DeleteAPIKey(keyID); err != nil {
+		writeOpenAIError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if s.apiKeyStore != nil {
+		if err := s.apiKeyStore.DeleteAPIKey(keyID); err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "failed to delete api key: "+err.Error())
+			return
+		}
+	}
+	s.logs.AddApp("info", "api key deleted", keyID)
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
+}
+
+func (s *Server) saveState() error {
+	if s.stateSaver == nil {
+		return nil
+	}
+	state := s.router.State()
+	state.LogLevel = s.logs.Level()
+	state.RequestLogRetentionDays = s.RequestLogRetentionDays()
+	state.WebExposed = s.router.WebExposed()
+	return s.stateSaver.Save(state)
+}
+
+func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
+	models := s.modelsForRequest(r)
+	data := make([]map[string]any, 0, len(models))
+	for _, model := range models {
+		data = append(data, map[string]any{
+			"id":             model.ID,
+			"object":         "model",
+			"created":        0,
+			"owned_by":       model.ProviderID,
+			"context_length": model.ContextLength,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+}
+
+func (s *Server) handleClaudeModels(w http.ResponseWriter, r *http.Request) {
+	models := s.modelsForRequest(r)
+	data := make([]map[string]any, 0, len(models)+len(claudeModelAliases))
+	seen := map[string]bool{}
+	for _, entry := range claudeModelAliasEntries() {
+		id := stringValue(entry["id"])
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		if entry["created_at"] == "" {
+			entry["created_at"] = time.Now().UTC().Format(time.RFC3339)
+		}
+		data = append(data, entry)
+	}
+	for _, model := range models {
+		if seen[model.ID] {
+			continue
+		}
+		seen[model.ID] = true
+		data = append(data, map[string]any{
+			"id":           model.ID,
+			"type":         "model",
+			"display_name": model.ID,
+			"created_at":   time.Now().UTC().Format(time.RFC3339),
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": data, "has_more": false})
+}
+
+func (s *Server) modelsForRequest(r *http.Request) []domain.Model {
+	state := s.router.State()
+	providerID := ""
+	if token := extractConsumerAPIKey(r); token != "" {
+		if key, ok := s.router.APIKeyByToken(token); ok && strings.TrimSpace(key.RouteID) != "" {
+			if route, err := s.router.RouteByID(key.RouteID); err == nil {
+				providerID = route.ProviderID
+			}
+		}
+	}
+	models := make([]domain.Model, 0, len(state.Models))
+	for _, model := range state.Models {
+		if !model.InMenu {
+			continue
+		}
+		if providerID != "" && model.ProviderID != providerID {
+			continue
+		}
+		models = append(models, model)
+	}
+	return models
+}
+
+func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+
+	var req map[string]any
+	if len(strings.TrimSpace(string(body))) > 0 {
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+			return
+		}
+	} else {
+		req = map[string]any{}
+	}
+
+	route, err := s.router.ActiveOpenAIChatRoute()
+	var matchedKey domain.APIKey
+	var gatewayKeyMatched bool
+	if testRouteID := strings.TrimSpace(r.Header.Get(headerGatewayRouteID)); testRouteID != "" && r.Header.Get(headerGatewayInternalTest) == "1" {
+		route, err = s.router.RouteByID(testRouteID)
+	} else if token := extractConsumerAPIKey(r); token != "" {
+		if key, ok := s.router.APIKeyByToken(token); ok {
+			matchedKey = key
+			gatewayKeyMatched = true
+			if key.RouteID != "" {
+				route, err = s.router.RouteByID(key.RouteID)
+			}
+			if s.apiKeyStore != nil {
+				_ = s.apiKeyStore.TouchAPIKey(key.ID, time.Now().UTC().Format(time.RFC3339))
+			}
+		}
+	}
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	internalTest := strings.TrimSpace(r.Header.Get(headerGatewayInternalTest)) == "1"
+	if gatewayKeyMatched && !internalTest && route.OutputProtocol != domain.ProtocolOpenAIChat {
+		mismatchBody := routeProtocolMismatchBody(route, domain.ProtocolOpenAIChat)
+		writeRouteProtocolMismatch(w, route, domain.ProtocolOpenAIChat)
+		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, "", "rejected", route.OutputProtocol.DisplayName()+" endpoint mismatch", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, mismatchBody)
+		return
+	}
+	decision, err := s.router.Decide(route.ID)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	requestModel, _ := req["model"].(string)
+	model, logModel := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
+	thinkingOverride := ""
+	if gatewayKeyMatched {
+		thinkingOverride = matchedKey.ThinkingDepthOverride
+	}
+
+	stream, _ := req["stream"].(bool)
+	if s.rejectIfStreamDisabled(w, route.OutputProtocol, stream, domain.ProtocolOpenAIChat) {
+		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, logModel, "rejected", "stream disabled", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, []byte(`stream disabled`))
+		return
+	}
+	status := http.StatusOK
+	req["model"] = model
+	requestDepth, requestHasDepth := req["reasoning_effort"].(string)
+	if depth := s.router.ResolveThinkingDepth(route, thinkingOverride, requestHasDepth, requestDepth); depth != "" {
+		req["reasoning_effort"] = depth
+	}
+	if stream && decision.Action == "pass_through" && decision.InputProtocol == domain.ProtocolOpenAIChat {
+		req["stream_options"] = map[string]any{"include_usage": true}
+	}
+	var usage TokenUsage
+	var responseLog []byte
+	var ttftMs int64
+	status, usage, responseLog, err = s.executeProtocolFlow(wrapTTFTWriter(w, started, &ttftMs), r, route, decision, model, req, domain.ProtocolOpenAIChat, gatewayKeyMatched)
+	if err != nil {
+		s.logs.AddApp("error", "chat request failed", err.Error())
+		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
+		writeOpenAIError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, decision.Action, decision.ConversionLabel, r.URL.Path, status, usage, ttftMs, body, responseLog)
+	s.logs.AddApp("debug", "handled chat request", fmt.Sprintf("route=%s model=%s status=%d", route.ID, model, status))
+	slog.Info("handled chat request", "route", route.ID, "model", model, "action", decision.Action, "stream", stream)
+}
+
+func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": "failed to read request body", "type": "invalid_request_error"}})
+		return
+	}
+
+	var req map[string]any
+	if len(strings.TrimSpace(string(body))) > 0 {
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": "invalid json: " + err.Error(), "type": "invalid_request_error"}})
+			return
+		}
+	} else {
+		req = map[string]any{}
+	}
+
+	var route domain.Route
+	var matchedKey domain.APIKey
+	var gatewayKeyMatched bool
+	if testRouteID := strings.TrimSpace(r.Header.Get(headerGatewayRouteID)); testRouteID != "" && r.Header.Get(headerGatewayInternalTest) == "1" {
+		route, err = s.router.RouteByID(testRouteID)
+	} else if token := extractConsumerAPIKey(r); token != "" {
+		if key, ok := s.router.APIKeyByToken(token); ok {
+			matchedKey = key
+			gatewayKeyMatched = true
+			if key.RouteID != "" {
+				route, err = s.router.RouteByID(key.RouteID)
+			}
+			if s.apiKeyStore != nil {
+				_ = s.apiKeyStore.TouchAPIKey(key.ID, time.Now().UTC().Format(time.RFC3339))
+			}
+		}
+	}
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]any{"message": err.Error(), "type": "authentication_error"}})
+		return
+	}
+	internalTest := strings.TrimSpace(r.Header.Get(headerGatewayInternalTest)) == "1"
+	if gatewayKeyMatched && !internalTest && route.OutputProtocol != domain.ProtocolOpenAIResponses {
+		mismatchBody := routeProtocolMismatchBody(route, domain.ProtocolOpenAIResponses)
+		writeRouteProtocolMismatch(w, route, domain.ProtocolOpenAIResponses)
+		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, "", "rejected", route.OutputProtocol.DisplayName()+" endpoint mismatch", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, mismatchBody)
+		return
+	}
+	decision, err := s.router.Decide(route.ID)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": err.Error(), "type": "gateway_error"}})
+		return
+	}
+
+	requestModel, _ := req["model"].(string)
+	model, logModel := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
+	thinkingOverride := ""
+	if gatewayKeyMatched {
+		thinkingOverride = matchedKey.ThinkingDepthOverride
+	}
+
+	stream, _ := req["stream"].(bool)
+	if s.rejectIfStreamDisabled(w, route.OutputProtocol, stream, domain.ProtocolOpenAIResponses) {
+		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, logModel, "rejected", "stream disabled", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, []byte(`stream disabled`))
+		return
+	}
+	status := http.StatusOK
+	req["model"] = model
+	if depth := s.router.ResolveThinkingDepth(route, thinkingOverride, false, ""); depth != "" {
+		req["reasoning"] = map[string]any{"effort": depth}
+	}
+	var usage TokenUsage
+	var responseLog []byte
+	var ttftMs int64
+	status, usage, responseLog, err = s.executeProtocolFlow(wrapTTFTWriter(w, started, &ttftMs), r, route, decision, model, req, domain.ProtocolOpenAIResponses, gatewayKeyMatched)
+	if err != nil {
+		s.logs.AddApp("error", "responses request failed", err.Error())
+		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": err.Error(), "type": "gateway_error"}})
+		return
+	}
+	s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, decision.Action, decision.ConversionLabel, r.URL.Path, status, usage, ttftMs, body, responseLog)
+	s.logs.AddApp("debug", "handled responses request", fmt.Sprintf("route=%s model=%s status=%d", route.ID, model, status))
+	slog.Info("handled responses request", "route", route.ID, "model", model, "action", decision.Action, "stream", stream)
+}
+
+// handleClaudeMessages serves POST /anthropic/v1/messages, the native
+// Anthropic Messages API pass-through endpoint, mirroring handleOpenAIChat's
+// route-resolution pattern (test header or consumer API key -> router.Decide).
+func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+
+	var req map[string]any
+	if len(strings.TrimSpace(string(body))) > 0 {
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+			return
+		}
+	} else {
+		req = map[string]any{}
+	}
+
+	var route domain.Route
+	var matchedKey domain.APIKey
+	var gatewayKeyMatched bool
+	if testRouteID := strings.TrimSpace(r.Header.Get(headerGatewayRouteID)); testRouteID != "" && r.Header.Get(headerGatewayInternalTest) == "1" {
+		route, err = s.router.RouteByID(testRouteID)
+	} else if token := extractConsumerAPIKey(r); token != "" {
+		if key, ok := s.router.APIKeyByToken(token); ok {
+			matchedKey = key
+			gatewayKeyMatched = true
+			if key.RouteID != "" {
+				route, err = s.router.RouteByID(key.RouteID)
+			} else {
+				err = fmt.Errorf("api key %q has no route configured", key.ID)
+			}
+			if s.apiKeyStore != nil {
+				_ = s.apiKeyStore.TouchAPIKey(key.ID, time.Now().UTC().Format(time.RFC3339))
+			}
+		} else {
+			err = fmt.Errorf("invalid api key")
+		}
+	} else {
+		err = fmt.Errorf("missing api key")
+	}
+	if err != nil {
+		writeOpenAIError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	internalTest := strings.TrimSpace(r.Header.Get(headerGatewayInternalTest)) == "1"
+	if gatewayKeyMatched && !internalTest && route.OutputProtocol != domain.ProtocolClaude {
+		mismatchBody := routeProtocolMismatchBody(route, domain.ProtocolClaude)
+		writeRouteProtocolMismatch(w, route, domain.ProtocolClaude)
+		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, "", "rejected", route.OutputProtocol.DisplayName()+" endpoint mismatch", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, mismatchBody)
+		return
+	}
+	decision, err := s.router.Decide(route.ID)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	requestModel, _ := req["model"].(string)
+	model, logModel := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
+
+	stream, _ := req["stream"].(bool)
+	if s.rejectIfStreamDisabled(w, route.OutputProtocol, stream, domain.ProtocolClaude) {
+		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, logModel, "rejected", "stream disabled", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, []byte(`stream disabled`))
+		return
+	}
+	status := http.StatusOK
+	req["model"] = model
+	var usage TokenUsage
+	var responseLog []byte
+	var ttftMs int64
+	status, usage, responseLog, err = s.executeProtocolFlow(wrapTTFTWriter(w, started, &ttftMs), r, route, decision, model, req, domain.ProtocolClaude, gatewayKeyMatched)
+	if err != nil {
+		s.logs.AddApp("error", "claude messages request failed", err.Error())
+		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
+		writeClaudeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, decision.Action, decision.ConversionLabel, r.URL.Path, status, usage, ttftMs, body, responseLog)
+	s.logs.AddApp("debug", "handled claude messages request", fmt.Sprintf("route=%s model=%s status=%d stream=%v", route.ID, model, status, stream))
+}
+
+// handleClaudeCountTokens proxies Anthropic's token counting endpoint, which
+// Claude Code uses during startup to validate the selected model.
+func (s *Server) handleClaudeCountTokens(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeClaudeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+
+	var req map[string]any
+	if len(strings.TrimSpace(string(body))) > 0 {
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeClaudeError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+			return
+		}
+	} else {
+		req = map[string]any{}
+	}
+
+	route, matchedKey, gatewayKeyMatched, err := s.resolveClaudeConsumerRoute(r)
+	if err != nil {
+		writeClaudeError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	internalTest := strings.TrimSpace(r.Header.Get(headerGatewayInternalTest)) == "1"
+	if gatewayKeyMatched && !internalTest && route.OutputProtocol != domain.ProtocolClaude {
+		writeRouteProtocolMismatch(w, route, domain.ProtocolClaude)
+		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, "", "rejected", route.OutputProtocol.DisplayName()+" endpoint mismatch", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, routeProtocolMismatchBody(route, domain.ProtocolClaude))
+		return
+	}
+	decision, err := s.router.Decide(route.ID)
+	if err != nil {
+		writeClaudeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	requestModel, _ := req["model"].(string)
+	model, logModel := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
+	if model == "" || model == "request-model-not-set" {
+		writeClaudeError(w, http.StatusBadRequest, "model is required")
+		return
+	}
+	req["model"] = model
+	upstreamBody, err := json.Marshal(req)
+	if err != nil {
+		writeClaudeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	provider, err := s.router.ProviderByID(decision.ProviderID)
+	if err != nil {
+		writeClaudeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	status, responseBody, err := s.proxyClaudeCountTokens(r, provider, upstreamBody)
+	if err != nil {
+		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, "pass_through", decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, TokenUsage{}, body, []byte(err.Error()))
+		writeClaudeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	for key, values := range map[string]string{"Content-Type": "application/json"} {
+		w.Header().Set(key, values)
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(responseBody)
+	s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, "pass_through", decision.ConversionLabel, r.URL.Path, status, TokenUsage{}, body, responseBody)
+}
+
+func (s *Server) resolveClaudeConsumerRoute(r *http.Request) (domain.Route, domain.APIKey, bool, error) {
+	if testRouteID := strings.TrimSpace(r.Header.Get(headerGatewayRouteID)); testRouteID != "" && r.Header.Get(headerGatewayInternalTest) == "1" {
+		route, err := s.router.RouteByID(testRouteID)
+		return route, domain.APIKey{}, false, err
+	}
+	token := extractConsumerAPIKey(r)
+	if token == "" {
+		return domain.Route{}, domain.APIKey{}, false, fmt.Errorf("missing api key")
+	}
+	key, ok := s.router.APIKeyByToken(token)
+	if !ok {
+		return domain.Route{}, domain.APIKey{}, false, fmt.Errorf("invalid api key")
+	}
+	if key.RouteID == "" {
+		return domain.Route{}, domain.APIKey{}, false, fmt.Errorf("api key %q has no route configured", key.ID)
+	}
+	route, err := s.router.RouteByID(key.RouteID)
+	if err != nil {
+		return domain.Route{}, domain.APIKey{}, false, err
+	}
+	if s.apiKeyStore != nil {
+		_ = s.apiKeyStore.TouchAPIKey(key.ID, time.Now().UTC().Format(time.RFC3339))
+	}
+	return route, key, true, nil
+}
+
+func (s *Server) proxyClaudeCountTokens(r *http.Request, provider domain.Provider, body []byte) (int, []byte, error) {
+	isOAuth := provider.AuthType == domain.AuthTypeClaudeOAuth
+	var request *http.Request
+	var err error
+	if isOAuth {
+		refreshed, refreshErr := s.ensureFreshClaudeToken(provider)
+		if refreshErr != nil {
+			return 0, nil, refreshErr
+		}
+		provider = refreshed
+		request, _, err = buildClaudeOAuthRequest(r.Context(), provider, body, r.Header.Get("anthropic-beta"), true, claudeCountTokensURL)
+		if err != nil {
+			return 0, nil, err
+		}
+	} else {
+		upstreamURL := strings.TrimSpace(provider.BaseURL)
+		if upstreamURL == "" {
+			upstreamURL = claudeCountTokensURL
+		} else if !strings.Contains(strings.ToLower(upstreamURL), "count_tokens") {
+			upstreamURL = strings.TrimRight(upstreamURL, "/")
+			if strings.HasSuffix(strings.ToLower(upstreamURL), "/messages") {
+				upstreamURL += "/count_tokens"
+			} else {
+				upstreamURL += "/v1/messages/count_tokens"
+			}
+		}
+		request, err = http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
+		if err != nil {
+			return 0, nil, err
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Accept", "application/json")
+		request.Header.Set("anthropic-version", "2023-06-01")
+		applyProviderAuth(request, provider, r.Header.Get("Authorization"))
+	}
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	response, err := client.Do(request)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer response.Body.Close()
+	responseBody, readErr := io.ReadAll(response.Body)
+	if readErr != nil {
+		return 0, nil, readErr
+	}
+	return response.StatusCode, responseBody, nil
+}
+
+type providerTestResult struct {
+	Success   bool           `json:"success"`
+	Provider  string         `json:"providerId"`
+	ModelsURL string         `json:"modelsUrl"`
+	Status    int            `json:"status,omitempty"`
+	LatencyMs int64          `json:"latencyMs"`
+	Models    []domain.Model `json:"models"`
+	Error     string         `json:"error,omitempty"`
+	Preview   string         `json:"preview,omitempty"`
+}
+
+func (s *Server) fetchProviderModels(r *http.Request, provider domain.Provider, started time.Time) providerTestResult {
+	if provider.AuthType == domain.AuthTypeCursorOAuth {
+		baseURL, refreshed, err := s.resolveCursorBridgeBaseURL(provider)
+		if err != nil {
+			return providerTestResult{Success: false, Provider: provider.ID, LatencyMs: time.Since(started).Milliseconds(), Error: err.Error(), Models: []domain.Model{}}
+		}
+		provider = refreshed
+		modelsURL := strings.TrimRight(baseURL, "/") + "/models"
+		request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, modelsURL, nil)
+		if err != nil {
+			return providerTestResult{Success: false, Provider: provider.ID, ModelsURL: modelsURL, LatencyMs: time.Since(started).Milliseconds(), Error: err.Error(), Models: []domain.Model{}}
+		}
+		request.Header.Set("Accept", "application/json")
+		client := &http.Client{Timeout: 30 * time.Second}
+		response, err := client.Do(request)
+		if err != nil {
+			return providerTestResult{Success: false, Provider: provider.ID, ModelsURL: modelsURL, LatencyMs: time.Since(started).Milliseconds(), Error: err.Error(), Models: []domain.Model{}}
+		}
+		defer response.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 256*1024))
+		preview := strings.TrimSpace(strings.ReplaceAll(string(body), "\n", " "))
+		if len(preview) > 900 {
+			preview = preview[:900]
+		}
+		models, parseErr := parseModelsResponse(body, provider)
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			return providerTestResult{Success: false, Provider: provider.ID, ModelsURL: modelsURL, Status: response.StatusCode, LatencyMs: time.Since(started).Milliseconds(), Error: fmt.Sprintf("models endpoint returned HTTP %d", response.StatusCode), Preview: preview, Models: []domain.Model{}}
+		}
+		if parseErr != nil {
+			return providerTestResult{Success: false, Provider: provider.ID, ModelsURL: modelsURL, Status: response.StatusCode, LatencyMs: time.Since(started).Milliseconds(), Error: parseErr.Error(), Preview: preview, Models: []domain.Model{}}
+		}
+		return providerTestResult{Success: true, Provider: provider.ID, ModelsURL: modelsURL, Status: response.StatusCode, LatencyMs: time.Since(started).Milliseconds(), Models: models, Preview: preview}
+	}
+
+	modelsURL, err := deriveModelsURL(provider)
+	if err != nil {
+		return providerTestResult{Success: false, Provider: provider.ID, LatencyMs: time.Since(started).Milliseconds(), Error: err.Error(), Models: []domain.Model{}}
+	}
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, modelsURL, nil)
+	if err != nil {
+		return providerTestResult{Success: false, Provider: provider.ID, ModelsURL: modelsURL, LatencyMs: time.Since(started).Milliseconds(), Error: err.Error(), Models: []domain.Model{}}
+	}
+	request.Header.Set("Accept", "application/json")
+	if provider.AuthType == domain.AuthTypeClaudeOAuth {
+		refreshed, refreshErr := s.ensureFreshClaudeToken(provider)
+		if refreshErr != nil {
+			return providerTestResult{Success: false, Provider: provider.ID, ModelsURL: modelsURL, LatencyMs: time.Since(started).Milliseconds(), Error: refreshErr.Error(), Models: []domain.Model{}}
+		}
+		provider = refreshed
+		if provider.ClaudeOAuth == nil || strings.TrimSpace(provider.ClaudeOAuth.AccessToken) == "" {
+			return providerTestResult{Success: false, Provider: provider.ID, ModelsURL: modelsURL, LatencyMs: time.Since(started).Milliseconds(), Error: "provider has no Claude OAuth access token", Models: []domain.Model{}}
+		}
+		request.Header.Set("Authorization", "Bearer "+provider.ClaudeOAuth.AccessToken)
+		request.Header.Set("anthropic-version", "2023-06-01")
+		request.Header.Set("anthropic-beta", mergeAnthropicBetaValue(""))
+		request.Header.Set("User-Agent", "axios/1.13.6")
+	} else {
+		applyProviderAuth(request, provider, r.Header.Get("Authorization"))
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	response, err := client.Do(request)
+	if err != nil {
+		return providerTestResult{Success: false, Provider: provider.ID, ModelsURL: modelsURL, LatencyMs: time.Since(started).Milliseconds(), Error: err.Error(), Models: []domain.Model{}}
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(response.Body, 256*1024))
+	preview := strings.TrimSpace(strings.ReplaceAll(string(body), "\n", " "))
+	if len(preview) > 900 {
+		preview = preview[:900]
+	}
+	models, parseErr := parseModelsResponse(body, provider)
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return providerTestResult{Success: false, Provider: provider.ID, ModelsURL: modelsURL, Status: response.StatusCode, LatencyMs: time.Since(started).Milliseconds(), Error: fmt.Sprintf("models endpoint returned HTTP %d", response.StatusCode), Preview: preview, Models: []domain.Model{}}
+	}
+	if parseErr != nil {
+		return providerTestResult{Success: false, Provider: provider.ID, ModelsURL: modelsURL, Status: response.StatusCode, LatencyMs: time.Since(started).Milliseconds(), Error: parseErr.Error(), Preview: preview, Models: []domain.Model{}}
+	}
+	return providerTestResult{Success: true, Provider: provider.ID, ModelsURL: modelsURL, Status: response.StatusCode, LatencyMs: time.Since(started).Milliseconds(), Models: models, Preview: preview}
+}
+
+func deriveModelsURL(provider domain.Provider) (string, error) {
+	base := strings.TrimSpace(provider.BaseURL)
+	if base == "" {
+		return "", fmt.Errorf("provider baseUrl is required")
+	}
+	parsed, err := url.Parse(base)
+	if err != nil {
+		return "", err
+	}
+	parsed.RawQuery = ""
+	path := parsed.Path
+	lowerPath := strings.ToLower(path)
+	if strings.Contains(strings.ToLower(parsed.Host), "anthropic.com") {
+		parsed.Path = "/v1/models"
+		return parsed.String(), nil
+	}
+	if deploymentIndex := strings.Index(lowerPath, "/deployments/"); deploymentIndex >= 0 && strings.Contains(lowerPath, "/chat/completions") {
+		parsed.Path = strings.TrimRight(path[:deploymentIndex], "/") + "/models"
+		return parsed.String(), nil
+	}
+	replacements := []struct {
+		old string
+		new string
+	}{
+		{"/chat/completions", "/models"},
+		{"/responses", "/models"},
+		{"/messages", "/models"},
+	}
+	for _, replacement := range replacements {
+		if strings.Contains(lowerPath, replacement.old) {
+			index := strings.LastIndex(lowerPath, replacement.old)
+			parsed.Path = path[:index] + replacement.new
+			return parsed.String(), nil
+		}
+	}
+	if strings.HasSuffix(path, "/") {
+		parsed.Path = strings.TrimRight(path, "/") + "/models"
+	} else {
+		parsed.Path = strings.TrimRight(path, "/") + "/models"
+	}
+	return parsed.String(), nil
+}
+
+func parseModelsResponse(body []byte, provider domain.Provider) ([]domain.Model, error) {
+	var payload struct {
+		Data []struct {
+			ID            string `json:"id"`
+			ContextLength int    `json:"context_length"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	models := make([]domain.Model, 0, len(payload.Data))
+	for _, item := range payload.Data {
+		id := strings.TrimSpace(item.ID)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		contextLength := item.ContextLength
+		if contextLength == 0 {
+			contextLength = 128000
+		}
+		models = append(models, domain.Model{ID: id, ProviderID: provider.ID, Protocol: provider.Protocol, ContextLength: contextLength, InMenu: true})
+	}
+	if len(models) == 0 {
+		return nil, fmt.Errorf("models endpoint returned no usable model ids")
+	}
+	return models, nil
+}
+
+func extractResponseErrorMessage(responseBody []byte) string {
+	text := strings.TrimSpace(string(responseBody))
+	if text == "" {
+		return ""
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(responseBody, &payload); err != nil {
+		text := strings.TrimSpace(string(responseBody))
+		if strings.Contains(text, "data:") {
+			return ""
+		}
+		if len(text) > 500 {
+			return text[:500]
+		}
+		return text
+	}
+	if errorValue, ok := payload["error"]; ok {
+		if item, ok := errorValue.(map[string]any); ok {
+			return formatAPIErrorMessage(item)
+		}
+		return strings.TrimSpace(fmt.Sprint(errorValue))
+	}
+	if payload["type"] == "error" {
+		if errorValue, ok := payload["error"].(map[string]any); ok {
+			return formatAPIErrorMessage(errorValue)
+		}
+	}
+	return ""
+}
+
+func formatAPIErrorMessage(item map[string]any) string {
+	message, errType := errorMessageFromValue(item, "")
+	switch {
+	case errType != "" && message != "" && !strings.EqualFold(message, "error") && errType != "api_error":
+		return errType + ": " + message
+	case message != "" && message != "upstream request failed":
+		return message
+	case errType != "" && errType != "api_error":
+		return errType
+	case message != "":
+		return message
+	default:
+		return ""
+	}
+}
+
+func responseHeaderMap(headers http.Header) map[string]string {
+	result := make(map[string]string, len(headers))
+	for key, values := range headers {
+		result[key] = strings.Join(values, ", ")
+	}
+	return result
+}
+
+func buildRouteTestReproduceCurl(gatewayURL, routeID, requestBody string) string {
+	escapedBody := strings.ReplaceAll(requestBody, "'", `'\''`)
+	return fmt.Sprintf(
+		"curl -sv '%s' \\\n  -H 'Content-Type: application/json' \\\n  -H '%s: %s' \\\n  -H '%s: 1' \\\n  -d '%s'",
+		gatewayURL,
+		headerGatewayRouteID,
+		routeID,
+		headerGatewayInternalTest,
+		escapedBody,
+	)
+}
+
+func buildRouteTestDiagnostics(route domain.Route, provider domain.Provider, decision domain.RouteDecision, model, gatewayURL, upstreamURL, requestBody string, response *http.Response, responseBody []byte) map[string]any {
+	status := 0
+	responseHeaders := map[string]string{}
+	if response != nil {
+		status = response.StatusCode
+		responseHeaders = responseHeaderMap(response.Header)
+	}
+	errorMessage := extractResponseErrorMessage(responseBody)
+	diagnostics := map[string]any{
+		"routeId":          route.ID,
+		"routeName":        route.Name,
+		"providerId":       provider.ID,
+		"providerProtocol": provider.Protocol,
+		"outputProtocol":   route.OutputProtocol,
+		"providerBaseUrl":  provider.BaseURL,
+		"upstreamUrl":      upstreamURL,
+		"gatewayUrl":       gatewayURL,
+		"action":           decision.Action,
+		"protocolFlow":     decision.ConversionLabel,
+		"mode":             route.Mode,
+		"model":            model,
+		"status":           status,
+		"requestBody":      requestBody,
+		"responseBody":     string(responseBody),
+		"responseHeaders":  responseHeaders,
+		"errorMessage":     errorMessage,
+		"reproduceCurl":    buildRouteTestReproduceCurl(gatewayURL, route.ID, requestBody),
+	}
+	return diagnostics
+}
+
+func (s *Server) testRoute(r *http.Request, routeID string, requestModel string, message string, started time.Time) (map[string]any, int) {
+	route, err := s.router.RouteByID(routeID)
+	if err != nil {
+		return map[string]any{"success": false, "error": err.Error(), "latencyMs": time.Since(started).Milliseconds()}, http.StatusNotFound
+	}
+	decision, err := s.router.Decide(route.ID)
+	if err != nil {
+		return map[string]any{"success": false, "routeId": route.ID, "error": err.Error(), "latencyMs": time.Since(started).Milliseconds()}, http.StatusBadGateway
+	}
+	model := s.router.ResolveModel(route, "", requestModel)
+	if provider, err := s.router.ProviderForRoute(route); err == nil {
+		model = applyProviderModelFallback(provider, model)
+	}
+	if strings.TrimSpace(model) == "" {
+		model = "request-model-not-set"
+	}
+	if strings.TrimSpace(message) == "" {
+		message = "ping from Protocol Gateway route test"
+	}
+
+	provider, err := s.router.ProviderForRoute(route)
+	if err != nil {
+		return map[string]any{"success": false, "routeId": route.ID, "error": err.Error(), "latencyMs": time.Since(started).Milliseconds()}, http.StatusBadGateway
+	}
+	upstreamURL := ""
+	if provider.Protocol == domain.ProtocolOpenAIChat {
+		upstreamURL = resolveProviderChatURL(provider, model)
+	} else if strings.TrimSpace(provider.BaseURL) != "" {
+		upstreamURL = strings.TrimSpace(provider.BaseURL)
+	}
+
+	gatewayURL, err := gatewayOutputURL(s.router.State(), route.OutputProtocol)
+	if err != nil {
+		return map[string]any{"success": false, "routeId": route.ID, "error": err.Error(), "latencyMs": time.Since(started).Milliseconds()}, http.StatusBadGateway
+	}
+
+	payload := map[string]any{
+		"model":    model,
+		"stream":   false,
+		"messages": []map[string]any{{"role": "user", "content": message}},
+	}
+	switch route.OutputProtocol {
+	case domain.ProtocolClaude:
+		payload = map[string]any{
+			"model":      model,
+			"max_tokens": 1024,
+			"stream":     false,
+			"messages":   []map[string]any{{"role": "user", "content": message}},
+		}
+	case domain.ProtocolOpenAIResponses:
+		payload = map[string]any{
+			"model":  model,
+			"stream": false,
+			"input":  message,
+		}
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return map[string]any{"success": false, "routeId": route.ID, "error": err.Error(), "latencyMs": time.Since(started).Milliseconds()}, http.StatusBadRequest
+	}
+	requestBody := string(body)
+
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, gatewayURL, bytes.NewReader(body))
+	if err != nil {
+		return map[string]any{"success": false, "routeId": route.ID, "error": err.Error(), "latencyMs": time.Since(started).Milliseconds()}, http.StatusBadRequest
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(headerGatewayRouteID, route.ID)
+	request.Header.Set(headerGatewayInternalTest, "1")
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	response, err := client.Do(request)
+	if err != nil {
+		diagnostics := buildRouteTestDiagnostics(route, provider, decision, model, gatewayURL, upstreamURL, requestBody, nil, nil)
+		diagnostics["transportError"] = err.Error()
+		diagJSON, _ := json.Marshal(diagnostics)
+		s.logs.AddApp("error", "route test transport failed", string(diagJSON))
+		return map[string]any{
+			"success":      false,
+			"routeId":      route.ID,
+			"providerId":   provider.ID,
+			"model":        model,
+			"action":       decision.Action,
+			"protocolFlow": decision.ConversionLabel,
+			"gatewayUrl":   gatewayURL,
+			"upstreamUrl":  upstreamURL,
+			"requestBody":  requestBody,
+			"error":        err.Error(),
+			"diagnostics":  diagnostics,
+			"latencyMs":    time.Since(started).Milliseconds(),
+		}, http.StatusOK
+	}
+	defer response.Body.Close()
+	readLimit := int64(4096)
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		readLimit = 32768
+	}
+	responseBody, _ := io.ReadAll(io.LimitReader(response.Body, readLimit))
+	preview := strings.TrimSpace(strings.ReplaceAll(string(responseBody), "\n", " "))
+	if len(preview) > 900 {
+		preview = preview[:900]
+	}
+	latency := time.Since(started).Milliseconds()
+	success := response.StatusCode >= 200 && response.StatusCode < 300
+	usage := ParseOpenAIUsage(responseBody)
+	if usage.InputTokens == 0 && usage.OutputTokens == 0 {
+		usage = ParseClaudeUsage(responseBody)
+	}
+	if usage.InputTokens == 0 && usage.OutputTokens == 0 {
+		usage = ParseResponsesUsage(responseBody)
+	}
+	s.recordRequestLogFromRequest(r, started, domain.APIKey{}, false, route.ID, provider.ID, model, "test_"+decision.Action, decision.ConversionLabel, gatewayURL, response.StatusCode, usage, body, responseBody)
+	result := map[string]any{
+		"success":      success,
+		"routeId":      route.ID,
+		"providerId":   provider.ID,
+		"model":        model,
+		"action":       decision.Action,
+		"protocolFlow": decision.ConversionLabel,
+		"status":       response.StatusCode,
+		"latencyMs":    latency,
+		"preview":      preview,
+		"responseBody": string(responseBody),
+		"gatewayUrl":   gatewayURL,
+		"upstreamUrl":  upstreamURL,
+		"requestBody":  requestBody,
+	}
+	if !success {
+		diagnostics := buildRouteTestDiagnostics(route, provider, decision, model, gatewayURL, upstreamURL, requestBody, response, responseBody)
+		result["diagnostics"] = diagnostics
+		if errorMessage := extractResponseErrorMessage(responseBody); errorMessage != "" {
+			result["error"] = errorMessage
+		} else {
+			result["error"] = fmt.Sprintf("route test failed with HTTP %d", response.StatusCode)
+		}
+		diagJSON, _ := json.Marshal(diagnostics)
+		s.logs.AddApp("error", "route test failed", string(diagJSON))
+	} else {
+		s.logs.AddApp("info", "route test completed", fmt.Sprintf("route=%s gateway=%s status=%d latency=%dms", route.ID, gatewayURL, response.StatusCode, latency))
+	}
+	return result, http.StatusOK
+}
+
+func gatewayOutputURL(state domain.GatewayState, protocol domain.Protocol) (string, error) {
+	for _, endpoint := range state.Endpoints {
+		if endpoint.Protocol != protocol {
+			continue
+		}
+		base := strings.TrimRight(fmt.Sprintf("http://%s:%d%s", endpoint.ListenHost, endpoint.ListenPort, endpoint.BasePath), "/")
+		switch protocol {
+		case domain.ProtocolOpenAIChat:
+			return base + "/chat/completions", nil
+		case domain.ProtocolOpenAIResponses:
+			return base + "/responses", nil
+		case domain.ProtocolClaude:
+			// Endpoint BasePath is /anthropic; the real route is /anthropic/v1/messages.
+			return base + "/v1/messages", nil
+		}
+	}
+	return "", fmt.Errorf("no output endpoint configured for protocol %s", protocol)
+}
+
+func (s *Server) proxyOpenAIToClaudeMessages(w http.ResponseWriter, r *http.Request, provider domain.Provider, model string, claudeReq map[string]any, skipIncomingAuth bool) (int, TokenUsage, []byte, error) {
+	openAIReq, err := claudeRequestToOpenAIChat(claudeReq, model)
+	if err != nil {
+		return 0, TokenUsage{}, nil, err
+	}
+	stream, _ := openAIReq["stream"].(bool)
+	upstreamBody, err := json.Marshal(openAIReq)
+	if err != nil {
+		return 0, TokenUsage{}, nil, err
+	}
+
+	model = applyProviderModelMapping(provider, model)
+	upstreamBody, bodyErr := applyRequestAdapterBody(provider, model, upstreamBody)
+	if bodyErr != nil {
+		return 0, TokenUsage{}, nil, bodyErr
+	}
+	upstreamURL := resolveProviderChatURLWithAdapter(provider, model)
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(upstreamBody))
+	if err != nil {
+		return 0, TokenUsage{}, nil, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	if stream {
+		request.Header.Set("Accept", "text/event-stream")
+	} else {
+		request.Header.Set("Accept", "application/json")
+	}
+	if authValue := resolveProviderAuth(provider); authValue != "" {
+		header := provider.AuthHeader
+		if header == "" {
+			header = "Authorization"
+		}
+		if strings.EqualFold(header, "Authorization") && !strings.HasPrefix(strings.ToLower(authValue), "bearer ") {
+			authValue = "Bearer " + authValue
+		}
+		request.Header.Set(header, authValue)
+	} else if !skipIncomingAuth {
+		if incomingAuth := r.Header.Get("Authorization"); incomingAuth != "" {
+			request.Header.Set("Authorization", incomingAuth)
+		}
+	}
+	applyRequestAdapterHeaders(request, provider, model)
+
+	client := &http.Client{Timeout: 0}
+	response, err := client.Do(request)
+	if err != nil {
+		return 0, TokenUsage{}, nil, err
+	}
+	defer response.Body.Close()
+
+	if stream {
+		for key, values := range response.Header {
+			if strings.EqualFold(key, "Content-Length") {
+				continue
+			}
+			for _, value := range values {
+				w.Header().Add(key, value)
+			}
+		}
+		if w.Header().Get("Content-Type") == "" {
+			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		}
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(response.StatusCode)
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			responseBody, readErr := io.ReadAll(response.Body)
+			if readErr != nil {
+				return response.StatusCode, TokenUsage{}, nil, readErr
+			}
+			var payload map[string]any
+			_ = json.Unmarshal(responseBody, &payload)
+			claudeBody, _, convErr := openAIErrorValueToClaude(errorValueOrBody(payload, response.StatusCode, responseBody), model)
+			if convErr != nil || len(claudeBody) == 0 {
+				_, writeErr := w.Write(responseBody)
+				return response.StatusCode, TokenUsage{}, responseBody, writeErr
+			}
+			_, writeErr := w.Write(claudeBody)
+			return response.StatusCode, TokenUsage{}, claudeBody, writeErr
+		}
+		usage, streamErr := streamOpenAIChatToClaudeEvents(w, response.Body, model)
+		return response.StatusCode, usage, nil, streamErr
+	}
+
+	responseBody, readErr := io.ReadAll(response.Body)
+	if readErr != nil {
+		return 0, TokenUsage{}, nil, readErr
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		var payload map[string]any
+		_ = json.Unmarshal(responseBody, &payload)
+		claudeBody, _, convErr := openAIErrorValueToClaude(errorValueOrBody(payload, response.StatusCode, responseBody), model)
+		if convErr != nil || len(claudeBody) == 0 {
+			w.WriteHeader(response.StatusCode)
+			_, writeErr := w.Write(responseBody)
+			return response.StatusCode, TokenUsage{}, responseBody, writeErr
+		}
+		w.WriteHeader(response.StatusCode)
+		_, writeErr := w.Write(claudeBody)
+		return response.StatusCode, TokenUsage{}, claudeBody, writeErr
+	}
+
+	claudeBody, usage, err := openAIChatResponseToClaude(responseBody, model)
+	if err != nil {
+		return 0, TokenUsage{}, nil, err
+	}
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(claudeBody)))
+	w.WriteHeader(http.StatusOK)
+	if _, writeErr := w.Write(claudeBody); writeErr != nil {
+		return http.StatusOK, usage, claudeBody, writeErr
+	}
+	return http.StatusOK, usage, nil, nil
+}
+
+func (s *Server) proxyOpenAIChat(w http.ResponseWriter, r *http.Request, provider domain.Provider, model string, body []byte, skipIncomingAuth bool) (int, TokenUsage, []byte, error) {
+	stream := requestBodyWantsStream(body)
+	if provider.AuthType == domain.AuthTypeCursorOAuth {
+		baseURL, refreshed, err := s.resolveCursorBridgeBaseURL(provider)
+		if err != nil {
+			return 0, TokenUsage{}, nil, err
+		}
+		provider = refreshed
+		upstreamURL := strings.TrimRight(baseURL, "/") + "/chat/completions"
+		request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
+		if err != nil {
+			return 0, TokenUsage{}, nil, err
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Accept", r.Header.Get("Accept"))
+		client := &http.Client{Timeout: 0}
+		response, err := client.Do(request)
+		if err != nil {
+			return 0, TokenUsage{}, nil, err
+		}
+		defer response.Body.Close()
+		return writePassThroughResponse(w, response, stream, ParseOpenAIUsage)
+	}
+
+	model = applyProviderModelMapping(provider, model)
+	body, bodyErr := applyRequestAdapterBody(provider, model, body)
+	if bodyErr != nil {
+		return 0, TokenUsage{}, nil, bodyErr
+	}
+	upstreamURL := resolveProviderChatURLWithAdapter(provider, model)
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
+	if err != nil {
+		return 0, TokenUsage{}, nil, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", r.Header.Get("Accept"))
+	if authValue := resolveProviderAuth(provider); authValue != "" {
+		header := provider.AuthHeader
+		if header == "" {
+			header = "Authorization"
+		}
+		if strings.EqualFold(header, "Authorization") && !strings.HasPrefix(strings.ToLower(authValue), "bearer ") {
+			authValue = "Bearer " + authValue
+		}
+		request.Header.Set(header, authValue)
+	} else if !skipIncomingAuth {
+		if incomingAuth := r.Header.Get("Authorization"); incomingAuth != "" {
+			request.Header.Set("Authorization", incomingAuth)
+		}
+	}
+	applyRequestAdapterHeaders(request, provider, model)
+
+	client := &http.Client{Timeout: 0}
+	response, err := client.Do(request)
+	if err != nil {
+		return 0, TokenUsage{}, nil, err
+	}
+	defer response.Body.Close()
+	return writePassThroughResponse(w, response, stream, ParseOpenAIUsage)
+}
+
+// proxyClaudeMessages forwards a Claude Messages API request to the upstream
+// provider (Anthropic directly for claude_oauth providers, or provider.BaseURL
+// for a regular Claude API-key provider), streaming the response back
+// unchanged. For claude_oauth providers this refreshes the access token if
+// needed, injects the billing marker, and forces the anthropic-beta header.
+func (s *Server) proxyClaudeMessages(w http.ResponseWriter, r *http.Request, provider domain.Provider, body []byte) (int, TokenUsage, []byte, error) {
+	isOAuth := provider.AuthType == domain.AuthTypeClaudeOAuth
+
+	var request *http.Request
+	var err error
+	if isOAuth {
+		// Claude OAuth requests authenticate with a bearer access token (plus the
+		// billing marker + anthropic-beta header), never the x-api-key header
+		// used by ordinary Claude API-key providers.
+		refreshed, refreshErr := s.ensureFreshClaudeToken(provider)
+		if refreshErr != nil {
+			return 0, TokenUsage{}, nil, refreshErr
+		}
+		provider = refreshed
+		request, _, err = buildClaudeOAuthRequest(r.Context(), provider, body, r.Header.Get("anthropic-beta"), true, claudeMessagesURL)
+		if err != nil {
+			return 0, TokenUsage{}, nil, err
+		}
+		request.Header.Set("Accept", r.Header.Get("Accept"))
+	} else {
+		upstreamURL := strings.TrimSpace(provider.BaseURL)
+		if upstreamURL == "" {
+			upstreamURL = claudeMessagesURL
+		}
+		request, err = http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
+		if err != nil {
+			return 0, TokenUsage{}, nil, err
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Accept", r.Header.Get("Accept"))
+		request.Header.Set("anthropic-version", "2023-06-01")
+		applyProviderAuth(request, provider, r.Header.Get("Authorization"))
+	}
+
+	client := &http.Client{Timeout: 0}
+	response, err := client.Do(request)
+	if err != nil {
+		return 0, TokenUsage{}, nil, err
+	}
+	defer response.Body.Close()
+	return writePassThroughResponse(w, response, requestBodyWantsStream(body), ParseClaudeUsage)
+}
+
+func (s *Server) doClaudeProviderRequest(ctx context.Context, r *http.Request, provider domain.Provider, body []byte, accept string) (*http.Response, error) {
+	isOAuth := provider.AuthType == domain.AuthTypeClaudeOAuth
+	var request *http.Request
+	var err error
+	if isOAuth {
+		refreshed, refreshErr := s.ensureFreshClaudeToken(provider)
+		if refreshErr != nil {
+			return nil, refreshErr
+		}
+		provider = refreshed
+		request, _, err = buildClaudeOAuthRequest(ctx, provider, body, r.Header.Get("anthropic-beta"), false, claudeMessagesURL)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		upstreamURL := strings.TrimSpace(provider.BaseURL)
+		if upstreamURL == "" || strings.Contains(strings.ToLower(upstreamURL), "anthropic.com") {
+			upstreamURL = claudeMessagesURL
+		} else if !strings.Contains(strings.ToLower(upstreamURL), "/messages") {
+			upstreamURL = strings.TrimRight(upstreamURL, "/") + "/messages"
+		}
+		request, err = http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("anthropic-version", "2023-06-01")
+		applyProviderAuth(request, provider, r.Header.Get("Authorization"))
+	}
+	if accept != "" {
+		request.Header.Set("Accept", accept)
+	} else {
+		request.Header.Set("Accept", "application/json")
+	}
+	client := &http.Client{Timeout: 0}
+	return client.Do(request)
+}
+
+func (s *Server) proxyClaudeToOpenAIChat(w http.ResponseWriter, r *http.Request, provider domain.Provider, model string, openAIReq map[string]any, skipIncomingAuth bool) (int, TokenUsage, []byte, error) {
+	_ = skipIncomingAuth
+	clientToolNames := extractOpenAIToolNames(openAIReq)
+	claudeReq, err := openAIChatToClaudeRequest(openAIReq, model)
+	if err != nil {
+		return 0, TokenUsage{}, nil, err
+	}
+	stream, _ := claudeReq["stream"].(bool)
+	upstreamBody, err := json.Marshal(claudeReq)
+	if err != nil {
+		return 0, TokenUsage{}, nil, err
+	}
+	accept := "application/json"
+	if stream {
+		accept = "text/event-stream"
+	}
+	response, err := s.doClaudeProviderRequest(r.Context(), r, provider, upstreamBody, accept)
+	if err != nil {
+		return 0, TokenUsage{}, nil, err
+	}
+	defer response.Body.Close()
+
+	if stream {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(response.StatusCode)
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			responseBody, readErr := io.ReadAll(response.Body)
+			if readErr != nil {
+				return response.StatusCode, TokenUsage{}, nil, readErr
+			}
+			openAIBody, _, convErr := claudeResponseToOpenAIChat(responseBody, model, clientToolNames)
+			if convErr != nil || len(openAIBody) == 0 {
+				_, writeErr := w.Write(responseBody)
+				return response.StatusCode, TokenUsage{}, responseBody, writeErr
+			}
+			_, writeErr := w.Write(openAIBody)
+			return response.StatusCode, TokenUsage{}, openAIBody, writeErr
+		}
+		usage, streamErr := streamClaudeToOpenAIChatEvents(w, response.Body, model, clientToolNames)
+		return response.StatusCode, usage, nil, streamErr
+	}
+
+	responseBody, readErr := io.ReadAll(response.Body)
+	if readErr != nil {
+		return 0, TokenUsage{}, nil, readErr
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		openAIBody, _, convErr := claudeResponseToOpenAIChat(responseBody, model, clientToolNames)
+		if convErr != nil || len(openAIBody) == 0 {
+			w.WriteHeader(response.StatusCode)
+			_, writeErr := w.Write(responseBody)
+			return response.StatusCode, TokenUsage{}, responseBody, writeErr
+		}
+		w.WriteHeader(response.StatusCode)
+		_, writeErr := w.Write(openAIBody)
+		return response.StatusCode, TokenUsage{}, openAIBody, writeErr
+	}
+
+	openAIBody, usage, err := claudeResponseToOpenAIChat(responseBody, model, clientToolNames)
+	if err != nil {
+		return 0, TokenUsage{}, nil, err
+	}
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(openAIBody)))
+	w.WriteHeader(http.StatusOK)
+	if _, writeErr := w.Write(openAIBody); writeErr != nil {
+		return http.StatusOK, usage, openAIBody, writeErr
+	}
+	return http.StatusOK, usage, openAIBody, nil
+}
+
+func applyProviderAuth(request *http.Request, provider domain.Provider, incomingAuth string) {
+	if authValue := resolveProviderAuth(provider); authValue != "" {
+		header := provider.AuthHeader
+		if header == "" {
+			header = "Authorization"
+		}
+		if strings.EqualFold(header, "Authorization") && !strings.HasPrefix(strings.ToLower(authValue), "bearer ") {
+			authValue = "Bearer " + authValue
+		}
+		request.Header.Set(header, authValue)
+	} else if incomingAuth != "" {
+		request.Header.Set("Authorization", incomingAuth)
+	}
+}
+
+func resolveProviderAuth(provider domain.Provider) string {
+	source := strings.TrimSpace(provider.APIKeySource)
+	if source == "" {
+		return ""
+	}
+	if strings.HasPrefix(source, "env:") {
+		return strings.TrimSpace(os.Getenv(strings.TrimPrefix(source, "env:")))
+	}
+	if strings.HasPrefix(source, "literal:") {
+		return strings.TrimSpace(strings.TrimPrefix(source, "literal:"))
+	}
+	if strings.HasPrefix(source, "keychain:") {
+		// Future improvement: resolve secrets from the macOS Keychain here so they
+		// never need to be stored on disk. apiKeySource is persisted verbatim today.
+		return ""
+	}
+	return source
+}
+
+func (s *Server) writeConversionPlaceholder(w http.ResponseWriter, model string, decision domain.RouteDecision, stream bool) []byte {
+	message := fmt.Sprintf("Protocol conversion is not implemented yet: %s.", decision.ConversionLabel)
+	if stream {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.WriteHeader(http.StatusNotImplemented)
+		payload := map[string]any{
+			"id":      "chatcmpl-conversion-placeholder",
+			"object":  "chat.completion.chunk",
+			"created": time.Now().Unix(),
+			"model":   model,
+			"choices": []map[string]any{{"index": 0, "delta": map[string]any{"content": message}, "finish_reason": "stop"}},
+		}
+		bytes, _ := json.Marshal(payload)
+		fmt.Fprintf(w, "data: %s\n\n", bytes)
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		return []byte(fmt.Sprintf("data: %s\n\ndata: [DONE]\n\n", bytes))
+	}
+	body := map[string]any{
+		"error": map[string]any{
+			"message": message,
+			"type":    "conversion_not_implemented",
+		},
+	}
+	writeJSON(w, http.StatusNotImplemented, body)
+	encoded, _ := json.Marshal(body)
+	return encoded
+}
+
+func (s *Server) writeMockOpenAIResponse(w http.ResponseWriter, model string, decision domain.RouteDecision) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":      "chatcmpl-prototype",
+		"object":  "chat.completion",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []map[string]any{
+			{
+				"index": 0,
+				"message": map[string]any{
+					"role":    "assistant",
+					"content": fmt.Sprintf("Protocol Gateway MVP: %s via %s.", decision.Action, decision.ConversionLabel),
+				},
+				"finish_reason": "stop",
+			},
+		},
+		"usage": map[string]any{"prompt_tokens": 10, "completion_tokens": 22, "total_tokens": 32},
+	})
+}
+
+func (s *Server) writeMockOpenAIStream(w http.ResponseWriter, model string, decision domain.RouteDecision) {
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	flusher, _ := w.(http.Flusher)
+	chunks := []string{
+		"Protocol Gateway MVP: ",
+		decision.Action,
+		" via ",
+		decision.ConversionLabel,
+		".",
+	}
+	for _, chunk := range chunks {
+		payload := map[string]any{
+			"id":      "chatcmpl-prototype",
+			"object":  "chat.completion.chunk",
+			"created": time.Now().Unix(),
+			"model":   model,
+			"choices": []map[string]any{{"index": 0, "delta": map[string]any{"content": chunk}, "finish_reason": nil}},
+		}
+		bytes, _ := json.Marshal(payload)
+		fmt.Fprintf(w, "data: %s\n\n", bytes)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	fmt.Fprint(w, "data: [DONE]\n\n")
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeOpenAIError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]any{"error": map[string]any{"message": message, "type": "gateway_error"}})
+}
+
+func writeClaudeError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    "gateway_error",
+			"message": message,
+		},
+	})
+}
+
+func extractConsumerAPIKey(r *http.Request) string {
+	if key := strings.TrimSpace(r.Header.Get("x-api-key")); key != "" {
+		return key
+	}
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if len(auth) > 7 && strings.EqualFold(auth[:7], "bearer ") {
+		return strings.TrimSpace(auth[7:])
+	}
+	return ""
+}
+
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}

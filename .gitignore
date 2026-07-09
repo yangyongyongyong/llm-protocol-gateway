@@ -1,0 +1,49 @@
+# Go
+bin/
+.cache/
+*.test
+*.out
+
+# Frontend
+web/node_modules/
+web/dist/
+web/tsconfig.tsbuildinfo
+
+# Desktop (Wails)
+desktop/build/bin/
+desktop/frontend/dist/
+desktop/frontend/node_modules/
+desktop/frontend/package.json.md5
+desktop/frontend/wailsjs/
+.cache/app-bundle/
+.cache/packaged_resolve_check.go
+
+# Logs
+*.log
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Local env
+.env
+.env.*
+.gateway/
+
+# Local editor history
+.history/
+
+# Local runtime data (providers, OAuth tokens, SQLite, tunnels)
+*.db
+*.db-shm
+*.db-wal
+**/gateway.db*
+web/.history/
+desktop/frontend/.history/
+
+# Packaged / local cloudflare artifacts if ever copied into repo
+**/.cloudflared/
+**/cert.pem
+**/tunnel-config.yml
+!internal/tunnel/quick_tunnel_config.yml

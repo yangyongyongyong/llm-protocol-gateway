@@ -1,0 +1,920 @@
+package gateway
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+	"unicode"
+
+	"github.com/luca/llm-protocol-gateway/internal/config"
+	"github.com/luca/llm-protocol-gateway/internal/domain"
+)
+
+type Router struct {
+	mu    sync.RWMutex
+	state domain.GatewayState
+}
+
+func NewRouter(state domain.GatewayState) *Router {
+	mergeDefaultEndpoints(&state)
+	normalizePublicAccess(&state)
+	rebuildModels(&state)
+	return &Router{state: state}
+}
+
+func mergeDefaultEndpoints(state *domain.GatewayState) {
+	defaults := config.DefaultEndpoints()
+	overrides := make(map[string]domain.OutputEndpoint, len(state.Endpoints))
+	for _, endpoint := range state.Endpoints {
+		overrides[endpoint.ID] = endpoint
+	}
+	merged := make([]domain.OutputEndpoint, 0, len(defaults))
+	for _, endpoint := range defaults {
+		endpoint.StreamEnabled = true
+		if override, ok := overrides[endpoint.ID]; ok {
+			// StreamEnabled is applied from a dedicated settings map when present;
+			// endpoint copies from Load may carry the field after an explicit save.
+			endpoint.StreamEnabled = override.StreamEnabled
+			if host := strings.TrimSpace(override.ListenHost); host != "" {
+				endpoint.ListenHost = host
+			}
+			if override.ListenPort > 0 {
+				endpoint.ListenPort = override.ListenPort
+			}
+		}
+		merged = append(merged, endpoint)
+	}
+	state.Endpoints = merged
+}
+
+// ApplyEndpointStreamOverrides merges persisted per-endpoint stream flags onto
+// the fixed endpoint list. Missing IDs keep the current (default true) value.
+func ApplyEndpointStreamOverrides(state *domain.GatewayState, overrides map[string]bool) {
+	if len(overrides) == 0 {
+		return
+	}
+	for index := range state.Endpoints {
+		if enabled, ok := overrides[state.Endpoints[index].ID]; ok {
+			state.Endpoints[index].StreamEnabled = enabled
+		}
+	}
+}
+
+// UpdateEndpointStreamEnabled toggles whether clients may request SSE streaming
+// on a fixed output protocol endpoint.
+func (r *Router) UpdateEndpointStreamEnabled(endpointID string, enabled bool) (domain.OutputEndpoint, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for index := range r.state.Endpoints {
+		if r.state.Endpoints[index].ID != endpointID {
+			continue
+		}
+		r.state.Endpoints[index].StreamEnabled = enabled
+		return r.state.Endpoints[index], nil
+	}
+	return domain.OutputEndpoint{}, fmt.Errorf("endpoint %q not found", endpointID)
+}
+
+// EndpointByProtocol returns the fixed output endpoint for a protocol.
+func (r *Router) EndpointByProtocol(protocol domain.Protocol) (domain.OutputEndpoint, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.endpointByProtocolLocked(protocol)
+}
+
+// StreamEnabledForProtocol reports whether streaming is allowed on the output
+// protocol. Missing endpoints default to enabled.
+func (r *Router) StreamEnabledForProtocol(protocol domain.Protocol) bool {
+	endpoint, ok := r.EndpointByProtocol(protocol)
+	if !ok {
+		return true
+	}
+	return endpoint.StreamEnabled
+}
+
+// SetEndpointAdvertise updates the host/port shown to clients for fixed output
+// endpoints (LAN IP + listen port). Bind address is controlled separately by
+// GATEWAY_ADDR.
+func (r *Router) SetEndpointAdvertise(host string, port int) {
+	host = strings.TrimSpace(host)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for index := range r.state.Endpoints {
+		if host != "" {
+			r.state.Endpoints[index].ListenHost = host
+		}
+		if port > 0 {
+			r.state.Endpoints[index].ListenPort = port
+		}
+	}
+}
+
+func (r *Router) State() domain.GatewayState {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.state
+}
+
+func (r *Router) SetRequestLogRetentionDays(days int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if days <= 0 {
+		days = 7
+	}
+	r.state.RequestLogRetentionDays = days
+}
+
+func (r *Router) SetWebExposed(enabled bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.WebExposed = enabled
+}
+
+func (r *Router) WebExposed() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.state.WebExposed
+}
+
+func (r *Router) UpdatePublicAccess(settings domain.PublicAccessSettings) domain.PublicAccessSettings {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	current := r.state.PublicAccess
+	current.Enabled = settings.Enabled
+	if strings.TrimSpace(settings.Provider) != "" {
+		current.Provider = strings.TrimSpace(settings.Provider)
+	}
+	if settings.Mode != "" {
+		current.Mode = settings.Mode
+	}
+	// Domains and named-tunnel fields are assigned verbatim (including empty) so
+	// callers can clear a previous custom-domain bind. Internal helpers that only
+	// want a partial update must pass the current values they intend to keep.
+	current.CustomDomain = strings.TrimSpace(settings.CustomDomain)
+	current.UIDomain = strings.TrimSpace(settings.UIDomain)
+	// ExposeAPI / ExposeUI are only applied for custom-domain writes. Quick-tunnel
+	// / partial updates omit these bools (JSON false zero-value) and must not wipe
+	// the independently configured public surfaces.
+	if settings.Mode == domain.PublicAccessModeCustomDomain ||
+		current.CustomDomain != "" ||
+		current.UIDomain != "" {
+		current.ExposeAPI = settings.ExposeAPI
+		current.ExposeUI = settings.ExposeUI
+	}
+	if strings.TrimSpace(settings.Expose) != "" {
+		current.Expose = strings.TrimSpace(settings.Expose)
+	}
+	current.RuntimeURL = strings.TrimSpace(settings.RuntimeURL)
+	current.TunnelName = strings.TrimSpace(settings.TunnelName)
+	current.TunnelToken = strings.TrimSpace(settings.TunnelToken)
+	current.CredentialsFile = strings.TrimSpace(settings.CredentialsFile)
+	current.TunnelConfigFile = strings.TrimSpace(settings.TunnelConfigFile)
+
+	r.state.PublicAccess = current
+	normalizePublicAccess(&r.state)
+	return r.state.PublicAccess
+}
+
+func normalizePublicAccess(state *domain.GatewayState) {
+	settings := state.PublicAccess
+	if strings.TrimSpace(settings.Provider) == "" {
+		settings.Provider = "cloudflare"
+	}
+	if settings.Mode == "" {
+		settings.Mode = domain.PublicAccessModeRandomTunnel
+	}
+	if strings.TrimSpace(settings.Expose) == "" {
+		settings.Expose = "all"
+	}
+	settings.CustomDomain = cleanPublicHost(settings.CustomDomain)
+	settings.UIDomain = cleanPublicHost(settings.UIDomain)
+	settings.RuntimeURL = strings.TrimRight(strings.TrimSpace(settings.RuntimeURL), "/")
+	settings.PublicBaseURL = ""
+	settings.UIPublicBaseURL = ""
+
+	if settings.Mode == domain.PublicAccessModeCustomDomain &&
+		settings.CustomDomain != "" &&
+		settings.UIDomain != "" &&
+		strings.EqualFold(settings.CustomDomain, settings.UIDomain) {
+		// Keep API hostname; force UI hostname empty so callers re-bind with a split pair.
+		settings.UIDomain = ""
+	}
+	if settings.Mode == domain.PublicAccessModeCustomDomain {
+		if !settings.ExposeAPI && !settings.ExposeUI {
+			// Keep mode, but nothing is published until a surface is enabled.
+		}
+		if settings.ExposeAPI && settings.CustomDomain == "" && settings.ExposeUI && settings.UIDomain == "" {
+			settings.Mode = domain.PublicAccessModeRandomTunnel
+		}
+	}
+
+	switch {
+	case !settings.Enabled:
+		settings.Status = "disabled"
+		settings.StatusMessage = "Public access is disabled. Enable it to use a Cloudflare quick tunnel URL, or configure a purchased Cloudflare domain such as lucadesign.uk."
+	case settings.Provider != "cloudflare":
+		settings.Status = "unsupported"
+		settings.StatusMessage = "Only the Cloudflare control-plane scaffold is available in this MVP."
+	case settings.Mode == domain.PublicAccessModeCustomDomain:
+		if settings.ExposeAPI && settings.CustomDomain != "" {
+			settings.PublicBaseURL = "https://" + settings.CustomDomain
+		}
+		if settings.ExposeUI && settings.UIDomain != "" {
+			settings.UIPublicBaseURL = "https://" + settings.UIDomain
+		}
+		settings.Status = "configured_pending_tunnel"
+		settings.StatusMessage = "Custom domain is saved locally. Live Cloudflare setup still needs cloudflared credentials or API token, a tunnel, DNS route, and ingress mapping to this gateway."
+	case settings.RuntimeURL != "":
+		settings.PublicBaseURL = settings.RuntimeURL
+		settings.Status = "runtime_url_recorded"
+		settings.StatusMessage = "Cloudflare random tunnel mode is selected. The URL is recorded from the tunnel runtime; start cloudflared quick tunnel to refresh it."
+	default:
+		settings.Status = "waiting_for_tunnel"
+		settings.StatusMessage = "Cloudflare random tunnel mode is selected. Start cloudflared with the local gateway URL to receive a random trycloudflare.com domain."
+	}
+
+	state.PublicAccess = settings
+	for index := range state.Endpoints {
+		apiPublished := settings.Enabled && settings.PublicBaseURL != "" &&
+			(settings.Mode != domain.PublicAccessModeCustomDomain || settings.ExposeAPI)
+		state.Endpoints[index].PublicAccessEnabled = apiPublished
+		if apiPublished && publicExposeMatches(settings.Expose, state.Endpoints[index].Protocol) {
+			state.Endpoints[index].PublicURL = settings.PublicBaseURL + state.Endpoints[index].BasePath
+		} else {
+			state.Endpoints[index].PublicURL = ""
+		}
+	}
+}
+
+func cleanPublicHost(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.TrimPrefix(value, "https://")
+	value = strings.TrimPrefix(value, "http://")
+	return strings.TrimRight(value, "/")
+}
+
+func publicExposeMatches(expose string, protocol domain.Protocol) bool {
+	switch expose {
+	case "openai_chat":
+		return protocol == domain.ProtocolOpenAIChat
+	case "openai_responses":
+		return protocol == domain.ProtocolOpenAIResponses
+	case "claude":
+		return protocol == domain.ProtocolClaude
+	default:
+		return true
+	}
+}
+
+func (r *Router) AddProvider(provider domain.Provider) (domain.Provider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	provider.Name = strings.TrimSpace(provider.Name)
+	provider.BaseURL = strings.TrimSpace(provider.BaseURL)
+	provider.DefaultModel = strings.TrimSpace(provider.DefaultModel)
+	provider.DefaultThinkingDepth = strings.TrimSpace(provider.DefaultThinkingDepth)
+	if provider.Name == "" {
+		return domain.Provider{}, fmt.Errorf("provider name is required")
+	}
+	// OAuth providers have their baseUrl auto-filled by normalizeProvider
+	// (there's nothing else for the user to configure), so skip the manual
+	// requirement for those modes only.
+	if provider.BaseURL == "" &&
+		provider.AuthType != domain.AuthTypeClaudeOAuth &&
+		provider.AuthType != domain.AuthTypeCursorOAuth {
+		return domain.Provider{}, fmt.Errorf("provider baseUrl is required")
+	}
+	if provider.ID == "" {
+		provider.ID = uniqueID(slug(provider.Name), func(id string) bool {
+			for _, item := range r.state.Providers {
+				if item.ID == id {
+					return true
+				}
+			}
+			return false
+		})
+	}
+	normalizeProvider(&provider)
+
+	r.state.Providers = append(r.state.Providers, provider)
+	r.rebuildModelsLocked()
+	return provider, nil
+}
+
+func (r *Router) UpdateProvider(providerID string, patch domain.Provider) (domain.Provider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID != providerID {
+			continue
+		}
+		updated := r.state.Providers[index]
+		if strings.TrimSpace(patch.Name) != "" {
+			updated.Name = strings.TrimSpace(patch.Name)
+		}
+		if patch.Protocol != "" {
+			updated.Protocol = patch.Protocol
+		}
+		if strings.TrimSpace(patch.BaseURL) != "" {
+			updated.BaseURL = strings.TrimSpace(patch.BaseURL)
+		}
+		updated.APIKeySource = strings.TrimSpace(patch.APIKeySource)
+		updated.DefaultModel = strings.TrimSpace(patch.DefaultModel)
+		updated.DefaultThinkingDepth = strings.TrimSpace(patch.DefaultThinkingDepth)
+		if strings.TrimSpace(patch.AuthHeader) != "" {
+			updated.AuthHeader = strings.TrimSpace(patch.AuthHeader)
+		}
+		if patch.Models != nil {
+			updated.Models = patch.Models
+		}
+		if strings.TrimSpace(patch.AuthType) != "" {
+			updated.AuthType = strings.TrimSpace(patch.AuthType)
+		}
+		// Explicitly allow clearing requestAdapter by sending null/empty object.
+		updated.RequestAdapter = patch.RequestAdapter
+		normalizeProvider(&updated)
+		r.state.Providers[index] = updated
+		r.rebuildModelsLocked()
+		return updated, nil
+	}
+	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+}
+
+func normalizeProvider(provider *domain.Provider) {
+	provider.APIKeySource = strings.TrimSpace(provider.APIKeySource)
+	provider.AuthType = strings.TrimSpace(provider.AuthType)
+	if provider.AuthType == "" {
+		provider.AuthType = domain.AuthTypeAPIKey
+	}
+	if provider.AuthType == domain.AuthTypeClaudeOAuth {
+		// Claude OAuth providers always talk to the official Anthropic API;
+		// there is nothing else for the user to configure.
+		provider.Protocol = domain.ProtocolClaude
+		provider.BaseURL = "https://api.anthropic.com"
+	}
+	if provider.AuthType == domain.AuthTypeCursorOAuth {
+		// Cursor OAuth providers proxy through the local gRPC bridge at request time.
+		provider.Protocol = domain.ProtocolOpenAIChat
+		provider.BaseURL = ""
+	}
+	if provider.HealthStatus == "" {
+		provider.HealthStatus = "unchecked"
+	}
+	if provider.AuthHeader == "" {
+		provider.AuthHeader = "Authorization"
+	}
+	provider.RequestAdapter = normalizeRequestAdapter(provider.RequestAdapter)
+	if len(provider.Models) == 0 && provider.DefaultModel != "" {
+		provider.Models = []domain.Model{{ID: provider.DefaultModel, ProviderID: provider.ID, Protocol: provider.Protocol, ContextLength: 128000, InMenu: true}}
+	}
+	for index := range provider.Models {
+		provider.Models[index].ProviderID = provider.ID
+		provider.Models[index].Protocol = provider.Protocol
+	}
+}
+
+func (r *Router) AddRoute(route domain.Route) (domain.Route, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	route.Name = strings.TrimSpace(route.Name)
+	if route.Name == "" {
+		return domain.Route{}, fmt.Errorf("route name is required")
+	}
+	if _, ok := r.providerLocked(route.ProviderID); !ok {
+		return domain.Route{}, fmt.Errorf("provider %q not found", route.ProviderID)
+	}
+	endpoint, ok := r.endpointByProtocolLocked(route.OutputProtocol)
+	if !ok {
+		return domain.Route{}, fmt.Errorf("output protocol %q not available", route.OutputProtocol)
+	}
+	if route.ID == "" {
+		route.ID = uniqueID(slug(route.Name), func(id string) bool {
+			for _, item := range r.state.Routes {
+				if item.ID == id {
+					return true
+				}
+			}
+			return false
+		})
+	}
+	if route.OutputEndpointID == "" {
+		route.OutputEndpointID = endpoint.ID
+	}
+	if route.Mode == "" {
+		route.Mode = domain.RouteModeAuto
+	}
+	route.Enabled = true
+
+	r.state.Routes = append(r.state.Routes, route)
+	return route, nil
+}
+
+func (r *Router) UpdateRoute(routeID string, patch domain.Route) (domain.Route, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for index := range r.state.Routes {
+		if r.state.Routes[index].ID != routeID {
+			continue
+		}
+		updated := r.state.Routes[index]
+		if strings.TrimSpace(patch.Name) != "" {
+			updated.Name = strings.TrimSpace(patch.Name)
+		}
+		if strings.TrimSpace(patch.ProviderID) != "" {
+			if _, ok := r.providerLocked(patch.ProviderID); !ok {
+				return domain.Route{}, fmt.Errorf("provider %q not found", patch.ProviderID)
+			}
+			updated.ProviderID = strings.TrimSpace(patch.ProviderID)
+		}
+		if patch.OutputProtocol != "" {
+			endpoint, ok := r.endpointByProtocolLocked(patch.OutputProtocol)
+			if !ok {
+				return domain.Route{}, fmt.Errorf("output protocol %q not available", patch.OutputProtocol)
+			}
+			updated.OutputProtocol = patch.OutputProtocol
+			updated.OutputEndpointID = endpoint.ID
+		}
+		if patch.Mode != "" {
+			updated.Mode = patch.Mode
+		}
+		r.state.Routes[index] = updated
+		return updated, nil
+	}
+	return domain.Route{}, fmt.Errorf("route %q not found", routeID)
+}
+
+func (r *Router) DeleteRoute(routeID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, key := range r.state.APIKeys {
+		if key.RouteID == routeID {
+			return fmt.Errorf("route %q is used by api key %q", routeID, key.Name)
+		}
+	}
+	for index := range r.state.Routes {
+		if r.state.Routes[index].ID == routeID {
+			r.state.Routes = append(r.state.Routes[:index], r.state.Routes[index+1:]...)
+			return nil
+		}
+	}
+	return fmt.Errorf("route %q not found", routeID)
+}
+
+func (r *Router) AddAPIKey(key domain.APIKey) (domain.APIKey, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	key.Name = strings.TrimSpace(key.Name)
+	if key.Name == "" {
+		return domain.APIKey{}, fmt.Errorf("api key name is required")
+	}
+	key.RouteID = strings.TrimSpace(key.RouteID)
+	if key.RouteID != "" {
+		if _, ok := r.routeLocked(key.RouteID); !ok {
+			return domain.APIKey{}, fmt.Errorf("route %q not found", key.RouteID)
+		}
+	}
+	if strings.TrimSpace(key.Key) == "" {
+		token, err := generateAPIKey()
+		if err != nil {
+			return domain.APIKey{}, err
+		}
+		key.Key = token
+	}
+	if key.ID == "" {
+		key.ID = uniqueID(slug(key.Name), func(id string) bool {
+			for _, item := range r.state.APIKeys {
+				if item.ID == id {
+					return true
+				}
+			}
+			return false
+		})
+	}
+	key.ModelOverride = strings.TrimSpace(key.ModelOverride)
+	key.ModelAliases = normalizeModelAliases(key.ModelAliases)
+	key.ThinkingDepthOverride = strings.TrimSpace(key.ThinkingDepthOverride)
+	key.Enabled = true
+	if key.CreatedAt == "" {
+		key.CreatedAt = nowRFC3339()
+	}
+
+	r.state.APIKeys = append(r.state.APIKeys, key)
+	return key, nil
+}
+
+func (r *Router) UpdateAPIKey(keyID string, patch domain.APIKey) (domain.APIKey, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for index := range r.state.APIKeys {
+		if r.state.APIKeys[index].ID != keyID {
+			continue
+		}
+		updated := r.state.APIKeys[index]
+		if strings.TrimSpace(patch.Name) != "" {
+			updated.Name = strings.TrimSpace(patch.Name)
+		}
+		if routeID := strings.TrimSpace(patch.RouteID); routeID != "" {
+			if _, ok := r.routeLocked(routeID); !ok {
+				return domain.APIKey{}, fmt.Errorf("route %q not found", routeID)
+			}
+			updated.RouteID = routeID
+		}
+		updated.ModelOverride = strings.TrimSpace(patch.ModelOverride)
+		if patch.ModelAliases != nil {
+			updated.ModelAliases = normalizeModelAliases(patch.ModelAliases)
+		}
+		updated.ThinkingDepthOverride = strings.TrimSpace(patch.ThinkingDepthOverride)
+		updated.Enabled = patch.Enabled
+		r.state.APIKeys[index] = updated
+		return updated, nil
+	}
+	return domain.APIKey{}, fmt.Errorf("api key %q not found", keyID)
+}
+
+func (r *Router) DeleteAPIKey(keyID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for index := range r.state.APIKeys {
+		if r.state.APIKeys[index].ID == keyID {
+			r.state.APIKeys = append(r.state.APIKeys[:index], r.state.APIKeys[index+1:]...)
+			return nil
+		}
+	}
+	return fmt.Errorf("api key %q not found", keyID)
+}
+
+// APIKeyByToken returns the enabled API key matching the raw token, if any.
+func (r *Router) APIKeyByToken(token string) (domain.APIKey, bool) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return domain.APIKey{}, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, key := range r.state.APIKeys {
+		if key.Enabled && key.Key == token {
+			return key, true
+		}
+	}
+	return domain.APIKey{}, false
+}
+
+func (r *Router) routeLocked(routeID string) (domain.Route, bool) {
+	for _, route := range r.state.Routes {
+		if route.ID == routeID {
+			return route, true
+		}
+	}
+	return domain.Route{}, false
+}
+
+func (r *Router) DeleteProvider(providerID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, route := range r.state.Routes {
+		if route.ProviderID == providerID {
+			return fmt.Errorf("provider %q is used by route %q", providerID, route.Name)
+		}
+	}
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID == providerID {
+			r.state.Providers = append(r.state.Providers[:index], r.state.Providers[index+1:]...)
+			r.rebuildModelsLocked()
+			return nil
+		}
+	}
+	return fmt.Errorf("provider %q not found", providerID)
+}
+
+// SetProviderClaudeOAuth stores (or replaces) the Claude OAuth credential for
+// a provider and forces it into claude_oauth auth mode.
+func (r *Router) SetProviderClaudeOAuth(providerID string, credential domain.ClaudeOAuthCredential) (domain.Provider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID != providerID {
+			continue
+		}
+		updated := r.state.Providers[index]
+		updated.AuthType = domain.AuthTypeClaudeOAuth
+		credentialCopy := credential
+		updated.ClaudeOAuth = &credentialCopy
+		normalizeProvider(&updated)
+		r.state.Providers[index] = updated
+		return updated, nil
+	}
+	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+}
+
+// ClearProviderClaudeOAuth removes the stored Claude OAuth credential (logout)
+// while leaving the provider in claude_oauth auth mode so the user can
+// reconnect without re-configuring the provider.
+func (r *Router) ClearProviderClaudeOAuth(providerID string) (domain.Provider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID != providerID {
+			continue
+		}
+		updated := r.state.Providers[index]
+		updated.ClaudeOAuth = nil
+		normalizeProvider(&updated)
+		r.state.Providers[index] = updated
+		return updated, nil
+	}
+	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+}
+
+// SetProviderCursorOAuth stores (or replaces) the Cursor OAuth credential for
+// a provider and forces it into cursor_oauth auth mode.
+func (r *Router) SetProviderCursorOAuth(providerID string, credential domain.CursorOAuthCredential) (domain.Provider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID != providerID {
+			continue
+		}
+		updated := r.state.Providers[index]
+		updated.AuthType = domain.AuthTypeCursorOAuth
+		credentialCopy := credential
+		updated.CursorOAuth = &credentialCopy
+		normalizeProvider(&updated)
+		r.state.Providers[index] = updated
+		return updated, nil
+	}
+	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+}
+
+// ClearProviderCursorOAuth removes the stored Cursor OAuth credential (logout)
+// while leaving the provider in cursor_oauth auth mode so the user can
+// reconnect without re-configuring the provider.
+func (r *Router) ClearProviderCursorOAuth(providerID string) (domain.Provider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID != providerID {
+			continue
+		}
+		updated := r.state.Providers[index]
+		updated.CursorOAuth = nil
+		normalizeProvider(&updated)
+		r.state.Providers[index] = updated
+		return updated, nil
+	}
+	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+}
+
+func (r *Router) ProviderByID(providerID string) (domain.Provider, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	provider, ok := r.providerLocked(providerID)
+	if !ok {
+		return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+	}
+	return provider, nil
+}
+
+func (r *Router) UpdateProviderModels(providerID string, models []domain.Model, healthStatus string) (domain.Provider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID != providerID {
+			continue
+		}
+		for modelIndex := range models {
+			models[modelIndex].ProviderID = providerID
+			models[modelIndex].Protocol = r.state.Providers[index].Protocol
+			models[modelIndex].InMenu = true
+			if models[modelIndex].ContextLength == 0 {
+				models[modelIndex].ContextLength = 128000
+			}
+		}
+		r.state.Providers[index].Models = models
+		if strings.TrimSpace(healthStatus) != "" {
+			r.state.Providers[index].HealthStatus = strings.TrimSpace(healthStatus)
+		}
+		r.rebuildModelsLocked()
+		return r.state.Providers[index], nil
+	}
+	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+}
+
+func (r *Router) RouteByID(routeID string) (domain.Route, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	for _, route := range r.state.Routes {
+		if route.ID == routeID {
+			return route, nil
+		}
+	}
+	return domain.Route{}, fmt.Errorf("route %q not found", routeID)
+}
+
+func (r *Router) Decide(routeID string) (domain.RouteDecision, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var route *domain.Route
+	for i := range r.state.Routes {
+		if r.state.Routes[i].ID == routeID {
+			route = &r.state.Routes[i]
+			break
+		}
+	}
+	if route == nil {
+		return domain.RouteDecision{}, fmt.Errorf("route %q not found", routeID)
+	}
+
+	provider, ok := r.providerLocked(route.ProviderID)
+	if !ok {
+		return domain.RouteDecision{}, fmt.Errorf("provider %q not found", route.ProviderID)
+	}
+
+	action := "convert"
+	if route.Mode == domain.RouteModePassThrough || (route.Mode == domain.RouteModeAuto && route.OutputProtocol == provider.Protocol) {
+		action = "pass_through"
+	}
+	if route.Mode == domain.RouteModeConvert {
+		action = "convert"
+	}
+
+	return domain.RouteDecision{
+		RouteID:         route.ID,
+		ProviderID:      provider.ID,
+		OutputProtocol:  route.OutputProtocol,
+		InputProtocol:   provider.Protocol,
+		Mode:            route.Mode,
+		Action:          action,
+		ConversionLabel: fmt.Sprintf("%s -> %s", provider.Protocol.DisplayName(), route.OutputProtocol.DisplayName()),
+	}, nil
+}
+
+func (r *Router) ActiveOpenAIChatRoute() (domain.Route, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var fallback *domain.Route
+	for index := range r.state.Routes {
+		route := &r.state.Routes[index]
+		if !route.Enabled || route.OutputProtocol != domain.ProtocolOpenAIChat {
+			continue
+		}
+		if fallback == nil {
+			fallback = route
+		}
+		provider, ok := r.providerLocked(route.ProviderID)
+		if ok && provider.Protocol == domain.ProtocolOpenAIChat {
+			return *route, nil
+		}
+	}
+	if fallback != nil {
+		return *fallback, nil
+	}
+	return domain.Route{}, fmt.Errorf("no active OpenAI Chat route")
+}
+
+func (r *Router) ProviderForRoute(route domain.Route) (domain.Provider, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	provider, ok := r.providerLocked(route.ProviderID)
+	if !ok {
+		return domain.Provider{}, fmt.Errorf("provider %q not found", route.ProviderID)
+	}
+	return provider, nil
+}
+
+// ResolveModel picks the effective model for a request. A fixed API-key model
+// replacement wins outright and ignores the request body model; otherwise the
+// request model is used, falling back to the route's provider default model.
+func (r *Router) ResolveModel(route domain.Route, override string, requestModel string) string {
+	requestModel = resolveClaudeModelAlias(requestModel)
+	if override = strings.TrimSpace(override); override != "" {
+		return override
+	}
+	if requestModel != "" {
+		return requestModel
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	provider, ok := r.providerLocked(route.ProviderID)
+	if ok && strings.TrimSpace(provider.DefaultModel) != "" {
+		return strings.TrimSpace(provider.DefaultModel)
+	}
+	return ""
+}
+
+// ResolveThinkingDepth picks the effective reasoning effort. An API-key
+// override wins outright; otherwise the request value is used when present,
+// falling back to the route's provider default thinking depth.
+func (r *Router) ResolveThinkingDepth(route domain.Route, override string, requestHasDepth bool, requestDepth string) string {
+	if override = strings.TrimSpace(override); override != "" {
+		return override
+	}
+	if requestHasDepth {
+		return strings.TrimSpace(requestDepth)
+	}
+	r.mu.RLock()
+	provider, ok := r.providerLocked(route.ProviderID)
+	r.mu.RUnlock()
+	if ok {
+		return strings.TrimSpace(provider.DefaultThinkingDepth)
+	}
+	return ""
+}
+
+func (r *Router) providerLocked(providerID string) (domain.Provider, bool) {
+	for _, provider := range r.state.Providers {
+		if provider.ID == providerID {
+			return provider, true
+		}
+	}
+	return domain.Provider{}, false
+}
+
+func (r *Router) endpointByProtocolLocked(protocol domain.Protocol) (domain.OutputEndpoint, bool) {
+	for _, endpoint := range r.state.Endpoints {
+		if endpoint.Protocol == protocol {
+			return endpoint, true
+		}
+	}
+	return domain.OutputEndpoint{}, false
+}
+
+func (r *Router) rebuildModelsLocked() {
+	rebuildModels(&r.state)
+}
+
+func rebuildModels(state *domain.GatewayState) {
+	models := make([]domain.Model, 0)
+	for _, provider := range state.Providers {
+		models = append(models, provider.Models...)
+	}
+	state.Models = models
+}
+
+func slug(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var builder strings.Builder
+	lastDash := false
+	for _, char := range value {
+		if unicode.IsLetter(char) || unicode.IsDigit(char) {
+			builder.WriteRune(char)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			builder.WriteRune('-')
+			lastDash = true
+		}
+	}
+	result := strings.Trim(builder.String(), "-")
+	if result == "" {
+		return "item"
+	}
+	return result
+}
+
+func generateAPIKey() (string, error) {
+	buf := make([]byte, 24)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return "sk-gw-" + hex.EncodeToString(buf), nil
+}
+
+func nowRFC3339() string {
+	return time.Now().UTC().Format(time.RFC3339)
+}
+
+func uniqueID(base string, exists func(string) bool) string {
+	if !exists(base) {
+		return base
+	}
+	for index := 2; ; index++ {
+		candidate := fmt.Sprintf("%s-%d", base, index)
+		if !exists(candidate) {
+			return candidate
+		}
+	}
+}

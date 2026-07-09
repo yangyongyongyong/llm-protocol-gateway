@@ -1,0 +1,21 @@
+{
+  "scripts": {
+    "dev:web": "vite --host 127.0.0.1 --port 5173",
+    "dev": "bash ../scripts/dev.sh",
+    "verify": "bash ../scripts/verify-dev.sh",
+    "gateway": "bash ../scripts/ensure-gateway.sh",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 4173"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "typescript": "latest",
+    "vite": "latest"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3"
+  }
+}

@@ -1,0 +1,2 @@
+# Isolated cloudflared config for account-less quick tunnels.
+# Prevents inheriting ~/.cloudflared/config.yml ingress rules such as http_status:404.

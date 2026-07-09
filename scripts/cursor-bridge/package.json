@@ -1,0 +1,9 @@
+{
+  "name": "llm-protocol-gateway-cursor-bridge",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@bufbuild/protobuf": "^2.2.5",
+    "zod": "^3.24.2"
+  }
+}

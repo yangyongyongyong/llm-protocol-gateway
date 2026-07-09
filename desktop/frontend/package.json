@@ -1,0 +1,9 @@
+{
+  "name": "llm-protocol-gateway-desktop-shell",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "build": "node ./sync-dist.mjs",
+    "dev": "node ./sync-dist.mjs"
+  }
+}

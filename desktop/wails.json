@@ -1,0 +1,20 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "LLM Protocol Gateway",
+  "outputfilename": "LLM Protocol Gateway",
+  "frontend:dir": "frontend",
+  "frontend:install": "true",
+  "frontend:build": "true",
+  "wailsjsdir": "frontend",
+  "author": {
+    "name": "Luca",
+    "email": ""
+  },
+  "info": {
+    "companyName": "Luca",
+    "productName": "LLM Protocol Gateway",
+    "productVersion": "0.1.0",
+    "copyright": "Copyright Luca",
+    "comments": "Local LLM protocol gateway"
+  }
+}
