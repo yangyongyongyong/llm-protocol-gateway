@@ -5,6 +5,86 @@ import (
 	"testing"
 )
 
+func TestOpenAIChatToClaudeRequestSanitizesInvalidToolUseIDs(t *testing.T) {
+	openAIReq := map[string]any{
+		"model": "claude-sonnet-5",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "read this"},
+			map[string]any{
+				"role": "assistant",
+				"tool_calls": []any{
+					map[string]any{
+						"id":   "functions.Read:1",
+						"type": "function",
+						"function": map[string]any{
+							"name":      "Read",
+							"arguments": `{"path":"a.go"}`,
+						},
+					},
+				},
+			},
+			map[string]any{
+				"role":         "tool",
+				"tool_call_id": "functions.Read:1",
+				"content":      "ok",
+			},
+		},
+	}
+	claudeReq, err := openAIChatToClaudeRequest(openAIReq, "claude-sonnet-5")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	messages := claudeReq["messages"].([]map[string]any)
+	assistantBlocks := messages[1]["content"].([]any)
+	toolUse := assistantBlocks[0].(map[string]any)
+	if toolUse["id"] != "functions_Read_1" {
+		t.Fatalf("tool_use.id = %q, want sanitized", toolUse["id"])
+	}
+	resultBlocks := messages[2]["content"].([]any)
+	toolResult := resultBlocks[0].(map[string]any)
+	if toolResult["tool_use_id"] != "functions_Read_1" {
+		t.Fatalf("tool_use_id = %q, want matching sanitized id", toolResult["tool_use_id"])
+	}
+}
+
+func TestOpenAIContentToClaudeBlocksConvertsImageURL(t *testing.T) {
+	blocks := openAIContentToClaudeBlocks([]any{
+		map[string]any{"type": "text", "text": "see image"},
+		map[string]any{
+			"type": "image_url",
+			"image_url": map[string]any{
+				"url": "data:image/png;base64,abc123",
+			},
+		},
+	})
+	if len(blocks) != 2 {
+		t.Fatalf("expected 2 blocks, got %d", len(blocks))
+	}
+	image := blocks[1].(map[string]any)
+	if image["type"] != "image" {
+		t.Fatalf("expected image block, got %#v", image)
+	}
+	source := image["source"].(map[string]any)
+	if source["type"] != "base64" || source["media_type"] != "image/png" || source["data"] != "abc123" {
+		t.Fatalf("unexpected image source %#v", source)
+	}
+}
+
+func TestSanitizeAnthropicToolUseID(t *testing.T) {
+	cases := map[string]string{
+		"call_1":           "call_1",
+		"functions.Read:1": "functions_Read_1",
+		"call|abc":         "call_abc",
+		"  ":               "toolu_missing",
+		"...":              "toolu_sanitized",
+	}
+	for in, want := range cases {
+		if got := sanitizeAnthropicToolUseID(in); got != want {
+			t.Fatalf("sanitizeAnthropicToolUseID(%q)=%q want %q", in, got, want)
+		}
+	}
+}
+
 func TestOpenAIChatToClaudeRequestMapsToolsAndMessages(t *testing.T) {
 	openAIReq := map[string]any{
 		"model": "claude-sonnet-5",

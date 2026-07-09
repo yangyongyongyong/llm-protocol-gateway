@@ -15,16 +15,15 @@ func openAIContentToClaudeBlocks(content any) []any {
 		}
 		return []any{map[string]any{"type": "text", "text": typed}}
 	case []any:
-		blocks := cloneContentBlocks(typed)
-		for index, block := range blocks {
+		blocks := make([]any, 0, len(typed))
+		for _, block := range typed {
 			item, ok := block.(map[string]any)
 			if !ok {
 				continue
 			}
-			if item["type"] == "input_text" {
-				item["type"] = "text"
+			if converted := openAIContentBlockToClaude(item); converted != nil {
+				blocks = append(blocks, converted)
 			}
-			blocks[index] = item
 		}
 		return blocks
 	default:
@@ -34,6 +33,103 @@ func openAIContentToClaudeBlocks(content any) []any {
 		}
 		return []any{map[string]any{"type": "text", "text": text}}
 	}
+}
+
+func openAIContentBlockToClaude(item map[string]any) map[string]any {
+	blockType := stringValue(item["type"])
+	switch blockType {
+	case "input_text", "text":
+		out := map[string]any{"type": "text", "text": stringValue(item["text"])}
+		if cacheControl, ok := item["cache_control"]; ok {
+			out["cache_control"] = cacheControl
+		}
+		return out
+	case "image_url":
+		return openAIImageURLBlockToClaude(item)
+	case "image":
+		// Already Claude-shaped (or close); pass through with a shallow copy.
+		out := cloneAnyMap(item)
+		if out == nil {
+			return nil
+		}
+		out["type"] = "image"
+		return out
+	default:
+		// Preserve unknown blocks (including cache_control-bearing text variants).
+		out := cloneAnyMap(item)
+		if out == nil {
+			return nil
+		}
+		if blockType == "" {
+			if _, hasText := out["text"]; hasText {
+				out["type"] = "text"
+			}
+		}
+		return out
+	}
+}
+
+func openAIImageURLBlockToClaude(item map[string]any) map[string]any {
+	imageURL, _ := item["image_url"].(map[string]any)
+	if imageURL == nil {
+		if url := stringValue(item["image_url"]); url != "" {
+			imageURL = map[string]any{"url": url}
+		}
+	}
+	if imageURL == nil {
+		return nil
+	}
+	url := strings.TrimSpace(stringValue(imageURL["url"]))
+	if url == "" {
+		return nil
+	}
+	out := map[string]any{"type": "image"}
+	if strings.HasPrefix(url, "data:") {
+		mediaType, data, ok := splitDataURL(url)
+		if !ok {
+			return nil
+		}
+		out["source"] = map[string]any{
+			"type":       "base64",
+			"media_type": mediaType,
+			"data":       data,
+		}
+	} else {
+		out["source"] = map[string]any{
+			"type": "url",
+			"url":  url,
+		}
+	}
+	if cacheControl, ok := item["cache_control"]; ok {
+		out["cache_control"] = cacheControl
+	}
+	return out
+}
+
+func splitDataURL(dataURL string) (mediaType, data string, ok bool) {
+	dataURL = strings.TrimSpace(dataURL)
+	if !strings.HasPrefix(dataURL, "data:") {
+		return "", "", false
+	}
+	rest := strings.TrimPrefix(dataURL, "data:")
+	comma := strings.IndexByte(rest, ',')
+	if comma < 0 {
+		return "", "", false
+	}
+	meta := rest[:comma]
+	data = rest[comma+1:]
+	if data == "" {
+		return "", "", false
+	}
+	mediaType = "image/png"
+	if semi := strings.IndexByte(meta, ';'); semi >= 0 {
+		if mt := strings.TrimSpace(meta[:semi]); mt != "" {
+			mediaType = mt
+		}
+	} else if mt := strings.TrimSpace(meta); mt != "" {
+		mediaType = mt
+	}
+	return mediaType, data, true
 }
 
 func normalizeOpenAIContentForClaude(content any) any {

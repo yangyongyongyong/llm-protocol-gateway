@@ -3,8 +3,31 @@ package gateway
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 )
+
+// anthropicToolUseIDInvalid matches characters Anthropic rejects in tool_use.id /
+// tool_result.tool_use_id (must be ^[a-zA-Z0-9_-]+$). Cursor and other clients
+// often emit IDs like "functions.Read:1" or "call|abc" that pass OpenAI validation
+// but fail on Claude.
+var anthropicToolUseIDInvalid = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
+
+// sanitizeAnthropicToolUseID rewrites a tool call id to Anthropic's allowed
+// charset. The same transform is applied to tool_use.id and tool_result.tool_use_id
+// so pairings stay intact.
+func sanitizeAnthropicToolUseID(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "toolu_missing"
+	}
+	sanitized := anthropicToolUseIDInvalid.ReplaceAllString(id, "_")
+	sanitized = strings.Trim(sanitized, "_")
+	if sanitized == "" {
+		return "toolu_sanitized"
+	}
+	return sanitized
+}
 
 func cloneAnyMap(value map[string]any) map[string]any {
 	if value == nil {
@@ -311,7 +334,7 @@ func openAIToolCallsToClaudeBlocks(toolCalls []any) []any {
 		}
 		block := map[string]any{
 			"type":  "tool_use",
-			"id":    stringValue(call["id"]),
+			"id":    sanitizeAnthropicToolUseID(stringValue(call["id"])),
 			"name":  name,
 			"input": parseJSONArguments(stringValue(functionValue["arguments"])),
 		}
@@ -486,7 +509,7 @@ func openAIMessagesToClaude(rawMessages []any) ([]any, []map[string]any, error) 
 			}
 			pendingToolResults = append(pendingToolResults, map[string]any{
 				"type":        "tool_result",
-				"tool_use_id": toolCallID,
+				"tool_use_id": sanitizeAnthropicToolUseID(toolCallID),
 				"content":     normalizeToolResultContent(entry["content"]),
 			})
 			continue

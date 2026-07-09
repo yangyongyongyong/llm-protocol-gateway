@@ -81,7 +81,7 @@ func isAdminAuthPublicPath(path string) bool {
 	switch path {
 	case "/__health", "/__auth/status", "/__auth/setup", "/__auth/login", "/__auth/logout":
 		return true
-	case "/login", "/favicon.ico":
+	case "/login", "/favicon.ico", "/favicon.svg", "/apple-touch-icon.png":
 		return true
 	}
 	return strings.HasPrefix(path, "/assets/")

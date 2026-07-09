@@ -138,7 +138,7 @@ func normalizeClaudePassThroughContentBlock(block map[string]any) map[string]any
 	case "tool_use":
 		out := map[string]any{
 			"type": "tool_use",
-			"id":   stringValue(block["id"]),
+			"id":   sanitizeAnthropicToolUseID(stringValue(block["id"])),
 			"name": stringValue(block["name"]),
 		}
 		if input, ok := block["input"]; ok {
@@ -148,7 +148,7 @@ func normalizeClaudePassThroughContentBlock(block map[string]any) map[string]any
 	case "tool_result":
 		return map[string]any{
 			"type":        "tool_result",
-			"tool_use_id": stringValue(block["tool_use_id"]),
+			"tool_use_id": sanitizeAnthropicToolUseID(stringValue(block["tool_use_id"])),
 			"content":     normalizeClaudePassThroughToolResultContent(block["content"]),
 		}
 	case "image":

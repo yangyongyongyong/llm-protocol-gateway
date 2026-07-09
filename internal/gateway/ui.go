@@ -122,7 +122,12 @@ func shouldServeUIFallback(path string) bool {
 	if _, ok := uiNavPaths[path]; ok {
 		return true
 	}
-	return path == "/index.html" || path == "/favicon.ico"
+	switch path {
+	case "/index.html", "/favicon.ico", "/favicon.svg", "/apple-touch-icon.png":
+		return true
+	default:
+		return false
+	}
 }
 
 func newUIHandler(distDir string) http.Handler {
