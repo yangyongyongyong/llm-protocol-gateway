@@ -129,7 +129,12 @@ func streamClaudeToOpenAIChatEvents(w http.ResponseWriter, reader io.Reader, mod
 				if currentToolOpenAIIndex < 0 {
 					continue
 				}
-				partialJSON := strings.TrimSpace(stringValue(delta["partial_json"]))
+				// NOTE: do NOT TrimSpace here. Tool-call arguments are streamed as
+				// partial_json fragments and a fragment boundary can fall on a
+				// space (e.g. "git status --short" split into "git status" + " --short").
+				// Trimming each fragment drops those boundary spaces and corrupts
+				// the reassembled arguments (producing "git status--short").
+				partialJSON := stringValue(delta["partial_json"])
 				if partialJSON == "" {
 					continue
 				}
