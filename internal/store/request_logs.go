@@ -126,9 +126,13 @@ func (s *Store) QueryRequestLogs(query monitor.RequestLogQuery) (monitor.Request
 
 	offset := (page - 1) * pageSize
 	args = append(args, pageSize, offset)
-	rows, err := s.db.Query(`SELECT time, api_key_id, api_key_name, route_id, provider_id, model, action, protocol_flow, path,
+	selectCols := `time, api_key_id, api_key_name, route_id, provider_id, model, action, protocol_flow, path,
 		status, input_tokens, output_tokens, cache_tokens, latency_ms, ttft_ms, client_host, access_source,
-		error_description, request_body, response_body
+		error_description`
+	if query.IncludeBodies {
+		selectCols += `, request_body, response_body`
+	}
+	rows, err := s.db.Query(`SELECT `+selectCols+`
 		FROM request_logs WHERE `+whereSQL+` ORDER BY time DESC, id DESC LIMIT ? OFFSET ?`, args...)
 	if err != nil {
 		return monitor.RequestLogPage{}, err
@@ -137,7 +141,13 @@ func (s *Store) QueryRequestLogs(query monitor.RequestLogQuery) (monitor.Request
 
 	logs := make([]monitor.RequestLog, 0, pageSize)
 	for rows.Next() {
-		item, scanErr := scanRequestLog(rows)
+		var item monitor.RequestLog
+		var scanErr error
+		if query.IncludeBodies {
+			item, scanErr = scanRequestLog(rows)
+		} else {
+			item, scanErr = scanRequestLogSummary(rows)
+		}
 		if scanErr != nil {
 			return monitor.RequestLogPage{}, scanErr
 		}
@@ -175,6 +185,52 @@ func scanRequestLog(rows *sql.Rows) (monitor.RequestLog, error) {
 		&item.ErrorDescription,
 		&item.RequestBody,
 		&item.ResponseBody,
+	); err != nil {
+		return monitor.RequestLog{}, err
+	}
+	parsed, parseErr := time.Parse(time.RFC3339Nano, timeValue)
+	if parseErr != nil {
+		parsed, parseErr = time.Parse(time.RFC3339, timeValue)
+	}
+	if parseErr == nil {
+		item.Time = parsed
+	}
+	if ttft.Valid {
+		item.TTFTMillis = ttft.Int64
+	}
+	if clientHost.Valid {
+		item.ClientHost = clientHost.String
+	}
+	if accessSource.Valid {
+		item.AccessSource = accessSource.String
+	}
+	return item, nil
+}
+
+func scanRequestLogSummary(rows *sql.Rows) (monitor.RequestLog, error) {
+	var item monitor.RequestLog
+	var timeValue string
+	var ttft sql.NullInt64
+	var clientHost, accessSource sql.NullString
+	if err := rows.Scan(
+		&timeValue,
+		&item.APIKeyID,
+		&item.APIKeyName,
+		&item.RouteID,
+		&item.ProviderID,
+		&item.Model,
+		&item.Action,
+		&item.ProtocolFlow,
+		&item.Path,
+		&item.Status,
+		&item.InputTokens,
+		&item.OutputTokens,
+		&item.CacheTokens,
+		&item.LatencyMillis,
+		&ttft,
+		&clientHost,
+		&accessSource,
+		&item.ErrorDescription,
 	); err != nil {
 		return monitor.RequestLog{}, err
 	}

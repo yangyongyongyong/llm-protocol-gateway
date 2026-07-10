@@ -33,6 +33,35 @@ func normalizeClaudeUsageFields(inputTokens, outputTokens, cacheReadTokens, cach
 	}
 }
 
+// normalizeInclusiveInputTokens converts provider usage fields into total prompt
+// tokens INCLUDING cache hits. OpenAI-compatible providers usually report inclusive
+// prompt_tokens, but some proxies mirror Anthropic semantics (exclusive prompt +
+// separate cache hit/miss counts).
+func normalizeInclusiveInputTokens(baseInput, cacheRead, cacheCreation, cacheMiss int64) int64 {
+	if baseInput < 0 {
+		baseInput = 0
+	}
+	if cacheRead < 0 {
+		cacheRead = 0
+	}
+	if cacheCreation < 0 {
+		cacheCreation = 0
+	}
+	if cacheMiss < 0 {
+		cacheMiss = 0
+	}
+	if cacheRead == 0 && cacheCreation == 0 {
+		return baseInput
+	}
+	if baseInput >= cacheRead {
+		return baseInput
+	}
+	if cacheMiss > 0 {
+		return cacheMiss + cacheRead + cacheCreation
+	}
+	return baseInput + cacheRead + cacheCreation
+}
+
 // claudeExclusiveInputTokens converts inclusive InputTokens back to Anthropic's
 // non-cached input_tokens field for Claude client responses.
 func claudeExclusiveInputTokens(usage TokenUsage, cacheCreationTokens int64) int64 {
@@ -70,10 +99,14 @@ func parseOpenAIUsageJSON(body []byte) TokenUsage {
 	if usage == nil {
 		return TokenUsage{}
 	}
+	promptTokens := int64FromAny(usage["prompt_tokens"])
+	cacheRead := int64(cacheHitTokenCount(usage))
+	cacheCreation := int64FromAny(usage["cache_creation_input_tokens"])
+	cacheMiss := int64FromAny(usage["prompt_cache_miss_tokens"])
 	return TokenUsage{
-		InputTokens:  int64FromAny(usage["prompt_tokens"]),
+		InputTokens:  normalizeInclusiveInputTokens(promptTokens, cacheRead, cacheCreation, cacheMiss),
 		OutputTokens: int64FromAny(usage["completion_tokens"]),
-		CacheTokens:  int64(cacheHitTokenCount(usage)),
+		CacheTokens:  cacheRead,
 	}
 }
 
@@ -218,12 +251,13 @@ func parseResponsesUsageJSON(body []byte) TokenUsage {
 	if !ok {
 		return TokenUsage{}
 	}
+	inputTokens := int64FromAny(usageValue["input_tokens"])
 	cacheTokens := int64(0)
 	if details, ok := usageValue["input_tokens_details"].(map[string]any); ok {
 		cacheTokens = int64FromAny(details["cached_tokens"])
 	}
 	return TokenUsage{
-		InputTokens:  int64FromAny(usageValue["input_tokens"]),
+		InputTokens:  normalizeInclusiveInputTokens(inputTokens, cacheTokens, 0, 0),
 		OutputTokens: int64FromAny(usageValue["output_tokens"]),
 		CacheTokens:  cacheTokens,
 	}

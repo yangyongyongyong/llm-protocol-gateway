@@ -106,7 +106,7 @@ func inputItemsFromChatMessages(messages []any) ([]any, string, error) {
 			continue
 		}
 		if role == "tool" {
-			callID := stringValue(entry["tool_call_id"])
+			callID := sanitizeResponsesCallID(stringValue(entry["tool_call_id"]))
 			if callID == "" {
 				continue
 			}
@@ -134,7 +134,7 @@ func inputItemsFromChatMessages(messages []any) ([]any, string, error) {
 					}
 					inputItems = append(inputItems, map[string]any{
 						"type":      "function_call",
-						"call_id":   stringValue(call["id"]),
+						"call_id":   sanitizeResponsesCallID(stringValue(call["id"])),
 						"name":      name,
 						"arguments": stringValue(functionValue["arguments"]),
 					})
@@ -206,6 +206,79 @@ func openAIChatToResponsesRequest(chatReq map[string]any, model string) (map[str
 	return responsesReq, nil
 }
 
+func responsesInputBlockToChat(block map[string]any) map[string]any {
+	blockType := strings.TrimSpace(stringValue(block["type"]))
+	switch blockType {
+	case "input_text", "output_text":
+		text := stringValue(block["text"])
+		if text == "" {
+			return nil
+		}
+		return map[string]any{"type": "text", "text": text}
+	case "input_image":
+		url := ""
+		detail := strings.TrimSpace(stringValue(block["detail"]))
+		switch typed := block["image_url"].(type) {
+		case string:
+			url = strings.TrimSpace(typed)
+		case map[string]any:
+			url = strings.TrimSpace(stringValue(typed["url"]))
+			if detail == "" {
+				detail = strings.TrimSpace(stringValue(typed["detail"]))
+			}
+		}
+		if url == "" {
+			return nil
+		}
+		imageURL := map[string]any{"url": url}
+		if detail != "" {
+			imageURL["detail"] = detail
+		}
+		return map[string]any{"type": "image_url", "image_url": imageURL}
+	case "image_url", "text":
+		if cloned := cloneAnyMap(block); cloned != nil {
+			return cloned
+		}
+		return nil
+	default:
+		if cloned := cloneAnyMap(block); cloned != nil {
+			return cloned
+		}
+		return nil
+	}
+}
+
+func normalizeResponsesContentForChat(content any) any {
+	switch typed := content.(type) {
+	case string:
+		return typed
+	case []any:
+		blocks := make([]any, 0, len(typed))
+		for _, item := range typed {
+			block, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if converted := responsesInputBlockToChat(block); converted != nil {
+				blocks = append(blocks, converted)
+			}
+		}
+		if len(blocks) == 0 {
+			return ""
+		}
+		if len(blocks) == 1 {
+			if single, ok := blocks[0].(map[string]any); ok && stringValue(single["type"]) == "text" {
+				if text := stringValue(single["text"]); text != "" && len(single) <= 2 {
+					return text
+				}
+			}
+		}
+		return blocks
+	default:
+		return normalizeClaudeContentForOpenAI(content)
+	}
+}
+
 func chatMessagesFromResponsesInput(input any) ([]map[string]any, error) {
 	messages := make([]map[string]any, 0, 8)
 	switch typed := input.(type) {
@@ -221,8 +294,26 @@ func chatMessagesFromResponsesInput(input any) ([]map[string]any, error) {
 				continue
 			}
 			itemType := strings.TrimSpace(stringValue(entry["type"]))
+			if itemType == "message" {
+				role := strings.TrimSpace(stringValue(entry["role"]))
+				if role == "" {
+					continue
+				}
+				if role == "system" || role == "developer" {
+					role = "system"
+				}
+				if role != "user" && role != "assistant" && role != "system" {
+					continue
+				}
+				content := normalizeResponsesContentForChat(entry["content"])
+				if isEmptyOpenAIContent(content) {
+					continue
+				}
+				messages = append(messages, map[string]any{"role": role, "content": content})
+				continue
+			}
 			if itemType == "function_call" {
-				callID := stringValue(entry["call_id"])
+				callID := sanitizeResponsesCallID(stringValue(entry["call_id"]))
 				name := stringValue(entry["name"])
 				if callID == "" || name == "" {
 					continue
@@ -242,7 +333,7 @@ func chatMessagesFromResponsesInput(input any) ([]map[string]any, error) {
 				continue
 			}
 			if itemType == "function_call_output" {
-				callID := stringValue(entry["call_id"])
+				callID := sanitizeResponsesCallID(stringValue(entry["call_id"]))
 				if callID == "" {
 					continue
 				}
@@ -263,7 +354,7 @@ func chatMessagesFromResponsesInput(input any) ([]map[string]any, error) {
 			if role != "user" && role != "assistant" && role != "system" {
 				continue
 			}
-			content := normalizeClaudeContentForOpenAI(entry["content"])
+			content := normalizeResponsesContentForChat(entry["content"])
 			if isEmptyOpenAIContent(content) {
 				continue
 			}
@@ -321,7 +412,7 @@ func responsesToOpenAIChatRequest(responsesReq map[string]any, model string) (ma
 			chatReq["reasoning_effort"] = effort
 		}
 	}
-	copyToolsFieldDirect(responsesReq, chatReq)
+	copyResponsesToolsToChat(responsesReq, chatReq)
 	return chatReq, nil
 }
 
@@ -346,7 +437,7 @@ func responsesToOpenAIChatResponse(responsesBody []byte, model string) ([]byte, 
 				continue
 			}
 			if stringValue(block["type"]) == "function_call" {
-				callID := stringValue(block["call_id"])
+				callID := sanitizeResponsesCallID(stringValue(block["call_id"]))
 				name := stringValue(block["name"])
 				if callID == "" || name == "" {
 					continue
@@ -442,7 +533,7 @@ func openAIChatToResponsesResponse(chatBody []byte, model string) ([]byte, Token
 			}
 			output = append(output, map[string]any{
 				"type":      "function_call",
-				"call_id":   stringValue(call["id"]),
+				"call_id":   sanitizeResponsesCallID(stringValue(call["id"])),
 				"name":      name,
 				"arguments": stringValue(functionValue["arguments"]),
 			})

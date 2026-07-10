@@ -5,13 +5,16 @@ import (
 	"time"
 )
 
-// oauthUsageCacheTTL is long enough to absorb repeated UI polls while still
-// fresh enough for subscription-quota display.
-const oauthUsageCacheTTL = 2 * time.Minute
+const (
+	// oauthUsageFreshTTL: serve cache without upstream fetch while fresh.
+	oauthUsageFreshTTL = 3 * time.Minute
+	// oauthUsageStaleTTL: still return stale cache instantly; refresh async after fresh window.
+	oauthUsageStaleTTL = 1 * time.Hour
+)
 
 type oauthUsageCacheEntry struct {
 	value     any
-	expiresAt time.Time
+	fetchedAt time.Time
 }
 
 // oauthUsageCache stores recent Claude/Cursor usage reports keyed by provider.
@@ -25,34 +28,59 @@ func newOAuthUsageCache() *oauthUsageCache {
 }
 
 func (c *oauthUsageCache) get(key string) (any, bool) {
-	if c == nil {
-		return nil, false
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	entry, ok := c.entries[key]
-	if !ok {
-		return nil, false
-	}
-	if time.Now().After(entry.expiresAt) {
-		delete(c.entries, key)
+	entry, ok := c.getEntry(key)
+	if !ok || !c.isFresh(entry) {
 		return nil, false
 	}
 	return entry.value, true
 }
 
-func (c *oauthUsageCache) set(key string, value any, ttl time.Duration) {
+func (c *oauthUsageCache) getAllowStale(key string) (any, bool) {
+	entry, ok := c.getEntry(key)
+	if !ok {
+		return nil, false
+	}
+	return entry.value, true
+}
+
+func (c *oauthUsageCache) getEntry(key string) (oauthUsageCacheEntry, bool) {
+	if c == nil {
+		return oauthUsageCacheEntry{}, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[key]
+	if !ok {
+		return oauthUsageCacheEntry{}, false
+	}
+	if time.Since(entry.fetchedAt) > oauthUsageStaleTTL {
+		delete(c.entries, key)
+		return oauthUsageCacheEntry{}, false
+	}
+	return entry, true
+}
+
+func (c *oauthUsageCache) isFresh(entry oauthUsageCacheEntry) bool {
+	return time.Since(entry.fetchedAt) <= oauthUsageFreshTTL
+}
+
+func (c *oauthUsageCache) needsRefresh(key string) bool {
+	entry, ok := c.getEntry(key)
+	if !ok {
+		return true
+	}
+	return !c.isFresh(entry)
+}
+
+func (c *oauthUsageCache) set(key string, value any) {
 	if c == nil || value == nil {
 		return
-	}
-	if ttl <= 0 {
-		ttl = oauthUsageCacheTTL
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.entries[key] = oauthUsageCacheEntry{
 		value:     value,
-		expiresAt: time.Now().Add(ttl),
+		fetchedAt: time.Now(),
 	}
 }
 

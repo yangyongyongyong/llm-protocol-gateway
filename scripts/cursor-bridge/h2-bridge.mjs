@@ -81,6 +81,15 @@ if (!configBuf) process.exit(1);
 
 const config = JSON.parse(configBuf.toString("utf8"));
 const { accessToken, url, path: rpcPath } = config;
+// "connect" (default) for AgentService streaming; "proto" for unary RPCs
+// like GetUsableModels / AvailableModels (Cursor returns 415 for connect+proto).
+const transport = config.transport === "proto" ? "proto" : "connect";
+const contentType =
+  typeof config.contentType === "string" && config.contentType
+    ? config.contentType
+    : transport === "proto"
+      ? "application/proto"
+      : "application/connect+proto";
 
 const client = http2.connect(url || "https://api2.cursor.sh");
 
@@ -104,18 +113,23 @@ client.on("error", () => {
   process.exit(1);
 });
 
-const h2Stream = client.request({
+const requestHeaders = {
   ":method": "POST",
   ":path": rpcPath || "/agent.v1.AgentService/Run",
-  "content-type": "application/connect+proto",
-  "connect-protocol-version": "1",
-  te: "trailers",
+  "content-type": contentType,
   authorization: `Bearer ${accessToken}`,
   "x-ghost-mode": "true",
-  "x-cursor-client-version": CURSOR_CLIENT_VERSION,
-  "x-cursor-client-type": "cli",
+  "x-cursor-client-version":
+    config.clientVersion || CURSOR_CLIENT_VERSION,
+  "x-cursor-client-type": config.clientType || "cli",
   "x-request-id": crypto.randomUUID(),
-});
+};
+if (transport === "connect") {
+  requestHeaders["connect-protocol-version"] = "1";
+  requestHeaders.te = "trailers";
+}
+
+const h2Stream = client.request(requestHeaders);
 
 // Forward H2 response data → stdout (length-prefixed)
 h2Stream.on("data", (chunk) => {

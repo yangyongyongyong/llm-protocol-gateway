@@ -46,12 +46,17 @@ type RequestLogStore interface {
 	PruneRequestLogs(int) error
 }
 
+type UsageDailyStore interface {
+	monitor.UsageDailyStore
+}
+
 type Server struct {
 	router                  *Router
 	logs                    *monitor.Store
 	stateSaver              StateSaver
 	apiKeyStore             APIKeyStore
 	requestLogStore         RequestLogStore
+	usageDailyStore         UsageDailyStore
 	tunnels                 *tunnel.Manager
 	pendingClaudeOAuth      *claudeOAuthPendingStore
 	pendingCursorOAuth      *cursorOAuthPendingStore
@@ -60,12 +65,17 @@ type Server struct {
 	requestLogRetentionDays int
 	adminAuth               AdminAuthStore
 	oauthUsageCache         *oauthUsageCache
+	requestStatsCache       *requestStatsCache
 	// oauthUsageFetchMu serializes upstream usage fetches per provider so
 	// concurrent UI polls share one in-flight request after cache miss.
 	oauthUsageFetchMu sync.Map
 	// webExposedChange is invoked when the UI toggles LAN/Web exposure so the
 	// process owner (CLI runtime / desktop app) can rebind the HTTP listener.
 	webExposedChange func(enabled bool) error
+
+	// selfcheckJobs holds in-memory async self-check jobs (CLI smoke tests).
+	selfcheckMu   sync.Mutex
+	selfcheckJobs map[string]*selfcheckJob
 }
 
 func NewServer(router *Router, logs *monitor.Store, stateSaver ...StateSaver) *Server {
@@ -75,6 +85,7 @@ func NewServer(router *Router, logs *monitor.Store, stateSaver ...StateSaver) *S
 		pendingClaudeOAuth:      newClaudeOAuthPendingStore(),
 		pendingCursorOAuth:      newCursorOAuthPendingStore(),
 		oauthUsageCache:         newOAuthUsageCache(),
+		requestStatsCache:       newRequestStatsCache(),
 		requestLogRetentionDays: 7,
 	}
 	if days := router.State().RequestLogRetentionDays; days > 0 {
@@ -87,6 +98,10 @@ func NewServer(router *Router, logs *monitor.Store, stateSaver ...StateSaver) *S
 		}
 		if rls, ok := stateSaver[0].(RequestLogStore); ok {
 			server.requestLogStore = rls
+		}
+		if uds, ok := stateSaver[0].(UsageDailyStore); ok {
+			server.usageDailyStore = uds
+			logs.SetUsageDailyStore(uds)
 		}
 		if auth, ok := stateSaver[0].(AdminAuthStore); ok {
 			server.adminAuth = auth
@@ -192,10 +207,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /__apikeys", s.handleCreateAPIKey)
 	mux.HandleFunc("PATCH /__apikeys/{id}", s.handleUpdateAPIKey)
 	mux.HandleFunc("DELETE /__apikeys/{id}", s.handleDeleteAPIKey)
+	mux.HandleFunc("GET /__selfcheck/tools", s.handleSelfcheckTools)
+	mux.HandleFunc("POST /__selfcheck", s.handleSelfcheckStart)
+	mux.HandleFunc("GET /__selfcheck/{jobId}", s.handleSelfcheckStatus)
 	mux.HandleFunc("GET /v1/models", s.handleOpenAIModels)
 	mux.HandleFunc("GET /anthropic/v1/models", s.handleClaudeModels)
 	mux.HandleFunc("POST /v1/chat/completions", s.handleOpenAIChat)
 	mux.HandleFunc("POST /chat/completions", s.handleOpenAIChat)
+	mux.HandleFunc("POST /v1/images/generations", s.handleOpenAIImagesGenerations)
+	mux.HandleFunc("POST /openai/v1/images/generations", s.handleOpenAIImagesGenerations)
 	mux.HandleFunc("POST /openai/v1/responses", s.handleOpenAIResponses)
 	mux.HandleFunc("POST /anthropic/v1/messages", s.handleClaudeMessages)
 	mux.HandleFunc("POST /anthropic/v1/messages/count_tokens", s.handleClaudeCountTokens)
@@ -287,10 +307,11 @@ func redactProviderForClient(provider domain.Provider) domain.Provider {
 
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	query := monitor.RequestLogQuery{
-		Status:     strings.TrimSpace(r.URL.Query().Get("status")),
-		APIKeyName: strings.TrimSpace(r.URL.Query().Get("apiKeyName")),
-		Page:       atoiDefault(r.URL.Query().Get("page"), 1),
-		PageSize:   atoiDefault(r.URL.Query().Get("pageSize"), 100),
+		Status:        strings.TrimSpace(r.URL.Query().Get("status")),
+		APIKeyName:    strings.TrimSpace(r.URL.Query().Get("apiKeyName")),
+		Page:          atoiDefault(r.URL.Query().Get("page"), 1),
+		PageSize:      atoiDefault(r.URL.Query().Get("pageSize"), 100),
+		IncludeBodies: parseBoolQuery(r.URL.Query().Get("includeBodies")),
 	}
 	if from := strings.TrimSpace(r.URL.Query().Get("from")); from != "" {
 		if parsed, err := time.Parse(time.RFC3339, from); err == nil {
@@ -309,12 +330,19 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	if s.requestLogStore != nil {
 		page, err := s.requestLogStore.QueryRequestLogs(query)
 		if err == nil {
+			if !query.IncludeBodies {
+				stripRequestLogBodies(page.Items)
+			}
 			writeJSON(w, http.StatusOK, page)
 			return
 		}
 		s.logs.AddApp("warn", "query request logs failed", err.Error())
 	}
-	writeJSON(w, http.StatusOK, s.logs.Query(query))
+	page := s.logs.Query(query)
+	if !query.IncludeBodies {
+		stripRequestLogBodies(page.Items)
+	}
+	writeJSON(w, http.StatusOK, page)
 }
 
 func atoiDefault(raw string, fallback int) int {
@@ -327,6 +355,22 @@ func atoiDefault(raw string, fallback int) int {
 		return fallback
 	}
 	return value
+}
+
+func parseBoolQuery(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func stripRequestLogBodies(logs []monitor.RequestLog) {
+	for i := range logs {
+		logs[i].RequestBody = ""
+		logs[i].ResponseBody = ""
+	}
 }
 
 func (s *Server) handleRequestStats(w http.ResponseWriter, r *http.Request) {
@@ -348,21 +392,135 @@ func (s *Server) handleRequestStats(w http.ResponseWriter, r *http.Request) {
 			to = parsed.Add(24 * time.Hour)
 		}
 	}
-	logs := s.logs.List(5000)
-	if s.requestLogStore != nil {
-		if page, err := s.requestLogStore.QueryRequestLogs(monitor.RequestLogQuery{
-			From: from.AddDate(0, 0, -31), To: to, Page: 1, PageSize: 500, Status: "all",
-		}); err == nil && len(page.Items) > 0 {
-			// Prefer a broader window for month/daily charts; fall back to memory.
-			if all, listErr := s.requestLogStore.ListRequestLogs(5000); listErr == nil && len(all) > 0 {
-				logs = all
-			} else {
-				logs = page.Items
-			}
+	cacheKey := from.Format(time.RFC3339) + "|" + to.Format(time.RFC3339)
+	if cached, ok := s.requestStatsCache.get(cacheKey); ok {
+		w.Header().Set("Cache-Control", "private, max-age=5")
+		writeJSON(w, http.StatusOK, cached)
+		return
+	}
+	snapshot := s.logs.UsageStatsRange(now, from, to)
+	s.requestStatsCache.set(cacheKey, snapshot)
+	w.Header().Set("Cache-Control", "private, max-age=5")
+	writeJSON(w, http.StatusOK, snapshot)
+}
+
+// loadRequestLogsForStats pages through persisted request logs up to limit.
+// QueryRequestLogs caps pageSize at 500, so a single ListRequestLogs(5000) call
+// would silently truncate and drop older alias-form model rows from rankings.
+func (s *Server) loadRequestLogsForStats(from, to time.Time, limit int) []monitor.RequestLog {
+	if s.requestLogStore == nil {
+		return nil
+	}
+	if limit <= 0 {
+		limit = 5000
+	}
+	out := make([]monitor.RequestLog, 0, limit)
+	pageSize := 500
+	for page := 1; len(out) < limit; page++ {
+		result, err := s.requestLogStore.QueryRequestLogs(monitor.RequestLogQuery{
+			From: from, To: to, Page: page, PageSize: pageSize, Status: "all",
+		})
+		if err != nil || len(result.Items) == 0 {
+			break
+		}
+		out = append(out, result.Items...)
+		if len(result.Items) < pageSize || len(out) >= result.Total {
+			break
 		}
 	}
-	writeJSON(w, http.StatusOK, s.logs.UsageStatsRange(logs, now, from, to))
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
 }
+
+// RebuildUsageStats loads persisted daily aggregates, or replays request logs once
+// to backfill when the usage_daily tables are empty.
+func (s *Server) RebuildUsageStats() {
+	retention := s.RequestLogRetentionDays()
+	since := time.Now().AddDate(0, 0, -retention)
+
+	if s.usageDailyStore != nil {
+		days, last, err := s.usageDailyStore.LoadUsageSince(since)
+		if err != nil {
+			s.logs.AddApp("warn", "load usage daily aggregates failed", err.Error())
+		} else if len(days) > 0 && s.usageDailyAggregatesMatchLogs(days) {
+			s.logs.ResetUsageStats()
+			s.logs.BootstrapUsageDays(days, last)
+			return
+		}
+		if err := s.usageDailyStore.ClearUsageDaily(); err != nil {
+			s.logs.AddApp("warn", "clear usage daily aggregates failed", err.Error())
+		}
+	}
+
+	s.rebuildUsageStatsFromLogs(since)
+}
+
+func (s *Server) usageDailyAggregatesMatchLogs(days map[string]monitor.UsageDayBuckets) bool {
+	var agg int64
+	for _, day := range days {
+		agg += day.Total.RequestCount
+	}
+	if agg == 0 {
+		return false
+	}
+	counter, ok := s.usageDailyStore.(interface {
+		CountRequestLogs() (int64, error)
+	})
+	if !ok {
+		return true
+	}
+	logCount, err := counter.CountRequestLogs()
+	if err != nil || logCount == 0 {
+		return true
+	}
+	// Allow small drift from retention pruning vs loaded window.
+	if agg > logCount {
+		return false
+	}
+	return agg >= logCount-5
+}
+
+func (s *Server) rebuildUsageStatsFromLogs(since time.Time) {
+	s.logs.ResetUsageStats()
+	logs := s.logs.List(memoryLogCap)
+	if s.requestLogStore != nil {
+		if all := s.loadRequestLogsForStats(since, time.Now().Add(24*time.Hour), memoryLogCap); len(all) > len(logs) {
+			logs = all
+		}
+	}
+	if len(logs) == 0 {
+		return
+	}
+	state := s.router.State()
+	keysByID := make(map[string]domain.APIKey, len(state.APIKeys))
+	keysByName := make(map[string]domain.APIKey, len(state.APIKeys))
+	for _, key := range state.APIKeys {
+		keysByID[key.ID] = key
+		if name := strings.TrimSpace(key.Name); name != "" {
+			keysByName[strings.ToLower(name)] = key
+		}
+	}
+	for _, log := range logs {
+		resolved := resolveRequestLogModelForUsage(s.router, log, keysByID, keysByName)
+		s.logs.ApplyUsageEventSync(monitor.UsageEvent{
+			Time:         log.Time,
+			APIKeyID:     log.APIKeyID,
+			APIKeyName:   log.APIKeyName,
+			ProviderID:   log.ProviderID,
+			Model:        resolved,
+			Status:       log.Status,
+			InputTokens:  log.InputTokens,
+			OutputTokens: log.OutputTokens,
+			CacheTokens:  log.CacheTokens,
+			LatencyMs:    log.LatencyMillis,
+			TTFTMs:       log.TTFTMillis,
+		})
+	}
+}
+
+const memoryLogCap = 50000
 
 func (s *Server) recordRequestLog(started time.Time, matchedKey domain.APIKey, gatewayKeyMatched bool, routeID, providerID, model, action, protocolFlow, path string, status int, usage TokenUsage, requestBody, responseBody []byte) {
 	s.recordRequestLogEx(started, matchedKey, gatewayKeyMatched, routeID, providerID, model, action, protocolFlow, path, status, usage, 0, "", "", requestBody, responseBody)
@@ -423,6 +581,19 @@ func (s *Server) recordRequestLogEx(started time.Time, matchedKey domain.APIKey,
 		}
 	}
 	s.logs.Add(entry)
+	s.logs.EnqueueUsage(monitor.UsageEvent{
+		Time:         started,
+		APIKeyID:     entry.APIKeyID,
+		APIKeyName:   entry.APIKeyName,
+		ProviderID:   providerID,
+		Model:        model,
+		Status:       status,
+		InputTokens:  usage.InputTokens,
+		OutputTokens: usage.OutputTokens,
+		CacheTokens:  usage.CacheTokens,
+		LatencyMs:    latency,
+		TTFTMs:       ttftMs,
+	})
 	if s.requestLogStore != nil {
 		if err := s.requestLogStore.AppendRequestLogWithRetention(entry, s.RequestLogRetentionDays()); err != nil {
 			s.logs.AddApp("warn", "failed to persist request log", err.Error())
@@ -478,6 +649,7 @@ func (s *Server) handleSetRequestLogRetention(w http.ResponseWriter, r *http.Req
 	if s.requestLogStore != nil {
 		_ = s.requestLogStore.PruneRequestLogs(days)
 	}
+	s.logs.PruneUsageStatsBefore(time.Now().AddDate(0, 0, -days))
 	s.logs.AddApp("info", "request log retention updated", fmt.Sprintf("days=%d", days))
 	writeJSON(w, http.StatusOK, map[string]any{"requestLogRetentionDays": days})
 }
@@ -635,7 +807,21 @@ func (s *Server) RestorePublicAccess() {
 	if !settings.Enabled {
 		return
 	}
-	settings = s.ensureSplitCustomDomains(context.Background())
+	if settings.Mode == domain.PublicAccessModeCustomDomain {
+		apiDomain := ""
+		uiDomain := ""
+		if settings.ExposeAPI {
+			apiDomain = cleanPublicHost(settings.CustomDomain)
+		}
+		if settings.ExposeUI {
+			uiDomain = cleanPublicHost(settings.UIDomain)
+		}
+		if tunnel.CustomDomainConfigReusable(settings.TunnelConfigFile, settings.CredentialsFile, apiDomain, uiDomain, s.localGatewayPort()) {
+			slog.Info("public access restore reusing tunnel config", "config", settings.TunnelConfigFile, "api", apiDomain, "ui", uiDomain)
+		} else {
+			settings = s.ensureSplitCustomDomains(context.Background())
+		}
+	}
 	tunnelSettings := s.tunnelSettingsFromPublicAccess(settings)
 	state, err := s.tunnels.Start(tunnelSettings)
 	s.applyTunnelURL(state)
@@ -1373,8 +1559,9 @@ func (s *Server) handleClaudeOAuthUsage(w http.ResponseWriter, r *http.Request) 
 	forceRefresh := strings.EqualFold(r.URL.Query().Get("refresh"), "1") || strings.EqualFold(r.URL.Query().Get("refresh"), "true")
 	if forceRefresh {
 		s.oauthUsageCache.invalidate(cacheKey)
-	} else if cached, ok := s.oauthUsageCache.get(cacheKey); ok {
+	} else if cached, ok := s.oauthUsageCache.getAllowStale(cacheKey); ok {
 		if report, ok := cached.(ClaudeOAuthUsageReport); ok {
+			s.maybeRefreshClaudeOAuthUsageAsync(providerID)
 			writeJSON(w, http.StatusOK, report)
 			return
 		}
@@ -1402,7 +1589,7 @@ func (s *Server) handleClaudeOAuthUsage(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if report.Available {
-		s.oauthUsageCache.set(cacheKey, report, oauthUsageCacheTTL)
+		s.oauthUsageCache.set(cacheKey, report)
 	}
 	writeJSON(w, http.StatusOK, report)
 }
@@ -1429,8 +1616,9 @@ func (s *Server) handleCursorOAuthUsage(w http.ResponseWriter, r *http.Request) 
 	forceRefresh := strings.EqualFold(r.URL.Query().Get("refresh"), "1") || strings.EqualFold(r.URL.Query().Get("refresh"), "true")
 	if forceRefresh {
 		s.oauthUsageCache.invalidate(cacheKey)
-	} else if cached, ok := s.oauthUsageCache.get(cacheKey); ok {
+	} else if cached, ok := s.oauthUsageCache.getAllowStale(cacheKey); ok {
 		if report, ok := cached.(CursorOAuthUsageReport); ok {
+			s.maybeRefreshCursorOAuthUsageAsync(providerID)
 			writeJSON(w, http.StatusOK, report)
 			return
 		}
@@ -1458,7 +1646,7 @@ func (s *Server) handleCursorOAuthUsage(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if report.Available {
-		s.oauthUsageCache.set(cacheKey, report, oauthUsageCacheTTL)
+		s.oauthUsageCache.set(cacheKey, report)
 	}
 	writeJSON(w, http.StatusOK, report)
 }
@@ -1495,6 +1683,14 @@ func (s *Server) handleProviderThinkingTest(w http.ResponseWriter, r *http.Reque
 	_ = json.NewDecoder(r.Body).Decode(&payload)
 	result, status := s.testProviderThinkingChat(r, providerID, payload, started)
 	writeJSON(w, status, result)
+}
+
+func resolveProviderImageURL(provider domain.Provider) string {
+	upstreamURL := strings.TrimRight(strings.TrimSpace(provider.BaseURL), "/")
+	if !strings.Contains(strings.ToLower(upstreamURL), "/images/generations") {
+		upstreamURL += "/images/generations"
+	}
+	return upstreamURL
 }
 
 func resolveProviderChatURL(provider domain.Provider, model string) string {
@@ -2032,7 +2228,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestModel, _ := req["model"].(string)
-	model, logModel := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
+	model, _ := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
 	thinkingOverride := ""
 	if gatewayKeyMatched {
 		thinkingOverride = matchedKey.ThinkingDepthOverride
@@ -2040,7 +2236,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	stream, _ := req["stream"].(bool)
 	if s.rejectIfStreamDisabledForKey(w, gatewayKeyMatched, matchedKey, stream, domain.ProtocolOpenAIChat) {
-		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, logModel, "rejected", "stream disabled", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, []byte(`stream disabled`))
+		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, model, "rejected", "stream disabled", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, []byte(`stream disabled`))
 		return
 	}
 	status := http.StatusOK
@@ -2058,11 +2254,11 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	status, usage, responseLog, err = s.executeProtocolFlow(wrapTTFTWriter(w, started, &ttftMs), r, route, decision, model, req, domain.ProtocolOpenAIChat, gatewayKeyMatched)
 	if err != nil {
 		s.logs.AddApp("error", "chat request failed", err.Error())
-		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
+		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
 		writeOpenAIError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, decision.Action, decision.ConversionLabel, r.URL.Path, status, usage, ttftMs, body, responseLog)
+	s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, decision.Action, decision.ConversionLabel, r.URL.Path, status, usage, ttftMs, body, responseLog)
 	s.logs.AddApp("debug", "handled chat request", fmt.Sprintf("route=%s model=%s status=%d", route.ID, model, status))
 	slog.Info("handled chat request", "route", route.ID, "model", model, "action", decision.Action, "stream", stream)
 }
@@ -2120,7 +2316,7 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestModel, _ := req["model"].(string)
-	model, logModel := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
+	model, _ := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
 	thinkingOverride := ""
 	if gatewayKeyMatched {
 		thinkingOverride = matchedKey.ThinkingDepthOverride
@@ -2128,7 +2324,7 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 
 	stream, _ := req["stream"].(bool)
 	if s.rejectIfStreamDisabledForKey(w, gatewayKeyMatched, matchedKey, stream, domain.ProtocolOpenAIResponses) {
-		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, logModel, "rejected", "stream disabled", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, []byte(`stream disabled`))
+		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, model, "rejected", "stream disabled", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, []byte(`stream disabled`))
 		return
 	}
 	status := http.StatusOK
@@ -2142,13 +2338,95 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 	status, usage, responseLog, err = s.executeProtocolFlow(wrapTTFTWriter(w, started, &ttftMs), r, route, decision, model, req, domain.ProtocolOpenAIResponses, gatewayKeyMatched)
 	if err != nil {
 		s.logs.AddApp("error", "responses request failed", err.Error())
-		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
+		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": err.Error(), "type": "gateway_error"}})
 		return
 	}
-	s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, decision.Action, decision.ConversionLabel, r.URL.Path, status, usage, ttftMs, body, responseLog)
+	s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, decision.Action, decision.ConversionLabel, r.URL.Path, status, usage, ttftMs, body, responseLog)
 	s.logs.AddApp("debug", "handled responses request", fmt.Sprintf("route=%s model=%s status=%d", route.ID, model, status))
 	slog.Info("handled responses request", "route", route.ID, "model", model, "action", decision.Action, "stream", stream)
+}
+
+func (s *Server) handleOpenAIImagesGenerations(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+
+	var req map[string]any
+	if len(strings.TrimSpace(string(body))) > 0 {
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+			return
+		}
+	} else {
+		req = map[string]any{}
+	}
+
+	var route domain.Route
+	var matchedKey domain.APIKey
+	var gatewayKeyMatched bool
+	if testRouteID := strings.TrimSpace(r.Header.Get(headerGatewayRouteID)); testRouteID != "" && r.Header.Get(headerGatewayInternalTest) == "1" {
+		route, err = s.router.RouteByID(testRouteID)
+	} else if token := extractConsumerAPIKey(r); token != "" {
+		if key, ok := s.router.APIKeyByToken(token); ok {
+			matchedKey = key
+			gatewayKeyMatched = true
+			if key.RouteID != "" {
+				route, err = s.router.RouteByID(key.RouteID)
+			} else {
+				err = fmt.Errorf("api key %q has no route configured", key.ID)
+			}
+			if s.apiKeyStore != nil {
+				_ = s.apiKeyStore.TouchAPIKey(key.ID, time.Now().UTC().Format(time.RFC3339))
+			}
+		} else {
+			err = fmt.Errorf("invalid api key")
+		}
+	} else {
+		err = fmt.Errorf("missing api key")
+	}
+	if err != nil {
+		writeOpenAIError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+
+	decision, err := s.router.Decide(route.ID)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	requestModel, _ := req["model"].(string)
+	model, _ := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
+	if strings.TrimSpace(model) == "" {
+		model = "gpt-image-2"
+	}
+	req["model"] = model
+	body, err = json.Marshal(req)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "failed to encode request body")
+		return
+	}
+
+	provider, err := s.router.ProviderByID(decision.ProviderID)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	status, usage, responseLog, err := s.proxyOpenAIImages(w, r, provider, model, body, gatewayKeyMatched)
+	if err != nil {
+		s.logs.AddApp("error", "image generation request failed", err.Error())
+		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, "pass_through", "images/generations", r.URL.Path, http.StatusBadGateway, usage, body, []byte(err.Error()))
+		writeOpenAIError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, "pass_through", "images/generations", r.URL.Path, status, usage, body, responseLog)
+	s.logs.AddApp("debug", "handled image generation request", fmt.Sprintf("route=%s model=%s status=%d", route.ID, model, status))
+	slog.Info("handled image generation request", "route", route.ID, "model", model, "status", status)
 }
 
 // handleClaudeMessages serves POST /anthropic/v1/messages, the native
@@ -2213,11 +2491,11 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestModel, _ := req["model"].(string)
-	model, logModel := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
+	model, _ := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
 
 	stream, _ := req["stream"].(bool)
 	if s.rejectIfStreamDisabledForKey(w, gatewayKeyMatched, matchedKey, stream, domain.ProtocolClaude) {
-		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, logModel, "rejected", "stream disabled", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, []byte(`stream disabled`))
+		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, model, "rejected", "stream disabled", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, []byte(`stream disabled`))
 		return
 	}
 	status := http.StatusOK
@@ -2228,11 +2506,11 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 	status, usage, responseLog, err = s.executeProtocolFlow(wrapTTFTWriter(w, started, &ttftMs), r, route, decision, model, req, domain.ProtocolClaude, gatewayKeyMatched)
 	if err != nil {
 		s.logs.AddApp("error", "claude messages request failed", err.Error())
-		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
+		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
 		writeClaudeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, decision.Action, decision.ConversionLabel, r.URL.Path, status, usage, ttftMs, body, responseLog)
+	s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, decision.Action, decision.ConversionLabel, r.URL.Path, status, usage, ttftMs, body, responseLog)
 	s.logs.AddApp("debug", "handled claude messages request", fmt.Sprintf("route=%s model=%s status=%d stream=%v", route.ID, model, status, stream))
 }
 
@@ -2274,7 +2552,7 @@ func (s *Server) handleClaudeCountTokens(w http.ResponseWriter, r *http.Request)
 	}
 
 	requestModel, _ := req["model"].(string)
-	model, logModel := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
+	model, _ := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
 	if model == "" || model == "request-model-not-set" {
 		writeClaudeError(w, http.StatusBadRequest, "model is required")
 		return
@@ -2293,7 +2571,7 @@ func (s *Server) handleClaudeCountTokens(w http.ResponseWriter, r *http.Request)
 	}
 	status, responseBody, err := s.proxyClaudeCountTokens(r, provider, upstreamBody)
 	if err != nil {
-		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, "pass_through", decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, TokenUsage{}, body, []byte(err.Error()))
+		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, "pass_through", decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, TokenUsage{}, body, []byte(err.Error()))
 		writeClaudeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
@@ -2302,7 +2580,7 @@ func (s *Server) handleClaudeCountTokens(w http.ResponseWriter, r *http.Request)
 	}
 	w.WriteHeader(status)
 	_, _ = w.Write(responseBody)
-	s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, "pass_through", decision.ConversionLabel, r.URL.Path, status, TokenUsage{}, body, responseBody)
+	s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, "pass_through", decision.ConversionLabel, r.URL.Path, status, TokenUsage{}, body, responseBody)
 }
 
 func (s *Server) resolveClaudeConsumerRoute(r *http.Request) (domain.Route, domain.APIKey, bool, error) {
@@ -2332,6 +2610,12 @@ func (s *Server) resolveClaudeConsumerRoute(r *http.Request) (domain.Route, doma
 }
 
 func (s *Server) proxyClaudeCountTokens(r *http.Request, provider domain.Provider, body []byte) (int, []byte, error) {
+	// Cursor OAuth (and other empty-baseURL OpenAI-chat providers) have no Anthropic
+	// count_tokens upstream. Return a lightweight stub so Claude Code startup checks pass.
+	if provider.AuthType == domain.AuthTypeCursorOAuth || (provider.Protocol == domain.ProtocolOpenAIChat && strings.TrimSpace(provider.BaseURL) == "") {
+		stub, _ := json.Marshal(map[string]any{"input_tokens": 1})
+		return http.StatusOK, stub, nil
+	}
 	isOAuth := provider.AuthType == domain.AuthTypeClaudeOAuth
 	var request *http.Request
 	var err error
@@ -2398,7 +2682,7 @@ func (s *Server) fetchProviderModels(r *http.Request, provider domain.Provider, 
 			return providerTestResult{Success: false, Provider: provider.ID, LatencyMs: time.Since(started).Milliseconds(), Error: err.Error(), Models: []domain.Model{}}
 		}
 		provider = refreshed
-		modelsURL := strings.TrimRight(baseURL, "/") + "/models"
+		modelsURL := strings.TrimRight(baseURL, "/") + "/models?refresh=1"
 		request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, modelsURL, nil)
 		if err != nil {
 			return providerTestResult{Success: false, Provider: provider.ID, ModelsURL: modelsURL, LatencyMs: time.Since(started).Milliseconds(), Error: err.Error(), Models: []domain.Model{}}
@@ -2820,7 +3104,18 @@ func (s *Server) proxyOpenAIToClaudeMessages(w http.ResponseWriter, r *http.Requ
 	if bodyErr != nil {
 		return 0, TokenUsage{}, nil, bodyErr
 	}
-	upstreamURL := resolveProviderChatURLWithAdapter(provider, model)
+
+	var upstreamURL string
+	if provider.AuthType == domain.AuthTypeCursorOAuth {
+		baseURL, refreshed, bridgeErr := s.resolveCursorBridgeBaseURL(provider)
+		if bridgeErr != nil {
+			return 0, TokenUsage{}, nil, bridgeErr
+		}
+		provider = refreshed
+		upstreamURL = strings.TrimRight(baseURL, "/") + "/chat/completions"
+	} else {
+		upstreamURL = resolveProviderChatURLWithAdapter(provider, model)
+	}
 	request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(upstreamBody))
 	if err != nil {
 		return 0, TokenUsage{}, nil, err
@@ -2831,21 +3126,23 @@ func (s *Server) proxyOpenAIToClaudeMessages(w http.ResponseWriter, r *http.Requ
 	} else {
 		request.Header.Set("Accept", "application/json")
 	}
-	if authValue := resolveProviderAuth(provider); authValue != "" {
-		header := provider.AuthHeader
-		if header == "" {
-			header = "Authorization"
+	if provider.AuthType != domain.AuthTypeCursorOAuth {
+		if authValue := resolveProviderAuth(provider); authValue != "" {
+			header := provider.AuthHeader
+			if header == "" {
+				header = "Authorization"
+			}
+			if strings.EqualFold(header, "Authorization") && !strings.HasPrefix(strings.ToLower(authValue), "bearer ") {
+				authValue = "Bearer " + authValue
+			}
+			request.Header.Set(header, authValue)
+		} else if !skipIncomingAuth {
+			if incomingAuth := r.Header.Get("Authorization"); incomingAuth != "" {
+				request.Header.Set("Authorization", incomingAuth)
+			}
 		}
-		if strings.EqualFold(header, "Authorization") && !strings.HasPrefix(strings.ToLower(authValue), "bearer ") {
-			authValue = "Bearer " + authValue
-		}
-		request.Header.Set(header, authValue)
-	} else if !skipIncomingAuth {
-		if incomingAuth := r.Header.Get("Authorization"); incomingAuth != "" {
-			request.Header.Set("Authorization", incomingAuth)
-		}
+		applyRequestAdapterHeaders(request, provider, model)
 	}
-	applyRequestAdapterHeaders(request, provider, model)
 
 	client := &http.Client{Timeout: 0}
 	response, err := client.Do(request)
@@ -2979,6 +3276,89 @@ func (s *Server) proxyOpenAIChat(w http.ResponseWriter, r *http.Request, provide
 	}
 	defer response.Body.Close()
 	return writePassThroughResponse(w, response, stream, ParseOpenAIUsage)
+}
+
+func (s *Server) proxyOpenAIImages(w http.ResponseWriter, r *http.Request, provider domain.Provider, model string, body []byte, skipIncomingAuth bool) (int, TokenUsage, []byte, error) {
+	if provider.AuthType == domain.AuthTypeCursorOAuth {
+		status, responseBody, err := s.fetchCursorBridgeImages(r, provider, body)
+		if err == nil && status >= 200 && status < 300 {
+			for key, values := range map[string]string{"Content-Type": "application/json"} {
+				w.Header().Set(key, values)
+			}
+			w.WriteHeader(status)
+			if len(responseBody) > 0 {
+				_, _ = w.Write(responseBody)
+			}
+			return status, TokenUsage{}, responseBody, nil
+		}
+		if apiKey := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); apiKey != "" {
+			return s.proxyOpenAIImagesUpstream(w, r.Context(), "https://api.openai.com/v1/images/generations", apiKey, body)
+		}
+		if err != nil {
+			return 0, TokenUsage{}, nil, fmt.Errorf("%w (Cursor OAuth 本地 bridge 暂无法生成图片；可设置 OPENAI_API_KEY 作为 Images API 回退)", err)
+		}
+		return status, TokenUsage{}, responseBody, fmt.Errorf("cursor bridge image generation failed with HTTP %d", status)
+	}
+
+	model = applyProviderModelMapping(provider, model)
+	body, bodyErr := applyRequestAdapterBody(provider, model, body)
+	if bodyErr != nil {
+		return 0, TokenUsage{}, nil, bodyErr
+	}
+	upstreamURL := resolveProviderImageURL(provider)
+	authValue := resolveProviderAuth(provider)
+	if authValue == "" && skipIncomingAuth {
+		authValue = strings.TrimPrefix(strings.TrimSpace(r.Header.Get("Authorization")), "Bearer ")
+	}
+	return s.proxyOpenAIImagesUpstream(w, r.Context(), upstreamURL, authValue, body)
+}
+
+func (s *Server) fetchCursorBridgeImages(r *http.Request, provider domain.Provider, body []byte) (int, []byte, error) {
+	baseURL, refreshed, err := s.resolveCursorBridgeBaseURL(provider)
+	if err != nil {
+		return 0, nil, err
+	}
+	_ = refreshed
+	upstreamURL := strings.TrimRight(baseURL, "/") + "/images/generations"
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
+	if err != nil {
+		return 0, nil, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	client := &http.Client{Timeout: 0}
+	response, err := client.Do(request)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(response.Body)
+	if err != nil {
+		return 0, nil, err
+	}
+	return response.StatusCode, responseBody, nil
+}
+
+func (s *Server) proxyOpenAIImagesUpstream(w http.ResponseWriter, ctx context.Context, upstreamURL string, authValue string, body []byte) (int, TokenUsage, []byte, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(body))
+	if err != nil {
+		return 0, TokenUsage{}, nil, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+	if authValue != "" {
+		if !strings.HasPrefix(strings.ToLower(authValue), "bearer ") {
+			authValue = "Bearer " + authValue
+		}
+		request.Header.Set("Authorization", authValue)
+	}
+	client := &http.Client{Timeout: 0}
+	response, err := client.Do(request)
+	if err != nil {
+		return 0, TokenUsage{}, nil, err
+	}
+	defer response.Body.Close()
+	return writePassThroughResponse(w, response, false, func([]byte) TokenUsage { return TokenUsage{} })
 }
 
 // proxyClaudeMessages forwards a Claude Messages API request to the upstream

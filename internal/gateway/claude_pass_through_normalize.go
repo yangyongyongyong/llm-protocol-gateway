@@ -219,6 +219,11 @@ func normalizeClaudePassThroughTools(raw []any) []any {
 		}
 		if schema, ok := tool["input_schema"]; ok {
 			normalized["input_schema"] = schema
+		} else if parameters, ok := tool["parameters"]; ok {
+			normalized["input_schema"] = parameters
+		} else if name := stringValue(normalized["name"]); name != "" {
+			// Anthropic rejects custom tools without input_schema.
+			normalized["input_schema"] = map[string]any{"type": "object", "properties": map[string]any{}}
 		}
 		if len(normalized) == 0 {
 			continue

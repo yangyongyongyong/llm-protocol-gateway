@@ -5,29 +5,42 @@ import (
 	"time"
 )
 
-func TestOAuthUsageCacheTTL(t *testing.T) {
+func TestOAuthUsageCacheFreshAndStale(t *testing.T) {
 	t.Parallel()
 	cache := newOAuthUsageCache()
-	cache.set("claude:p1", ClaudeOAuthUsageReport{Available: true, FetchedAt: "now"}, 50*time.Millisecond)
+	cache.set("claude:p1", ClaudeOAuthUsageReport{Available: true, FetchedAt: "now"})
 
 	if got, ok := cache.get("claude:p1"); !ok {
-		t.Fatal("expected cache hit")
+		t.Fatal("expected fresh cache hit")
 	} else if report, ok := got.(ClaudeOAuthUsageReport); !ok || !report.Available {
 		t.Fatalf("unexpected cached value: %#v", got)
 	}
 
-	time.Sleep(70 * time.Millisecond)
+	entry, ok := cache.getEntry("claude:p1")
+	if !ok {
+		t.Fatal("expected entry")
+	}
+	entry.fetchedAt = time.Now().Add(-oauthUsageFreshTTL - time.Second)
+	cache.mu.Lock()
+	cache.entries["claude:p1"] = entry
+	cache.mu.Unlock()
+
 	if _, ok := cache.get("claude:p1"); ok {
-		t.Fatal("expected cache miss after TTL")
+		t.Fatal("expected fresh miss after fresh TTL")
+	}
+	if got, ok := cache.getAllowStale("claude:p1"); !ok {
+		t.Fatal("expected stale hit")
+	} else if report, ok := got.(ClaudeOAuthUsageReport); !ok || !report.Available {
+		t.Fatalf("unexpected stale value: %#v", got)
 	}
 }
 
 func TestOAuthUsageCacheInvalidate(t *testing.T) {
 	t.Parallel()
 	cache := newOAuthUsageCache()
-	cache.set("cursor:p1", CursorOAuthUsageReport{Available: true}, time.Minute)
+	cache.set("cursor:p1", CursorOAuthUsageReport{Available: true})
 	cache.invalidate("cursor:p1")
-	if _, ok := cache.get("cursor:p1"); ok {
+	if _, ok := cache.getAllowStale("cursor:p1"); ok {
 		t.Fatal("expected invalidated entry to miss")
 	}
 }

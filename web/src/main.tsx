@@ -247,6 +247,44 @@ type ProvidersImportResult = {
   errors: string[];
 };
 
+type SelfcheckToolInfo = {
+  id: string;
+  label: string;
+  path: string;
+  found: boolean;
+  client: string;
+  protocol: string;
+};
+
+type SelfcheckCaseResult = {
+  providerId: string;
+  providerName: string;
+  client: string;
+  protocol: string;
+  model?: string;
+  success: boolean;
+  contentOK: boolean;
+  latencyMs: number;
+  outputPreview?: string;
+  error?: string;
+  routeId?: string;
+  apiKeyName?: string;
+};
+
+type SelfcheckJobStatus = {
+  jobId: string;
+  status: 'running' | 'done' | 'error';
+  prompt?: string;
+  timeoutMs?: number;
+  lanRoot?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  error?: string;
+  results: SelfcheckCaseResult[];
+  total: number;
+  completed: number;
+};
+
 type OutputEndpoint = {
   id: string;
   name: string;
@@ -368,6 +406,14 @@ type ProviderDayStats = {
   cacheTokens: number;
 };
 
+type ModelDayStats = {
+  model: string;
+  requestCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheTokens: number;
+};
+
 type DailyRequestPoint = {
   date: string;
   requestCount: number;
@@ -390,18 +436,21 @@ type RequestStatsSnapshot = {
     lastRequest?: LogEntry;
     byApiKey: APIKeyDayStats[];
     byProvider?: ProviderDayStats[];
+    byModel?: ModelDayStats[];
   };
   month: {
     period: string;
     total: APIKeyDayStats;
     byApiKey: APIKeyDayStats[];
     byProvider?: ProviderDayStats[];
+    byModel?: ModelDayStats[];
   };
   range?: {
     period: string;
     total: APIKeyDayStats;
     byApiKey: APIKeyDayStats[];
     byProvider?: ProviderDayStats[];
+    byModel?: ModelDayStats[];
   };
   from?: string;
   to?: string;
@@ -576,9 +625,10 @@ const navItems = [
   { id: 'usage-stats', label: '用量统计' },
   { id: 'public-access', label: '公网访问' },
   { id: 'traffic-tokens', label: '流量与 Token' },
+  { id: 'self-check', label: '自检' },
   { id: 'settings', label: '设置' },
 ] as const;
-const navIcons = ['◉', '☰', '🔑', '⌘', '▣', '↗', '≡', '⚙'];
+const navIcons = ['◉', '☰', '🔑', '⌘', '▣', '↗', '≡', '✓', '⚙'];
 type NavItemID = typeof navItems[number]['id'];
 
 function navPathForID(id: NavItemID) {
@@ -635,18 +685,22 @@ function trafficLogKeyLabel(log: LogEntry) {
   return log.apiKeyName?.trim() || '未绑定 Key';
 }
 
+function trafficLogProviderLabel(log: LogEntry, providers: Provider[]) {
+  return providerUsageLabel(log.providerId || '_unknown', providers);
+}
+
 function isTrafficLogError(log: LogEntry) {
   return log.status >= 400 || Boolean(log.errorDescription?.trim()) || Boolean(log.responseBody?.trim());
 }
 
-function formatTrafficLogDetail(log: LogEntry) {
+function formatTrafficLogDetail(log: LogEntry, providers: Provider[] = []) {
   const lines = [
     '=== Traffic Request Log Detail ===',
     `time: ${new Date(log.time).toLocaleString()}`,
     `status: HTTP ${log.status}`,
     `apiKey: ${trafficLogKeyLabel(log)}${log.apiKeyId ? ` (${log.apiKeyId})` : ''}`,
     `route: ${log.routeId}`,
-    `provider: ${log.providerId}`,
+    `provider: ${trafficLogProviderLabel(log, providers)}${log.providerId ? ` (${log.providerId})` : ''}`,
     `model: ${log.model}`,
     `action: ${log.action}`,
     `protocolFlow: ${log.protocolFlow}`,
@@ -848,7 +902,8 @@ function apiKeyBindingFromRoute(route: Route | undefined) {
 }
 
 function formatTokenSummary(stats: Pick<APIKeyDayStats, 'inputTokens' | 'outputTokens' | 'cacheTokens'>) {
-  return `入(含缓存) ${formatTokenCount(stats.inputTokens)} · 出 ${formatTokenCount(stats.outputTokens)} · 缓存命中 ${formatTokenCount(stats.cacheTokens || 0)}`;
+  const { totalInput, cacheHits } = normalizePromptTokenStats(stats.inputTokens, stats.cacheTokens || 0);
+  return `in ${formatTokenCount(totalInput)} · out ${formatTokenCount(stats.outputTokens)} · cache ${formatTokenCount(cacheHits)}`;
 }
 
 type LegacyRequestStatsSnapshot = {
@@ -870,12 +925,14 @@ function normalizeRequestStats(raw: RequestStatsSnapshot | LegacyRequestStatsSna
         lastRequest: legacy.lastRequest,
         byApiKey: legacy.byApiKey || [],
         byProvider: [],
+        byModel: [],
       },
       month: {
         period: legacy.date.slice(0, 7),
         total: legacy.total,
         byApiKey: legacy.byApiKey || [],
         byProvider: [],
+        byModel: [],
       },
     };
   }
@@ -939,6 +996,119 @@ function apiKeyClientAuthHint(route: Route) {
   if (route.outputProtocol === 'claude') return 'Claude Code：Base URL 填到 /anthropic（不要带 /v1）+ x-api-key';
   if (route.outputProtocol === 'openai_responses') return 'OpenAI Responses 客户端：Base URL + Bearer Key';
   return 'OpenAI 客户端：Base URL（如 /v1）+ Bearer Key';
+}
+
+function sanitizeClientConfigID(name: string) {
+  const id = name.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+  return id || 'gateway';
+}
+
+function apiKeyGatewayRoot(endpoints: OutputEndpoint[], publicBase: string) {
+  return (publicBase || localGatewayRoot(endpoints)).replace(/\/$/, '');
+}
+
+function buildApiKeyOpenCodeConfig(key: APIKey, route: Route | undefined, endpoints: OutputEndpoint[], publicBase: string, provider?: Provider) {
+  const providerID = sanitizeClientConfigID(key.name);
+  const model = resolveApiKeyModel(key, provider);
+  const root = apiKeyGatewayRoot(endpoints, publicBase);
+  const useResponses = route?.outputProtocol === 'openai_responses';
+  const baseURL = useResponses ? `${root}/openai/v1` : `${root}/v1`;
+  const npm = useResponses ? '@ai-sdk/openai' : '@ai-sdk/openai-compatible';
+  const models: Record<string, { name: string }> = { [model]: { name: model } };
+  for (const alias of Object.keys(key.modelAliases || {})) {
+    if (alias.trim()) models[alias.trim()] = { name: alias.trim() };
+  }
+  const config = {
+    $schema: 'https://opencode.ai/config.json',
+    model: `${providerID}/${model}`,
+    provider: {
+      [providerID]: {
+        npm,
+        name: key.name || providerID,
+        options: {
+          baseURL,
+          apiKey: key.key,
+        },
+        models,
+      },
+    },
+  };
+  return `${JSON.stringify(config, null, 2)}\n`;
+}
+
+function buildApiKeyCodexConfig(key: APIKey, route: Route | undefined, endpoints: OutputEndpoint[], publicBase: string, provider?: Provider) {
+  const providerID = sanitizeClientConfigID(key.name);
+  const model = resolveApiKeyModel(key, provider);
+  const baseURL = `${apiKeyGatewayRoot(endpoints, publicBase)}/openai/v1`;
+  const warning = !route || route.outputProtocol !== 'openai_responses'
+    ? '# 注意：当前密钥输出协议不是 OpenAI Responses，请先改为「OpenAI Responses」\n'
+    : '';
+  return `# ~/.codex/config.toml （用户级；项目内 .codex/config.toml 不会生效 provider）
+# Codex 使用 Responses：base_url 指向网关 /openai/v1，wire_api = "responses"
+${warning}model_provider = "${providerID}"
+model = "${model}"
+model_reasoning_effort = "medium"
+
+[model_providers.${providerID}]
+name = "${key.name || providerID}"
+base_url = "${baseURL}"
+wire_api = "responses"
+requires_openai_auth = true
+experimental_bearer_token = "${key.key}"
+`;
+}
+
+function buildApiKeyClaudeConfig(key: APIKey, route: Route | undefined, endpoints: OutputEndpoint[], publicBase: string, provider?: Provider) {
+  const model = resolveApiKeyModel(key, provider);
+  const baseURL = `${apiKeyGatewayRoot(endpoints, publicBase)}/anthropic`;
+  const config = {
+    env: {
+      ANTHROPIC_BASE_URL: baseURL,
+      ANTHROPIC_AUTH_TOKEN: key.key,
+      ANTHROPIC_API_KEY: key.key,
+      ANTHROPIC_MODEL: model,
+    },
+  };
+  return `${JSON.stringify(config, null, 2)}\n`;
+}
+
+function clientConfigFilePath(client: 'opencode' | 'codex' | 'claude') {
+  if (client === 'opencode') return '~/.config/opencode/opencode.json';
+  if (client === 'codex') return '~/.codex/config.toml';
+  return '~/.claude/settings.json';
+}
+
+function clientConfigTitle(client: 'opencode' | 'codex' | 'claude') {
+  if (client === 'opencode') return 'OpenCode 配置';
+  if (client === 'codex') return 'Codex 配置';
+  return 'Claude Code 配置';
+}
+
+function buildApiKeyClientConfig(
+  client: 'opencode' | 'codex' | 'claude',
+  key: APIKey,
+  route: Route | undefined,
+  endpoints: OutputEndpoint[],
+  publicBase: string,
+  provider?: Provider,
+) {
+  if (client === 'opencode') return buildApiKeyOpenCodeConfig(key, route, endpoints, publicBase, provider);
+  if (client === 'codex') return buildApiKeyCodexConfig(key, route, endpoints, publicBase, provider);
+  return buildApiKeyClaudeConfig(key, route, endpoints, publicBase, provider);
+}
+
+function clientConfigProtocolHint(client: 'opencode' | 'codex' | 'claude', route?: Route) {
+  if (!route) return '请先绑定输出协议';
+  if (client === 'opencode' && route.outputProtocol !== 'openai_chat' && route.outputProtocol !== 'openai_responses') {
+    return 'OpenCode 通常需要密钥输出协议为 OpenAI Chat（或 Responses）';
+  }
+  if (client === 'codex' && route.outputProtocol !== 'openai_responses') {
+    return 'Codex 需要密钥输出协议为 OpenAI Responses';
+  }
+  if (client === 'claude' && route.outputProtocol !== 'claude') {
+    return 'Claude Code 需要密钥输出协议为 Claude';
+  }
+  return '';
 }
 
 function resolveApiKeyModel(key: APIKey, provider?: Provider) {
@@ -1263,7 +1433,7 @@ function UsageLineChart({ title, points }: { title: string; points: DailyRequest
   );
 }
 
-function UsageBarChart({ title, items }: { title: string; items: Array<{ label: string; value: number }> }) {
+function UsageBarChart({ title, items, formatValue }: { title: string; items: Array<{ label: string; value: number }>; formatValue?: (value: number) => string }) {
   const max = Math.max(1, ...items.map((item) => item.value));
   return (
     <div className="usage-chart-card">
@@ -1274,7 +1444,7 @@ function UsageBarChart({ title, items }: { title: string; items: Array<{ label: 
             <div className="usage-bar-row" key={item.label}>
               <span className="usage-bar-label" title={item.label}>{item.label}</span>
               <div className="usage-bar-track"><div className="usage-bar-fill" style={{ width: `${(item.value / max) * 100}%` }} /></div>
-              <span className="usage-bar-value">{item.value}</span>
+              <span className="usage-bar-value">{formatValue ? formatValue(item.value) : item.value}</span>
             </div>
           ))}
         </div>
@@ -1283,17 +1453,39 @@ function UsageBarChart({ title, items }: { title: string; items: Array<{ label: 
   );
 }
 
-function UsageStackedTokens({ title, input, output, cache }: { title: string; input: number; output: number; cache: number }) {
-  const total = Math.max(1, input + output + cache);
+function normalizePromptTokenStats(input: number, cache: number) {
+  // InputTokens from API is prompt total (inclusive). Legacy rows may store
+  // exclusive non-cached counts; when cache > input, treat as Claude semantics.
+  const cacheHits = Math.max(0, cache || 0);
+  let totalInput = Math.max(0, input || 0);
+  if (cacheHits > 0 && totalInput < cacheHits) {
+    totalInput += cacheHits;
+  }
+  const nonCachedInput = Math.max(0, totalInput - cacheHits);
+  const hitRatePct = totalInput > 0 ? Math.min(100, (cacheHits / totalInput) * 100) : 0;
+  return { totalInput, cacheHits, nonCachedInput, hitRatePct };
+}
+
+function UsageCacheHitRate({ title, input, cache }: { title: string; input: number; cache: number }) {
+  const { totalInput, cacheHits, hitRatePct } = normalizePromptTokenStats(input, cache);
+  const hitRateLabel = totalInput > 0 ? `${hitRatePct.toFixed(1)}%` : '—';
+
   return (
     <div className="usage-chart-card">
       <div className="usage-section-title">{title}</div>
-      <div className="usage-stack-bar">
-        <div style={{ width: `${(input / total) * 100}%`, background: '#2563eb' }} title={`输入 ${input}`} />
-        <div style={{ width: `${(output / total) * 100}%`, background: '#059669' }} title={`输出 ${output}`} />
-        <div style={{ width: `${(cache / total) * 100}%`, background: '#d97706' }} title={`缓存 ${cache}`} />
-      </div>
-      <div className="hint-line">入 {formatTokenCount(input)} · 出 {formatTokenCount(output)} · 缓存 {formatTokenCount(cache)}</div>
+      {totalInput === 0 ? (
+        <div className="empty-state compact">暂无数据</div>
+      ) : (
+        <>
+          <div className="usage-cache-hit-row">
+            <div className="usage-stack-bar usage-cache-hit-bar" title={`cache hit rate ${hitRateLabel}`}>
+              <div style={{ width: `${hitRatePct}%`, background: '#d97706' }} title={`cache ${cacheHits}`} />
+            </div>
+            <span className="usage-cache-hit-pct">{hitRateLabel}</span>
+          </div>
+          <div className="hint-line">in {formatTokenCount(totalInput)} · cache {formatTokenCount(cacheHits)}</div>
+        </>
+      )}
     </div>
   );
 }
@@ -1386,6 +1578,23 @@ function formatTokenCount(value: number) {
   return String(value);
 }
 
+function formatCompactCount(value: number) {
+  const formatScaled = (scaled: number, unit: string) => {
+    const decimals = scaled >= 100 ? 0 : scaled >= 10 ? 1 : 2;
+    const formatted = scaled.toFixed(decimals).replace(/\.0+$/, '').replace(/(\.\d)0$/, '$1');
+    return `${formatted}${unit}`;
+  };
+  if (value >= 100_000_000) return formatScaled(value / 100_000_000, '亿');
+  if (value >= 1_000_000) return formatScaled(value / 1_000_000, '百万');
+  if (value >= 10_000) return formatScaled(value / 10_000, '万');
+  return value.toLocaleString('zh-CN');
+}
+
+function formatTokenSummaryCompact(stats: Pick<APIKeyDayStats, 'inputTokens' | 'outputTokens' | 'cacheTokens'>) {
+  const { totalInput, cacheHits } = normalizePromptTokenStats(stats.inputTokens, stats.cacheTokens || 0);
+  return `in ${formatCompactCount(totalInput)} · out ${formatCompactCount(stats.outputTokens)} · cache ${formatCompactCount(cacheHits)}`;
+}
+
 function App() {
   const [activeNav, setActiveNav] = useState<NavItemID>(() => navIDFromPath(window.location.pathname));
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => readStoredTheme());
@@ -1394,6 +1603,8 @@ function App() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [logsTotal, setLogsTotal] = useState(0);
   const [logsPage, setLogsPage] = useState(1);
+  const [logsLoading, setLogsLoading] = useState(false);
+  const [logsFetchedOnce, setLogsFetchedOnce] = useState(false);
   const [logsStatusFilter, setLogsStatusFilter] = useState<'all' | '2xx' | '4xx' | '5xx'>('all');
   const [logsApiKeyName, setLogsApiKeyName] = useState('');
   const [logsFrom, setLogsFrom] = useState('');
@@ -1402,6 +1613,7 @@ function App() {
   const [usageFrom, setUsageFrom] = useState(() => new Date().toISOString().slice(0, 10));
   const [usageTo, setUsageTo] = useState(() => new Date().toISOString().slice(0, 10));
   const [trafficLogDetail, setTrafficLogDetail] = useState<LogEntry | null>(null);
+  const [trafficLogDetailLoading, setTrafficLogDetailLoading] = useState(false);
   const [requestStats, setRequestStats] = useState<RequestStatsSnapshot | null>(null);
   const [appLogs, setAppLogs] = useState<AppLogEntry[]>([]);
   const [logLevel, setLogLevel] = useState('info');
@@ -1421,7 +1633,8 @@ function App() {
   const [showManualToken, setShowManualToken] = useState(false);
   const cloudflarePollRef = useRef<number | null>(null);
   const [tunnelBusy, setTunnelBusy] = useState(false);
-  const [backendConnected, setBackendConnected] = useState(false);
+  // null = 尚未探测，避免刷新瞬间误闪「后端未连接」
+  const [backendConnected, setBackendConnected] = useState<boolean | null>(null);
   const [backendReconnecting, setBackendReconnecting] = useState(false);
   const [authStatus, setAuthStatus] = useState<AdminAuthStatus | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
@@ -1462,6 +1675,14 @@ function App() {
   const [apiKeyFilterID, setApiKeyFilterID] = useState('__all__');
   const [apiKeyProviderFilter, setApiKeyProviderFilter] = useState('__all__');
   const [apiKeyOutputProtocolFilter, setApiKeyOutputProtocolFilter] = useState('__all__');
+  const [selfcheckProviderIDs, setSelfcheckProviderIDs] = useState<string[]>([]);
+  const [selfcheckTimeoutSec, setSelfcheckTimeoutSec] = useState(90);
+  const [selfcheckPrompt, setSelfcheckPrompt] = useState('1+1等于几');
+  const [selfcheckTools, setSelfcheckTools] = useState<SelfcheckToolInfo[]>([]);
+  const [selfcheckLanRoot, setSelfcheckLanRoot] = useState('');
+  const [selfcheckRunning, setSelfcheckRunning] = useState(false);
+  const [selfcheckJob, setSelfcheckJob] = useState<SelfcheckJobStatus | null>(null);
+  const selfcheckPollRef = useRef<number | null>(null);
   const [providerDraft, setProviderDraft] = useState({
     name: '我的 OpenAI 对话 Provider',
     protocol: 'openai_chat' as Protocol,
@@ -1497,6 +1718,7 @@ function App() {
     streamEnabled: true,
   });
   const [modelsProviderFilter, setModelsProviderFilter] = useState('__all__');
+  const [modelsSearchQuery, setModelsSearchQuery] = useState('');
 
   const selectedRoute = useMemo(
     () => state.routes.find((route) => route.id === selectedRouteID) || state.routes[0],
@@ -1566,17 +1788,45 @@ function App() {
       return false;
     });
   }, [state.models, sortedProviders]);
+  const modelsSearch = useMemo(() => {
+    const query = modelsSearchQuery.trim();
+    if (!query) return { matcher: null as null | ((text: string) => boolean), error: '' };
+    try {
+      const re = new RegExp(query, 'i');
+      return { matcher: (text: string) => re.test(text), error: '' };
+    } catch (err) {
+      const needle = query.toLowerCase();
+      return {
+        matcher: (text: string) => text.toLowerCase().includes(needle),
+        error: err instanceof Error ? err.message : '无效的正则表达式',
+      };
+    }
+  }, [modelsSearchQuery]);
+
   const filteredModels = useMemo(() => {
     const base = modelsProviderFilter === '__all__'
       ? state.models
       : state.models.filter((model) => model.providerId === modelsProviderFilter);
-    return [...base].sort((a, b) => {
+    const matched = !modelsSearch.matcher
+      ? base
+      : base.filter((model) => {
+          const provider = state.providers.find((item) => item.id === model.providerId);
+          const haystacks = [
+            model.id,
+            model.providerId,
+            provider?.name || '',
+            provider ? providerOptionLabel(provider) : '',
+            protocolLabel(model.protocol),
+          ];
+          return haystacks.some((text) => Boolean(text) && modelsSearch.matcher!(text));
+        });
+    return [...matched].sort((a, b) => {
       const ca = recentModelRequestCounts.get(`${a.providerId}::${a.id}`) || recentModelRequestCounts.get(a.id) || 0;
       const cb = recentModelRequestCounts.get(`${b.providerId}::${b.id}`) || recentModelRequestCounts.get(b.id) || 0;
       if (ca !== cb) return cb - ca;
       return a.id.localeCompare(b.id);
     });
-  }, [state.models, modelsProviderFilter, recentModelRequestCounts]);
+  }, [state.models, state.providers, modelsProviderFilter, modelsSearch, recentModelRequestCounts]);
   const modelsMenuSummary = useMemo(() => {
     const counts = new Map<string, number>();
     for (const model of state.models) {
@@ -1654,9 +1904,10 @@ function App() {
 
   useEffect(() => {
     void (async () => {
-      const auth = await refreshAuthStatus();
+      // 首屏并行探测健康与鉴权，避免等 3s 轮询才知道连接状态
+      const [connected, auth] = await Promise.all([refreshBackendHealth(), refreshAuthStatus()]);
       setAuthChecked(true);
-      if (auth && (!auth.requireAuth || auth.authenticated)) {
+      if (connected && auth && (!auth.requireAuth || auth.authenticated)) {
         await bootstrapAuthenticatedSession();
       }
     })();
@@ -1664,12 +1915,11 @@ function App() {
     // __state (App WebView and browser otherwise diverge after first paint).
     const timer = window.setInterval(() => {
       void (async () => {
-        const connected = await refreshBackendHealth();
+        const [connected, auth] = await Promise.all([refreshBackendHealth(), refreshAuthStatus()]);
         if (!connected) {
           await reconnectBackend(false);
           return;
         }
-        const auth = await refreshAuthStatus();
         if (auth && (!auth.requireAuth || auth.authenticated)) {
           void refreshState(false);
           void refreshRequestStats();
@@ -1727,6 +1977,28 @@ function App() {
     }
   }, [activeNav]);
 
+  useEffect(() => {
+    if (activeNav !== 'usage-stats') return;
+    void refreshRequestStats(usageFrom, usageTo);
+  }, [activeNav]);
+
+  useEffect(() => {
+    if (activeNav !== 'traffic-tokens') return;
+    void refreshLogs(logsPage);
+  }, [activeNav]);
+
+  useEffect(() => {
+    if (activeNav !== 'self-check') return;
+    void refreshSelfcheckTools();
+  }, [activeNav]);
+
+  useEffect(() => () => {
+    if (selfcheckPollRef.current != null) {
+      window.clearInterval(selfcheckPollRef.current);
+      selfcheckPollRef.current = null;
+    }
+  }, []);
+
   function goToPage(sectionID: NavItemID) {
     const path = navPathForID(sectionID);
     if (window.location.pathname !== path) {
@@ -1752,11 +2024,12 @@ function App() {
   }
 
   async function bootstrapAuthenticatedSession() {
-    await refreshState(false);
-    await refreshLogs();
-    await refreshRequestStats();
-    await refreshAppLogs();
-    await refreshCloudflareAuthStatus();
+    await Promise.all([
+      refreshState(false),
+      refreshRequestStats(),
+      refreshAppLogs(),
+      refreshCloudflareAuthStatus(),
+    ]);
   }
 
   async function submitAdminAuth(mode: 'setup' | 'login') {
@@ -1799,6 +2072,7 @@ function App() {
   }
 
   async function logoutAdmin() {
+    if (!window.confirm('确定退出登录？')) return;
     setAuthBusy(true);
     try {
       await fetch(`${API_BASE}/__auth/logout`, { method: 'POST', credentials: 'same-origin' });
@@ -1870,9 +2144,11 @@ function App() {
     try {
       const connected = await refreshBackendHealth();
       if (connected) {
-        await refreshState(false);
-        await refreshLogs();
-        await refreshRequestStats();
+        await Promise.all([
+          refreshState(false),
+          refreshRequestStats(),
+          ...(activeNav === 'traffic-tokens' ? [refreshLogs()] : []),
+        ]);
         if (showFeedback) showToast('后端已重新连接');
         return true;
       }
@@ -1917,16 +2193,26 @@ function App() {
     }
   }
 
+  function buildLogsQueryParams(page: number, includeBodies = false) {
+    const params = new URLSearchParams();
+    params.set('page', String(page));
+    params.set('pageSize', '100');
+    params.set('status', logsStatusFilter);
+    if (includeBodies) params.set('includeBodies', '1');
+    if (logsFrom) params.set('from', logsFrom);
+    if (logsTo) params.set('to', logsTo);
+    if (logsApiKeyName.trim()) params.set('apiKeyName', logsApiKeyName.trim());
+    return params;
+  }
+
+  function trafficLogMatchKey(log: LogEntry) {
+    return `${log.time}|${log.path}|${log.status}|${log.model}|${log.latencyMs}`;
+  }
+
   async function refreshLogs(page = logsPage) {
+    setLogsLoading(true);
     try {
-      const params = new URLSearchParams();
-      params.set('page', String(page));
-      params.set('pageSize', '100');
-      params.set('status', logsStatusFilter);
-      if (logsFrom) params.set('from', logsFrom);
-      if (logsTo) params.set('to', logsTo);
-      if (logsApiKeyName.trim()) params.set('apiKeyName', logsApiKeyName.trim());
-      const response = await fetch(`${API_BASE}/__logs?${params.toString()}`);
+      const response = await fetch(`${API_BASE}/__logs?${buildLogsQueryParams(page).toString()}`, { credentials: 'same-origin' });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json() as LogPage | LogEntry[];
       if (Array.isArray(data)) {
@@ -1938,9 +2224,30 @@ function App() {
         setLogsTotal(data.total || 0);
         setLogsPage(data.page || page);
       }
-      await refreshRequestStats();
+      setLogsFetchedOnce(true);
     } catch {
       // Keep UI usable when backend is down.
+      setLogsFetchedOnce(true);
+    } finally {
+      setLogsLoading(false);
+    }
+  }
+
+  async function openTrafficLogDetail(log: LogEntry) {
+    setTrafficLogDetail(log);
+    setTrafficLogDetailLoading(true);
+    try {
+      const response = await fetch(`${API_BASE}/__logs?${buildLogsQueryParams(logsPage, true).toString()}`, { credentials: 'same-origin' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json() as LogPage | LogEntry[];
+      const items = Array.isArray(data) ? data : data.items || [];
+      const matchKey = trafficLogMatchKey(log);
+      const full = items.find((item) => trafficLogMatchKey(item) === matchKey);
+      if (full) setTrafficLogDetail(full);
+    } catch {
+      // Summary-only detail is still useful when body fetch fails.
+    } finally {
+      setTrafficLogDetailLoading(false);
     }
   }
 
@@ -2362,8 +2669,10 @@ function App() {
         setThinkingTestOpen(true);
         showToast(result.success ? `对话测试成功：HTTP ${result.status}` : `对话测试未通过：${result.status || result.error || 'unknown'}`);
       }
-      await refreshLogs();
-      await refreshAppLogs();
+      if (activeNav === 'traffic-tokens' && logsFetchedOnce) {
+        await refreshLogs();
+      }
+      await Promise.all([refreshRequestStats(), refreshAppLogs()]);
     } catch (error) {
       setChatTestResult({ success: false, error: String(error) });
       showToast(`对话测试失败：${String(error)}`);
@@ -2980,6 +3289,107 @@ function App() {
     setSelectedExportProviderIDs([]);
   }
 
+  function toggleSelfcheckProvider(providerID: string) {
+    setSelfcheckProviderIDs((current) => (
+      current.includes(providerID)
+        ? current.filter((id) => id !== providerID)
+        : [...current, providerID]
+    ));
+  }
+
+  function selectAllSelfcheckProviders() {
+    setSelfcheckProviderIDs(sortedProviders.map((provider) => provider.id));
+  }
+
+  function clearSelfcheckProviders() {
+    setSelfcheckProviderIDs([]);
+  }
+
+  async function refreshSelfcheckTools() {
+    try {
+      const response = await fetch(`${API_BASE}/__selfcheck/tools`, { credentials: 'same-origin' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json() as { tools?: SelfcheckToolInfo[]; lanRoot?: string };
+      setSelfcheckTools(data.tools || []);
+      setSelfcheckLanRoot(data.lanRoot || localGatewayRoot(state.endpoints));
+    } catch (error) {
+      showToast(`加载自检工具状态失败：${String(error)}`);
+    }
+  }
+
+  function stopSelfcheckPolling() {
+    if (selfcheckPollRef.current != null) {
+      window.clearInterval(selfcheckPollRef.current);
+      selfcheckPollRef.current = null;
+    }
+  }
+
+  async function pollSelfcheckJob(jobId: string) {
+    try {
+      const response = await fetch(`${API_BASE}/__selfcheck/${encodeURIComponent(jobId)}`, { credentials: 'same-origin' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json() as SelfcheckJobStatus;
+      setSelfcheckJob(data);
+      if (data.status === 'done' || data.status === 'error') {
+        stopSelfcheckPolling();
+        setSelfcheckRunning(false);
+        const okCount = (data.results || []).filter((item) => item.success && item.contentOK).length;
+        const total = data.total || (data.results || []).length;
+        if (data.status === 'error') {
+          showToast(`自检失败：${data.error || '未知错误'}`);
+        } else {
+          showToast(`自检完成：${okCount}/${total} 通过`);
+        }
+        void refreshState(false);
+      }
+    } catch (error) {
+      stopSelfcheckPolling();
+      setSelfcheckRunning(false);
+      showToast(`轮询自检结果失败：${String(error)}`);
+    }
+  }
+
+  async function startSelfcheck() {
+    if (selfcheckRunning) return;
+    if (selfcheckProviderIDs.length === 0) {
+      showToast('请先勾选至少一个 Provider');
+      return;
+    }
+    const timeoutMs = Math.max(5, Math.min(600, selfcheckTimeoutSec || 90)) * 1000;
+    setSelfcheckRunning(true);
+    setSelfcheckJob(null);
+    stopSelfcheckPolling();
+    try {
+      const response = await fetch(`${API_BASE}/__selfcheck`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          providerIds: selfcheckProviderIDs,
+          timeoutMs,
+          prompt: selfcheckPrompt.trim() || '1+1等于几',
+        }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const data = await response.json() as { jobId: string };
+      showToast('自检已开始，正在并行探测…');
+      await pollSelfcheckJob(data.jobId);
+      selfcheckPollRef.current = window.setInterval(() => {
+        void pollSelfcheckJob(data.jobId);
+      }, 1000);
+    } catch (error) {
+      setSelfcheckRunning(false);
+      showToast(`启动自检失败：${String(error)}`);
+    }
+  }
+
+  function selfcheckClientLabel(client: string) {
+    if (client === 'opencode') return 'OpenCode';
+    if (client === 'codex') return 'Codex';
+    if (client === 'claude') return 'Claude';
+    return client;
+  }
+
   function providersExportFilename() {
     const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
     return `providers-export-${stamp}.json`;
@@ -3438,11 +3848,11 @@ function App() {
             </div>
           </div>
 
-          {(!backendConnected || backendReconnecting) && (
+          {(backendConnected === false || backendReconnecting) && (
             <button
               type="button"
-              className={`status-pill status-pill-btn ${backendConnected ? '' : 'off'} ${backendReconnecting ? 'reconnecting' : ''}`}
-              onClick={() => { if (!backendConnected && !backendReconnecting) void reconnectBackend(true); }}
+              className={`status-pill status-pill-btn ${backendConnected === false ? 'off' : ''} ${backendReconnecting ? 'reconnecting' : ''}`}
+              onClick={() => { if (backendConnected === false && !backendReconnecting) void reconnectBackend(true); }}
               title="点击尝试重新连接后端"
             >
               <span className="dot" />
@@ -3585,6 +3995,7 @@ function App() {
                       onDelete={deleteApiKey}
                       onClone={openCloneApiKeyModal}
                       onRefreshModels={refreshApiKeyModelsForProvider}
+                      onToast={showToast}
                     />
                   ) : (
                     <div className="api-keys-detail empty-state">请从左侧列表选择一个 API 密钥。</div>
@@ -3755,10 +4166,20 @@ function App() {
                     value: item.requestCount,
                   }))}
                 />
-                <UsageStackedTokens
-                  title="Token 构成（区间）"
+                <UsageBarChart
+                  title="模型使用量排名（Token）"
+                  formatValue={formatCompactCount}
+                  items={(requestStats?.range?.byModel || usageToday?.byModel || [])
+                    .filter((item) => item.model && item.model !== '_unknown')
+                    .slice(0, 8)
+                    .map((item) => ({
+                      label: item.model,
+                      value: (item.inputTokens || 0) + (item.outputTokens || 0),
+                    }))}
+                />
+                <UsageCacheHitRate
+                  title="缓存命中率（区间）"
                   input={requestStats?.range?.total.inputTokens ?? usageToday?.total.inputTokens ?? 0}
-                  output={requestStats?.range?.total.outputTokens ?? usageToday?.total.outputTokens ?? 0}
                   cache={requestStats?.range?.total.cacheTokens ?? usageToday?.total.cacheTokens ?? 0}
                 />
                 <UsageStatusChart title="状态码分布" items={requestStats?.status || []} />
@@ -3832,6 +4253,38 @@ function App() {
                           <span>{formatTokenSummary(row)}</span>
                           <span>{month?.requestCount ?? 0}</span>
                           <span>{month ? formatTokenSummary(month) : '—'}</span>
+                        </div>
+                      );
+                    });
+                  })()}
+                </div>
+              </div>
+
+              <div className="usage-table-wrap">
+                <div className="usage-section-title">模型使用量排名（区间，按 Token 总量）</div>
+                <div className="usage-table">
+                  <div className="usage-header">
+                    <span>排名 / 模型</span>
+                    <span>区间请求</span>
+                    <span>区间 Token</span>
+                    <span>本月请求</span>
+                    <span>本月 Token</span>
+                  </div>
+                  {(() => {
+                    const rows = [...(requestStats?.range?.byModel || usageToday?.byModel || [])]
+                      .filter((item) => item.model && item.model !== '_unknown');
+                    if (rows.length === 0) {
+                      return <div className="empty-state">暂无模型请求记录。</div>;
+                    }
+                    return rows.map((row, index) => {
+                      const month = usageMonth?.byModel?.find((item) => item.model === row.model);
+                      return (
+                        <div className="usage-row" key={row.model}>
+                          <span className="usage-key-name">#{index + 1} {row.model}</span>
+                          <span>{formatCompactCount(row.requestCount)}</span>
+                          <span>{formatTokenSummaryCompact(row)}</span>
+                          <span>{formatCompactCount(month?.requestCount ?? 0)}</span>
+                          <span>{month ? formatTokenSummaryCompact(month) : '—'}</span>
                         </div>
                       );
                     });
@@ -4042,11 +4495,27 @@ function App() {
               <div className="panel-header">
                 <div>
                   <h2 className="panel-title">模型列表</h2>
-                  <p className="panel-desc">查看全部模型，或按输入 Provider 过滤。在 Provider 卡片点击「获取模型」可同步最新列表。</p>
+                  <p className="panel-desc">查看全部模型，或按输入 Provider 过滤；支持按名称关键字 / 正则检索。在 Provider 卡片点击「获取模型」可同步最新列表。</p>
                 </div>
                 <button className="btn" onClick={() => void refreshState()}>刷新列表</button>
               </div>
               <div className="models-toolbar">
+                <div className="models-search-row">
+                  <input
+                    className="models-search-input"
+                    type="search"
+                    value={modelsSearchQuery}
+                    placeholder="按名称检索，支持正则，如 gpt-5\\.6|sonnet"
+                    onChange={(event) => setModelsSearchQuery(event.target.value)}
+                    aria-label="模型名称检索"
+                  />
+                  {modelsSearchQuery.trim() ? (
+                    <button className="mini-btn" type="button" onClick={() => setModelsSearchQuery('')}>清除</button>
+                  ) : null}
+                </div>
+                {modelsSearch.error ? (
+                  <div className="hint-line error">正则无效，已回退为普通包含匹配：{modelsSearch.error}</div>
+                ) : null}
                 <div className="models-filter-group">
                   <button
                     className={`models-filter-chip ${modelsProviderFilter === '__all__' ? 'active' : ''}`}
@@ -4067,14 +4536,17 @@ function App() {
                 <div className="models-toolbar-meta">
                   当前显示 {filteredModels.length} 个模型
                   {modelsProviderFilter !== '__all__' ? ` · ${state.providers.find((item) => item.id === modelsProviderFilter)?.name || modelsProviderFilter}` : ''}
+                  {modelsSearchQuery.trim() ? ` · 检索「${modelsSearchQuery.trim()}」` : ''}
                 </div>
               </div>
               {state.models.length === 0 ? (
                 <div className="empty-state">暂无模型。点击输入 Provider 卡片上的「获取模型」后，会根据 Provider 接口自动拉取模型列表。</div>
               ) : filteredModels.length === 0 ? (
                 <div className="empty-state">
-                  该 Provider 暂无模型记录。
-                  {(() => {
+                  {modelsSearchQuery.trim()
+                    ? '没有匹配当前检索条件的模型，请调整关键字或正则。'
+                    : '该 Provider 暂无模型记录。'}
+                  {!modelsSearchQuery.trim() && (() => {
                     const provider = state.providers.find((item) => item.id === modelsProviderFilter);
                     if (!provider) return null;
                     const canSync = provider.authType === 'cursor_oauth'
@@ -4121,7 +4593,7 @@ function App() {
           {activeNav === 'traffic-tokens' && (
           <section className="section-full">
             <div className="card panel traffic-panel">
-              <div className="panel-header"><div><h2 className="panel-title">流量请求日志</h2><p className="panel-desc">支持按时间段、状态与密钥名称筛选；展示访问来源与首 Token 延迟（TTFT）。默认保留 {requestLogRetentionDays} 天。</p></div><button className="btn" onClick={() => void refreshLogs(1)}>刷新日志</button></div>
+              <div className="panel-header"><div><h2 className="panel-title">流量请求日志</h2><p className="panel-desc">支持按时间段、状态与密钥名称筛选；展示访问来源与首 Token 延迟（TTFT）。默认保留 {requestLogRetentionDays} 天。</p></div><button className="btn" disabled={logsLoading} onClick={() => void refreshLogs(1)}>{logsLoading ? '加载中…' : '刷新日志'}</button></div>
               <div className="form-grid compact" style={{ marginBottom: 12 }}>
                 <label className="field">
                   <span>开始日期</span>
@@ -4170,13 +4642,18 @@ function App() {
                 </div>
               </div>
               <div className="log-table">
-                {logs.length === 0 ? <div className="empty-state">暂无流量日志。运行路由测试或真实转发请求后会记录。</div> : (
+                {logsLoading || !logsFetchedOnce ? (
+                  <div className="empty-state">加载流量日志中…</div>
+                ) : logs.length === 0 ? (
+                  <div className="empty-state">暂无流量日志。运行路由测试或真实转发请求后会记录。</div>
+                ) : (
                   <>
                     <div className="log-header traffic-log-header">
                       <span>时间</span>
                       <span>状态</span>
                       <span>来源</span>
                       <span>密钥</span>
+                      <span>输入 Provider</span>
                       <span>模型</span>
                       <span>Token</span>
                       <span>TTFT</span>
@@ -4190,16 +4667,17 @@ function App() {
                           <Badge tone={statusTone(log.status)}>{log.status}</Badge>
                           <span className="log-source" title={log.clientHost || undefined}>{accessSourceLabel(log.accessSource)}</span>
                           <span className="log-key" title={log.apiKeyId || undefined}>{trafficLogKeyLabel(log)}</span>
+                          <span className="log-provider" title={log.providerId || undefined}>{trafficLogProviderLabel(log, state.providers || [])}</span>
                           <span className="log-model">{log.model}</span>
                           <span className="log-token" title="入=总 input（含缓存命中）；缓存=cache hit">入 {log.inputTokens} · 出 {log.outputTokens} · 缓存 {log.cacheTokens || 0}</span>
                           <span className="log-latency">{log.ttftMs != null ? `${log.ttftMs}ms` : '—'}</span>
                           <span className="log-latency">{log.latencyMs}ms</span>
                           {isTrafficLogError(log) ? (
-                            <button className="mini-btn" type="button" onClick={() => setTrafficLogDetail(log)}>详情</button>
+                            <button className="mini-btn" type="button" onClick={() => void openTrafficLogDetail(log)}>详情</button>
                           ) : <span className="log-detail-placeholder" />}
                         </div>
                         <div className="log-row-sub" title={`${log.protocolFlow} · ${log.path}`}>
-                          {actionLabel(log.action)} · {log.protocolFlow} · {log.path}{log.errorDescription ? ` · ${log.errorDescription}` : ''}
+                          {trafficLogProviderLabel(log, state.providers || [])} · {actionLabel(log.action)} · {log.protocolFlow} · {log.path}{log.errorDescription ? ` · ${log.errorDescription}` : ''}
                         </div>
                       </div>
                     ))}
@@ -4213,6 +4691,153 @@ function App() {
                   </>
                 )}
               </div>
+            </div>
+          </section>
+          )}
+
+          {activeNav === 'self-check' && (
+          <section className="section-full">
+            <div className="card panel">
+              <div className="panel-header">
+                <div>
+                  <h2 className="panel-title">自检</h2>
+                  <p className="panel-desc">
+                    对勾选的输入 Provider，并行用 OpenCode（Chat）、Codex（Responses）、Claude CLI 走局域网网关探测，并校验回答内容是否像「1+1=2」。
+                  </p>
+                </div>
+                <button
+                  className="btn primary"
+                  type="button"
+                  disabled={selfcheckRunning || selfcheckProviderIDs.length === 0 || sortedProviders.length === 0}
+                  onClick={() => void startSelfcheck()}
+                >
+                  {selfcheckRunning
+                    ? `自检中… ${selfcheckJob?.completed ?? 0}/${selfcheckJob?.total ?? selfcheckProviderIDs.length * 3}`
+                    : '开始自检'}
+                </button>
+              </div>
+
+              <div className="form-grid compact" style={{ marginBottom: 14 }}>
+                <label className="field">
+                  <span>超时（秒 / 每用例）</span>
+                  <input
+                    type="number"
+                    min={5}
+                    max={600}
+                    value={selfcheckTimeoutSec}
+                    disabled={selfcheckRunning}
+                    onChange={(event) => setSelfcheckTimeoutSec(Number(event.target.value) || 90)}
+                  />
+                </label>
+                <label className="field">
+                  <span>探测 Prompt</span>
+                  <input
+                    type="text"
+                    value={selfcheckPrompt}
+                    disabled={selfcheckRunning}
+                    onChange={(event) => setSelfcheckPrompt(event.target.value)}
+                  />
+                </label>
+                <label className="field">
+                  <span>局域网根地址</span>
+                  <input type="text" readOnly value={selfcheckLanRoot || localGatewayRoot(state.endpoints)} />
+                </label>
+              </div>
+
+              <div className="hint-line" style={{ marginBottom: 12 }}>
+                CLI 可用性：
+                {selfcheckTools.length === 0
+                  ? '加载中…'
+                  : selfcheckTools.map((tool) => (
+                    <span key={tool.id} style={{ marginLeft: 10 }}>
+                      {tool.label}{' '}
+                      <Badge tone={tool.found ? 'green' : 'red'}>{tool.found ? '可用' : '缺失'}</Badge>
+                    </span>
+                  ))}
+              </div>
+
+              {sortedProviders.length > 0 ? (
+                <div className="providers-toolbar">
+                  <label className="checkbox-field">
+                    <input
+                      type="checkbox"
+                      checked={selfcheckProviderIDs.length > 0 && selfcheckProviderIDs.length === sortedProviders.length}
+                      disabled={selfcheckRunning}
+                      onChange={(event) => {
+                        if (event.target.checked) selectAllSelfcheckProviders();
+                        else clearSelfcheckProviders();
+                      }}
+                    />
+                    <span>全选 Provider</span>
+                  </label>
+                  <span className="providers-toolbar-meta">已选 {selfcheckProviderIDs.length} / {sortedProviders.length}</span>
+                  {selfcheckProviderIDs.length > 0 ? (
+                    <button className="mini-btn" type="button" disabled={selfcheckRunning} onClick={clearSelfcheckProviders}>清除选择</button>
+                  ) : null}
+                </div>
+              ) : null}
+
+              {sortedProviders.length === 0 ? (
+                <div className="empty-state">暂无输入 Provider，请先在「输入 Provider」页添加。</div>
+              ) : (
+                <div className="selfcheck-provider-list">
+                  {sortedProviders.map((provider) => (
+                    <label className="checkbox-field selfcheck-provider-item" key={provider.id}>
+                      <input
+                        type="checkbox"
+                        checked={selfcheckProviderIDs.includes(provider.id)}
+                        disabled={selfcheckRunning}
+                        onChange={() => toggleSelfcheckProvider(provider.id)}
+                      />
+                      <span>{providerOptionLabel(provider)}</span>
+                      <Badge tone={protocolTone(provider.protocol)}>{protocolLabel(provider.protocol)}</Badge>
+                    </label>
+                  ))}
+                </div>
+              )}
+
+              {selfcheckJob ? (
+                <div className="usage-table-wrap">
+                  <div className="usage-section-title">
+                    结果
+                    {selfcheckJob.status === 'running' ? ` · 进行中 ${selfcheckJob.completed}/${selfcheckJob.total}` : null}
+                    {selfcheckJob.status === 'done' ? ' · 已完成' : null}
+                    {selfcheckJob.status === 'error' ? ` · 失败：${selfcheckJob.error || ''}` : null}
+                  </div>
+                  <div className="usage-table selfcheck-table">
+                    <div className="selfcheck-header">
+                      <span>Provider</span>
+                      <span>客户端</span>
+                      <span>协议</span>
+                      <span>成功</span>
+                      <span>内容</span>
+                      <span>耗时</span>
+                      <span>预览 / 错误</span>
+                    </div>
+                    {(selfcheckJob.results || []).length === 0 ? (
+                      <div className="empty-state">等待用例完成…</div>
+                    ) : (
+                      [...selfcheckJob.results]
+                        .sort((a, b) => `${a.providerName}-${a.client}`.localeCompare(`${b.providerName}-${b.client}`, 'zh'))
+                        .map((row, index) => (
+                          <div className="selfcheck-row" key={`${row.providerId}-${row.client}-${index}`}>
+                            <span className="usage-key-name">{row.providerName || row.providerId}</span>
+                            <span>{selfcheckClientLabel(row.client)}</span>
+                            <span>{protocolLabel(row.protocol as Protocol)}</span>
+                            <span><Badge tone={row.success ? 'green' : 'red'}>{row.success ? '是' : '否'}</Badge></span>
+                            <span><Badge tone={row.contentOK ? 'green' : 'amber'}>{row.contentOK ? 'OK' : '失败'}</Badge></span>
+                            <span>{row.latencyMs} ms</span>
+                            <span className="selfcheck-preview" title={row.error || row.outputPreview || ''}>
+                              {row.error || row.outputPreview || '—'}
+                            </span>
+                          </div>
+                        ))
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="empty-state" style={{ marginTop: 16 }}>勾选 Provider 后点击「开始自检」。每个 Provider 会并行跑 3 个客户端用例。</div>
+              )}
             </div>
           </section>
           )}
@@ -4360,14 +4985,15 @@ function App() {
           <div className={`test-result-card fail`}>
             <div className="test-result-head">
               <Badge tone={statusTone(trafficLogDetail.status)}>HTTP {trafficLogDetail.status}</Badge>
-              <span>{trafficLogKeyLabel(trafficLogDetail)} · {trafficLogDetail.routeId} · {trafficLogDetail.model} · {trafficLogDetail.latencyMs}ms</span>
+              <span>{trafficLogKeyLabel(trafficLogDetail)} · {trafficLogProviderLabel(trafficLogDetail, state.providers || [])} · {trafficLogDetail.routeId} · {trafficLogDetail.model} · {trafficLogDetail.latencyMs}ms</span>
             </div>
             {trafficLogDetail.errorDescription ? <div className="hint-line error">{trafficLogDetail.errorDescription}</div> : null}
+            {trafficLogDetailLoading ? <div className="hint-line">加载请求/响应体…</div> : null}
             <div className="field-label-row">
               <label>完整诊断信息</label>
-              <CopyButton value={formatTrafficLogDetail(trafficLogDetail)} label="复制全部" />
+              <CopyButton value={formatTrafficLogDetail(trafficLogDetail, state.providers || [])} label="复制全部" />
             </div>
-            <pre className="json-preview">{formatTrafficLogDetail(trafficLogDetail)}</pre>
+            <pre className="json-preview">{formatTrafficLogDetail(trafficLogDetail, state.providers || [])}</pre>
           </div>
           <div className="actions modal-actions">
             <button className="btn" onClick={() => setTrafficLogDetail(null)}>关闭</button>
@@ -4430,13 +5056,39 @@ function App() {
         <Modal title={editingProviderID ? '编辑输入 Provider' : '创建输入 Provider'} description="API Key Source 可留空：留空时透传客户端 Authorization；也可直接填 sk-xxx，或填 env:VAR_NAME / literal:sk-xxx。Fallback Model 只在模型接口不可用时兜底。" onClose={() => { setProviderModalOpen(false); setEditingProviderID(''); resetClaudeOAuthFlowState(); resetCursorOAuthFlowState(); }}>
           <div className="form-grid modal-form">
             <Field label="Provider 名称" value={providerDraft.name} onChange={(value) => setProviderDraft((current) => ({ ...current, name: value }))} />
-            <SelectField label="协议" values={fixedOutputLabels} value={protocolLabel(providerDraft.protocol)} onChange={(value) => setProviderDraft((current) => ({ ...current, protocol: protocolFromLabel(value), authType: 'api_key' }))} />
+            <SelectField
+              label="协议"
+              values={
+                providerDraft.authType === 'cursor_oauth'
+                  ? ['OpenAI Chat']
+                  : providerDraft.authType === 'claude_oauth'
+                    ? ['Claude']
+                    : fixedOutputLabels
+              }
+              value={protocolLabel(providerDraft.protocol)}
+              onChange={(value) => setProviderDraft((current) => ({
+                ...current,
+                protocol: protocolFromLabel(value),
+                // Switching protocol drops OAuth modes that are protocol-bound.
+                authType: 'api_key',
+              }))}
+            />
+            {providerDraft.authType === 'cursor_oauth' && (
+              <div className="hint-line">Cursor OAuth 上游固定为 OpenAI Chat（本地 bridge `/v1/chat/completions`）；客户端若要 Responses/Claude，请在路由输出协议里转换。</div>
+            )}
+            {providerDraft.authType === 'claude_oauth' && (
+              <div className="hint-line">Claude OAuth 上游固定为 Claude 协议。</div>
+            )}
             {providerDraft.protocol === 'claude' && (
               <SelectField
                 label="连接方式"
                 values={['API Key', '登录 Claude 账号 (OAuth)']}
                 value={providerDraft.authType === 'claude_oauth' ? '登录 Claude 账号 (OAuth)' : 'API Key'}
-                onChange={(value) => setProviderDraft((current) => ({ ...current, authType: value === '登录 Claude 账号 (OAuth)' ? 'claude_oauth' : 'api_key' }))}
+                onChange={(value) => setProviderDraft((current) => ({
+                  ...current,
+                  authType: value === '登录 Claude 账号 (OAuth)' ? 'claude_oauth' : 'api_key',
+                  protocol: value === '登录 Claude 账号 (OAuth)' ? 'claude' : current.protocol,
+                }))}
               />
             )}
             {providerDraft.protocol === 'openai_chat' && (
@@ -4444,7 +5096,11 @@ function App() {
                 label="连接方式"
                 values={['API Key', '登录 Cursor 账号 (OAuth)']}
                 value={providerDraft.authType === 'cursor_oauth' ? '登录 Cursor 账号 (OAuth)' : 'API Key'}
-                onChange={(value) => setProviderDraft((current) => ({ ...current, authType: value === '登录 Cursor 账号 (OAuth)' ? 'cursor_oauth' : 'api_key' }))}
+                onChange={(value) => setProviderDraft((current) => ({
+                  ...current,
+                  authType: value === '登录 Cursor 账号 (OAuth)' ? 'cursor_oauth' : 'api_key',
+                  protocol: value === '登录 Cursor 账号 (OAuth)' ? 'openai_chat' : current.protocol,
+                }))}
               />
             )}
             {!(providerDraft.protocol === 'claude' && providerDraft.authType === 'claude_oauth') && !(providerDraft.protocol === 'openai_chat' && providerDraft.authType === 'cursor_oauth') && (
@@ -4859,6 +5515,25 @@ function claudeUsageFillTone(utilization: number): string {
 // interval conservative so backgrounded / multi-provider UIs don't hammer
 // Anthropic / Cursor quota APIs.
 const OAUTH_USAGE_POLL_MS = 3 * 60_000;
+const OAUTH_USAGE_STORAGE_PREFIX = 'oauth-usage:';
+
+function readOAuthUsageCache<T>(path: string): T | null {
+  try {
+    const raw = sessionStorage.getItem(`${OAUTH_USAGE_STORAGE_PREFIX}${path}`);
+    if (!raw) return null;
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
+function writeOAuthUsageCache(path: string, data: unknown) {
+  try {
+    sessionStorage.setItem(`${OAUTH_USAGE_STORAGE_PREFIX}${path}`, JSON.stringify(data));
+  } catch {
+    // ignore quota / private mode
+  }
+}
 
 function usePageVisible() {
   const [visible, setVisible] = React.useState(() => typeof document === 'undefined' || document.visibilityState !== 'hidden');
@@ -4874,19 +5549,24 @@ function useOAuthUsageReport<T extends { available?: boolean; error?: string }>(
   enabled: boolean,
   path: string,
 ) {
-  const [report, setReport] = React.useState<T | null>(null);
+  const [report, setReport] = React.useState<T | null>(() => (enabled ? readOAuthUsageCache<T>(path) : null));
   const [loading, setLoading] = React.useState(false);
   const pageVisible = usePageVisible();
   const pathRef = React.useRef(path);
+  const reportRef = React.useRef(report);
   pathRef.current = path;
+  reportRef.current = report;
 
-  const load = React.useCallback(async (opts?: { force?: boolean; skipIfHidden?: boolean }) => {
+  const load = React.useCallback(async (opts?: { force?: boolean; skipIfHidden?: boolean; silent?: boolean }) => {
     const force = Boolean(opts?.force);
     const skipIfHidden = opts?.skipIfHidden !== false;
+    const silent = Boolean(opts?.silent);
     if (!force && skipIfHidden && typeof document !== 'undefined' && document.visibilityState === 'hidden') {
       return;
     }
-    setLoading(true);
+    if (!silent && (force || reportRef.current == null)) {
+      setLoading(true);
+    }
     try {
       const url = force ? `${API_BASE}${pathRef.current}?refresh=1` : `${API_BASE}${pathRef.current}`;
       const response = await fetch(url);
@@ -4895,12 +5575,19 @@ function useOAuthUsageReport<T extends { available?: boolean; error?: string }>(
       }
       const data = await response.json() as T;
       setReport(data);
+      writeOAuthUsageCache(pathRef.current, data);
     } catch (error) {
-      setReport({ available: false, error: error instanceof Error ? error.message : '无法获取额度' } as T);
+      if (reportRef.current == null) {
+        setReport({ available: false, error: error instanceof Error ? error.message : '无法获取额度' } as T);
+      }
     } finally {
-      setLoading(false);
+      if (!silent || force) {
+        setLoading(false);
+      }
     }
   }, []);
+
+  const hadCachedReportRef = React.useRef(report != null);
 
   React.useEffect(() => {
     if (!enabled) {
@@ -4908,17 +5595,17 @@ function useOAuthUsageReport<T extends { available?: boolean; error?: string }>(
       return undefined;
     }
     let cancelled = false;
-    const safeLoad = async (force = false) => {
+    const safeLoad = async (opts: { force?: boolean; skipIfHidden?: boolean; silent?: boolean }) => {
       if (cancelled) return;
-      await load({ force, skipIfHidden: !force });
+      await load(opts);
     };
 
     if (pageVisible) {
-      void safeLoad(false);
+      void safeLoad({ force: false, skipIfHidden: false, silent: hadCachedReportRef.current });
     }
     const timer = window.setInterval(() => {
       if (document.visibilityState === 'hidden') return;
-      void safeLoad(false);
+      void safeLoad({ force: false, skipIfHidden: true, silent: true });
     }, OAUTH_USAGE_POLL_MS);
 
     return () => {
@@ -4930,7 +5617,7 @@ function useOAuthUsageReport<T extends { available?: boolean; error?: string }>(
   return {
     report,
     loading,
-    refresh: () => load({ force: true, skipIfHidden: false }),
+    refresh: () => load({ force: true, skipIfHidden: false, silent: false }),
   };
 }
 
@@ -5114,6 +5801,7 @@ function ApiKeyDetailPanel({
   onDelete,
   onClone,
   onRefreshModels,
+  onToast,
 }: {
   keyItem: APIKey;
   providers: Provider[];
@@ -5131,10 +5819,18 @@ function ApiKeyDetailPanel({
   onDelete: (key: APIKey) => Promise<void>;
   onClone: (key: APIKey) => void;
   onRefreshModels: (providerId: string, providerName: string) => Promise<void>;
+  onToast?: (message: string) => void;
 }) {
   const { route, binding, routeProvider, bindingAction } = getApiKeyBinding(keyItem, routes, providers);
   const modelOptions = routeProvider ? models.filter((model) => model.providerId === routeProvider.id) : [];
-  const apiKeyClientURL = route ? apiKeyClientBaseURL(route, endpoints, tunnelRunning ? livePublicURL : '') : '';
+  const publicAvailable = Boolean(tunnelRunning && livePublicURL);
+  const defaultPublicBase = publicAvailable ? livePublicURL : '';
+  const apiKeyClientURL = route ? apiKeyClientBaseURL(route, endpoints, defaultPublicBase) : '';
+  const [clientConfigModal, setClientConfigModal] = React.useState<'opencode' | 'codex' | 'claude' | null>(null);
+
+  function openClientConfigModal(client: 'opencode' | 'codex' | 'claude') {
+    setClientConfigModal(client);
+  }
 
   return (
     <div className="api-keys-detail card">
@@ -5225,6 +5921,37 @@ function ApiKeyDetailPanel({
           onSave={(modelAliases) => onUpdateModelAliases(keyItem, modelAliases)}
         />
       </div>
+
+      <div className="api-key-client-configs">
+        <div className="field-label-row">
+          <label>一键复制客户端配置</label>
+        </div>
+        <div className="hint-line">
+          点击后复制到剪贴板，并弹窗预览配置路径与内容；可在弹窗内切换内网 / 公网域名。
+        </div>
+        <div className="api-key-client-config-actions">
+          <button className="btn client-config-btn" type="button" disabled={!route} onClick={() => openClientConfigModal('opencode')}>
+            复制 OpenCode 配置
+          </button>
+          <button className="btn client-config-btn" type="button" disabled={!route} onClick={() => openClientConfigModal('codex')}>
+            复制 Codex 配置
+          </button>
+          <button className="btn client-config-btn" type="button" disabled={!route} onClick={() => openClientConfigModal('claude')}>
+            复制 Claude 配置
+          </button>
+        </div>
+        {route ? (
+          <div className="hint-line">
+            当前输出协议：{protocolLabel(route.outputProtocol)}。
+            {[
+              clientConfigProtocolHint('opencode', route),
+              clientConfigProtocolHint('codex', route),
+              clientConfigProtocolHint('claude', route),
+            ].filter(Boolean).join(' ')}
+          </div>
+        ) : null}
+      </div>
+
       {route ? (
         <div className="api-key-call-example">
           <div className="field-label-row">
@@ -5239,7 +5966,149 @@ function ApiKeyDetailPanel({
           <pre className="curl-preview">{buildApiKeyPublicCurl(keyItem, route, endpoints, livePublicURL, routeProvider)}</pre>
         </div>
       ) : null}
+
+      {clientConfigModal && route ? (
+        <ApiKeyClientConfigModal
+          client={clientConfigModal}
+          keyItem={keyItem}
+          route={route}
+          provider={routeProvider}
+          endpoints={endpoints}
+          lanRoot={localGatewayRoot(endpoints)}
+          publicBase={livePublicURL}
+          publicAvailable={publicAvailable}
+          onClose={() => setClientConfigModal(null)}
+          onToast={onToast}
+        />
+      ) : null}
     </div>
+  );
+}
+
+function ApiKeyClientConfigModal({
+  client,
+  keyItem,
+  route,
+  provider,
+  endpoints,
+  lanRoot,
+  publicBase,
+  publicAvailable,
+  onClose,
+  onToast,
+}: {
+  client: 'opencode' | 'codex' | 'claude';
+  keyItem: APIKey;
+  route: Route;
+  provider?: Provider;
+  endpoints: OutputEndpoint[];
+  lanRoot: string;
+  publicBase: string;
+  publicAvailable: boolean;
+  onClose: () => void;
+  onToast?: (message: string) => void;
+}) {
+  const [networkMode, setNetworkMode] = React.useState<'lan' | 'public'>(publicAvailable ? 'public' : 'lan');
+  const effectivePublicBase = networkMode === 'public' && publicAvailable ? publicBase : '';
+  const configText = React.useMemo(
+    () => buildApiKeyClientConfig(client, keyItem, route, endpoints, effectivePublicBase, provider),
+    [client, keyItem, route, endpoints, effectivePublicBase, provider],
+  );
+  const filePath = clientConfigFilePath(client);
+  const gatewayRoot = apiKeyGatewayRoot(endpoints, effectivePublicBase);
+  const protocolHint = clientConfigProtocolHint(client, route);
+
+  const copyConfig = React.useCallback((text: string, message: string) => {
+    void navigator.clipboard.writeText(text).then(() => {
+      onToast?.(message);
+    });
+  }, [onToast]);
+
+  React.useEffect(() => {
+    const modeLabel = networkMode === 'public' ? '公网域名' : '内网';
+    copyConfig(configText, `已复制 ${clientConfigTitle(client)}（${modeLabel}）`);
+    // 仅打开弹窗时自动复制一次；切换网络时由按钮自行复制
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  React.useEffect(() => {
+    if (!publicAvailable && networkMode === 'public') {
+      setNetworkMode('lan');
+    }
+  }, [publicAvailable, networkMode]);
+
+  return (
+    <Modal
+      title={clientConfigTitle(client)}
+      description="已复制到剪贴板。可切换内网 / 公网域名后再次复制。"
+      onClose={onClose}
+      size="wide"
+    >
+      <div className="api-key-client-config-modal">
+        <div className="field">
+          <label>配置文件路径</label>
+          <div className="field-inline">
+            <div className="field-readonly code">{filePath}</div>
+            <CopyButton value={filePath} label="复制路径" />
+          </div>
+        </div>
+
+        <div className="field">
+          <label>网关地址</label>
+          <div className="api-key-network-toggle" role="group" aria-label="网关地址类型">
+            <button
+              className={`mini-btn${networkMode === 'lan' ? ' active' : ''}`}
+              type="button"
+              onClick={() => {
+                setNetworkMode('lan');
+                const next = buildApiKeyClientConfig(client, keyItem, route, endpoints, '', provider);
+                copyConfig(next, `已复制 ${clientConfigTitle(client)}（内网）`);
+              }}
+            >
+              内网
+            </button>
+            <button
+              className={`mini-btn${networkMode === 'public' ? ' active' : ''}`}
+              type="button"
+              disabled={!publicAvailable}
+              title={publicAvailable ? publicBase : '未开启公网域名 / 隧道'}
+              onClick={() => {
+                if (!publicAvailable) return;
+                setNetworkMode('public');
+                const next = buildApiKeyClientConfig(client, keyItem, route, endpoints, publicBase, provider);
+                copyConfig(next, `已复制 ${clientConfigTitle(client)}（公网域名）`);
+              }}
+            >
+              公网域名
+            </button>
+          </div>
+          <div className="hint-line">
+            当前根地址：{gatewayRoot}
+            {!publicAvailable ? ' · 公网域名不可用（请先在「公网访问」开启隧道/域名）' : ''}
+          </div>
+        </div>
+
+        {protocolHint ? <div className="hint-line error">{protocolHint}</div> : null}
+
+        <div className="field">
+          <div className="field-label-row">
+            <label>配置内容预览</label>
+            <CopyButton value={configText} label="再次复制" />
+          </div>
+          <pre className="curl-preview api-key-client-config-preview">{configText}</pre>
+        </div>
+      </div>
+      <div className="actions modal-actions">
+        <button className="btn" type="button" onClick={onClose}>关闭</button>
+        <button
+          className="btn primary"
+          type="button"
+          onClick={() => copyConfig(configText, `已复制 ${clientConfigTitle(client)}`)}
+        >
+          复制配置
+        </button>
+      </div>
+    </Modal>
   );
 }
 
@@ -5502,6 +6371,172 @@ function ApiKeyModelMappingControl({
   );
 }
 
+type SearchableModelOption = { id: string; label: string };
+
+function filterModelOptions(models: Model[], queryRaw: string): SearchableModelOption[] {
+  const needle = queryRaw.trim().toLowerCase();
+  const options = models.map((model) => ({ id: model.id, label: model.id }));
+  if (!needle) return options;
+  return options.filter((option) => option.label.toLowerCase().includes(needle));
+}
+
+function SearchableModelSelect({
+  value,
+  models,
+  disabled,
+  emptyLabel,
+  onChange,
+}: {
+  value: string;
+  models: Model[];
+  disabled?: boolean;
+  emptyLabel: string;
+  onChange: (value: string) => void;
+}) {
+  const rootRef = React.useRef<HTMLDivElement | null>(null);
+  const inputRef = React.useRef<HTMLInputElement | null>(null);
+  const listRef = React.useRef<HTMLDivElement | null>(null);
+  const [open, setOpen] = React.useState(false);
+  const [query, setQuery] = React.useState('');
+  const [highlight, setHighlight] = React.useState(0);
+
+  const filtered = React.useMemo(() => filterModelOptions(models, query), [models, query]);
+  const options = React.useMemo<SearchableModelOption[]>(() => {
+    const empty: SearchableModelOption = { id: '', label: emptyLabel };
+    if (!query.trim()) return [empty, ...filtered];
+    const matchedEmpty = emptyLabel.toLowerCase().includes(query.trim().toLowerCase());
+    return matchedEmpty ? [empty, ...filtered] : filtered;
+  }, [emptyLabel, filtered, query]);
+
+  const displayLabel = value || emptyLabel;
+
+  const close = React.useCallback(() => {
+    setOpen(false);
+    setQuery('');
+    setHighlight(0);
+  }, []);
+
+  const selectOption = React.useCallback((next: string) => {
+    onChange(next);
+    close();
+  }, [close, onChange]);
+
+  React.useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) close();
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    return () => document.removeEventListener('mousedown', onPointerDown);
+  }, [close, open]);
+
+  React.useEffect(() => {
+    if (!open) return;
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  }, [open]);
+
+  React.useEffect(() => {
+    setHighlight(0);
+  }, [query, open]);
+
+  React.useEffect(() => {
+    if (!open || !listRef.current) return;
+    const active = listRef.current.querySelector<HTMLElement>('[data-active="true"]');
+    active?.scrollIntoView({ block: 'nearest' });
+  }, [highlight, open, options]);
+
+  const onKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      if (!open) {
+        setOpen(true);
+        return;
+      }
+      setHighlight((prev) => (options.length === 0 ? 0 : (prev + 1) % options.length));
+      return;
+    }
+    if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (!open) {
+        setOpen(true);
+        return;
+      }
+      setHighlight((prev) => (options.length === 0 ? 0 : (prev - 1 + options.length) % options.length));
+      return;
+    }
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      if (!open) {
+        setOpen(true);
+        return;
+      }
+      const option = options[highlight];
+      if (option) selectOption(option.id);
+      return;
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      close();
+    }
+  };
+
+  return (
+    <div className={`searchable-select${open ? ' open' : ''}`} ref={rootRef}>
+      <input
+        ref={inputRef}
+        className="searchable-select-input"
+        type="text"
+        role="combobox"
+        aria-expanded={open}
+        aria-autocomplete="list"
+        aria-controls="searchable-model-list"
+        disabled={disabled}
+        value={open ? query : displayLabel}
+        placeholder={open ? '输入关键字筛选模型…' : emptyLabel}
+        onFocus={() => {
+          if (disabled) return;
+          setOpen(true);
+          setQuery('');
+        }}
+        onClick={() => {
+          if (disabled) return;
+          setOpen(true);
+          setQuery('');
+        }}
+        onChange={(event) => {
+          setOpen(true);
+          setQuery(event.target.value);
+        }}
+        onKeyDown={onKeyDown}
+      />
+      {open ? (
+        <div className="searchable-select-menu" id="searchable-model-list" role="listbox" ref={listRef}>
+          {options.length === 0 ? (
+            <div className="searchable-select-empty">无匹配模型</div>
+          ) : options.map((option, index) => (
+            <button
+              key={option.id || '__empty__'}
+              type="button"
+              role="option"
+              aria-selected={option.id === value}
+              data-active={index === highlight ? 'true' : 'false'}
+              className={`searchable-select-option${option.id === value ? ' selected' : ''}${index === highlight ? ' active' : ''}`}
+              onMouseEnter={() => setHighlight(index)}
+              onMouseDown={(event) => {
+                event.preventDefault();
+                selectOption(option.id);
+              }}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function ApiKeyFixedModelField({
   value,
   models,
@@ -5521,15 +6556,21 @@ function ApiKeyFixedModelField({
     <div className="field">
       <label>固定模型替换</label>
       <div className="field-inline">
-        <select value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)}>
-          <option value="">（不替换，使用请求体 model）</option>
-          {models.map((model) => <option key={model.id} value={model.id}>{model.id}</option>)}
-        </select>
+        <SearchableModelSelect
+          value={value}
+          models={models}
+          disabled={disabled}
+          emptyLabel="（不替换，使用请求体 model）"
+          onChange={onChange}
+        />
         <button className="mini-btn" type="button" disabled={disabled || refreshing} onClick={onRefresh} title="从绑定路由的 Provider 重新获取模型列表">
           {refreshing ? '刷新中…' : '刷新模型'}
         </button>
       </div>
-      <div className="hint-line">设置后将忽略请求体中的 model，统一替换为所选模型。</div>
+      <div className="hint-line">
+        设置后将忽略请求体中的 model，统一替换为所选模型。
+        {models.length > 0 ? ` · 共 ${models.length} 个，点开后输入关键字筛选` : ''}
+      </div>
     </div>
   );
 }

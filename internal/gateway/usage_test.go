@@ -58,7 +58,44 @@ data: [DONE]
 func TestParseOpenAIUsageFromJSONWithCachedTokensDetails(t *testing.T) {
 	body := []byte(`{"usage":{"prompt_tokens":200,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":150}}}`)
 	usage := ParseOpenAIUsage(body)
+	if usage.InputTokens != 200 {
+		t.Fatalf("expected inclusive input tokens: %d", usage.InputTokens)
+	}
 	if usage.CacheTokens != 150 {
 		t.Fatalf("unexpected cache tokens: %d", usage.CacheTokens)
+	}
+}
+
+func TestParseOpenAIUsageExclusivePromptTokens(t *testing.T) {
+	body := []byte(`{"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_cache_hit_tokens":96,"prompt_cache_miss_tokens":4}}`)
+	usage := ParseOpenAIUsage(body)
+	if usage.InputTokens != 100 {
+		t.Fatalf("expected inclusive input from miss+cache, got %d", usage.InputTokens)
+	}
+	if usage.CacheTokens != 96 {
+		t.Fatalf("unexpected cache tokens: %d", usage.CacheTokens)
+	}
+}
+
+func TestParseOpenAIUsageExclusivePromptWithoutMiss(t *testing.T) {
+	body := []byte(`{"usage":{"prompt_tokens":17900000,"completion_tokens":1,"prompt_cache_hit_tokens":188800000}}`)
+	usage := ParseOpenAIUsage(body)
+	if usage.InputTokens != 17900000+188800000 {
+		t.Fatalf("expected prompt+cache inclusive input, got %d", usage.InputTokens)
+	}
+	if usage.CacheTokens != 188800000 {
+		t.Fatalf("unexpected cache tokens: %d", usage.CacheTokens)
+	}
+}
+
+func TestNormalizeInclusiveInputTokens(t *testing.T) {
+	if got := normalizeInclusiveInputTokens(120, 96, 0, 0); got != 120 {
+		t.Fatalf("expected inclusive prompt to stay %d, got %d", 120, got)
+	}
+	if got := normalizeInclusiveInputTokens(10, 96, 0, 4); got != 100 {
+		t.Fatalf("expected miss+cache total 100, got %d", got)
+	}
+	if got := normalizeInclusiveInputTokens(678, 9218, 0, 0); got != 678+9218 {
+		t.Fatalf("expected exclusive prompt+cache, got %d", got)
 	}
 }

@@ -18,9 +18,9 @@ type RequestLog struct {
 	ProtocolFlow     string    `json:"protocolFlow"`
 	Path             string    `json:"path"`
 	Status           int       `json:"status"`
-	InputTokens      int64     `json:"inputTokens"`
+	InputTokens      int64     `json:"inputTokens"`  // prompt total (inclusive of cache)
 	OutputTokens     int64     `json:"outputTokens"`
-	CacheTokens      int64     `json:"cacheTokens"`
+	CacheTokens      int64     `json:"cacheTokens"`  // cache-read/hit portion only
 	LatencyMillis    int64     `json:"latencyMs"`
 	TTFTMillis       int64     `json:"ttftMs,omitempty"`
 	ClientHost       string    `json:"clientHost,omitempty"`
@@ -38,12 +38,13 @@ const (
 
 // RequestLogQuery filters and pages request logs.
 type RequestLogQuery struct {
-	From       time.Time
-	To         time.Time
-	Status     string // all | 2xx | 4xx | 5xx
-	APIKeyName string // substring match against api_key_name (case-insensitive)
-	Page       int
-	PageSize   int
+	From          time.Time
+	To            time.Time
+	Status        string // all | 2xx | 4xx | 5xx
+	APIKeyName    string // substring match against api_key_name (case-insensitive)
+	Page          int
+	PageSize      int
+	IncludeBodies bool // list views should omit heavy request/response bodies
 }
 
 type RequestLogPage struct {
@@ -52,6 +53,8 @@ type RequestLogPage struct {
 	Page  int          `json:"page"`
 }
 
+// APIKeyDayStats aggregates token usage. InputTokens is prompt total (inclusive
+// of cache); CacheTokens is cache-read only. UI "in" = InputTokens - CacheTokens.
 type APIKeyDayStats struct {
 	APIKeyID     string `json:"apiKeyId"`
 	APIKeyName   string `json:"apiKeyName"`
@@ -69,12 +72,22 @@ type ProviderDayStats struct {
 	CacheTokens  int64  `json:"cacheTokens"`
 }
 
+// ModelDayStats aggregates request/token usage for one model id.
+type ModelDayStats struct {
+	Model        string `json:"model"`
+	RequestCount int64  `json:"requestCount"`
+	InputTokens  int64  `json:"inputTokens"`
+	OutputTokens int64  `json:"outputTokens"`
+	CacheTokens  int64  `json:"cacheTokens"`
+}
+
 type TodayStatsSnapshot struct {
 	Date        string             `json:"date"`
 	Total       APIKeyDayStats     `json:"total"`
 	LastRequest *RequestLog        `json:"lastRequest,omitempty"`
 	ByAPIKey    []APIKeyDayStats   `json:"byApiKey"`
 	ByProvider  []ProviderDayStats `json:"byProvider"`
+	ByModel     []ModelDayStats    `json:"byModel"`
 }
 
 type PeriodStatsSnapshot struct {
@@ -82,6 +95,7 @@ type PeriodStatsSnapshot struct {
 	Total      APIKeyDayStats     `json:"total"`
 	ByAPIKey   []APIKeyDayStats   `json:"byApiKey"`
 	ByProvider []ProviderDayStats `json:"byProvider"`
+	ByModel    []ModelDayStats    `json:"byModel"`
 }
 
 type DailyRequestPoint struct {
@@ -117,14 +131,66 @@ type AppLog struct {
 }
 
 type Store struct {
-	mu       sync.RWMutex
-	logs     []RequestLog
-	appLogs  []AppLog
-	logLevel string
+	mu               sync.RWMutex
+	logs             []RequestLog
+	appLogs          []AppLog
+	logLevel         string
+	usageByDay       map[string]*usageDayStats
+	lastUsageRequest *RequestLog
+	usageEvents      chan UsageEvent
+	usageOnce        sync.Once
+	usageDailyStore  UsageDailyStore
 }
 
 func NewStore() *Store {
-	return &Store{logs: make([]RequestLog, 0, 256), appLogs: make([]AppLog, 0, 256), logLevel: "info"}
+	return &Store{
+		logs:       make([]RequestLog, 0, 256),
+		appLogs:    make([]AppLog, 0, 256),
+		logLevel:   "info",
+		usageByDay: make(map[string]*usageDayStats),
+	}
+}
+
+// SetUsageDailyStore wires SQLite persistence for daily usage aggregates.
+func (s *Store) SetUsageDailyStore(store UsageDailyStore) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.usageDailyStore = store
+}
+
+// BootstrapUsageDays loads persisted daily aggregates into memory at startup.
+func (s *Store) BootstrapUsageDays(days map[string]UsageDayBuckets, last *RequestLog) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for dayKey, buckets := range days {
+		day := newUsageDayStats()
+		day.total = buckets.Total
+		day.total.APIKeyName = "全部"
+		day.status2xx = buckets.Status2xx
+		day.status4xx = buckets.Status4xx
+		day.status5xx = buckets.Status5xx
+		day.statusOther = buckets.StatusOther
+		day.latencySum = buckets.LatencySum
+		day.ttftSum = buckets.TTFTSum
+		day.ttftCount = buckets.TTFTCount
+		for id, stats := range buckets.ByAPIKey {
+			copied := stats
+			day.byAPIKey[id] = &copied
+		}
+		for id, stats := range buckets.ByProvider {
+			copied := stats
+			day.byProvider[id] = &copied
+		}
+		for id, stats := range buckets.ByModel {
+			copied := stats
+			day.byModel[id] = &copied
+		}
+		s.usageByDay[dayKey] = day
+	}
+	if last != nil {
+		copied := *last
+		s.lastUsageRequest = &copied
+	}
 }
 
 const memoryLogCap = 50000
@@ -257,6 +323,103 @@ func aggregateByProvider(logs []RequestLog, since time.Time) []ProviderDayStats 
 	return out
 }
 
+func modelUsageTotalTokens(stats ModelDayStats) int64 {
+	return stats.InputTokens + stats.OutputTokens
+}
+
+// NormalizeModelForStats returns a real upstream model id suitable for usage
+// counters. Placeholders and unresolved aliases are rejected.
+func NormalizeModelForStats(raw string) (string, bool) {
+	model := CanonicalModelForUsage(raw)
+	if model == "" || model == "_unknown" {
+		return "", false
+	}
+	switch strings.ToLower(model) {
+	case "your-model", "request-model-not-set":
+		return "", false
+	}
+	return model, true
+}
+
+func sortModelDayStats(byModel map[string]*ModelDayStats) []ModelDayStats {
+	out := make([]ModelDayStats, 0, len(byModel))
+	for _, stats := range byModel {
+		out = append(out, *stats)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		ti, tj := modelUsageTotalTokens(out[i]), modelUsageTotalTokens(out[j])
+		if ti == tj {
+			if out[i].RequestCount == out[j].RequestCount {
+				return out[i].Model < out[j].Model
+			}
+			return out[i].RequestCount > out[j].RequestCount
+		}
+		return ti > tj
+	})
+	return out
+}
+
+// CanonicalModelForUsage returns the upstream/real model id for ranking.
+// Historical logs may store "alias -> real-model"; prefer the real side.
+func CanonicalModelForUsage(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "_unknown"
+	}
+	if left, right, ok := strings.Cut(raw, "->"); ok {
+		if real := strings.TrimSpace(right); real != "" {
+			return real
+		}
+		if alias := strings.TrimSpace(left); alias != "" {
+			return alias
+		}
+	}
+	return raw
+}
+
+// aggregateByModel ranks models by total token usage (input+output+cache),
+// then by request count, then by model name. Alias forms are collapsed onto
+// the resolved real model name. Empty / unknown model rows are omitted.
+func aggregateByModel(logs []RequestLog, since time.Time) []ModelDayStats {
+	byModel := map[string]*ModelDayStats{}
+
+	for index := range logs {
+		log := logs[index]
+		if log.Time.Before(since) {
+			continue
+		}
+		model := CanonicalModelForUsage(log.Model)
+		if model == "" || model == "_unknown" {
+			continue
+		}
+		stats, ok := byModel[model]
+		if !ok {
+			stats = &ModelDayStats{Model: model}
+			byModel[model] = stats
+		}
+		stats.RequestCount++
+		stats.InputTokens += log.InputTokens
+		stats.OutputTokens += log.OutputTokens
+		stats.CacheTokens += log.CacheTokens
+	}
+
+	out := make([]ModelDayStats, 0, len(byModel))
+	for _, stats := range byModel {
+		out = append(out, *stats)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		ti, tj := modelUsageTotalTokens(out[i]), modelUsageTotalTokens(out[j])
+		if ti == tj {
+			if out[i].RequestCount == out[j].RequestCount {
+				return out[i].Model < out[j].Model
+			}
+			return out[i].RequestCount > out[j].RequestCount
+		}
+		return ti > tj
+	})
+	return out
+}
+
 func aggregateLogsSince(logs []RequestLog, since time.Time, periodLabel string) PeriodStatsSnapshot {
 	total := APIKeyDayStats{APIKeyName: "全部"}
 	byKey := map[string]*APIKeyDayStats{}
@@ -307,23 +470,17 @@ func aggregateLogsSince(logs []RequestLog, since time.Time, periodLabel string) 
 	}
 }
 
-func (s *Store) PeriodStats(logs []RequestLog, now time.Time, since time.Time, periodLabel string) PeriodStatsSnapshot {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	source := logs
-	if len(source) == 0 {
-		source = s.logs
-	}
-	return aggregateLogsSince(source, since, periodLabel)
+func (s *Store) PeriodStats(now time.Time, since time.Time, periodLabel string) PeriodStatsSnapshot {
+	return s.periodStatsSince(since, periodLabel)
 }
 
-func (s *Store) UsageStats(logs []RequestLog, now time.Time) UsageStatsSnapshot {
+func (s *Store) UsageStats(now time.Time) UsageStatsSnapshot {
 	localNow := now.Local()
 	dayStart := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, localNow.Location())
-	return s.UsageStatsRange(logs, now, dayStart, dayStart.Add(24*time.Hour))
+	return s.UsageStatsRange(now, dayStart, dayStart.Add(24*time.Hour))
 }
 
-func (s *Store) UsageStatsRange(logs []RequestLog, now time.Time, from, to time.Time) UsageStatsSnapshot {
+func (s *Store) UsageStatsRange(now time.Time, from, to time.Time) UsageStatsSnapshot {
 	localNow := now.Local()
 	dayStart := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, localNow.Location())
 	monthStart := time.Date(localNow.Year(), localNow.Month(), 1, 0, 0, 0, 0, localNow.Location())
@@ -335,23 +492,19 @@ func (s *Store) UsageStatsRange(logs []RequestLog, now time.Time, from, to time.
 	}
 
 	s.mu.RLock()
-	source := logs
-	if len(source) == 0 {
-		source = s.logs
-	}
-	s.mu.RUnlock()
+	defer s.mu.RUnlock()
 
-	today := s.TodayStatsFromLogs(source, now)
-	month := aggregateLogsSince(source, monthStart, monthStart.Format("2006-01"))
-	rangeStats := aggregateLogsInRange(source, from, to, from.Format("2006-01-02")+" ~ "+to.Add(-time.Nanosecond).Format("2006-01-02"))
+	today := s.todayStatsFromCountersLocked(dayStart)
+	month := s.periodStatsSinceLocked(monthStart, monthStart.Format("2006-01"))
+	rangeStats := s.periodStatsInRangeLocked(from, to, from.Format("2006-01-02")+" ~ "+to.Add(-time.Nanosecond).Format("2006-01-02"))
 	return UsageStatsSnapshot{
 		Today:  today,
 		Month:  month,
 		Range:  &rangeStats,
 		From:   from.Format(time.RFC3339),
 		To:     to.Format(time.RFC3339),
-		Daily:  aggregateDaily(source, from, to),
-		Status: aggregateStatus(source, from, to),
+		Daily:  s.dailyStatsInRangeLocked(from, to),
+		Status: s.statusStatsInRangeLocked(from, to),
 	}
 }
 
@@ -536,9 +689,7 @@ func (s *Store) TodayStatsFromLogs(logs []RequestLog, now time.Time) TodayStatsS
 }
 
 func (s *Store) TodayStats(now time.Time) TodayStatsSnapshot {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.TodayStatsFromLogs(s.logs, now)
+	return s.todayStatsFromCounters(now)
 }
 
 func (s *Store) AddApp(level string, message string, context string) {

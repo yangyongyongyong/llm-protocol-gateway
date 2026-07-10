@@ -173,6 +173,7 @@ func (rt *Runtime) Start(cfg Config) error {
 	if err := db.PruneRequestLogs(retentionDays); err != nil {
 		slog.Warn("request log prune failed", "error", err)
 	}
+	logs.PruneUsageStatsBefore(time.Now().AddDate(0, 0, -retentionDays))
 	if persisted, err := db.ListRequestLogs(1000); err != nil {
 		slog.Warn("request log restore failed", "error", err)
 	} else if len(persisted) > 0 {
@@ -263,6 +264,9 @@ func (rt *Runtime) Start(cfg Config) error {
 		time.Sleep(300 * time.Millisecond)
 		server.RestorePublicAccess()
 		server.SyncConnectedCursorProvidersWithEmptyModels()
+		server.RebuildUsageStats()
+		server.StartOAuthUsageBackgroundRefresh(context.Background())
+		server.StartCursorModelBackgroundRefresh(context.Background())
 	}()
 
 	rt.started = true

@@ -127,33 +127,63 @@ func contentBlocksFromAny(content any) []any {
 	}
 }
 
+func emptyClaudeToolInputSchema() map[string]any {
+	return map[string]any{"type": "object", "properties": map[string]any{}}
+}
+
+func claudeToolInputSchema(values ...any) any {
+	for _, value := range values {
+		if value == nil {
+			continue
+		}
+		return value
+	}
+	return emptyClaudeToolInputSchema()
+}
+
 func openAIToolToClaude(tool map[string]any) map[string]any {
 	toolType := strings.TrimSpace(stringValue(tool["type"]))
 	if toolType == "" {
 		toolType = "function"
 	}
+
+	// Chat Completions nested function tool: {type:"function", function:{name,parameters}}
 	if toolType == "function" {
-		functionValue, _ := tool["function"].(map[string]any)
-		claudeTool := map[string]any{"name": stringValue(functionValue["name"])}
-		if description := stringValue(functionValue["description"]); description != "" {
+		if functionValue, ok := tool["function"].(map[string]any); ok {
+			claudeTool := map[string]any{"name": stringValue(functionValue["name"])}
+			if description := stringValue(functionValue["description"]); description != "" {
+				claudeTool["description"] = description
+			}
+			claudeTool["input_schema"] = claudeToolInputSchema(functionValue["parameters"], functionValue["input_schema"])
+			return claudeTool
+		}
+		// Responses API flat function tool: {type:"function", name, parameters}
+		claudeTool := map[string]any{"name": stringValue(tool["name"])}
+		if description := stringValue(tool["description"]); description != "" {
 			claudeTool["description"] = description
 		}
-		if parameters := functionValue["parameters"]; parameters != nil {
-			claudeTool["input_schema"] = parameters
-		} else {
-			claudeTool["input_schema"] = map[string]any{"type": "object", "properties": map[string]any{}}
-		}
+		claudeTool["input_schema"] = claudeToolInputSchema(tool["parameters"], tool["input_schema"])
 		return claudeTool
 	}
-	claudeTool := map[string]any{"name": stringValue(tool["name"])}
-	if description := stringValue(tool["description"]); description != "" {
+
+	// Responses/Claude custom tools may be flat or nested under "custom".
+	name := stringValue(tool["name"])
+	description := stringValue(tool["description"])
+	schemaCandidates := []any{tool["input_schema"], tool["parameters"]}
+	if customValue, ok := tool["custom"].(map[string]any); ok {
+		if name == "" {
+			name = stringValue(customValue["name"])
+		}
+		if description == "" {
+			description = stringValue(customValue["description"])
+		}
+		schemaCandidates = append(schemaCandidates, customValue["input_schema"], customValue["parameters"])
+	}
+	claudeTool := map[string]any{"name": name}
+	if description != "" {
 		claudeTool["description"] = description
 	}
-	if schema := tool["input_schema"]; schema != nil {
-		claudeTool["input_schema"] = schema
-	} else if parameters := tool["parameters"]; parameters != nil {
-		claudeTool["input_schema"] = parameters
-	}
+	claudeTool["input_schema"] = claudeToolInputSchema(schemaCandidates...)
 	return claudeTool
 }
 
@@ -170,6 +200,129 @@ func claudeToolToOpenAI(tool map[string]any) map[string]any {
 		functionValue["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}}
 	}
 	return map[string]any{"type": "function", "function": functionValue}
+}
+
+// responsesToolToOpenAIChat normalizes a Responses API tool into Chat Completions
+// form ({type:"function", function:{name,parameters}}). Built-in Responses tools
+// without a client-callable name (web_search, file_search, ...) are dropped —
+// Chat providers like BigModel/Z.AI only accept type=function.
+func responsesToolToOpenAIChat(tool map[string]any) map[string]any {
+	if tool == nil {
+		return nil
+	}
+	// Already Chat Completions nested form.
+	if functionValue, ok := tool["function"].(map[string]any); ok {
+		name := stringValue(functionValue["name"])
+		if name == "" {
+			return nil
+		}
+		fn := map[string]any{"name": name}
+		if description := stringValue(functionValue["description"]); description != "" {
+			fn["description"] = description
+		}
+		fn["parameters"] = claudeToolInputSchema(functionValue["parameters"], functionValue["input_schema"])
+		return map[string]any{"type": "function", "function": fn}
+	}
+
+	toolType := strings.TrimSpace(strings.ToLower(stringValue(tool["type"])))
+	switch toolType {
+	case "", "function", "custom":
+		name := stringValue(tool["name"])
+		description := stringValue(tool["description"])
+		schemaCandidates := []any{tool["parameters"], tool["input_schema"]}
+		if customValue, ok := tool["custom"].(map[string]any); ok {
+			if name == "" {
+				name = stringValue(customValue["name"])
+			}
+			if description == "" {
+				description = stringValue(customValue["description"])
+			}
+			schemaCandidates = append(schemaCandidates, customValue["parameters"], customValue["input_schema"])
+		}
+		if name == "" {
+			return nil
+		}
+		fn := map[string]any{"name": name}
+		if description != "" {
+			fn["description"] = description
+		}
+		fn["parameters"] = claudeToolInputSchema(schemaCandidates...)
+		return map[string]any{"type": "function", "function": fn}
+	default:
+		return nil
+	}
+}
+
+func responsesToolsToOpenAIChat(tools []any) []any {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]any, 0, len(tools))
+	for _, item := range tools {
+		tool, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if converted := responsesToolToOpenAIChat(tool); converted != nil {
+			out = append(out, converted)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// responsesToolChoiceToOpenAIChat maps Responses tool_choice into Chat Completions.
+func responsesToolChoiceToOpenAIChat(choice any) any {
+	switch typed := choice.(type) {
+	case string:
+		return typed
+	case map[string]any:
+		choiceType := strings.TrimSpace(strings.ToLower(stringValue(typed["type"])))
+		switch choiceType {
+		case "auto", "none", "required":
+			return choiceType
+		case "function":
+			if functionValue, ok := typed["function"].(map[string]any); ok {
+				if name := stringValue(functionValue["name"]); name != "" {
+					return map[string]any{
+						"type":     "function",
+						"function": map[string]any{"name": name},
+					}
+				}
+			}
+			if name := stringValue(typed["name"]); name != "" {
+				return map[string]any{
+					"type":     "function",
+					"function": map[string]any{"name": name},
+				}
+			}
+		case "custom", "tool":
+			if name := stringValue(typed["name"]); name != "" {
+				return map[string]any{
+					"type":     "function",
+					"function": map[string]any{"name": name},
+				}
+			}
+		}
+		return cloneAnyMap(typed)
+	default:
+		return nil
+	}
+}
+
+func copyResponsesToolsToChat(source map[string]any, target map[string]any) {
+	if rawTools, exists := source["tools"]; exists {
+		if converted := responsesToolsToOpenAIChat(asMapSlice(rawTools)); len(converted) > 0 {
+			target["tools"] = converted
+		}
+	}
+	if rawChoice, exists := source["tool_choice"]; exists {
+		if converted := responsesToolChoiceToOpenAIChat(rawChoice); converted != nil {
+			target["tool_choice"] = converted
+		}
+	}
 }
 
 func openAIToolsToClaude(tools []any) []any {

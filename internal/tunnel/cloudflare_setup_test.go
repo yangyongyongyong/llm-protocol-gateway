@@ -60,8 +60,6 @@ func TestEnsureTunnelRecreatesWhenCredentialsMissing(t *testing.T) {
 		joined := strings.Join(args, " ")
 		calls = append(calls, joined)
 		switch {
-		case joined == "tunnel create llm-protocol-gateway" && len(calls) == 1:
-			return "", fmt.Errorf("tunnel with name already exists")
 		case joined == "tunnel list":
 			return "ID                                   NAME                 CREATED\n" +
 				"ff2f197e-d383-40f7-9fc8-50772d7e9c26 llm-protocol-gateway 2026-07-08T08:55:14Z\n", nil
@@ -83,8 +81,69 @@ func TestEnsureTunnelRecreatesWhenCredentialsMissing(t *testing.T) {
 	if cred != newCred {
 		t.Fatalf("cred=%q", cred)
 	}
-	if len(calls) != 4 {
+	if len(calls) != 3 {
 		t.Fatalf("calls=%v", calls)
+	}
+}
+
+func TestEnsureTunnelReusesExistingCredentials(t *testing.T) {
+	tmp := t.TempDir()
+	tunnelID := "ff2f197e-d383-40f7-9fc8-50772d7e9c26"
+	cred := filepath.Join(tmp, tunnelID+".json")
+	if err := os.WriteFile(cred, []byte(`{"AccountTag":"a","TunnelSecret":"s","TunnelID":"`+tunnelID+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var calls []string
+	setup := NewCloudflareSetup()
+	setup.homeDir = func() (string, error) { return tmp, nil }
+	setup.run = func(ctx context.Context, args ...string) (string, error) {
+		joined := strings.Join(args, " ")
+		calls = append(calls, joined)
+		if joined == "tunnel list" {
+			return "ID                                   NAME                 CREATED\n" +
+				tunnelID + " llm-protocol-gateway 2026-07-08T08:55:14Z\n", nil
+		}
+		return "", fmt.Errorf("unexpected args: %v", args)
+	}
+	id, gotCred, err := setup.ensureTunnel(ctxBackground(), "llm-protocol-gateway")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != tunnelID || gotCred != cred {
+		t.Fatalf("id=%q cred=%q", id, gotCred)
+	}
+	if len(calls) != 1 || calls[0] != "tunnel list" {
+		t.Fatalf("expected only tunnel list, got %v", calls)
+	}
+}
+
+func TestCustomDomainConfigReusable(t *testing.T) {
+	tmp := t.TempDir()
+	cred := filepath.Join(tmp, "cred.json")
+	config := filepath.Join(tmp, "tunnel-config.yml")
+	if err := os.WriteFile(cred, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body := fmt.Sprintf(`tunnel: abc
+credentials-file: %s
+ingress:
+  - hostname: api.lucadesign.uk
+    service: http://127.0.0.1:18093
+  - hostname: user.lucadesign.uk
+    service: http://127.0.0.1:18093
+  - service: http_status:404
+`, cred)
+	if err := os.WriteFile(config, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !CustomDomainConfigReusable(config, cred, "api.lucadesign.uk", "user.lucadesign.uk", 18093) {
+		t.Fatal("expected reusable")
+	}
+	if CustomDomainConfigReusable(config, cred, "api.lucadesign.uk", "user.lucadesign.uk", 18094) {
+		t.Fatal("port mismatch should not be reusable")
+	}
+	if CustomDomainConfigReusable(config, cred, "api.other.uk", "user.lucadesign.uk", 18093) {
+		t.Fatal("hostname mismatch should not be reusable")
 	}
 }
 

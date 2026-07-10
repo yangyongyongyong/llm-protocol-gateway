@@ -12,6 +12,14 @@ import (
 	"github.com/luca/llm-protocol-gateway/internal/domain"
 )
 
+// Protocol conversion orchestration.
+//
+// Isolation rules:
+//   - Transport/auth (cursor-bridge vs Claude OAuth) is provider-specific.
+//   - Chat→Responses stream engine is SHARED; inject quirks via
+//     ChatToResponsesStreamOptions (Cursor vs Standard). Never hardcode
+//     Cursor-only behavior into the default path used by Claude→Responses.
+
 func resolveProviderResponsesURL(provider domain.Provider, model string) string {
 	resolvedModel := strings.TrimSpace(model)
 	if resolvedModel == "" {
@@ -79,7 +87,16 @@ func (s *Server) proxyOpenAIChatToResponses(w http.ResponseWriter, r *http.Reque
 	if err != nil {
 		return 0, TokenUsage{}, nil, err
 	}
-	return s.proxyConvertedThroughChat(w, r, provider, model, chatReq, skipIncomingAuth, openAIChatToResponsesResponse, streamOpenAIChatToResponsesEvents)
+	// Cursor OAuth injects bridge quirks; other openai_chat providers stay standard
+	// so Claude→Responses (and generic Chat→Responses) are not coupled to Cursor fixes.
+	opts := StandardChatToResponsesStreamOptions()
+	if provider.AuthType == domain.AuthTypeCursorOAuth {
+		opts = CursorChatToResponsesStreamOptions()
+	}
+	streamConvert := func(w http.ResponseWriter, reader io.Reader, model string) (TokenUsage, error) {
+		return streamOpenAIChatToResponsesEventsWithOptions(w, reader, model, opts)
+	}
+	return s.proxyConvertedThroughChat(w, r, provider, model, chatReq, skipIncomingAuth, openAIChatToResponsesResponse, streamConvert)
 }
 
 func (s *Server) proxyResponsesToClaudeMessages(w http.ResponseWriter, r *http.Request, provider domain.Provider, model string, claudeReq map[string]any, skipIncomingAuth bool) (int, TokenUsage, []byte, error) {
@@ -112,7 +129,10 @@ func (s *Server) proxyClaudeToResponses(w http.ResponseWriter, r *http.Request, 
 		if err != nil {
 			return usage, err
 		}
-		usage2, err := streamOpenAIChatToResponsesEvents(w, bytes.NewReader(bridge.buf.Bytes()), model)
+		// Second hop always uses standard options — never Cursor quirks.
+		usage2, err := streamOpenAIChatToResponsesEventsWithOptions(
+			w, bytes.NewReader(bridge.buf.Bytes()), model, StandardChatToResponsesStreamOptions(),
+		)
 		if usage.InputTokens == 0 && usage.OutputTokens == 0 {
 			return usage2, err
 		}
@@ -154,13 +174,34 @@ func (s *Server) proxyConvertedThroughChat(w http.ResponseWriter, r *http.Reques
 		accept = "text/event-stream"
 	}
 	model = applyProviderModelMapping(provider, model)
-	upstreamBody, bodyErr := applyRequestAdapterBody(provider, model, upstreamBody)
-	if bodyErr != nil {
-		return 0, TokenUsage{}, nil, bodyErr
-	}
-	response, err := s.doOpenAIProviderRequest(r.Context(), r, provider, resolveProviderChatURLWithAdapter(provider, model), upstreamBody, accept, skipIncomingAuth)
-	if err != nil {
-		return 0, TokenUsage{}, nil, err
+	var response *http.Response
+	if provider.AuthType == domain.AuthTypeCursorOAuth {
+		baseURL, refreshed, bridgeErr := s.resolveCursorBridgeBaseURL(provider)
+		if bridgeErr != nil {
+			return 0, TokenUsage{}, nil, bridgeErr
+		}
+		provider = refreshed
+		upstreamURL := strings.TrimRight(baseURL, "/") + "/chat/completions"
+		request, reqErr := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(upstreamBody))
+		if reqErr != nil {
+			return 0, TokenUsage{}, nil, reqErr
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Accept", accept)
+		client := &http.Client{Timeout: 0}
+		response, err = client.Do(request)
+		if err != nil {
+			return 0, TokenUsage{}, nil, err
+		}
+	} else {
+		upstreamBody, bodyErr := applyRequestAdapterBody(provider, model, upstreamBody)
+		if bodyErr != nil {
+			return 0, TokenUsage{}, nil, bodyErr
+		}
+		response, err = s.doOpenAIProviderRequest(r.Context(), r, provider, resolveProviderChatURLWithAdapter(provider, model), upstreamBody, accept, skipIncomingAuth)
+		if err != nil {
+			return 0, TokenUsage{}, nil, err
+		}
 	}
 	defer response.Body.Close()
 	return s.finishConvertedProxy(w, response, model, stream, convert, streamConvert)

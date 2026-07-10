@@ -293,6 +293,162 @@ func TestResolveOpenAIToolNameFromClaudeRestoresLowercaseClientNames(t *testing.
 	}
 }
 
+func TestOpenAIToolToClaudeHandlesResponsesFlatAndCustomTools(t *testing.T) {
+	flat := openAIToolToClaude(map[string]any{
+		"type":        "function",
+		"name":        "shell",
+		"description": "Run a shell command",
+		"parameters": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"command": map[string]any{"type": "string"},
+			},
+		},
+	})
+	if flat["name"] != "shell" {
+		t.Fatalf("flat function name = %#v", flat["name"])
+	}
+	schema, _ := flat["input_schema"].(map[string]any)
+	if schema["type"] != "object" {
+		t.Fatalf("flat function schema = %#v", flat["input_schema"])
+	}
+
+	custom := openAIToolToClaude(map[string]any{
+		"type":        "custom",
+		"name":        "computer_use",
+		"description": "Control the computer",
+	})
+	if custom["name"] != "computer_use" {
+		t.Fatalf("custom name = %#v", custom["name"])
+	}
+	if custom["input_schema"] == nil {
+		t.Fatal("expected default input_schema for custom tool")
+	}
+
+	nested := openAIToolToClaude(map[string]any{
+		"type": "custom",
+		"custom": map[string]any{
+			"name":        "nested_tool",
+			"description": "nested",
+			"parameters": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+	})
+	if nested["name"] != "nested_tool" {
+		t.Fatalf("nested custom name = %#v", nested["name"])
+	}
+	if nested["input_schema"] == nil {
+		t.Fatal("expected nested custom input_schema")
+	}
+}
+
+func TestResponsesToClaudeRequestPreservesCodexStyleTools(t *testing.T) {
+	responsesReq := map[string]any{
+		"model": "claude-sonnet-5",
+		"input": "hi",
+		"tools": []any{
+			map[string]any{
+				"type":        "custom",
+				"name":        "update_plan",
+				"description": "Update the plan",
+			},
+			map[string]any{
+				"type":        "function",
+				"name":        "shell",
+				"description": "Shell",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"command": map[string]any{"type": "string"},
+					},
+				},
+			},
+		},
+	}
+	claudeReq, err := responsesToClaudeRequest(responsesReq, "claude-sonnet-5")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	tools, ok := claudeReq["tools"].([]any)
+	if !ok || len(tools) != 2 {
+		t.Fatalf("expected 2 claude tools, got %#v", claudeReq["tools"])
+	}
+	for i, item := range tools {
+		tool := item.(map[string]any)
+		if stringValue(tool["name"]) == "" {
+			t.Fatalf("tool[%d] missing name: %#v", i, tool)
+		}
+		if tool["input_schema"] == nil {
+			t.Fatalf("tool[%d] missing input_schema: %#v", i, tool)
+		}
+	}
+}
+
+func TestResponsesToolsToOpenAIChatNormalizesCustomAndDropsBuiltins(t *testing.T) {
+	responsesReq := map[string]any{
+		"model": "glm-5.1",
+		"input": "hi",
+		"tools": []any{
+			map[string]any{
+				"type":        "function",
+				"name":        "shell",
+				"description": "Shell",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"command": map[string]any{"type": "string"},
+					},
+				},
+			},
+			map[string]any{
+				"type":        "custom",
+				"name":        "update_plan",
+				"description": "Update plan",
+			},
+			map[string]any{"type": "web_search"},
+			map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name":        "already_nested",
+					"description": "ok",
+					"parameters":   map[string]any{"type": "object", "properties": map[string]any{}},
+				},
+			},
+		},
+		"tool_choice": map[string]any{"type": "function", "name": "shell"},
+	}
+	chatReq, err := responsesToOpenAIChatRequest(responsesReq, "glm-5.1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	tools, ok := chatReq["tools"].([]any)
+	if !ok || len(tools) != 3 {
+		t.Fatalf("expected 3 chat tools (dropped web_search), got %#v", chatReq["tools"])
+	}
+	for i, item := range tools {
+		tool := item.(map[string]any)
+		if tool["type"] != "function" {
+			t.Fatalf("tool[%d].type = %#v, want function", i, tool["type"])
+		}
+		fn, ok := tool["function"].(map[string]any)
+		if !ok || stringValue(fn["name"]) == "" {
+			t.Fatalf("tool[%d] missing nested function: %#v", i, tool)
+		}
+		if fn["parameters"] == nil {
+			t.Fatalf("tool[%d] missing parameters: %#v", i, tool)
+		}
+	}
+	choice, ok := chatReq["tool_choice"].(map[string]any)
+	if !ok || choice["type"] != "function" {
+		t.Fatalf("unexpected tool_choice %#v", chatReq["tool_choice"])
+	}
+	if fn, _ := choice["function"].(map[string]any); stringValue(fn["name"]) != "shell" {
+		t.Fatalf("expected tool_choice function shell, got %#v", choice)
+	}
+}
+
 func TestOpenAIChatResponseToClaudeMapsToolCalls(t *testing.T) {
 	openAIResp := []byte(`{
 		"id":"chatcmpl-test",

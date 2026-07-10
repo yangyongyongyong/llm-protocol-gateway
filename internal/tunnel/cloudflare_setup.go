@@ -434,6 +434,43 @@ ingress:
 	}, nil
 }
 
+// CustomDomainConfigReusable reports whether an existing named-tunnel config can
+// be started without calling Cloudflare Provision again (create/list/DNS).
+func CustomDomainConfigReusable(configFile, credentialsFile, apiDomain, uiDomain string, localPort int) bool {
+	configFile = strings.TrimSpace(configFile)
+	credentialsFile = strings.TrimSpace(credentialsFile)
+	apiDomain = strings.TrimSpace(apiDomain)
+	uiDomain = strings.TrimSpace(uiDomain)
+	if configFile == "" || credentialsFile == "" || localPort <= 0 {
+		return false
+	}
+	if apiDomain == "" && uiDomain == "" {
+		return false
+	}
+	if _, err := os.Stat(credentialsFile); err != nil {
+		return false
+	}
+	raw, err := os.ReadFile(configFile)
+	if err != nil {
+		return false
+	}
+	text := string(raw)
+	if !strings.Contains(text, credentialsFile) {
+		return false
+	}
+	wantService := fmt.Sprintf("http://127.0.0.1:%d", localPort)
+	if !strings.Contains(text, wantService) {
+		return false
+	}
+	if apiDomain != "" && !strings.Contains(text, "hostname: "+apiDomain) {
+		return false
+	}
+	if uiDomain != "" && !strings.Contains(text, "hostname: "+uiDomain) {
+		return false
+	}
+	return true
+}
+
 // routeDNS creates a CNAME for hostname → tunnel. If the record already exists
 // (Cloudflare API code 1003), retries with --overwrite-dns. Regardless of
 // cloudflared's exit code, we then ensure the zone CNAME actually points at
@@ -644,6 +681,29 @@ func dnsRecordConflict(combinedLower string) bool {
 }
 
 func (c *CloudflareSetup) ensureTunnel(ctx context.Context, name string) (string, string, error) {
+	// Prefer reuse: listing first avoids a slow Cloudflare "create" round-trip on
+	// every gateway restart when the named tunnel already exists.
+	tunnelID, credentialsFile, findErr := c.findTunnelByName(ctx, name)
+	if findErr == nil {
+		return tunnelID, credentialsFile, nil
+	}
+	if isMissingTunnelCredentials(findErr) {
+		deleteTarget := name
+		if tunnelID != "" {
+			deleteTarget = tunnelID
+		} else if id, idErr := c.lookupTunnelIDByName(ctx, name); idErr == nil {
+			deleteTarget = id
+		}
+		if _, delErr := c.run(ctx, "tunnel", "delete", "-f", deleteTarget); delErr != nil {
+			return "", "", fmt.Errorf("tunnel %q credentials missing (%v); failed to delete orphaned tunnel for recreate: %w", name, findErr, delErr)
+		}
+		output, err := c.run(ctx, "tunnel", "create", name)
+		if err != nil {
+			return "", "", fmt.Errorf("recreate tunnel %q after missing credentials: %w", name, err)
+		}
+		return parseTunnelCreateOutput(output)
+	}
+
 	output, err := c.run(ctx, "tunnel", "create", name)
 	if err == nil {
 		return parseTunnelCreateOutput(output)
@@ -652,12 +712,10 @@ func (c *CloudflareSetup) ensureTunnel(ctx context.Context, name string) (string
 	if !strings.Contains(lower, "already exists") {
 		return "", "", fmt.Errorf("create tunnel %q: %w", name, err)
 	}
-	tunnelID, credentialsFile, findErr := c.findTunnelByName(ctx, name)
+	tunnelID, credentialsFile, findErr = c.findTunnelByName(ctx, name)
 	if findErr == nil {
 		return tunnelID, credentialsFile, nil
 	}
-	// Local credentials were lost (common after reinstall / cleaned ~/.cloudflared).
-	// Delete the orphaned remote tunnel and recreate so bind can proceed.
 	if !isMissingTunnelCredentials(findErr) {
 		return "", "", findErr
 	}

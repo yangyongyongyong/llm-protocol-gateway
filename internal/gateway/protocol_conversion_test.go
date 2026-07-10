@@ -120,6 +120,72 @@ func TestResponsesToClaudeComposedRequest(t *testing.T) {
 	}
 }
 
+func TestResponsesInputImageConvertsToChatImageURL(t *testing.T) {
+	responsesReq := map[string]any{
+		"model": "gpt-5.3-codex",
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "what is this?"},
+					map[string]any{"type": "input_image", "image_url": "data:image/png;base64,abc123"},
+				},
+			},
+		},
+	}
+	chatReq, err := responsesToOpenAIChatRequest(responsesReq, "gpt-5.3-codex")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	messages, ok := chatReq["messages"].([]any)
+	if !ok || len(messages) != 1 {
+		t.Fatalf("expected one message, got %#v", chatReq["messages"])
+	}
+	message := messages[0].(map[string]any)
+	content, ok := message["content"].([]any)
+	if !ok || len(content) != 2 {
+		t.Fatalf("expected text+image content, got %#v", message["content"])
+	}
+	image := content[1].(map[string]any)
+	if image["type"] != "image_url" {
+		t.Fatalf("expected image_url block, got %#v", image)
+	}
+}
+
+func TestResponsesInputImageObjectURLConvertsToChatImageURL(t *testing.T) {
+	responsesReq := map[string]any{
+		"model": "gpt-5.3-codex",
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "describe"},
+					map[string]any{
+						"type": "input_image",
+						"image_url": map[string]any{
+							"url":    "data:image/png;base64,abc123",
+							"detail": "high",
+						},
+					},
+				},
+			},
+		},
+	}
+	chatReq, err := responsesToOpenAIChatRequest(responsesReq, "gpt-5.3-codex")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	messages := chatReq["messages"].([]any)
+	content := messages[0].(map[string]any)["content"].([]any)
+	image := content[1].(map[string]any)
+	imageURL := image["image_url"].(map[string]any)
+	if imageURL["url"] != "data:image/png;base64,abc123" || imageURL["detail"] != "high" {
+		t.Fatalf("expected object image_url conversion, got %#v", image)
+	}
+}
+
 func TestResponsesToOpenAIChatResponse(t *testing.T) {
 	body := []byte(`{
 		"id":"resp_1",

@@ -17,7 +17,7 @@ import (
 	"github.com/luca/llm-protocol-gateway/internal/domain"
 )
 
-const schemaVersion = 4
+const schemaVersion = 5
 
 type Store struct {
 	path string
@@ -161,6 +161,9 @@ func (s *Store) migrate() error {
 	}
 	if err := ensureRequestLogsTable(tx); err != nil {
 		return fmt.Errorf("migrate request_logs: %w", err)
+	}
+	if err := ensureUsageDailyTables(tx); err != nil {
+		return fmt.Errorf("migrate usage_daily: %w", err)
 	}
 	if err := addColumnIfMissing(tx, "api_keys", "model_aliases", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return fmt.Errorf("migrate: %w", err)

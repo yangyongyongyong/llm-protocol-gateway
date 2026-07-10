@@ -370,6 +370,17 @@ func (s *Server) syncCursorProviderModels(providerID string) (domain.Provider, e
 // OAuth providers that are already connected but have no models (e.g. older
 // connects that raced the async sync, or after a restart).
 func (s *Server) SyncConnectedCursorProvidersWithEmptyModels() {
+	s.syncConnectedCursorProviders(false)
+}
+
+// SyncConnectedCursorProviderModels refreshes model catalogs for every
+// connected Cursor OAuth provider (used on startup and periodic refresh so
+// newly shipped Cursor models appear without manual FALLBACK edits).
+func (s *Server) SyncConnectedCursorProviderModels() {
+	s.syncConnectedCursorProviders(true)
+}
+
+func (s *Server) syncConnectedCursorProviders(forceRefresh bool) {
 	state := s.router.State()
 	for _, provider := range state.Providers {
 		if provider.AuthType != domain.AuthTypeCursorOAuth {
@@ -378,13 +389,38 @@ func (s *Server) SyncConnectedCursorProvidersWithEmptyModels() {
 		if provider.CursorOAuth == nil || strings.TrimSpace(provider.CursorOAuth.AccessToken) == "" {
 			continue
 		}
-		if len(provider.Models) > 0 {
+		if !forceRefresh && len(provider.Models) > 0 {
 			continue
 		}
 		if _, err := s.syncCursorProviderModels(provider.ID); err != nil {
-			s.logs.AddApp("warn", "startup cursor model sync failed", fmt.Sprintf("provider=%s err=%s", provider.ID, err.Error()))
+			s.logs.AddApp("warn", "cursor model sync failed", fmt.Sprintf("provider=%s err=%s", provider.ID, err.Error()))
 		}
 	}
+}
+
+// StartCursorModelBackgroundRefresh periodically re-discovers Cursor models
+// so the provider catalog stays current without manual intervention.
+func (s *Server) StartCursorModelBackgroundRefresh(ctx context.Context) {
+	go func() {
+		// Initial full sync shortly after boot (bridge may still be warming).
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
+		s.SyncConnectedCursorProviderModels()
+
+		ticker := time.NewTicker(30 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.SyncConnectedCursorProviderModels()
+			}
+		}
+	}()
 }
 
 func (s *Server) pollCursorOAuthInBackground(providerID, flowID, uuid, verifier string) {
