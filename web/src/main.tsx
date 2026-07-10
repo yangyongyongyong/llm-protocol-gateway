@@ -4855,40 +4855,90 @@ function claudeUsageFillTone(utilization: number): string {
   return 'ok';
 }
 
-function ClaudeOAuthUsagePanel({ providerId, connected, compact }: { providerId: string; connected?: boolean; compact?: boolean }) {
-  const [report, setReport] = React.useState<ClaudeOAuthUsageReport | null>(null);
+// OAuth usage panels: poll only while the browser tab is visible, and keep the
+// interval conservative so backgrounded / multi-provider UIs don't hammer
+// Anthropic / Cursor quota APIs.
+const OAUTH_USAGE_POLL_MS = 3 * 60_000;
+
+function usePageVisible() {
+  const [visible, setVisible] = React.useState(() => typeof document === 'undefined' || document.visibilityState !== 'hidden');
+  React.useEffect(() => {
+    const onVisibility = () => setVisible(document.visibilityState !== 'hidden');
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => document.removeEventListener('visibilitychange', onVisibility);
+  }, []);
+  return visible;
+}
+
+function useOAuthUsageReport<T extends { available?: boolean; error?: string }>(
+  enabled: boolean,
+  path: string,
+) {
+  const [report, setReport] = React.useState<T | null>(null);
   const [loading, setLoading] = React.useState(false);
+  const pageVisible = usePageVisible();
+  const pathRef = React.useRef(path);
+  pathRef.current = path;
+
+  const load = React.useCallback(async (opts?: { force?: boolean; skipIfHidden?: boolean }) => {
+    const force = Boolean(opts?.force);
+    const skipIfHidden = opts?.skipIfHidden !== false;
+    if (!force && skipIfHidden && typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+      return;
+    }
+    setLoading(true);
+    try {
+      const url = force ? `${API_BASE}${pathRef.current}?refresh=1` : `${API_BASE}${pathRef.current}`;
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const data = await response.json() as T;
+      setReport(data);
+    } catch (error) {
+      setReport({ available: false, error: error instanceof Error ? error.message : '无法获取额度' } as T);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   React.useEffect(() => {
-    if (!connected) {
+    if (!enabled) {
       setReport(null);
       return undefined;
     }
     let cancelled = false;
-    const load = async () => {
-      setLoading(true);
-      try {
-        const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(providerId)}/claude-oauth/usage`);
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        const data = await response.json() as ClaudeOAuthUsageReport;
-        if (!cancelled) setReport(data);
-      } catch (error) {
-        if (!cancelled) {
-          setReport({ available: false, error: error instanceof Error ? error.message : '无法获取额度' });
-        }
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
+    const safeLoad = async (force = false) => {
+      if (cancelled) return;
+      await load({ force, skipIfHidden: !force });
     };
-    void load();
-    const timer = window.setInterval(() => { void load(); }, 60_000);
+
+    if (pageVisible) {
+      void safeLoad(false);
+    }
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'hidden') return;
+      void safeLoad(false);
+    }, OAUTH_USAGE_POLL_MS);
+
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [providerId, connected]);
+  }, [enabled, path, pageVisible, load]);
+
+  return {
+    report,
+    loading,
+    refresh: () => load({ force: true, skipIfHidden: false }),
+  };
+}
+
+function ClaudeOAuthUsagePanel({ providerId, connected, compact }: { providerId: string; connected?: boolean; compact?: boolean }) {
+  const { report, loading, refresh } = useOAuthUsageReport<ClaudeOAuthUsageReport>(
+    Boolean(connected),
+    `/__providers/${encodeURIComponent(providerId)}/claude-oauth/usage`,
+  );
 
   if (!connected) return null;
 
@@ -4903,7 +4953,20 @@ function ClaudeOAuthUsagePanel({ providerId, connected, compact }: { providerId:
     <div className={`claude-usage-panel${compact ? ' compact' : ''}`} onClick={(event) => event.stopPropagation()}>
       <div className="claude-usage-title">
         <span>Claude 订阅额度</span>
-        {loading ? <span className="claude-usage-status">刷新中…</span> : report?.fetchedAt ? <span className="claude-usage-status">更新于 {formatClaudeUsageResetAt(report.fetchedAt)}</span> : null}
+        <span className="claude-usage-actions">
+          {loading ? <span className="claude-usage-status">刷新中…</span> : report?.fetchedAt ? <span className="claude-usage-status">更新于 {formatClaudeUsageResetAt(report.fetchedAt)}</span> : null}
+          <button
+            type="button"
+            className="btn btn-tiny"
+            disabled={loading}
+            onClick={(event) => {
+              event.stopPropagation();
+              void refresh();
+            }}
+          >
+            刷新
+          </button>
+        </span>
       </div>
       {!report ? (
         <div className="claude-usage-empty">{loading ? '正在拉取额度…' : '暂无额度数据'}</div>
@@ -4935,39 +4998,10 @@ function ClaudeOAuthUsagePanel({ providerId, connected, compact }: { providerId:
 }
 
 function CursorOAuthUsagePanel({ providerId, connected, compact }: { providerId: string; connected?: boolean; compact?: boolean }) {
-  const [report, setReport] = React.useState<CursorOAuthUsageReport | null>(null);
-  const [loading, setLoading] = React.useState(false);
-
-  React.useEffect(() => {
-    if (!connected) {
-      setReport(null);
-      return undefined;
-    }
-    let cancelled = false;
-    const load = async () => {
-      setLoading(true);
-      try {
-        const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(providerId)}/cursor-oauth/usage`);
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        const data = await response.json() as CursorOAuthUsageReport;
-        if (!cancelled) setReport(data);
-      } catch (error) {
-        if (!cancelled) {
-          setReport({ available: false, error: error instanceof Error ? error.message : '无法获取额度' });
-        }
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    };
-    void load();
-    const timer = window.setInterval(() => { void load(); }, 60_000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [providerId, connected]);
+  const { report, loading, refresh } = useOAuthUsageReport<CursorOAuthUsageReport>(
+    Boolean(connected),
+    `/__providers/${encodeURIComponent(providerId)}/cursor-oauth/usage`,
+  );
 
   if (!connected) return null;
 
@@ -4977,7 +5011,20 @@ function CursorOAuthUsagePanel({ providerId, connected, compact }: { providerId:
     <div className={`claude-usage-panel cursor-usage-panel${compact ? ' compact' : ''}`} onClick={(event) => event.stopPropagation()}>
       <div className="claude-usage-title">
         <span>Cursor 订阅额度</span>
-        {loading ? <span className="claude-usage-status">刷新中…</span> : report?.fetchedAt ? <span className="claude-usage-status">更新于 {formatClaudeUsageResetAt(report.fetchedAt)}</span> : null}
+        <span className="claude-usage-actions">
+          {loading ? <span className="claude-usage-status">刷新中…</span> : report?.fetchedAt ? <span className="claude-usage-status">更新于 {formatClaudeUsageResetAt(report.fetchedAt)}</span> : null}
+          <button
+            type="button"
+            className="btn btn-tiny"
+            disabled={loading}
+            onClick={(event) => {
+              event.stopPropagation();
+              void refresh();
+            }}
+          >
+            刷新
+          </button>
+        </span>
       </div>
       {!report ? (
         <div className="claude-usage-empty">{loading ? '正在拉取额度…' : '暂无额度数据'}</div>

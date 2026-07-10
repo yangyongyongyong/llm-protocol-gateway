@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/luca/llm-protocol-gateway/internal/cursor"
@@ -58,6 +59,10 @@ type Server struct {
 	listenAddr              string
 	requestLogRetentionDays int
 	adminAuth               AdminAuthStore
+	oauthUsageCache         *oauthUsageCache
+	// oauthUsageFetchMu serializes upstream usage fetches per provider so
+	// concurrent UI polls share one in-flight request after cache miss.
+	oauthUsageFetchMu sync.Map
 	// webExposedChange is invoked when the UI toggles LAN/Web exposure so the
 	// process owner (CLI runtime / desktop app) can rebind the HTTP listener.
 	webExposedChange func(enabled bool) error
@@ -69,6 +74,7 @@ func NewServer(router *Router, logs *monitor.Store, stateSaver ...StateSaver) *S
 		logs:                    logs,
 		pendingClaudeOAuth:      newClaudeOAuthPendingStore(),
 		pendingCursorOAuth:      newCursorOAuthPendingStore(),
+		oauthUsageCache:         newOAuthUsageCache(),
 		requestLogRetentionDays: 7,
 	}
 	if days := router.State().RequestLogRetentionDays; days > 0 {
@@ -1363,6 +1369,28 @@ func (s *Server) handleClaudeOAuthUsage(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	cacheKey := "claude:" + providerID
+	forceRefresh := strings.EqualFold(r.URL.Query().Get("refresh"), "1") || strings.EqualFold(r.URL.Query().Get("refresh"), "true")
+	if forceRefresh {
+		s.oauthUsageCache.invalidate(cacheKey)
+	} else if cached, ok := s.oauthUsageCache.get(cacheKey); ok {
+		if report, ok := cached.(ClaudeOAuthUsageReport); ok {
+			writeJSON(w, http.StatusOK, report)
+			return
+		}
+	}
+
+	unlock := s.lockOAuthUsageFetch(cacheKey)
+	defer unlock()
+	if !forceRefresh {
+		if cached, ok := s.oauthUsageCache.get(cacheKey); ok {
+			if report, ok := cached.(ClaudeOAuthUsageReport); ok {
+				writeJSON(w, http.StatusOK, report)
+				return
+			}
+		}
+	}
+
 	refreshed, err := s.ensureFreshClaudeToken(provider)
 	if err != nil {
 		writeJSON(w, http.StatusOK, ClaudeOAuthUsageReport{Available: false, Error: err.Error()})
@@ -1372,6 +1400,9 @@ func (s *Server) handleClaudeOAuthUsage(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		writeJSON(w, http.StatusOK, ClaudeOAuthUsageReport{Available: false, Error: err.Error()})
 		return
+	}
+	if report.Available {
+		s.oauthUsageCache.set(cacheKey, report, oauthUsageCacheTTL)
 	}
 	writeJSON(w, http.StatusOK, report)
 }
@@ -1394,6 +1425,28 @@ func (s *Server) handleCursorOAuthUsage(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	cacheKey := "cursor:" + providerID
+	forceRefresh := strings.EqualFold(r.URL.Query().Get("refresh"), "1") || strings.EqualFold(r.URL.Query().Get("refresh"), "true")
+	if forceRefresh {
+		s.oauthUsageCache.invalidate(cacheKey)
+	} else if cached, ok := s.oauthUsageCache.get(cacheKey); ok {
+		if report, ok := cached.(CursorOAuthUsageReport); ok {
+			writeJSON(w, http.StatusOK, report)
+			return
+		}
+	}
+
+	unlock := s.lockOAuthUsageFetch(cacheKey)
+	defer unlock()
+	if !forceRefresh {
+		if cached, ok := s.oauthUsageCache.get(cacheKey); ok {
+			if report, ok := cached.(CursorOAuthUsageReport); ok {
+				writeJSON(w, http.StatusOK, report)
+				return
+			}
+		}
+	}
+
 	refreshed, err := s.ensureFreshCursorToken(provider)
 	if err != nil {
 		writeJSON(w, http.StatusOK, CursorOAuthUsageReport{Available: false, Error: err.Error()})
@@ -1404,7 +1457,17 @@ func (s *Server) handleCursorOAuthUsage(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusOK, CursorOAuthUsageReport{Available: false, Error: err.Error()})
 		return
 	}
+	if report.Available {
+		s.oauthUsageCache.set(cacheKey, report, oauthUsageCacheTTL)
+	}
 	writeJSON(w, http.StatusOK, report)
+}
+
+func (s *Server) lockOAuthUsageFetch(key string) func() {
+	muAny, _ := s.oauthUsageFetchMu.LoadOrStore(key, &sync.Mutex{})
+	mu := muAny.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 func (s *Server) handleProviderChatTest(w http.ResponseWriter, r *http.Request) {

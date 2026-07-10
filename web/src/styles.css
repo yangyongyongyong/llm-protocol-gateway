@@ -361,7 +361,9 @@ html[data-theme="dark"] .slate { color: #cbd5e1; }
 .claude-usage-panel { margin-top: 10px; padding: 12px; border-radius: 14px; border: 1px solid rgba(147, 51, 234, 0.16); background: rgba(147, 51, 234, 0.04); display: grid; gap: 10px; }
 .claude-usage-panel.compact { margin-top: 8px; padding: 10px 12px; }
 .claude-usage-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 12px; font-weight: 780; color: #5b21b6; }
+.claude-usage-actions { display: inline-flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .claude-usage-status { color: var(--muted); font-size: 11px; font-weight: 600; font-family: var(--mono); }
+.btn.btn-tiny { padding: 4px 10px; border-radius: 999px; font-size: 11px; font-weight: 700; line-height: 1.2; }
 .claude-usage-empty { color: var(--muted); font-size: 12px; }
 .claude-usage-empty.error { color: #dc2626; }
 .claude-usage-grid { display: grid; gap: 10px; }
