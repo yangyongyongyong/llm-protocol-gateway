@@ -744,6 +744,19 @@ func (r *Router) DeleteProvider(providerID string) error {
 			return fmt.Errorf("provider %q is used by route %q", providerID, route.Name)
 		}
 	}
+	for _, key := range r.state.APIKeys {
+		if route, ok := r.routeLocked(key.RouteID); ok && route.ProviderID == providerID {
+			return fmt.Errorf("provider %q is used by api key %q", providerID, key.Name)
+		}
+		for _, fallbackID := range key.FallbackProviderIDs {
+			if fallbackID == providerID {
+				return fmt.Errorf("provider %q is used as fallback by api key %q", providerID, key.Name)
+			}
+		}
+		if strings.TrimSpace(key.ActiveProviderID) == providerID {
+			return fmt.Errorf("provider %q is the active provider for api key %q", providerID, key.Name)
+		}
+	}
 	for index := range r.state.Providers {
 		if r.state.Providers[index].ID == providerID {
 			r.state.Providers = append(r.state.Providers[:index], r.state.Providers[index+1:]...)

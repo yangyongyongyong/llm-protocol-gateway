@@ -242,11 +242,13 @@ html[data-theme="dark"] .slate { color: #cbd5e1; }
 .api-keys-filter-field { min-width: 220px; flex: 1 1 220px; max-width: 320px; margin: 0; }
 .api-keys-toolbar-meta { margin-left: auto; color: var(--muted); font-size: 12px; font-weight: 700; padding-bottom: 10px; }
 .api-keys-bulk-actions { display: flex; align-items: center; gap: 8px; padding-bottom: 6px; }
-.api-keys-layout { display: grid; grid-template-columns: minmax(180px, 240px) minmax(0, 1fr); gap: 12px; align-items: start; }
+.api-keys-layout { display: grid; grid-template-columns: minmax(220px, 280px) minmax(0, 1fr); gap: 12px; align-items: start; }
 .api-keys-table-wrap { min-width: 0; border: 1px solid var(--border); border-radius: 18px; background: var(--surface); overflow: hidden; }
 .api-keys-table { display: grid; }
-.api-keys-table-head, .api-keys-row { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 8px; align-items: center; padding: 8px 10px; text-align: left; }
+.api-keys-table-head, .api-keys-row { display: grid; grid-template-columns: 18px minmax(0, 1fr) 88px; gap: 8px; align-items: center; padding: 8px 10px; text-align: left; }
 .api-keys-table-head { color: var(--muted); font-size: 11px; font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase; border-bottom: 1px solid var(--border); background: var(--surface-strong); }
+.api-keys-sort-btn { border: 0; background: transparent; color: inherit; font: inherit; font-size: 11px; font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase; padding: 0; cursor: pointer; text-align: left; }
+.api-keys-sort-btn:hover, .api-keys-sort-btn.active { color: var(--text); }
 .api-keys-row { border: 0; border-bottom: 1px solid var(--border); background: transparent; color: inherit; cursor: pointer; width: 100%; font: inherit; transition: 0.15s ease; }
 .api-keys-row:last-child { border-bottom: 0; }
 .api-keys-row:hover { background: var(--hover); }
@@ -266,6 +268,7 @@ html[data-theme="dark"] .slate { color: #cbd5e1; }
 .api-key-fallback-model { display: grid; gap: 6px; }
 .api-key-fallback-model > label { color: var(--muted); font-size: 12px; font-weight: 780; }
 .api-keys-cell.name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 800; }
+.api-keys-cell.created { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--muted); font-weight: 650; }
 .api-keys-detail { padding: 16px; border: 1px solid var(--border); border-radius: 18px; background: var(--surface); min-width: 0; }
 .api-keys-detail-head { margin-bottom: 4px; }
 .api-keys-detail-meta { white-space: normal; overflow: visible; text-overflow: unset; line-height: 1.5; }

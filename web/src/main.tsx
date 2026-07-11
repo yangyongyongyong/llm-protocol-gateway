@@ -906,6 +906,16 @@ function apiKeyBindingFromRoute(route: Route | undefined) {
   };
 }
 
+/** 首选绑定或备选列表中引用了该 Provider 的 API Key 都算引用。 */
+function apiKeyReferencesProvider(key: APIKey, routes: Route[], providerId: string) {
+  if (!providerId) return false;
+  const route = routes.find((item) => item.id === key.routeId);
+  if (route?.providerId === providerId) return true;
+  if ((key.fallbackProviderIds || []).includes(providerId)) return true;
+  if (key.activeProviderId === providerId) return true;
+  return false;
+}
+
 function formatTokenSummary(stats: Pick<APIKeyDayStats, 'inputTokens' | 'outputTokens' | 'cacheTokens'>) {
   const { totalInput, cacheHits } = normalizePromptTokenStats(stats.inputTokens, stats.cacheTokens || 0);
   return `in ${formatTokenCount(totalInput)} · out ${formatTokenCount(stats.outputTokens)} · cache ${formatTokenCount(cacheHits)}`;
@@ -1083,10 +1093,42 @@ function clientConfigFilePath(client: 'opencode' | 'codex' | 'claude') {
   return '~/.claude/settings.json';
 }
 
+function clientConfigHomeRelativePath(client: 'opencode' | 'codex' | 'claude') {
+  if (client === 'opencode') return '.config/opencode/opencode.json';
+  if (client === 'codex') return '.codex/config.toml';
+  return '.claude/settings.json';
+}
+
 function clientConfigTitle(client: 'opencode' | 'codex' | 'claude') {
   if (client === 'opencode') return 'OpenCode 配置';
   if (client === 'codex') return 'Codex 配置';
   return 'Claude Code 配置';
+}
+
+/** 生成可粘贴到终端执行的覆盖脚本：备份旧文件后写入完整配置。 */
+function buildApiKeyClientConfigInstallScript(client: 'opencode' | 'codex' | 'claude', configText: string) {
+  const rel = clientConfigHomeRelativePath(client);
+  const display = clientConfigFilePath(client);
+  // 避免配置正文里偶发出现相同结束标记
+  const marker = `LPG_CFG_${client.toUpperCase()}_${Date.now().toString(36)}`;
+  const body = configText.endsWith('\n') ? configText : `${configText}\n`;
+  return [
+    '# 覆盖客户端配置（粘贴到终端执行即可；勿带 shebang，避免 zsh 把 ! 当历史展开）',
+    'set -euo pipefail',
+    `FILE="$HOME/${rel}"`,
+    'mkdir -p "$(dirname "$FILE")"',
+    'if [ -f "$FILE" ]; then',
+    '  BAK="${FILE}.bak.$(date +%Y%m%d%H%M%S)"',
+    '  cp "$FILE" "$BAK"',
+    '  echo "已备份: $BAK"',
+    'fi',
+    `cat > "$FILE" <<'${marker}'`,
+    body.replace(/\n$/, ''),
+    marker,
+    `echo "已写入: ${display}"`,
+    'echo "完成。如客户端已在运行，请重启后再试。"',
+    '',
+  ].join('\n');
 }
 
 function buildApiKeyClientConfig(
@@ -1684,6 +1726,8 @@ function App() {
   const [apiKeyFilterID, setApiKeyFilterID] = useState('__all__');
   const [apiKeyProviderFilter, setApiKeyProviderFilter] = useState('__all__');
   const [apiKeyOutputProtocolFilter, setApiKeyOutputProtocolFilter] = useState('__all__');
+  const [apiKeySortBy, setApiKeySortBy] = useState<'name' | 'createdAt'>('createdAt');
+  const [apiKeySortDir, setApiKeySortDir] = useState<'asc' | 'desc'>('desc');
   const [selfcheckProviderIDs, setSelfcheckProviderIDs] = useState<string[]>([]);
   const [selfcheckTimeoutSec, setSelfcheckTimeoutSec] = useState(90);
   const [selfcheckPrompt, setSelfcheckPrompt] = useState('1+1等于几');
@@ -1861,8 +1905,32 @@ function App() {
     if (apiKeyFilterID !== '__all__') {
       keys = keys.filter((key) => key.id === apiKeyFilterID);
     }
-    return keys;
-  }, [state.apiKeys, state.routes, apiKeyFilterID, apiKeyProviderFilter, apiKeyOutputProtocolFilter]);
+    const sorted = [...keys];
+    const dir = apiKeySortDir === 'asc' ? 1 : -1;
+    sorted.sort((a, b) => {
+      if (apiKeySortBy === 'name') {
+        const byName = a.name.localeCompare(b.name, 'zh-CN');
+        if (byName !== 0) return byName * dir;
+      } else {
+        const ta = Date.parse(a.createdAt || '') || 0;
+        const tb = Date.parse(b.createdAt || '') || 0;
+        if (ta !== tb) return (ta - tb) * dir;
+        const byName = a.name.localeCompare(b.name, 'zh-CN');
+        if (byName !== 0) return byName * dir;
+      }
+      return a.id.localeCompare(b.id) * dir;
+    });
+    return sorted;
+  }, [state.apiKeys, state.routes, apiKeyFilterID, apiKeyProviderFilter, apiKeyOutputProtocolFilter, apiKeySortBy, apiKeySortDir]);
+
+  function toggleApiKeySort(field: 'name' | 'createdAt') {
+    if (apiKeySortBy === field) {
+      setApiKeySortDir((current) => (current === 'asc' ? 'desc' : 'asc'));
+      return;
+    }
+    setApiKeySortBy(field);
+    setApiKeySortDir(field === 'name' ? 'asc' : 'desc');
+  }
 
   const selectedApiKey = useMemo(() => {
     const keys = state.apiKeys || [];
@@ -3265,6 +3333,11 @@ function App() {
   }
 
   async function deleteProvider(providerID: string, providerName: string) {
+    const usedByKeys = (state.apiKeys || []).filter((key) => apiKeyReferencesProvider(key, state.routes, providerID));
+    if (usedByKeys.length > 0) {
+      showToast(`无法删除：${providerName} 正被 ${usedByKeys.length} 个 API 密钥引用（含备选）`);
+      return;
+    }
     const usedBy = state.routes.filter((route) => route.providerId === providerID);
     if (usedBy.length > 0) {
       showToast(`无法删除：${providerName} 正被 ${usedBy.map((route) => route.name).join(', ')} 使用`);
@@ -3828,10 +3901,9 @@ function App() {
   const lanAccessURL = webExposed
     ? `http://${lanHostHint || '<局域网IP>'}:${portHint}`
     : '已关闭（仅本机可访问）';
-  const activeProviderRouteCount = selectedProvider ? (state.apiKeys || []).filter((key) => {
-    const route = state.routes.find((item) => item.id === key.routeId);
-    return route?.providerId === selectedProvider.id;
-  }).length : 0;
+  const activeProviderRouteCount = selectedProvider ? (state.apiKeys || []).filter((key) => (
+    apiKeyReferencesProvider(key, state.routes, selectedProvider.id)
+  )).length : 0;
   const apiKeyDraftProvider = state.providers.find((item) => item.id === apiKeyDraft.providerId);
   const apiKeyDraftModels = apiKeyDraftProvider ? state.models.filter((model) => model.providerId === apiKeyDraftProvider.id) : [];
   const refreshingApiKeyModels = apiKeyDraftProvider ? testingProviderID === apiKeyDraftProvider.id : false;
@@ -4087,12 +4159,37 @@ function App() {
                             aria-label="全选当前列表"
                           />
                         </label>
-                        <span>名称</span>
+                        <button
+                          type="button"
+                          className={`api-keys-sort-btn${apiKeySortBy === 'name' ? ' active' : ''}`}
+                          onClick={() => toggleApiKeySort('name')}
+                          title="按名称排序"
+                        >
+                          名称{apiKeySortBy === 'name' ? (apiKeySortDir === 'asc' ? ' ↑' : ' ↓') : ''}
+                        </button>
+                        <button
+                          type="button"
+                          className={`api-keys-sort-btn${apiKeySortBy === 'createdAt' ? ' active' : ''}`}
+                          onClick={() => toggleApiKeySort('createdAt')}
+                          title="按创建时间排序"
+                        >
+                          创建时间{apiKeySortBy === 'createdAt' ? (apiKeySortDir === 'asc' ? ' ↑' : ' ↓') : ''}
+                        </button>
                       </div>
                       {filteredApiKeys.length === 0 ? (
                         <div className="empty-state compact">当前筛选条件下没有匹配的密钥。</div>
                       ) : filteredApiKeys.map((key, index) => {
                         const checked = checkedApiKeyIDs.includes(key.id);
+                        const createdLabel = key.createdAt
+                          ? (() => {
+                              const d = new Date(key.createdAt);
+                              if (Number.isNaN(d.getTime())) return key.createdAt.slice(0, 10) || '—';
+                              const y = d.getFullYear();
+                              const m = String(d.getMonth() + 1).padStart(2, '0');
+                              const day = String(d.getDate()).padStart(2, '0');
+                              return `${y}-${m}-${day}`;
+                            })()
+                          : '—';
                         return (
                           <button
                             type="button"
@@ -4123,7 +4220,8 @@ function App() {
                                 aria-label={`选择 ${key.name}`}
                               />
                             </label>
-                            <span className="api-keys-cell name">{key.name}</span>
+                            <span className="api-keys-cell name" title={key.name}>{key.name}</span>
+                            <span className="api-keys-cell created" title={createdLabel}>{createdLabel}</span>
                           </button>
                         );
                       })}
@@ -4207,10 +4305,9 @@ function App() {
               {sortedProviders.length === 0 ? <div className="empty-state">暂无 Provider。点击「添加输入 Provider」创建。</div> : (
                 <div className="provider-card-grid">
                   {sortedProviders.map((provider) => {
-                    const usedCount = (state.apiKeys || []).filter((key) => {
-                      const route = state.routes.find((item) => item.id === key.routeId);
-                      return route?.providerId === provider.id;
-                    }).length;
+                    const usedCount = (state.apiKeys || []).filter((key) => (
+                      apiKeyReferencesProvider(key, state.routes, provider.id)
+                    )).length;
                     return (
                       <ProviderCard
                         key={provider.id}
@@ -4243,7 +4340,7 @@ function App() {
                   })}
                 </div>
               )}
-              {selectedProvider && <div className="hint-line">当前 Provider 被 {activeProviderRouteCount} 个 API 密钥引用。引用数不为 0 时不能删除。</div>}
+              {selectedProvider && <div className="hint-line">当前 Provider 被 {activeProviderRouteCount} 个 API 密钥引用（含备选）。引用数不为 0 时不能删除。</div>}
             </div>
           </section>
           )}
@@ -6405,6 +6502,10 @@ function ApiKeyClientConfigModal({
     () => buildApiKeyClientConfig(client, keyItem, route, endpoints, effectivePublicBase, provider),
     [client, keyItem, route, endpoints, effectivePublicBase, provider],
   );
+  const installScript = React.useMemo(
+    () => buildApiKeyClientConfigInstallScript(client, configText),
+    [client, configText],
+  );
   const filePath = clientConfigFilePath(client);
   const gatewayRoot = apiKeyGatewayRoot(endpoints, effectivePublicBase);
   const protocolHint = clientConfigProtocolHint(client, route);
@@ -6417,7 +6518,7 @@ function ApiKeyClientConfigModal({
 
   React.useEffect(() => {
     const modeLabel = networkMode === 'public' ? '公网域名' : '内网';
-    copyConfig(configText, `已复制 ${clientConfigTitle(client)}（${modeLabel}）`);
+    copyConfig(installScript, `已复制覆盖脚本（${clientConfigTitle(client)} · ${modeLabel}），粘贴到终端执行即可`);
     // 仅打开弹窗时自动复制一次；切换网络时由按钮自行复制
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -6431,13 +6532,13 @@ function ApiKeyClientConfigModal({
   return (
     <Modal
       title={clientConfigTitle(client)}
-      description="已复制到剪贴板。可切换内网 / 公网域名后再次复制。"
+      description="已复制覆盖脚本到剪贴板。在终端粘贴执行即可写入配置（会先备份旧文件）。"
       onClose={onClose}
       size="wide"
     >
       <div className="api-key-client-config-modal">
         <div className="field">
-          <label>配置文件路径</label>
+          <label>目标配置文件</label>
           <div className="field-inline">
             <div className="field-readonly code">{filePath}</div>
             <CopyButton value={filePath} label="复制路径" />
@@ -6452,8 +6553,9 @@ function ApiKeyClientConfigModal({
               type="button"
               onClick={() => {
                 setNetworkMode('lan');
-                const next = buildApiKeyClientConfig(client, keyItem, route, endpoints, '', provider);
-                copyConfig(next, `已复制 ${clientConfigTitle(client)}（内网）`);
+                const nextConfig = buildApiKeyClientConfig(client, keyItem, route, endpoints, '', provider);
+                const nextScript = buildApiKeyClientConfigInstallScript(client, nextConfig);
+                copyConfig(nextScript, `已复制覆盖脚本（${clientConfigTitle(client)} · 内网）`);
               }}
             >
               内网
@@ -6466,8 +6568,9 @@ function ApiKeyClientConfigModal({
               onClick={() => {
                 if (!publicAvailable) return;
                 setNetworkMode('public');
-                const next = buildApiKeyClientConfig(client, keyItem, route, endpoints, publicBase, provider);
-                copyConfig(next, `已复制 ${clientConfigTitle(client)}（公网域名）`);
+                const nextConfig = buildApiKeyClientConfig(client, keyItem, route, endpoints, publicBase, provider);
+                const nextScript = buildApiKeyClientConfigInstallScript(client, nextConfig);
+                copyConfig(nextScript, `已复制覆盖脚本（${clientConfigTitle(client)} · 公网域名）`);
               }}
             >
               公网域名
@@ -6482,21 +6585,28 @@ function ApiKeyClientConfigModal({
         {protocolHint ? <div className="hint-line error">{protocolHint}</div> : null}
 
         <div className="field">
-          <div className="field-label-row">
-            <label>配置内容预览</label>
-            <CopyButton value={configText} label="再次复制" />
+          <label>配置覆盖脚本</label>
+          <div className="hint-line">
+            终端执行后会覆盖 {filePath}；若文件已存在，会先备份为同目录 `.bak.时间戳`。
           </div>
-          <pre className="curl-preview api-key-client-config-preview">{configText}</pre>
+          <pre className="curl-preview api-key-client-config-preview">{installScript}</pre>
         </div>
       </div>
       <div className="actions modal-actions">
         <button className="btn" type="button" onClick={onClose}>关闭</button>
         <button
+          className="btn"
+          type="button"
+          onClick={() => copyConfig(configText, `已复制纯配置内容（${clientConfigTitle(client)}）`)}
+        >
+          仅复制配置内容
+        </button>
+        <button
           className="btn primary"
           type="button"
-          onClick={() => copyConfig(configText, `已复制 ${clientConfigTitle(client)}`)}
+          onClick={() => copyConfig(installScript, `已复制覆盖脚本（${clientConfigTitle(client)}）`)}
         >
-          复制配置
+          复制覆盖脚本
         </button>
       </div>
     </Modal>
