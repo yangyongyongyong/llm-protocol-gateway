@@ -172,6 +172,53 @@ html[data-theme="dark"] .slate { color: #cbd5e1; }
 .usage-key-name { font-weight: 800; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .usage-last-card { margin-top: 16px; padding: 14px 16px; border-radius: 16px; border: 1px solid rgba(37, 99, 235, 0.12); background: rgba(37, 99, 235, 0.05); }
 .usage-last-title { font-size: 13px; font-weight: 800; margin-bottom: 6px; }
+/* 用量统计日历（单击选单日 / Shift 选区间） */
+.usage-range-bar { display: flex; flex-wrap: wrap; gap: 14px; align-items: stretch; }
+.usage-range-left { display: flex; flex-direction: column; }
+.usage-range-summary { color: var(--muted); font-size: 12px; font-weight: 780; padding-top: 8px; }
+/* 日历右侧：最近 30 天组合图（柱=Token 左轴，线=请求次数 右轴） */
+.usage-month-bars { flex: 1 1 320px; min-width: 280px; border: 1px solid var(--border); border-radius: 16px; background: var(--surface); padding: 12px 14px; display: flex; flex-direction: column; }
+.usage-month-bars-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+.usage-month-bars-title { font-size: 13px; font-weight: 800; }
+.usage-month-bars-legend { display: inline-flex; gap: 10px; color: var(--muted); font-size: 11px; font-weight: 700; }
+.usage-month-legend-item { display: inline-flex; align-items: center; gap: 4px; }
+.usage-month-legend-item .legend-bar { display: inline-block; width: 10px; height: 10px; border-radius: 3px; background: linear-gradient(180deg, #3b82f6, #2563eb); }
+.usage-month-legend-item .legend-line { display: inline-block; width: 14px; height: 0; border-top: 2px solid #f59e0b; border-radius: 2px; }
+.usage-month-bars-empty { color: var(--subtle); font-size: 12px; font-weight: 700; margin: auto 0; }
+.usage-month-bars-plot { flex: 1; display: flex; gap: 8px; min-height: 140px; }
+.usage-month-bars-yaxis { display: flex; flex-direction: column; justify-content: space-between; align-items: flex-end; color: var(--subtle); font-size: 10px; font-weight: 700; padding: 0 0 0 2px; min-width: 34px; }
+.usage-month-bars-yaxis.right { align-items: flex-start; color: #b45309; min-width: 26px; }
+html[data-theme="dark"] .usage-month-bars-yaxis.right { color: #fbbf24; }
+.usage-month-bars-track { flex: 1; display: flex; align-items: flex-end; gap: 8px; position: relative; }
+.usage-month-bar { flex: 1; display: flex; align-items: flex-end; height: 100%; border: 0; background: transparent; padding: 0; cursor: pointer; border-radius: 4px 4px 0 0; position: relative; z-index: 1; }
+.usage-month-bar span { display: block; width: 100%; border-radius: 4px 4px 2px 2px; background: linear-gradient(180deg, #3b82f6, #2563eb); transition: 0.12s ease; }
+.usage-month-bar:hover span { background: linear-gradient(180deg, #60a5fa, #3b82f6); }
+.usage-month-bar.zero span { background: var(--slate-soft); }
+.usage-month-line { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; color: #f59e0b; z-index: 2; }
+html[data-theme="dark"] .usage-month-line { color: #fbbf24; }
+/* 组合图数值标注：Token 在柱底内侧，请求次数在折线上方，互不重叠 */
+.usage-month-label { position: absolute; transform: translateX(-50%); font-size: 10px; font-weight: 800; line-height: 1; white-space: nowrap; pointer-events: none; z-index: 3; padding: 1px 4px; border-radius: 4px; }
+.usage-month-label.token { color: #fff; background: rgba(29, 78, 216, 0.85); }
+.usage-month-label.request { color: #b45309; background: rgba(255, 255, 255, 0.72); }
+html[data-theme="dark"] .usage-month-label.token { color: #fff; background: rgba(59, 130, 246, 0.8); }
+html[data-theme="dark"] .usage-month-label.request { color: #fbbf24; background: rgba(15, 23, 42, 0.6); }
+.usage-month-bars-xaxis { display: flex; gap: 8px; margin-top: 4px; padding-left: 42px; padding-right: 32px; }
+.usage-month-bars-xtick { flex: 1; text-align: center; color: var(--subtle); font-size: 10px; font-weight: 700; white-space: nowrap; overflow: visible; }
+.usage-calendar { border: 1px solid var(--border); border-radius: 16px; background: var(--surface); padding: 12px; width: 292px; }
+.usage-calendar-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.usage-calendar-title { font-size: 13px; font-weight: 800; }
+.usage-calendar-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }
+.usage-calendar-weekday { text-align: center; color: var(--subtle); font-size: 11px; font-weight: 800; padding: 4px 0; }
+.usage-calendar-day { border: 0; background: transparent; color: var(--text); font: inherit; font-size: 12px; font-weight: 700; border-radius: 9px; padding: 6px 0; cursor: pointer; transition: 0.12s ease; }
+.usage-calendar-day:hover:not(:disabled) { background: var(--hover); }
+.usage-calendar-day:disabled { color: var(--subtle); opacity: 0.45; cursor: not-allowed; }
+.usage-calendar-day.today { box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.55); }
+.usage-calendar-day.in-range { background: var(--blue-soft); color: #1d4ed8; border-radius: 0; }
+.usage-calendar-day.edge { background: #2563eb; color: #fff; border-radius: 9px; }
+.usage-calendar-foot { display: flex; align-items: center; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+.usage-calendar-hint { color: var(--subtle); font-size: 11px; font-weight: 700; margin-left: auto; }
+html[data-theme="dark"] .usage-calendar-day.in-range { color: #bfdbfe; }
+html[data-theme="dark"] .usage-calendar-day.edge { background: #3b82f6; color: #fff; }
 .side-stats-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .side-stats-header h3 { margin: 0; font-size: 13px; }
 .side-stats-date { color: var(--muted); font-size: 11px; font-weight: 700; }

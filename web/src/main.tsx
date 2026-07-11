@@ -1565,6 +1565,225 @@ function Metric({ label, value, note }: { label: string; value: string; note: st
   );
 }
 
+function formatLocalISODate(date: Date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+/** 用量统计日历：单击选单日，Shift+单击选区间，选完即回调。 */
+function UsageRangeCalendar({ from, to, onSelect }: {
+  from: string;
+  to: string;
+  onSelect: (from: string, to: string) => void;
+}) {
+  const todayStr = formatLocalISODate(new Date());
+  const [viewYM, setViewYM] = React.useState(() => (to || from || todayStr).slice(0, 7));
+  const [year, month] = viewYM.split('-').map(Number);
+  const startWeekday = (new Date(year, month - 1, 1).getDay() + 6) % 7; // 周一开头
+  const daysInMonth = new Date(year, month, 0).getDate();
+
+  const cells: (string | null)[] = [];
+  for (let i = 0; i < startWeekday; i += 1) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d += 1) {
+    cells.push(`${year}-${String(month).padStart(2, '0')}-${String(d).padStart(2, '0')}`);
+  }
+
+  function shiftMonth(delta: number) {
+    const next = new Date(year, month - 1 + delta, 1);
+    setViewYM(`${next.getFullYear()}-${String(next.getMonth() + 1).padStart(2, '0')}`);
+  }
+
+  function pickPreset(days: number) {
+    const end = new Date();
+    const start = new Date();
+    start.setDate(end.getDate() - (days - 1));
+    onSelect(formatLocalISODate(start), formatLocalISODate(end));
+    setViewYM(formatLocalISODate(end).slice(0, 7));
+  }
+
+  function handleDayClick(day: string, event: React.MouseEvent) {
+    if (event.shiftKey && from) {
+      const anchor = from;
+      const [a, b] = day < anchor ? [day, anchor] : [anchor, day];
+      onSelect(a, b);
+      return;
+    }
+    onSelect(day, day);
+  }
+
+  return (
+    <div className="usage-calendar" role="group" aria-label="选择统计日期区间">
+      <div className="usage-calendar-head">
+        <button className="mini-btn" type="button" onClick={() => shiftMonth(-1)} aria-label="上个月">‹</button>
+        <span className="usage-calendar-title">{year} 年 {month} 月</span>
+        <button className="mini-btn" type="button" onClick={() => shiftMonth(1)} aria-label="下个月">›</button>
+      </div>
+      <div className="usage-calendar-grid">
+        {['一', '二', '三', '四', '五', '六', '日'].map((w) => (
+          <span key={w} className="usage-calendar-weekday">{w}</span>
+        ))}
+        {cells.map((day, index) => {
+          if (!day) return <span key={`empty-${index}`} />;
+          const inRange = from && to && day >= from && day <= to;
+          const isEdge = day === from || day === to;
+          const isFuture = day > todayStr;
+          return (
+            <button
+              key={day}
+              type="button"
+              className={
+                `usage-calendar-day${inRange ? ' in-range' : ''}${isEdge ? ' edge' : ''}${day === todayStr ? ' today' : ''}`
+              }
+              disabled={isFuture}
+              onClick={(event) => handleDayClick(day, event)}
+              title={day}
+            >
+              {Number(day.slice(8))}
+            </button>
+          );
+        })}
+      </div>
+      <div className="usage-calendar-foot">
+        <button className="mini-btn" type="button" onClick={() => pickPreset(1)}>今天</button>
+        <button className="mini-btn" type="button" onClick={() => pickPreset(7)}>近 7 天</button>
+        <button className="mini-btn" type="button" onClick={() => pickPreset(30)}>近 30 天</button>
+        <span className="usage-calendar-hint">单击选单日 · Shift+单击选区间</span>
+      </div>
+    </div>
+  );
+}
+
+/** 英文紧凑单位：k / M / B，保留一位小数。 */
+function formatEnCompact(value: number) {
+  const trim = (n: number) => {
+    const s = n.toFixed(1);
+    return s.endsWith('.0') ? s.slice(0, -2) : s;
+  };
+  if (value >= 1e9) return `${trim(value / 1e9)}B`;
+  if (value >= 1e6) return `${trim(value / 1e6)}M`;
+  if (value >= 1e3) return `${trim(value / 1e3)}k`;
+  return String(value);
+}
+
+/** 最近 7 天组合图：柱状 = 每日总 Token（左轴），折线 = 请求次数（右轴）。 */
+function UsageMonthlyTokenBars({ points, onPickDay }: {
+  points: DailyRequestPoint[];
+  onPickDay?: (date: string) => void;
+}) {
+  const tokenValues = points.map((p) => (p.inputTokens || 0) + (p.outputTokens || 0));
+  const requestValues = points.map((p) => p.requestCount || 0);
+  const tokenMax = Math.max(...tokenValues, 1);
+  const requestMax = Math.max(...requestValues, 1);
+  // 折线坐标：每根柱子的中心点，比例坐标（0~100）
+  const linePoints = points.map((p, i) => {
+    const x = points.length === 1 ? 50 : ((i + 0.5) / points.length) * 100;
+    const y = 100 - (requestValues[i] / requestMax) * 96 - 2;
+    return `${x.toFixed(2)},${y.toFixed(2)}`;
+  }).join(' ');
+  // 数值标注：非 0 的每天都标
+  const barX = (i: number) => (points.length === 1 ? 50 : ((i + 0.5) / points.length) * 100);
+  // X 轴刻度：仅 7 天，每天都显示
+  const xTickIndexes = points.map((_, i) => i);
+  return (
+    <div className="usage-month-bars" role="img" aria-label="最近 7 天每日 Token 与请求次数组合图">
+      <div className="usage-month-bars-head">
+        <div className="usage-month-bars-title">最近 7 天 · 每日用量</div>
+        <div className="usage-month-bars-legend">
+          <span className="usage-month-legend-item"><i className="legend-bar" />Token（左轴）</span>
+          <span className="usage-month-legend-item"><i className="legend-line" />请求次数（右轴）</span>
+        </div>
+      </div>
+      {points.length === 0 ? (
+        <div className="usage-month-bars-empty">暂无数据</div>
+      ) : (
+        <>
+          <div className="usage-month-bars-plot">
+            <div className="usage-month-bars-yaxis">
+              <span>{formatTokenCount(tokenMax)}</span>
+              <span>{formatTokenCount(Math.round(tokenMax / 2))}</span>
+              <span>0</span>
+            </div>
+            <div className="usage-month-bars-track">
+              {points.map((p, i) => {
+                const value = tokenValues[i];
+                const h = value > 0 ? Math.max(4, Math.round((value / tokenMax) * 100)) : 2;
+                return (
+                  <button
+                    key={p.date}
+                    type="button"
+                    className={`usage-month-bar${value === 0 ? ' zero' : ''}`}
+                    title={`${p.date} · ${formatTokenCount(value)} tokens · ${p.requestCount} 次请求`}
+                    onClick={() => onPickDay?.(p.date)}
+                  >
+                    <span style={{ height: `${h}%` }} />
+                  </button>
+                );
+              })}
+              <svg
+                className="usage-month-line"
+                viewBox="0 0 100 100"
+                preserveAspectRatio="none"
+                aria-hidden="true"
+              >
+                <polyline
+                  points={linePoints}
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.6"
+                  strokeLinejoin="round"
+                  strokeLinecap="round"
+                  vectorEffect="non-scaling-stroke"
+                />
+              </svg>
+              {/* 柱内底部 Token 标注（k / M / B），与折线上方的请求数标注错开 */}
+              {points.map((p, i) => {
+                if (tokenValues[i] <= 0) return null;
+                return (
+                  <span
+                    key={`tl-${p.date}`}
+                    className="usage-month-label token"
+                    style={{ left: `${barX(i)}%`, bottom: '3%' }}
+                  >
+                    {formatEnCompact(tokenValues[i])}
+                  </span>
+                );
+              })}
+              {/* 折线请求次数标注，非 0 每天都标 */}
+              {points.map((p, i) => {
+                if (requestValues[i] <= 0) return null;
+                const y = (requestValues[i] / requestMax) * 96 + 2;
+                return (
+                  <span
+                    key={`rl-${p.date}`}
+                    className="usage-month-label request"
+                    style={{ left: `${barX(i)}%`, bottom: `${Math.min(y + 3, 95)}%` }}
+                  >
+                    {formatEnCompact(requestValues[i])}
+                  </span>
+                );
+              })}
+            </div>
+            <div className="usage-month-bars-yaxis right">
+              <span>{requestMax}</span>
+              <span>{Math.round(requestMax / 2)}</span>
+              <span>0</span>
+            </div>
+          </div>
+          <div className="usage-month-bars-xaxis">
+            {points.map((p, i) => (
+              <span key={p.date} className="usage-month-bars-xtick">
+                {xTickIndexes.includes(i) ? p.date.slice(5) : ''}
+              </span>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function endpointURL(endpoint?: OutputEndpoint) {
   if (!endpoint) return API_BASE;
   return `http://${endpoint.listenHost}:${endpoint.listenPort}${endpoint.basePath}`;
@@ -1659,9 +1878,16 @@ function App() {
   const [requestLogRetentionDays, setRequestLogRetentionDays] = useState(7);
   const [usageFrom, setUsageFrom] = useState(() => new Date().toISOString().slice(0, 10));
   const [usageTo, setUsageTo] = useState(() => new Date().toISOString().slice(0, 10));
+  // 背景轮询（3s 健康检查等）拿到的是首次渲染的闭包，必须经 ref 读取最新区间，
+  // 否则用户应用自定义区间后会立刻被「今天」的数据覆盖。
+  const usageRangeRef = useRef({ from: usageFrom, to: usageTo });
+  useEffect(() => {
+    usageRangeRef.current = { from: usageFrom, to: usageTo };
+  }, [usageFrom, usageTo]);
   const [trafficLogDetail, setTrafficLogDetail] = useState<LogEntry | null>(null);
   const [trafficLogDetailLoading, setTrafficLogDetailLoading] = useState(false);
   const [requestStats, setRequestStats] = useState<RequestStatsSnapshot | null>(null);
+  const [monthlyDaily, setMonthlyDaily] = useState<DailyRequestPoint[]>([]);
   const [appLogs, setAppLogs] = useState<AppLogEntry[]>([]);
   const [logLevel, setLogLevel] = useState('info');
   const [selectedRouteID, setSelectedRouteID] = useState('');
@@ -2063,6 +2289,7 @@ function App() {
   useEffect(() => {
     if (activeNav !== 'usage-stats') return;
     void refreshRequestStats(usageFrom, usageTo);
+    void refreshMonthlyDaily();
   }, [activeNav]);
 
   useEffect(() => {
@@ -2363,14 +2590,34 @@ function App() {
     }
   }
 
-  async function refreshRequestStats(from = usageFrom, to = usageTo) {
+  async function refreshRequestStats(from = usageRangeRef.current.from, to = usageRangeRef.current.to) {
     try {
+      // 容错：开始时间晚于结束时间时自动交换，避免后端返回空区间
+      if (from && to && from > to) [from, to] = [to, from];
       const params = new URLSearchParams();
       if (from) params.set('from', from);
       if (to) params.set('to', to);
       const response = await fetch(`${API_BASE}/__request-stats?${params.toString()}`);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       setRequestStats(normalizeRequestStats(await response.json() as RequestStatsSnapshot | LegacyRequestStatsSnapshot));
+    } catch {
+      // Keep UI usable when backend is down.
+    }
+  }
+
+  /** 独立拉取最近 7 天的按日数据，供日历旁的组合图使用（不受所选区间影响）。 */
+  async function refreshMonthlyDaily() {
+    try {
+      const end = new Date();
+      const start = new Date();
+      start.setDate(end.getDate() - 6);
+      const params = new URLSearchParams();
+      params.set('from', formatLocalISODate(start));
+      params.set('to', formatLocalISODate(end));
+      const response = await fetch(`${API_BASE}/__request-stats?${params.toString()}`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = normalizeRequestStats(await response.json() as RequestStatsSnapshot | LegacyRequestStatsSnapshot);
+      setMonthlyDaily(data?.daily || []);
     } catch {
       // Keep UI usable when backend is down.
     }
@@ -4375,23 +4622,34 @@ function App() {
               <div className="panel-header">
                 <div>
                   <h2 className="panel-title">用量统计</h2>
-                  <p className="panel-desc">按日期区间汇总请求与 Token；默认今天。图表为纯 SVG，不依赖额外库。</p>
+                  <p className="panel-desc">按日期区间汇总请求与 Token；单击日历选单日，Shift+单击选区间。</p>
                 </div>
                 <button className="btn" onClick={() => void refreshRequestStats(usageFrom, usageTo)}>刷新统计</button>
               </div>
 
-              <div className="form-grid compact" style={{ marginBottom: 12 }}>
-                <label className="field">
-                  <span>开始日期</span>
-                  <input type="date" value={usageFrom} onChange={(e) => setUsageFrom(e.target.value)} />
-                </label>
-                <label className="field">
-                  <span>结束日期</span>
-                  <input type="date" value={usageTo} onChange={(e) => setUsageTo(e.target.value)} />
-                </label>
-                <div className="field" style={{ display: 'flex', alignItems: 'flex-end' }}>
-                  <button className="btn" type="button" onClick={() => void refreshRequestStats(usageFrom, usageTo)}>应用区间</button>
+              <div className="usage-range-bar" style={{ marginBottom: 12 }}>
+                <div className="usage-range-left">
+                  <UsageRangeCalendar
+                    from={usageFrom}
+                    to={usageTo}
+                    onSelect={(nextFrom, nextTo) => {
+                      setUsageFrom(nextFrom);
+                      setUsageTo(nextTo);
+                      void refreshRequestStats(nextFrom, nextTo);
+                    }}
+                  />
+                  <div className="usage-range-summary">
+                    当前区间：{usageFrom === usageTo ? usageFrom : `${usageFrom} ~ ${usageTo}`}
+                  </div>
                 </div>
+                <UsageMonthlyTokenBars
+                  points={monthlyDaily}
+                  onPickDay={(date) => {
+                    setUsageFrom(date);
+                    setUsageTo(date);
+                    void refreshRequestStats(date, date);
+                  }}
+                />
               </div>
 
               <div className="grid-4">
