@@ -380,6 +380,7 @@ type LogEntry = {
   latencyMs: number;
   ttftMs?: number;
   clientHost?: string;
+  clientIp?: string;
   accessSource?: 'lan' | 'public' | 'local' | string;
   errorDescription?: string;
   requestBody?: string;
@@ -1572,11 +1573,12 @@ function formatLocalISODate(date: Date) {
   return `${y}-${m}-${d}`;
 }
 
-/** 用量统计日历：单击选单日，Shift+单击选区间，选完即回调。 */
-function UsageRangeCalendar({ from, to, onSelect }: {
+/** 用量统计日历：单击选单日，Shift+单击选区间，选完即回调。可选支持清除（不限日期）。 */
+function UsageRangeCalendar({ from, to, onSelect, onClear }: {
   from: string;
   to: string;
   onSelect: (from: string, to: string) => void;
+  onClear?: () => void;
 }) {
   const todayStr = formatLocalISODate(new Date());
   const [viewYM, setViewYM] = React.useState(() => (to || from || todayStr).slice(0, 7));
@@ -1649,6 +1651,7 @@ function UsageRangeCalendar({ from, to, onSelect }: {
         <button className="mini-btn" type="button" onClick={() => pickPreset(1)}>今天</button>
         <button className="mini-btn" type="button" onClick={() => pickPreset(7)}>近 7 天</button>
         <button className="mini-btn" type="button" onClick={() => pickPreset(30)}>近 30 天</button>
+        {onClear ? <button className="mini-btn" type="button" onClick={onClear} disabled={!from && !to}>清除</button> : null}
         <span className="usage-calendar-hint">单击选单日 · Shift+单击选区间</span>
       </div>
     </div>
@@ -2504,14 +2507,17 @@ function App() {
     }
   }
 
-  function buildLogsQueryParams(page: number, includeBodies = false) {
+  function buildLogsQueryParams(page: number, includeBodies = false, fromOverride?: string, toOverride?: string) {
     const params = new URLSearchParams();
     params.set('page', String(page));
     params.set('pageSize', '100');
     params.set('status', logsStatusFilter);
     if (includeBodies) params.set('includeBodies', '1');
-    if (logsFrom) params.set('from', logsFrom);
-    if (logsTo) params.set('to', logsTo);
+    // 日历选完立即刷新时 state 尚未生效，需显式传入新区间
+    const from = fromOverride !== undefined ? fromOverride : logsFrom;
+    const to = toOverride !== undefined ? toOverride : logsTo;
+    if (from) params.set('from', from);
+    if (to) params.set('to', to);
     if (logsApiKeyName.trim()) params.set('apiKeyName', logsApiKeyName.trim());
     return params;
   }
@@ -2520,10 +2526,10 @@ function App() {
     return `${log.time}|${log.path}|${log.status}|${log.model}|${log.latencyMs}`;
   }
 
-  async function refreshLogs(page = logsPage) {
+  async function refreshLogs(page = logsPage, fromOverride?: string, toOverride?: string) {
     setLogsLoading(true);
     try {
-      const response = await fetch(`${API_BASE}/__logs?${buildLogsQueryParams(page).toString()}`, { credentials: 'same-origin' });
+      const response = await fetch(`${API_BASE}/__logs?${buildLogsQueryParams(page, false, fromOverride, toOverride).toString()}`, { credentials: 'same-origin' });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json() as LogPage | LogEntry[];
       if (Array.isArray(data)) {
@@ -5103,51 +5109,66 @@ function App() {
           <section className="section-full">
             <div className="card panel traffic-panel">
               <div className="panel-header"><div><h2 className="panel-title">流量请求日志</h2><p className="panel-desc">支持按时间段、状态与密钥名称筛选；展示访问来源与首 Token 延迟（TTFT）。默认保留 {requestLogRetentionDays} 天。</p></div><button className="btn" disabled={logsLoading} onClick={() => void refreshLogs(1)}>{logsLoading ? '加载中…' : '刷新日志'}</button></div>
-              <div className="form-grid compact" style={{ marginBottom: 12 }}>
-                <label className="field">
-                  <span>开始日期</span>
-                  <input type="date" value={logsFrom} onChange={(e) => setLogsFrom(e.target.value)} />
-                </label>
-                <label className="field">
-                  <span>结束日期</span>
-                  <input type="date" value={logsTo} onChange={(e) => setLogsTo(e.target.value)} />
-                </label>
-                <label className="field">
-                  <span>状态</span>
-                  <select value={logsStatusFilter} onChange={(e) => setLogsStatusFilter(e.target.value as typeof logsStatusFilter)}>
-                    <option value="all">全部</option>
-                    <option value="2xx">2xx</option>
-                    <option value="4xx">4xx</option>
-                    <option value="5xx">5xx</option>
-                  </select>
-                </label>
-                <label className="field">
-                  <span>密钥名称</span>
-                  <input
-                    list="traffic-api-key-names"
-                    type="text"
-                    value={logsApiKeyName}
-                    placeholder="全部，或输入/选择名称"
-                    onChange={(e) => setLogsApiKeyName(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') {
-                        e.preventDefault();
-                        setLogsPage(1);
-                        void refreshLogs(1);
-                      }
+              <div className="usage-range-bar" style={{ marginBottom: 12 }}>
+                <div className="usage-range-left">
+                  <UsageRangeCalendar
+                    from={logsFrom}
+                    to={logsTo}
+                    onSelect={(nextFrom, nextTo) => {
+                      setLogsFrom(nextFrom);
+                      setLogsTo(nextTo);
+                      void refreshLogs(1, nextFrom, nextTo);
+                    }}
+                    onClear={() => {
+                      setLogsFrom('');
+                      setLogsTo('');
+                      void refreshLogs(1, '', '');
                     }}
                   />
-                  <datalist id="traffic-api-key-names">
-                    {(state.apiKeys || []).map((key) => (
-                      <option key={key.id} value={key.name} />
-                    ))}
-                  </datalist>
-                </label>
-                <div className="field" style={{ display: 'flex', alignItems: 'flex-end', gap: 8 }}>
-                  <button className="btn" type="button" onClick={() => { setLogsPage(1); void refreshLogs(1); }}>应用筛选</button>
-                  {logsApiKeyName ? (
-                    <button className="btn" type="button" onClick={() => { setLogsApiKeyName(''); setLogsPage(1); void refreshLogs(1); }}>清除密钥</button>
-                  ) : null}
+                  <div className="usage-range-summary">
+                    {logsFrom || logsTo
+                      ? `当前区间：${logsFrom === logsTo ? logsFrom : `${logsFrom} ~ ${logsTo}`}`
+                      : '未选日期：显示全部日志（倒序）'}
+                  </div>
+                </div>
+                <div className="traffic-filter-fields">
+                  <label className="field">
+                    <span>状态</span>
+                    <select value={logsStatusFilter} onChange={(e) => setLogsStatusFilter(e.target.value as typeof logsStatusFilter)}>
+                      <option value="all">全部</option>
+                      <option value="2xx">2xx</option>
+                      <option value="4xx">4xx</option>
+                      <option value="5xx">5xx</option>
+                    </select>
+                  </label>
+                  <label className="field">
+                    <span>密钥名称</span>
+                    <input
+                      list="traffic-api-key-names"
+                      type="text"
+                      value={logsApiKeyName}
+                      placeholder="全部，或输入/选择名称"
+                      onChange={(e) => setLogsApiKeyName(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          setLogsPage(1);
+                          void refreshLogs(1);
+                        }
+                      }}
+                    />
+                    <datalist id="traffic-api-key-names">
+                      {(state.apiKeys || []).map((key) => (
+                        <option key={key.id} value={key.name} />
+                      ))}
+                    </datalist>
+                  </label>
+                  <div className="field" style={{ display: 'flex', alignItems: 'flex-end', gap: 8 }}>
+                    <button className="btn" type="button" onClick={() => { setLogsPage(1); void refreshLogs(1); }}>应用筛选</button>
+                    {logsApiKeyName ? (
+                      <button className="btn" type="button" onClick={() => { setLogsApiKeyName(''); setLogsPage(1); void refreshLogs(1); }}>清除密钥</button>
+                    ) : null}
+                  </div>
                 </div>
               </div>
               <div className="log-table">
@@ -5161,6 +5182,7 @@ function App() {
                       <span>时间</span>
                       <span>状态</span>
                       <span>来源</span>
+                      <span>IP</span>
                       <span>密钥</span>
                       <span>输入 Provider</span>
                       <span>模型</span>
@@ -5175,6 +5197,7 @@ function App() {
                           <span className="log-time">{new Date(log.time).toLocaleString()}</span>
                           <Badge tone={statusTone(log.status)}>{log.status}</Badge>
                           <span className="log-source" title={log.clientHost || undefined}>{accessSourceLabel(log.accessSource)}</span>
+                          <span className="log-ip" title={log.clientIp || undefined}>{log.clientIp || '—'}</span>
                           <span className="log-key" title={log.apiKeyId || undefined}>{trafficLogKeyLabel(log)}</span>
                           <span className="log-provider" title={log.providerId || undefined}>{trafficLogProviderLabel(log, state.providers || [])}</span>
                           <span className="log-model">{log.model}</span>

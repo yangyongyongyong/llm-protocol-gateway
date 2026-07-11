@@ -523,7 +523,7 @@ func (s *Server) rebuildUsageStatsFromLogs(since time.Time) {
 const memoryLogCap = 50000
 
 func (s *Server) recordRequestLog(started time.Time, matchedKey domain.APIKey, gatewayKeyMatched bool, routeID, providerID, model, action, protocolFlow, path string, status int, usage TokenUsage, requestBody, responseBody []byte) {
-	s.recordRequestLogEx(started, matchedKey, gatewayKeyMatched, routeID, providerID, model, action, protocolFlow, path, status, usage, 0, "", "", requestBody, responseBody)
+	s.recordRequestLogEx(started, matchedKey, gatewayKeyMatched, routeID, providerID, model, action, protocolFlow, path, status, usage, 0, "", "", "", requestBody, responseBody)
 }
 
 func (s *Server) recordRequestLogFromRequest(r *http.Request, started time.Time, matchedKey domain.APIKey, gatewayKeyMatched bool, routeID, providerID, model, action, protocolFlow, path string, status int, usage TokenUsage, requestBody, responseBody []byte) {
@@ -532,15 +532,17 @@ func (s *Server) recordRequestLogFromRequest(r *http.Request, started time.Time,
 
 func (s *Server) recordRequestLogFromRequestTTFT(r *http.Request, started time.Time, matchedKey domain.APIKey, gatewayKeyMatched bool, routeID, providerID, model, action, protocolFlow, path string, status int, usage TokenUsage, ttftMs int64, requestBody, responseBody []byte) {
 	clientHost := ""
+	clientIP := ""
 	accessSource := monitor.AccessSourceLocal
 	if r != nil {
 		clientHost = requestClientHost(r)
+		clientIP = requestClientIP(r)
 		accessSource = classifyAccessSource(clientHost, s.router.State().PublicAccess.PublicBaseURL)
 	}
-	s.recordRequestLogEx(started, matchedKey, gatewayKeyMatched, routeID, providerID, model, action, protocolFlow, path, status, usage, ttftMs, clientHost, accessSource, requestBody, responseBody)
+	s.recordRequestLogEx(started, matchedKey, gatewayKeyMatched, routeID, providerID, model, action, protocolFlow, path, status, usage, ttftMs, clientHost, clientIP, accessSource, requestBody, responseBody)
 }
 
-func (s *Server) recordRequestLogEx(started time.Time, matchedKey domain.APIKey, gatewayKeyMatched bool, routeID, providerID, model, action, protocolFlow, path string, status int, usage TokenUsage, ttftMs int64, clientHost, accessSource string, requestBody, responseBody []byte) {
+func (s *Server) recordRequestLogEx(started time.Time, matchedKey domain.APIKey, gatewayKeyMatched bool, routeID, providerID, model, action, protocolFlow, path string, status int, usage TokenUsage, ttftMs int64, clientHost, clientIP, accessSource string, requestBody, responseBody []byte) {
 	if usage.InputTokens == 0 && usage.OutputTokens == 0 {
 		usage = EstimateTokenUsage(requestBody, responseBody)
 	}
@@ -564,6 +566,7 @@ func (s *Server) recordRequestLogEx(started time.Time, matchedKey domain.APIKey,
 		LatencyMillis: latency,
 		TTFTMillis:    ttftMs,
 		ClientHost:    clientHost,
+		ClientIP:      clientIP,
 		AccessSource:  accessSource,
 		RequestBody:   truncateForLog(requestBody, 8192),
 	}

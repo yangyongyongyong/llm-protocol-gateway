@@ -181,6 +181,22 @@ func (s *Store) migrate() error {
 	if err := addColumnIfMissing(tx, "api_keys", "fallback_model_overrides", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
+	// Multi-user support: keys carry an owner; empty owner means admin-owned.
+	if err := addColumnIfMissing(tx, "api_keys", "owner_user_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS users (
+		id TEXT PRIMARY KEY,
+		username TEXT NOT NULL UNIQUE,
+		password_hash TEXT NOT NULL DEFAULT '',
+		role TEXT NOT NULL DEFAULT 'user',
+		allowed_provider_ids TEXT NOT NULL DEFAULT '',
+		enabled INTEGER NOT NULL DEFAULT 1,
+		created_at TEXT NOT NULL DEFAULT '',
+		last_login_at TEXT NOT NULL DEFAULT ''
+	)`); err != nil {
+		return fmt.Errorf("migrate users: %w", err)
+	}
 	if _, err := tx.Exec(`INSERT INTO settings (key, value) VALUES ('version', ?)
 		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, fmt.Sprintf("%d", schemaVersion)); err != nil {
 		return err
@@ -669,7 +685,7 @@ func decodeFallbackModelOverrides(raw string) map[string]string {
 }
 
 func (s *Store) loadAPIKeys() ([]domain.APIKey, error) {
-	rows, err := s.db.Query(`SELECT id, name, key, route_id, model_override, model_aliases, thinking_depth_override, stream_enabled, fallback_provider_ids, fallback_model_overrides, active_provider_id, enabled, created_at, last_used_at
+	rows, err := s.db.Query(`SELECT id, name, key, route_id, model_override, model_aliases, thinking_depth_override, stream_enabled, fallback_provider_ids, fallback_model_overrides, active_provider_id, owner_user_id, enabled, created_at, last_used_at
 		FROM api_keys ORDER BY position, id`)
 	if err != nil {
 		return nil, err
@@ -683,7 +699,7 @@ func (s *Store) loadAPIKeys() ([]domain.APIKey, error) {
 		var modelAliases string
 		var fallbackProviderIDs string
 		var fallbackModelOverrides string
-		if err := rows.Scan(&k.ID, &k.Name, &k.Key, &k.RouteID, &k.ModelOverride, &modelAliases, &k.ThinkingDepthOverride, &streamEnabled, &fallbackProviderIDs, &fallbackModelOverrides, &k.ActiveProviderID, &enabled, &k.CreatedAt, &k.LastUsedAt); err != nil {
+		if err := rows.Scan(&k.ID, &k.Name, &k.Key, &k.RouteID, &k.ModelOverride, &modelAliases, &k.ThinkingDepthOverride, &streamEnabled, &fallbackProviderIDs, &fallbackModelOverrides, &k.ActiveProviderID, &k.OwnerUserID, &enabled, &k.CreatedAt, &k.LastUsedAt); err != nil {
 			return nil, err
 		}
 		k.Enabled = enabled != 0
@@ -692,6 +708,7 @@ func (s *Store) loadAPIKeys() ([]domain.APIKey, error) {
 		k.FallbackProviderIDs = decodeProviderIDList(fallbackProviderIDs)
 		k.FallbackModelOverrides = decodeFallbackModelOverrides(fallbackModelOverrides)
 		k.ActiveProviderID = strings.TrimSpace(k.ActiveProviderID)
+		k.OwnerUserID = strings.TrimSpace(k.OwnerUserID)
 		keys = append(keys, k)
 	}
 	return keys, rows.Err()
@@ -720,9 +737,9 @@ func (s *Store) CreateAPIKey(key domain.APIKey) error {
 		streamEnabled = 1
 	}
 	_, err := s.db.Exec(`INSERT INTO api_keys
-		(id, name, key, route_id, model_override, model_aliases, thinking_depth_override, stream_enabled, fallback_provider_ids, fallback_model_overrides, active_provider_id, enabled, created_at, last_used_at, position)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		key.ID, key.Name, key.Key, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, streamEnabled, encodeProviderIDList(key.FallbackProviderIDs), encodeFallbackModelOverrides(key.FallbackModelOverrides), strings.TrimSpace(key.ActiveProviderID), enabled, key.CreatedAt, key.LastUsedAt, position)
+		(id, name, key, route_id, model_override, model_aliases, thinking_depth_override, stream_enabled, fallback_provider_ids, fallback_model_overrides, active_provider_id, owner_user_id, enabled, created_at, last_used_at, position)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		key.ID, key.Name, key.Key, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, streamEnabled, encodeProviderIDList(key.FallbackProviderIDs), encodeFallbackModelOverrides(key.FallbackModelOverrides), strings.TrimSpace(key.ActiveProviderID), strings.TrimSpace(key.OwnerUserID), enabled, key.CreatedAt, key.LastUsedAt, position)
 	return err
 }
 
@@ -736,9 +753,9 @@ func (s *Store) UpdateAPIKey(key domain.APIKey) error {
 		streamEnabled = 1
 	}
 	_, err := s.db.Exec(`UPDATE api_keys
-		SET name = ?, route_id = ?, model_override = ?, model_aliases = ?, thinking_depth_override = ?, stream_enabled = ?, fallback_provider_ids = ?, fallback_model_overrides = ?, active_provider_id = ?, enabled = ?
+		SET name = ?, route_id = ?, model_override = ?, model_aliases = ?, thinking_depth_override = ?, stream_enabled = ?, fallback_provider_ids = ?, fallback_model_overrides = ?, active_provider_id = ?, owner_user_id = ?, enabled = ?
 		WHERE id = ?`,
-		key.Name, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, streamEnabled, encodeProviderIDList(key.FallbackProviderIDs), encodeFallbackModelOverrides(key.FallbackModelOverrides), strings.TrimSpace(key.ActiveProviderID), enabled, key.ID)
+		key.Name, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, streamEnabled, encodeProviderIDList(key.FallbackProviderIDs), encodeFallbackModelOverrides(key.FallbackModelOverrides), strings.TrimSpace(key.ActiveProviderID), strings.TrimSpace(key.OwnerUserID), enabled, key.ID)
 	return err
 }
 

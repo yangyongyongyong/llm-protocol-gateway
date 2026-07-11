@@ -207,9 +207,35 @@ type APIKey struct {
 	// ActiveProviderID is the provider currently used after failover. Empty
 	// means use the route's preferred provider.
 	ActiveProviderID string `json:"activeProviderId,omitempty"`
-	Enabled          bool   `json:"enabled"`
-	CreatedAt        string `json:"createdAt"`
-	LastUsedAt       string `json:"lastUsedAt,omitempty"`
+	// OwnerUserID binds this key to a console user. Empty means the key belongs
+	// to the administrator (legacy keys default to admin ownership).
+	OwnerUserID string `json:"ownerUserId,omitempty"`
+	Enabled     bool   `json:"enabled"`
+	CreatedAt   string `json:"createdAt"`
+	LastUsedAt  string `json:"lastUsedAt,omitempty"`
+}
+
+// UserRole enumerates console user roles.
+type UserRole string
+
+const (
+	UserRoleAdmin UserRole = "admin"
+	UserRoleUser  UserRole = "user"
+)
+
+// User is a management-console account. Normal users only see their own API
+// keys / logs / usage; admins manage everything including user accounts.
+type User struct {
+	ID           string   `json:"id"`
+	Username     string   `json:"username"`
+	PasswordHash string   `json:"-"`
+	Role         UserRole `json:"role"`
+	// AllowedProviderIDs restricts which input providers a normal user may bind
+	// API keys to. Admin-assigned; empty means no providers are available.
+	AllowedProviderIDs []string `json:"allowedProviderIds,omitempty"`
+	Enabled            bool     `json:"enabled"`
+	CreatedAt          string   `json:"createdAt"`
+	LastLoginAt        string   `json:"lastLoginAt,omitempty"`
 }
 
 type RouteDecision struct {

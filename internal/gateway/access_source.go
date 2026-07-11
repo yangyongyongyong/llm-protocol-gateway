@@ -21,6 +21,28 @@ func requestClientHost(r *http.Request) string {
 	return ""
 }
 
+// requestClientIP extracts the caller's real IP. Cloudflare tunnel puts the
+// original client IP in CF-Connecting-IP; generic proxies use X-Forwarded-For
+// (first hop) or X-Real-IP; direct connections fall back to RemoteAddr.
+func requestClientIP(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	if ip := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); ip != "" {
+		return stripHostPort(ip)
+	}
+	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
+		first := strings.TrimSpace(strings.Split(xff, ",")[0])
+		if first != "" {
+			return stripHostPort(first)
+		}
+	}
+	if ip := strings.TrimSpace(r.Header.Get("X-Real-IP")); ip != "" {
+		return stripHostPort(ip)
+	}
+	return stripHostPort(strings.TrimSpace(r.RemoteAddr))
+}
+
 func stripHostPort(hostport string) string {
 	hostport = strings.TrimSpace(hostport)
 	if hostport == "" {

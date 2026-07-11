@@ -24,6 +24,7 @@ type RequestLog struct {
 	LatencyMillis    int64     `json:"latencyMs"`
 	TTFTMillis       int64     `json:"ttftMs,omitempty"`
 	ClientHost       string    `json:"clientHost,omitempty"`
+	ClientIP         string    `json:"clientIp,omitempty"`
 	AccessSource     string    `json:"accessSource,omitempty"` // lan | public | local
 	ErrorDescription string    `json:"errorDescription,omitempty"`
 	RequestBody      string    `json:"requestBody,omitempty"`
@@ -42,6 +43,9 @@ type RequestLogQuery struct {
 	To            time.Time
 	Status        string // all | 2xx | 4xx | 5xx
 	APIKeyName    string // substring match against api_key_name (case-insensitive)
+	// APIKeyIDs restricts results to logs whose api_key_id is in this set.
+	// Used for per-user data isolation; nil means no restriction.
+	APIKeyIDs     []string
 	Page          int
 	PageSize      int
 	IncludeBodies bool // list views should omit heavy request/response bodies
@@ -242,6 +246,13 @@ func (s *Store) Query(query RequestLogQuery) RequestLogPage {
 		page = 1
 	}
 	keyNameFilter := strings.ToLower(strings.TrimSpace(query.APIKeyName))
+	var keyIDSet map[string]struct{}
+	if query.APIKeyIDs != nil {
+		keyIDSet = make(map[string]struct{}, len(query.APIKeyIDs))
+		for _, id := range query.APIKeyIDs {
+			keyIDSet[id] = struct{}{}
+		}
+	}
 	filtered := make([]RequestLog, 0, len(s.logs))
 	for _, item := range s.logs {
 		if !query.From.IsZero() && item.Time.Before(query.From) {
@@ -255,6 +266,11 @@ func (s *Store) Query(query RequestLogQuery) RequestLogPage {
 		}
 		if keyNameFilter != "" && !strings.Contains(strings.ToLower(item.APIKeyName), keyNameFilter) {
 			continue
+		}
+		if keyIDSet != nil {
+			if _, ok := keyIDSet[item.APIKeyID]; !ok {
+				continue
+			}
 		}
 		filtered = append(filtered, item)
 	}

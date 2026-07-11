@@ -26,9 +26,9 @@ func (s *Store) AppendRequestLogWithRetention(log monitor.RequestLog, retentionD
 	}
 	_, err := s.db.Exec(`INSERT INTO request_logs (
 		time, api_key_id, api_key_name, route_id, provider_id, model, action, protocol_flow, path,
-		status, input_tokens, output_tokens, cache_tokens, latency_ms, ttft_ms, client_host, access_source,
+		status, input_tokens, output_tokens, cache_tokens, latency_ms, ttft_ms, client_host, client_ip, access_source,
 		error_description, request_body, response_body
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		log.Time.UTC().Format(time.RFC3339Nano),
 		log.APIKeyID,
 		log.APIKeyName,
@@ -45,6 +45,7 @@ func (s *Store) AppendRequestLogWithRetention(log monitor.RequestLog, retentionD
 		log.LatencyMillis,
 		log.TTFTMillis,
 		log.ClientHost,
+		log.ClientIP,
 		log.AccessSource,
 		log.ErrorDescription,
 		log.RequestBody,
@@ -116,6 +117,19 @@ func (s *Store) QueryRequestLogs(query monitor.RequestLogQuery) (monitor.Request
 		where = append(where, "LOWER(api_key_name) LIKE ?")
 		args = append(args, "%"+strings.ToLower(keyName)+"%")
 	}
+	if query.APIKeyIDs != nil {
+		// Per-user isolation: an empty (non-nil) set must match nothing.
+		if len(query.APIKeyIDs) == 0 {
+			where = append(where, "1=0")
+		} else {
+			placeholders := make([]string, 0, len(query.APIKeyIDs))
+			for _, id := range query.APIKeyIDs {
+				placeholders = append(placeholders, "?")
+				args = append(args, id)
+			}
+			where = append(where, "api_key_id IN ("+strings.Join(placeholders, ",")+")")
+		}
+	}
 
 	whereSQL := strings.Join(where, " AND ")
 	var total int
@@ -127,7 +141,7 @@ func (s *Store) QueryRequestLogs(query monitor.RequestLogQuery) (monitor.Request
 	offset := (page - 1) * pageSize
 	args = append(args, pageSize, offset)
 	selectCols := `time, api_key_id, api_key_name, route_id, provider_id, model, action, protocol_flow, path,
-		status, input_tokens, output_tokens, cache_tokens, latency_ms, ttft_ms, client_host, access_source,
+		status, input_tokens, output_tokens, cache_tokens, latency_ms, ttft_ms, client_host, client_ip, access_source,
 		error_description`
 	if query.IncludeBodies {
 		selectCols += `, request_body, response_body`
@@ -163,7 +177,7 @@ func scanRequestLog(rows *sql.Rows) (monitor.RequestLog, error) {
 	var item monitor.RequestLog
 	var timeValue string
 	var ttft sql.NullInt64
-	var clientHost, accessSource sql.NullString
+	var clientHost, clientIP, accessSource sql.NullString
 	if err := rows.Scan(
 		&timeValue,
 		&item.APIKeyID,
@@ -181,6 +195,7 @@ func scanRequestLog(rows *sql.Rows) (monitor.RequestLog, error) {
 		&item.LatencyMillis,
 		&ttft,
 		&clientHost,
+		&clientIP,
 		&accessSource,
 		&item.ErrorDescription,
 		&item.RequestBody,
@@ -201,6 +216,9 @@ func scanRequestLog(rows *sql.Rows) (monitor.RequestLog, error) {
 	if clientHost.Valid {
 		item.ClientHost = clientHost.String
 	}
+	if clientIP.Valid {
+		item.ClientIP = clientIP.String
+	}
 	if accessSource.Valid {
 		item.AccessSource = accessSource.String
 	}
@@ -211,7 +229,7 @@ func scanRequestLogSummary(rows *sql.Rows) (monitor.RequestLog, error) {
 	var item monitor.RequestLog
 	var timeValue string
 	var ttft sql.NullInt64
-	var clientHost, accessSource sql.NullString
+	var clientHost, clientIP, accessSource sql.NullString
 	if err := rows.Scan(
 		&timeValue,
 		&item.APIKeyID,
@@ -229,6 +247,7 @@ func scanRequestLogSummary(rows *sql.Rows) (monitor.RequestLog, error) {
 		&item.LatencyMillis,
 		&ttft,
 		&clientHost,
+		&clientIP,
 		&accessSource,
 		&item.ErrorDescription,
 	); err != nil {
@@ -246,6 +265,9 @@ func scanRequestLogSummary(rows *sql.Rows) (monitor.RequestLog, error) {
 	}
 	if clientHost.Valid {
 		item.ClientHost = clientHost.String
+	}
+	if clientIP.Valid {
+		item.ClientIP = clientIP.String
 	}
 	if accessSource.Valid {
 		item.AccessSource = accessSource.String
@@ -272,6 +294,7 @@ func ensureRequestLogsTable(tx *sql.Tx) error {
 		latency_ms INTEGER NOT NULL DEFAULT 0,
 		ttft_ms INTEGER NOT NULL DEFAULT 0,
 		client_host TEXT NOT NULL DEFAULT '',
+		client_ip TEXT NOT NULL DEFAULT '',
 		access_source TEXT NOT NULL DEFAULT '',
 		error_description TEXT NOT NULL DEFAULT '',
 		request_body TEXT NOT NULL DEFAULT '',
@@ -286,6 +309,7 @@ func ensureRequestLogsTable(tx *sql.Tx) error {
 	}{
 		{"ttft_ms", "INTEGER NOT NULL DEFAULT 0"},
 		{"client_host", "TEXT NOT NULL DEFAULT ''"},
+		{"client_ip", "TEXT NOT NULL DEFAULT ''"},
 		{"access_source", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		if err := addColumnIfMissing(tx, "request_logs", col.name, col.def); err != nil {
