@@ -185,6 +185,13 @@ func (s *Store) migrate() error {
 	if err := addColumnIfMissing(tx, "api_keys", "owner_user_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
+	// Multiple forwarding profiles per key + the currently active profile id.
+	if err := addColumnIfMissing(tx, "api_keys", "profiles", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	if err := addColumnIfMissing(tx, "api_keys", "active_profile_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
 	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS users (
 		id TEXT PRIMARY KEY,
 		username TEXT NOT NULL UNIQUE,
@@ -684,8 +691,34 @@ func decodeFallbackModelOverrides(raw string) map[string]string {
 	return out
 }
 
+func encodeKeyProfiles(profiles []domain.KeyProfile) string {
+	if len(profiles) == 0 {
+		return ""
+	}
+	raw, err := json.Marshal(profiles)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
+func decodeKeyProfiles(raw string) []domain.KeyProfile {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var profiles []domain.KeyProfile
+	if err := json.Unmarshal([]byte(raw), &profiles); err != nil {
+		return nil
+	}
+	if len(profiles) == 0 {
+		return nil
+	}
+	return profiles
+}
+
 func (s *Store) loadAPIKeys() ([]domain.APIKey, error) {
-	rows, err := s.db.Query(`SELECT id, name, key, route_id, model_override, model_aliases, thinking_depth_override, stream_enabled, fallback_provider_ids, fallback_model_overrides, active_provider_id, owner_user_id, enabled, created_at, last_used_at
+	rows, err := s.db.Query(`SELECT id, name, key, route_id, model_override, model_aliases, thinking_depth_override, stream_enabled, fallback_provider_ids, fallback_model_overrides, active_provider_id, owner_user_id, profiles, active_profile_id, enabled, created_at, last_used_at
 		FROM api_keys ORDER BY position, id`)
 	if err != nil {
 		return nil, err
@@ -699,7 +732,8 @@ func (s *Store) loadAPIKeys() ([]domain.APIKey, error) {
 		var modelAliases string
 		var fallbackProviderIDs string
 		var fallbackModelOverrides string
-		if err := rows.Scan(&k.ID, &k.Name, &k.Key, &k.RouteID, &k.ModelOverride, &modelAliases, &k.ThinkingDepthOverride, &streamEnabled, &fallbackProviderIDs, &fallbackModelOverrides, &k.ActiveProviderID, &k.OwnerUserID, &enabled, &k.CreatedAt, &k.LastUsedAt); err != nil {
+		var profiles string
+		if err := rows.Scan(&k.ID, &k.Name, &k.Key, &k.RouteID, &k.ModelOverride, &modelAliases, &k.ThinkingDepthOverride, &streamEnabled, &fallbackProviderIDs, &fallbackModelOverrides, &k.ActiveProviderID, &k.OwnerUserID, &profiles, &k.ActiveProfileID, &enabled, &k.CreatedAt, &k.LastUsedAt); err != nil {
 			return nil, err
 		}
 		k.Enabled = enabled != 0
@@ -709,6 +743,8 @@ func (s *Store) loadAPIKeys() ([]domain.APIKey, error) {
 		k.FallbackModelOverrides = decodeFallbackModelOverrides(fallbackModelOverrides)
 		k.ActiveProviderID = strings.TrimSpace(k.ActiveProviderID)
 		k.OwnerUserID = strings.TrimSpace(k.OwnerUserID)
+		k.Profiles = decodeKeyProfiles(profiles)
+		k.ActiveProfileID = strings.TrimSpace(k.ActiveProfileID)
 		keys = append(keys, k)
 	}
 	return keys, rows.Err()
@@ -737,9 +773,9 @@ func (s *Store) CreateAPIKey(key domain.APIKey) error {
 		streamEnabled = 1
 	}
 	_, err := s.db.Exec(`INSERT INTO api_keys
-		(id, name, key, route_id, model_override, model_aliases, thinking_depth_override, stream_enabled, fallback_provider_ids, fallback_model_overrides, active_provider_id, owner_user_id, enabled, created_at, last_used_at, position)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		key.ID, key.Name, key.Key, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, streamEnabled, encodeProviderIDList(key.FallbackProviderIDs), encodeFallbackModelOverrides(key.FallbackModelOverrides), strings.TrimSpace(key.ActiveProviderID), strings.TrimSpace(key.OwnerUserID), enabled, key.CreatedAt, key.LastUsedAt, position)
+		(id, name, key, route_id, model_override, model_aliases, thinking_depth_override, stream_enabled, fallback_provider_ids, fallback_model_overrides, active_provider_id, owner_user_id, profiles, active_profile_id, enabled, created_at, last_used_at, position)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		key.ID, key.Name, key.Key, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, streamEnabled, encodeProviderIDList(key.FallbackProviderIDs), encodeFallbackModelOverrides(key.FallbackModelOverrides), strings.TrimSpace(key.ActiveProviderID), strings.TrimSpace(key.OwnerUserID), encodeKeyProfiles(key.Profiles), strings.TrimSpace(key.ActiveProfileID), enabled, key.CreatedAt, key.LastUsedAt, position)
 	return err
 }
 
@@ -753,9 +789,9 @@ func (s *Store) UpdateAPIKey(key domain.APIKey) error {
 		streamEnabled = 1
 	}
 	_, err := s.db.Exec(`UPDATE api_keys
-		SET name = ?, route_id = ?, model_override = ?, model_aliases = ?, thinking_depth_override = ?, stream_enabled = ?, fallback_provider_ids = ?, fallback_model_overrides = ?, active_provider_id = ?, owner_user_id = ?, enabled = ?
+		SET name = ?, route_id = ?, model_override = ?, model_aliases = ?, thinking_depth_override = ?, stream_enabled = ?, fallback_provider_ids = ?, fallback_model_overrides = ?, active_provider_id = ?, owner_user_id = ?, profiles = ?, active_profile_id = ?, enabled = ?
 		WHERE id = ?`,
-		key.Name, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, streamEnabled, encodeProviderIDList(key.FallbackProviderIDs), encodeFallbackModelOverrides(key.FallbackModelOverrides), strings.TrimSpace(key.ActiveProviderID), strings.TrimSpace(key.OwnerUserID), enabled, key.ID)
+		key.Name, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, streamEnabled, encodeProviderIDList(key.FallbackProviderIDs), encodeFallbackModelOverrides(key.FallbackModelOverrides), strings.TrimSpace(key.ActiveProviderID), strings.TrimSpace(key.OwnerUserID), encodeKeyProfiles(key.Profiles), strings.TrimSpace(key.ActiveProfileID), enabled, key.ID)
 	return err
 }
 

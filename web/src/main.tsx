@@ -333,9 +333,23 @@ type APIKey = {
   fallbackModelOverrides?: Record<string, string>;
   activeProviderId?: string;
   ownerUserId?: string;
+  profiles?: KeyProfile[];
+  activeProfileId?: string;
   enabled: boolean;
   createdAt: string;
   lastUsedAt?: string;
+};
+
+type KeyProfile = {
+  id: string;
+  name: string;
+  routeId: string;
+  modelOverride?: string;
+  modelAliases?: Record<string, string>;
+  thinkingDepthOverride?: string;
+  fallbackProviderIds?: string[];
+  fallbackModelOverrides?: Record<string, string>;
+  streamEnabled?: boolean;
 };
 
 type Model = {
@@ -4318,6 +4332,105 @@ function App() {
     }
   }
 
+  // 一键切换 Key 的当前生效转发方案（profile）。客户端 token 不变。
+  async function switchApiKeyProfile(key: APIKey, profileId: string) {
+    setSaving(true);
+    try {
+      const response = await fetch(`${API_BASE}/__apikeys/${encodeURIComponent(key.id)}/active-profile`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ profileId }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const updated = await response.json() as APIKey;
+      setState((current) => ({
+        ...current,
+        apiKeys: (current.apiKeys || []).map((item) => item.id === updated.id ? { ...item, ...updated } : item),
+      }));
+      const name = (updated.profiles || []).find((p) => p.id === profileId)?.name || profileId;
+      showToast(`已切换到方案：${name}`);
+      await refreshAppLogs();
+    } catch (error) {
+      showToast(`切换方案失败：${String(error)}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  // 新建转发方案：完整克隆当前 Key 顶层转发配置，可选立即启用。
+  async function createApiKeyProfile(key: APIKey, profile: Partial<KeyProfile>, activate: boolean) {
+    setSaving(true);
+    try {
+      const response = await fetch(`${API_BASE}/__apikeys/${encodeURIComponent(key.id)}/profiles`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...profile, activate }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const updated = await response.json() as APIKey;
+      setState((current) => ({
+        ...current,
+        apiKeys: (current.apiKeys || []).map((item) => item.id === updated.id ? { ...item, ...updated } : item),
+      }));
+      showToast(`已新增方案：${profile.name || ''}`);
+      await refreshAppLogs();
+    } catch (error) {
+      showToast(`新增方案失败：${String(error)}`);
+      throw error;
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function updateApiKeyProfile(key: APIKey, profileId: string, profile: Partial<KeyProfile>) {
+    setSaving(true);
+    try {
+      const response = await fetch(`${API_BASE}/__apikeys/${encodeURIComponent(key.id)}/profiles/${encodeURIComponent(profileId)}`, {
+        method: 'PATCH',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(profile),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const updated = await response.json() as APIKey;
+      setState((current) => ({
+        ...current,
+        apiKeys: (current.apiKeys || []).map((item) => item.id === updated.id ? { ...item, ...updated } : item),
+      }));
+      showToast(`已更新方案：${profile.name || ''}`);
+      await refreshAppLogs();
+    } catch (error) {
+      showToast(`更新方案失败：${String(error)}`);
+      throw error;
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function deleteApiKeyProfile(key: APIKey, profileId: string) {
+    setSaving(true);
+    try {
+      const response = await fetch(`${API_BASE}/__apikeys/${encodeURIComponent(key.id)}/profiles/${encodeURIComponent(profileId)}`, {
+        method: 'DELETE',
+        credentials: 'same-origin',
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const updated = await response.json() as APIKey;
+      setState((current) => ({
+        ...current,
+        apiKeys: (current.apiKeys || []).map((item) => item.id === updated.id ? { ...item, ...updated } : item),
+      }));
+      showToast('已删除方案');
+      await refreshAppLogs();
+    } catch (error) {
+      showToast(`删除方案失败：${String(error)}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
   function clearApiKeyChecks() {
     setCheckedApiKeyIDs([]);
     apiKeyCheckAnchorRef.current = null;
@@ -4846,6 +4959,10 @@ function App() {
                       onToast={showToast}
                       owners={!isNormalUser ? consoleUsers : undefined}
                       onUpdateOwner={!isNormalUser ? updateApiKeyOwner : undefined}
+                      onSwitchProfile={switchApiKeyProfile}
+                      onCreateProfile={createApiKeyProfile}
+                      onUpdateProfile={updateApiKeyProfile}
+                      onDeleteProfile={deleteApiKeyProfile}
                     />
                   ) : (
                     <div className="api-keys-detail empty-state">请从左侧列表选择一个 API 密钥。</div>
@@ -6773,6 +6890,10 @@ function ApiKeyDetailPanel({
   onToast,
   owners,
   onUpdateOwner,
+  onSwitchProfile,
+  onCreateProfile,
+  onUpdateProfile,
+  onDeleteProfile,
 }: {
   keyItem: APIKey;
   providers: Provider[];
@@ -6795,6 +6916,11 @@ function ApiKeyDetailPanel({
   // 用户归属（仅管理员可见/可改）；owners 为空时不渲染
   owners?: ConsoleUser[];
   onUpdateOwner?: (key: APIKey, ownerUserId: string) => Promise<void>;
+  // 转发方案（多套配置 + 一键切换）
+  onSwitchProfile: (key: APIKey, profileId: string) => Promise<void>;
+  onCreateProfile: (key: APIKey, profile: Partial<KeyProfile>, activate: boolean) => Promise<void>;
+  onUpdateProfile: (key: APIKey, profileId: string, profile: Partial<KeyProfile>) => Promise<void>;
+  onDeleteProfile: (key: APIKey, profileId: string) => Promise<void>;
 }) {
   const { route, binding, routeProvider, bindingAction } = getApiKeyBinding(keyItem, routes, providers);
   const modelOptions = routeProvider ? models.filter((model) => model.providerId === routeProvider.id) : [];
@@ -6803,6 +6929,9 @@ function ApiKeyDetailPanel({
   const apiKeyClientURL = route ? apiKeyClientBaseURL(route, endpoints, defaultPublicBase) : '';
   const [clientConfigModal, setClientConfigModal] = React.useState<'opencode' | 'codex' | 'claude' | null>(null);
   const [fallbackModalOpen, setFallbackModalOpen] = React.useState(false);
+  const profiles = keyItem.profiles || [];
+  const activeProfileId = keyItem.activeProfileId || '';
+  const activeProfile = profiles.find((item) => item.id === activeProfileId);
   const fallbackIds = keyItem.fallbackProviderIds || [];
   const fallbackModelOverrides = keyItem.fallbackModelOverrides || {};
   const activeProviderId = keyItem.activeProviderId || binding.providerId;
@@ -6812,6 +6941,50 @@ function ApiKeyDetailPanel({
 
   function openClientConfigModal(client: 'opencode' | 'codex' | 'claude') {
     setClientConfigModal(client);
+  }
+
+  // 新建方案 = 完整克隆当前 Key 顶层转发配置（备选 / 模型映射等一并带上）。
+  function snapshotCurrentProfile(name: string): Partial<KeyProfile> {
+    return {
+      name,
+      routeId: keyItem.routeId,
+      modelOverride: keyItem.modelOverride,
+      modelAliases: { ...(keyItem.modelAliases || {}) },
+      thinkingDepthOverride: keyItem.thinkingDepthOverride,
+      fallbackProviderIds: [...(keyItem.fallbackProviderIds || [])],
+      fallbackModelOverrides: { ...(keyItem.fallbackModelOverrides || {}) },
+      streamEnabled: keyItem.streamEnabled !== false,
+    };
+  }
+
+  async function handleCreateProfile() {
+    const name = window.prompt('新方案名称（将完整复制当前转发配置）', '');
+    if (name == null) return;
+    const trimmed = name.trim();
+    if (!trimmed) {
+      onToast?.('请填写方案名称');
+      return;
+    }
+    await onCreateProfile(keyItem, snapshotCurrentProfile(trimmed), true);
+  }
+
+  async function handleRenameProfile() {
+    if (!activeProfile) return;
+    const name = window.prompt('重命名当前方案', activeProfile.name);
+    if (name == null) return;
+    const trimmed = name.trim();
+    if (!trimmed || trimmed === activeProfile.name) return;
+    await onUpdateProfile(keyItem, activeProfile.id, { ...activeProfile, name: trimmed });
+  }
+
+  async function handleDeleteProfile() {
+    if (!activeProfile) return;
+    if (profiles.length <= 1) {
+      onToast?.('至少保留一套方案，或先新建再删除');
+      return;
+    }
+    if (!window.confirm(`删除方案「${activeProfile.name}」？删除后将切换到其余方案之一。`)) return;
+    await onDeleteProfile(keyItem, activeProfile.id);
   }
 
   return (
@@ -6828,6 +7001,57 @@ function ApiKeyDetailPanel({
           <button className="icon-btn danger" onClick={() => void onDelete(keyItem)} title="删除">删除</button>
         </div>
       </div>
+
+      <div className="api-key-profile-selector">
+        <div className="field-label-row">
+          <label>转发方案</label>
+          <div className="api-key-profile-toolbar">
+            <button className="btn" type="button" disabled={saving} onClick={() => void handleCreateProfile()}>
+              新建方案
+            </button>
+            {activeProfile ? (
+              <button className="btn" type="button" disabled={saving} onClick={() => void handleRenameProfile()}>
+                重命名
+              </button>
+            ) : null}
+            {activeProfile && profiles.length > 1 ? (
+              <button className="btn danger" type="button" disabled={saving} onClick={() => void handleDeleteProfile()}>
+                删除当前
+              </button>
+            ) : null}
+          </div>
+        </div>
+        <div className="hint-line">
+          同一 Key（token 不变）可切换多套完整转发配置。下方整页表单即当前生效方案（Provider / 备选 / 模型映射等）；切换方案后新请求立即走新配置。
+        </div>
+        <div className="api-key-profile-tabs" role="tablist" aria-label="转发方案">
+          {profiles.length === 0 ? (
+            <button className="api-key-profile-tab active" type="button" role="tab" aria-selected="true" disabled>
+              当前配置
+            </button>
+          ) : (
+            profiles.map((profile) => {
+              const isActive = profile.id === activeProfileId;
+              return (
+                <button
+                  key={profile.id}
+                  className={`api-key-profile-tab${isActive ? ' active' : ''}`}
+                  type="button"
+                  role="tab"
+                  aria-selected={isActive}
+                  disabled={saving || isActive}
+                  onClick={() => void onSwitchProfile(keyItem, profile.id)}
+                  title={isActive ? '当前生效方案' : `切换到「${profile.name}」`}
+                >
+                  {profile.name}
+                  {isActive ? <span className="api-key-profile-tab-mark">生效</span> : null}
+                </button>
+              );
+            })
+          )}
+        </div>
+      </div>
+
       <div className="form-grid compact">
         <ApiKeyNameField
           name={keyItem.name}

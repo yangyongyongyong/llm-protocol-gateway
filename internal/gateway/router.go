@@ -586,6 +586,14 @@ func (r *Router) UpdateAPIKey(keyID string, patch domain.APIKey) (domain.APIKey,
 			}
 		}
 		updated.ActiveProviderID = sanitizeActiveProviderID(updated.ActiveProviderID, preferredProviderID, updated.FallbackProviderIDs)
+		// Keep the active profile's full snapshot in sync with live top-level
+		// routing fields so editing the form is editing the current scheme.
+		if pid := strings.TrimSpace(updated.ActiveProfileID); pid != "" {
+			if pIdx := profileIndex(updated.Profiles, pid); pIdx >= 0 {
+				name := updated.Profiles[pIdx].Name
+				updated.Profiles[pIdx] = keyProfileFromKey(updated, pid, name)
+			}
+		}
 		r.state.APIKeys[index] = updated
 		return updated, nil
 	}
@@ -609,6 +617,245 @@ func (r *Router) SetAPIKeyActiveProvider(keyID, providerID string) (domain.APIKe
 		updated.ActiveProviderID = sanitizeActiveProviderID(strings.TrimSpace(providerID), preferredProviderID, updated.FallbackProviderIDs)
 		r.state.APIKeys[index] = updated
 		return updated, nil
+	}
+	return domain.APIKey{}, fmt.Errorf("api key %q not found", keyID)
+}
+
+// keyProfileFromKey captures the key's current top-level routing fields as a
+// profile snapshot (used to seed a default profile for legacy keys).
+func keyProfileFromKey(key domain.APIKey, id, name string) domain.KeyProfile {
+	return domain.KeyProfile{
+		ID:                     id,
+		Name:                   name,
+		RouteID:                key.RouteID,
+		ModelOverride:          key.ModelOverride,
+		ModelAliases:           cloneStringMap(key.ModelAliases),
+		ThinkingDepthOverride:  key.ThinkingDepthOverride,
+		FallbackProviderIDs:    cloneStringSlice(key.FallbackProviderIDs),
+		FallbackModelOverrides: cloneStringMap(key.FallbackModelOverrides),
+		StreamEnabled:          key.StreamEnabled,
+	}
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneStringSlice(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, len(in))
+	copy(out, in)
+	return out
+}
+
+// profileIndex returns the slice index of a profile id, or -1.
+func profileIndex(profiles []domain.KeyProfile, profileID string) int {
+	for i := range profiles {
+		if profiles[i].ID == profileID {
+			return i
+		}
+	}
+	return -1
+}
+
+// AddKeyProfile appends a new named forwarding profile to a key. When it is the
+// first alternative, the key's current live top-level config is preserved as
+// 「默认」so the prior setup becomes scheme #1; the new profile is then added
+// as scheme #2 (and activated when activate is true).
+func (r *Router) AddKeyProfile(keyID string, profile domain.KeyProfile, activate bool) (domain.APIKey, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for index := range r.state.APIKeys {
+		key := &r.state.APIKeys[index]
+		if key.ID != keyID {
+			continue
+		}
+		profile.Name = strings.TrimSpace(profile.Name)
+		if profile.Name == "" {
+			return domain.APIKey{}, fmt.Errorf("profile name is required")
+		}
+		if strings.TrimSpace(profile.RouteID) != "" {
+			if _, ok := r.routeLocked(profile.RouteID); !ok {
+				return domain.APIKey{}, fmt.Errorf("route %q not found", profile.RouteID)
+			}
+		}
+		profile.ID = uniqueID(slug(profile.Name), func(id string) bool {
+			return profileIndex(key.Profiles, id) >= 0
+		})
+		profile = r.normalizeProfileLocked(profile)
+		// First alternative: preserve the key's existing live config as「默认」
+		// so the prior setup becomes scheme #1, then the new profile is #2.
+		if len(key.Profiles) == 0 {
+			defaultID := uniqueID("default", func(id string) bool { return id == profile.ID })
+			key.Profiles = append(key.Profiles, keyProfileFromKey(*key, defaultID, "默认"))
+			key.ActiveProfileID = defaultID
+		}
+		key.Profiles = append(key.Profiles, profile)
+		if activate {
+			r.activateProfileLocked(key, profile.ID)
+		}
+		return *key, nil
+	}
+	return domain.APIKey{}, fmt.Errorf("api key %q not found", keyID)
+}
+
+// UpdateKeyProfile edits an existing profile in place; if it is the active
+// profile the change is reflected onto the key's live routing fields too.
+func (r *Router) UpdateKeyProfile(keyID, profileID string, profile domain.KeyProfile) (domain.APIKey, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for index := range r.state.APIKeys {
+		key := &r.state.APIKeys[index]
+		if key.ID != keyID {
+			continue
+		}
+		pIdx := profileIndex(key.Profiles, profileID)
+		if pIdx < 0 {
+			return domain.APIKey{}, fmt.Errorf("profile %q not found", profileID)
+		}
+		if name := strings.TrimSpace(profile.Name); name != "" {
+			key.Profiles[pIdx].Name = name
+		}
+		if strings.TrimSpace(profile.RouteID) != "" {
+			if _, ok := r.routeLocked(profile.RouteID); !ok {
+				return domain.APIKey{}, fmt.Errorf("route %q not found", profile.RouteID)
+			}
+		}
+		merged := key.Profiles[pIdx]
+		merged.RouteID = profile.RouteID
+		merged.ModelOverride = profile.ModelOverride
+		merged.ModelAliases = profile.ModelAliases
+		merged.ThinkingDepthOverride = profile.ThinkingDepthOverride
+		merged.FallbackProviderIDs = profile.FallbackProviderIDs
+		merged.FallbackModelOverrides = profile.FallbackModelOverrides
+		merged.StreamEnabled = profile.StreamEnabled
+		merged = r.normalizeProfileLocked(merged)
+		key.Profiles[pIdx] = merged
+		if key.ActiveProfileID == profileID {
+			r.activateProfileLocked(key, profileID)
+		}
+		return *key, nil
+	}
+	return domain.APIKey{}, fmt.Errorf("api key %q not found", keyID)
+}
+
+// DeleteKeyProfile removes a profile. Deleting the active profile falls back to
+// the first remaining profile (if any).
+func (r *Router) DeleteKeyProfile(keyID, profileID string) (domain.APIKey, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for index := range r.state.APIKeys {
+		key := &r.state.APIKeys[index]
+		if key.ID != keyID {
+			continue
+		}
+		pIdx := profileIndex(key.Profiles, profileID)
+		if pIdx < 0 {
+			return domain.APIKey{}, fmt.Errorf("profile %q not found", profileID)
+		}
+		key.Profiles = append(key.Profiles[:pIdx], key.Profiles[pIdx+1:]...)
+		if key.ActiveProfileID == profileID {
+			key.ActiveProfileID = ""
+			if len(key.Profiles) > 0 {
+				r.activateProfileLocked(key, key.Profiles[0].ID)
+			}
+		}
+		return *key, nil
+	}
+	return domain.APIKey{}, fmt.Errorf("api key %q not found", keyID)
+}
+
+// SwitchKeyProfile makes the given profile active: its routing snapshot is
+// copied onto the key's live top-level fields. The client token is unchanged.
+func (r *Router) SwitchKeyProfile(keyID, profileID string) (domain.APIKey, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for index := range r.state.APIKeys {
+		key := &r.state.APIKeys[index]
+		if key.ID != keyID {
+			continue
+		}
+		if profileIndex(key.Profiles, profileID) < 0 {
+			return domain.APIKey{}, fmt.Errorf("profile %q not found", profileID)
+		}
+		r.activateProfileLocked(key, profileID)
+		return *key, nil
+	}
+	return domain.APIKey{}, fmt.Errorf("api key %q not found", keyID)
+}
+
+// normalizeProfileLocked cleans a profile's fields against its own route's
+// preferred provider. Caller must hold r.mu.
+func (r *Router) normalizeProfileLocked(profile domain.KeyProfile) domain.KeyProfile {
+	profile.RouteID = strings.TrimSpace(profile.RouteID)
+	profile.ModelOverride = strings.TrimSpace(profile.ModelOverride)
+	profile.ModelAliases = normalizeModelAliases(profile.ModelAliases)
+	profile.ThinkingDepthOverride = strings.TrimSpace(profile.ThinkingDepthOverride)
+	preferredProviderID := ""
+	if route, ok := r.routeLocked(profile.RouteID); ok {
+		preferredProviderID = route.ProviderID
+	}
+	profile.FallbackProviderIDs = normalizeFallbackProviderIDs(profile.FallbackProviderIDs, preferredProviderID)
+	profile.FallbackModelOverrides = normalizeFallbackModelOverrides(profile.FallbackProviderIDs, profile.FallbackModelOverrides)
+	return profile
+}
+
+// activateProfileLocked copies a profile's routing fields onto the key's live
+// top-level fields and marks it active. Caller must hold r.mu.
+func (r *Router) activateProfileLocked(key *domain.APIKey, profileID string) {
+	pIdx := profileIndex(key.Profiles, profileID)
+	if pIdx < 0 {
+		return
+	}
+	profile := key.Profiles[pIdx]
+	key.RouteID = strings.TrimSpace(profile.RouteID)
+	key.ModelOverride = strings.TrimSpace(profile.ModelOverride)
+	key.ModelAliases = normalizeModelAliases(profile.ModelAliases)
+	key.ThinkingDepthOverride = strings.TrimSpace(profile.ThinkingDepthOverride)
+	preferredProviderID := ""
+	if route, ok := r.routeLocked(key.RouteID); ok {
+		preferredProviderID = route.ProviderID
+	}
+	key.FallbackProviderIDs = normalizeFallbackProviderIDs(profile.FallbackProviderIDs, preferredProviderID)
+	key.FallbackModelOverrides = normalizeFallbackModelOverrides(key.FallbackProviderIDs, profile.FallbackModelOverrides)
+	key.StreamEnabled = profile.StreamEnabled
+	key.ActiveProviderID = "" // reset failover position; chain may differ
+	key.ActiveProfileID = profileID
+}
+
+// SnapshotKeyProfile saves the key's current live top-level config as a new
+// named profile and (optionally) activates it. Useful to preserve a legacy
+// key's existing configuration before adding alternatives.
+func (r *Router) SnapshotKeyProfile(keyID, name string, activate bool) (domain.APIKey, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for index := range r.state.APIKeys {
+		key := &r.state.APIKeys[index]
+		if key.ID != keyID {
+			continue
+		}
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return domain.APIKey{}, fmt.Errorf("profile name is required")
+		}
+		id := uniqueID(slug(name), func(id string) bool {
+			return profileIndex(key.Profiles, id) >= 0
+		})
+		profile := keyProfileFromKey(*key, id, name)
+		key.Profiles = append(key.Profiles, profile)
+		if activate || key.ActiveProfileID == "" {
+			key.ActiveProfileID = id
+		}
+		return *key, nil
 	}
 	return domain.APIKey{}, fmt.Errorf("api key %q not found", keyID)
 }

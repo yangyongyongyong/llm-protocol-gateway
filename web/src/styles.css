@@ -308,6 +308,14 @@ html[data-theme="dark"] .usage-calendar-day.edge { background: #3b82f6; color: #
 .api-keys-check input { width: 14px; height: 14px; margin: 0; accent-color: #2563eb; }
 .api-keys-select-hint { padding: 8px 10px; border-top: 1px solid var(--border); color: var(--muted); font-size: 11px; font-weight: 650; line-height: 1.4; }
 .api-key-fallback-summary { display: grid; gap: 8px; }
+.api-key-profile-selector { display: grid; gap: 8px; margin: 4px 0 12px; padding: 12px; border: 1px solid var(--border); border-radius: 14px; background: color-mix(in srgb, var(--surface-strong) 88%, #2563eb 12%); }
+.api-key-profile-toolbar { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.api-key-profile-tabs { display: flex; flex-wrap: wrap; gap: 8px; }
+.api-key-profile-tab { display: inline-flex; align-items: center; gap: 6px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-strong); color: var(--text); font-size: 12px; font-weight: 750; cursor: pointer; }
+.api-key-profile-tab:disabled { cursor: default; opacity: 1; }
+.api-key-profile-tab.active { border-color: color-mix(in srgb, #2563eb 55%, var(--border)); background: color-mix(in srgb, #2563eb 14%, var(--surface-strong)); color: #1d4ed8; }
+.api-key-profile-tab:not(.active):hover { border-color: color-mix(in srgb, #2563eb 35%, var(--border)); }
+.api-key-profile-tab-mark { font-size: 10px; font-weight: 800; padding: 1px 6px; border-radius: 999px; background: color-mix(in srgb, #16a34a 18%, transparent); color: #15803d; }
 .api-key-fallback-modal { display: grid; gap: 12px; }
 .api-key-fallback-list { display: grid; gap: 8px; max-height: 360px; overflow: auto; padding-right: 4px; }
 .api-key-fallback-item { display: grid; gap: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface-strong); }

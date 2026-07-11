@@ -210,9 +210,33 @@ type APIKey struct {
 	// OwnerUserID binds this key to a console user. Empty means the key belongs
 	// to the administrator (legacy keys default to admin ownership).
 	OwnerUserID string `json:"ownerUserId,omitempty"`
-	Enabled     bool   `json:"enabled"`
-	CreatedAt   string `json:"createdAt"`
-	LastUsedAt  string `json:"lastUsedAt,omitempty"`
+	// Profiles holds named forwarding-config snapshots for this key. A single
+	// key (unchanged token) can carry multiple profiles; one is active at a
+	// time. The top-level routing fields above always mirror the active
+	// profile so request-time resolution never needs to touch this list.
+	Profiles []KeyProfile `json:"profiles,omitempty"`
+	// ActiveProfileID is the profile currently in effect. Empty means no
+	// profiles are configured and the top-level fields are used directly.
+	ActiveProfileID string `json:"activeProfileId,omitempty"`
+	Enabled         bool   `json:"enabled"`
+	CreatedAt       string `json:"createdAt"`
+	LastUsedAt      string `json:"lastUsedAt,omitempty"`
+}
+
+// KeyProfile is a named forwarding-configuration snapshot owned by an APIKey.
+// Switching the key's active profile copies these fields onto the key's
+// top-level routing fields, so the client-facing token never changes while the
+// upstream routing does. Fields mirror the routing subset of APIKey.
+type KeyProfile struct {
+	ID                     string            `json:"id"`
+	Name                   string            `json:"name"`
+	RouteID                string            `json:"routeId"`
+	ModelOverride          string            `json:"modelOverride,omitempty"`
+	ModelAliases           map[string]string `json:"modelAliases,omitempty"`
+	ThinkingDepthOverride  string            `json:"thinkingDepthOverride,omitempty"`
+	FallbackProviderIDs    []string          `json:"fallbackProviderIds,omitempty"`
+	FallbackModelOverrides map[string]string `json:"fallbackModelOverrides,omitempty"`
+	StreamEnabled          bool              `json:"streamEnabled"`
 }
 
 // UserRole enumerates console user roles.
