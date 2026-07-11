@@ -509,6 +509,7 @@ func (r *Router) AddAPIKey(key domain.APIKey) (domain.APIKey, error) {
 		return domain.APIKey{}, err
 	}
 	key.ActiveProviderID = strings.TrimSpace(key.ActiveProviderID)
+	key.OwnerUserID = strings.TrimSpace(key.OwnerUserID)
 	key.Enabled = true
 	if key.CreatedAt == "" {
 		key.CreatedAt = nowRFC3339()
@@ -518,6 +519,20 @@ func (r *Router) AddAPIKey(key domain.APIKey) (domain.APIKey, error) {
 
 	r.state.APIKeys = append(r.state.APIKeys, key)
 	return key, nil
+}
+
+// UpdateAPIKeyOwner reassigns a key to a console user ("" = admin-owned).
+func (r *Router) UpdateAPIKeyOwner(keyID, ownerUserID string) (domain.APIKey, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for index := range r.state.APIKeys {
+		if r.state.APIKeys[index].ID != keyID {
+			continue
+		}
+		r.state.APIKeys[index].OwnerUserID = strings.TrimSpace(ownerUserID)
+		return r.state.APIKeys[index], nil
+	}
+	return domain.APIKey{}, fmt.Errorf("api key %q not found", keyID)
 }
 
 func (r *Router) UpdateAPIKey(keyID string, patch domain.APIKey) (domain.APIKey, error) {

@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/luca/llm-protocol-gateway/internal/domain"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -31,12 +33,51 @@ type AdminAuthStore interface {
 	SetSetting(key, value string) error
 }
 
-type adminAuthStatus struct {
-	Configured    bool `json:"configured"`
-	Authenticated bool `json:"authenticated"`
-	RequireAuth   bool `json:"requireAuth"`
-	LocalBypass   bool `json:"localBypass"`
+// UserStore persists console user accounts (multi-user management).
+type UserStore interface {
+	ListUsers() ([]domain.User, error)
+	UserByID(id string) (domain.User, error)
+	UserByUsername(username string) (domain.User, error)
+	CreateUser(domain.User) error
+	UpdateUser(domain.User) error
+	DeleteUser(id string) error
+	TouchUserLogin(id string, lastLoginAt string) error
 }
+
+type adminAuthStatus struct {
+	Configured    bool   `json:"configured"`
+	Authenticated bool   `json:"authenticated"`
+	RequireAuth   bool   `json:"requireAuth"`
+	LocalBypass   bool   `json:"localBypass"`
+	Role          string `json:"role,omitempty"`
+	Username      string `json:"username,omitempty"`
+	UserID        string `json:"userId,omitempty"`
+}
+
+// sessionIdentity is the authenticated principal resolved from the session
+// cookie (or local bypass, which is treated as the admin).
+type sessionIdentity struct {
+	UserID   string
+	Username string
+	Role     domain.UserRole
+}
+
+func (id sessionIdentity) isAdmin() bool { return id.Role == domain.UserRoleAdmin }
+
+type authContextKey struct{}
+
+// identityFromRequest returns the authenticated identity stored by withAdminAuth.
+func identityFromRequest(r *http.Request) (sessionIdentity, bool) {
+	value, ok := r.Context().Value(authContextKey{}).(sessionIdentity)
+	return value, ok
+}
+
+// adminIdentity is the implicit identity for local bypass and legacy sessions.
+func adminIdentity() sessionIdentity {
+	return sessionIdentity{UserID: legacyAdminUserID, Username: "admin", Role: domain.UserRoleAdmin}
+}
+
+const legacyAdminUserID = "admin"
 
 func (s *Server) SetAdminAuthStore(store AdminAuthStore) {
 	s.adminAuth = store
@@ -51,7 +92,8 @@ func (s *Server) withAdminAuth(next http.Handler) http.Handler {
 
 		localBypass := isLocalAdminBypass(r)
 		if localBypass {
-			next.ServeHTTP(w, r)
+			// Local desktop app acts as the administrator.
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), authContextKey{}, adminIdentity())))
 			return
 		}
 
@@ -61,12 +103,35 @@ func (s *Server) withAdminAuth(next http.Handler) http.Handler {
 			s.denyAdminAuth(w, r, "admin password setup required")
 			return
 		}
-		if s.adminSessionValid(r) {
-			next.ServeHTTP(w, r)
+		identity, ok := s.sessionIdentity(r)
+		if !ok {
+			s.denyAdminAuth(w, r, "authentication required")
 			return
 		}
-		s.denyAdminAuth(w, r, "admin authentication required")
+		// Normal users may only access a whitelisted subset of console APIs.
+		if !identity.isAdmin() && !isUserAllowedPath(r.Method, r.URL.Path) {
+			writeOpenAIError(w, http.StatusForbidden, "permission denied")
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), authContextKey{}, identity)))
 	})
+}
+
+// isUserAllowedPath whitelists console routes reachable by role=user.
+// Data-level isolation (own keys only) is enforced inside each handler.
+func isUserAllowedPath(method, path string) bool {
+	switch path {
+	case "/__state", "/__logs", "/__request-stats", "/__apikeys", "/__auth/password":
+		return true
+	}
+	if strings.HasPrefix(path, "/__apikeys/") {
+		return true
+	}
+	// Static UI assets and SPA pages are served by the same handler chain.
+	if !strings.HasPrefix(path, "/__") && method == http.MethodGet {
+		return true
+	}
+	return false
 }
 
 func (s *Server) denyAdminAuth(w http.ResponseWriter, r *http.Request, message string) {
@@ -130,30 +195,61 @@ func (s *Server) adminAuthConfigured() bool {
 }
 
 func (s *Server) adminSessionValid(r *http.Request) bool {
+	identity, ok := s.sessionIdentity(r)
+	return ok && identity.isAdmin()
+}
+
+// sessionIdentity verifies the session cookie and resolves the logged-in user.
+// Legacy tokens (minted before multi-user) carry no user info and map to admin.
+func (s *Server) sessionIdentity(r *http.Request) (sessionIdentity, bool) {
 	if s.adminAuth == nil {
-		return false
+		return sessionIdentity{}, false
 	}
 	secret := strings.TrimSpace(s.adminAuth.Setting(settingAdminSession))
 	if secret == "" {
-		return false
+		return sessionIdentity{}, false
 	}
 	cookie, err := r.Cookie(adminSessionCookieName)
 	if err != nil || cookie == nil || strings.TrimSpace(cookie.Value) == "" {
-		return false
+		return sessionIdentity{}, false
 	}
-	return verifyAdminSessionToken(cookie.Value, secret)
+	userID, ok := verifySessionToken(cookie.Value, secret)
+	if !ok {
+		return sessionIdentity{}, false
+	}
+	if userID == "" || userID == legacyAdminUserID {
+		return adminIdentity(), true
+	}
+	if s.userStore == nil {
+		return sessionIdentity{}, false
+	}
+	user, err := s.userStore.UserByID(userID)
+	if err != nil || !user.Enabled {
+		return sessionIdentity{}, false
+	}
+	return sessionIdentity{UserID: user.ID, Username: user.Username, Role: user.Role}, true
 }
 
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	localBypass := isLocalAdminBypass(r)
 	configured := s.adminAuthConfigured()
-	authenticated := localBypass || s.adminSessionValid(r)
-	writeJSON(w, http.StatusOK, adminAuthStatus{
-		Configured:    configured,
-		Authenticated: authenticated,
-		RequireAuth:   !localBypass,
-		LocalBypass:   localBypass,
-	})
+	status := adminAuthStatus{
+		Configured:  configured,
+		RequireAuth: !localBypass,
+		LocalBypass: localBypass,
+	}
+	if localBypass {
+		status.Authenticated = true
+		status.Role = string(domain.UserRoleAdmin)
+		status.Username = "admin"
+		status.UserID = legacyAdminUserID
+	} else if identity, ok := s.sessionIdentity(r); ok {
+		status.Authenticated = true
+		status.Role = string(identity.Role)
+		status.Username = identity.Username
+		status.UserID = identity.UserID
+	}
+	writeJSON(w, http.StatusOK, status)
 }
 
 func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
@@ -202,25 +298,61 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var payload struct {
+		Username string `json:"username"`
 		Password string `json:"password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
-	hash := s.adminAuth.Setting(settingAdminPassword)
-	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(payload.Password)); err != nil {
-		writeOpenAIError(w, http.StatusUnauthorized, "invalid password")
+	username := strings.TrimSpace(payload.Username)
+	// Empty username or "admin" logs in as the administrator (legacy password).
+	if username == "" || strings.EqualFold(username, "admin") {
+		hash := s.adminAuth.Setting(settingAdminPassword)
+		if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(payload.Password)); err != nil {
+			writeOpenAIError(w, http.StatusUnauthorized, "invalid username or password")
+			return
+		}
+		s.issueSession(w, r, legacyAdminUserID)
+		s.logs.AddApp("info", "admin login success", requestHostname(r.Host))
+		localBypass := isLocalAdminBypass(r)
+		writeJSON(w, http.StatusOK, adminAuthStatus{
+			Configured:    true,
+			Authenticated: true,
+			RequireAuth:   !localBypass,
+			LocalBypass:   localBypass,
+			Role:          string(domain.UserRoleAdmin),
+			Username:      "admin",
+			UserID:        legacyAdminUserID,
+		})
 		return
 	}
-	s.issueAdminSession(w, r)
-	s.logs.AddApp("info", "admin login success", requestHostname(r.Host))
+	// Normal-user login.
+	if s.userStore == nil {
+		writeOpenAIError(w, http.StatusUnauthorized, "invalid username or password")
+		return
+	}
+	user, err := s.userStore.UserByUsername(username)
+	if err != nil || !user.Enabled {
+		writeOpenAIError(w, http.StatusUnauthorized, "invalid username or password")
+		return
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(payload.Password)); err != nil {
+		writeOpenAIError(w, http.StatusUnauthorized, "invalid username or password")
+		return
+	}
+	s.issueSession(w, r, user.ID)
+	_ = s.userStore.TouchUserLogin(user.ID, nowRFC3339())
+	s.logs.AddApp("info", "user login success", user.Username)
 	localBypass := isLocalAdminBypass(r)
 	writeJSON(w, http.StatusOK, adminAuthStatus{
 		Configured:    true,
 		Authenticated: true,
 		RequireAuth:   !localBypass,
 		LocalBypass:   localBypass,
+		Role:          string(user.Role),
+		Username:      user.Username,
+		UserID:        user.ID,
 	})
 }
 
@@ -235,8 +367,9 @@ func (s *Server) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	localBypass := isLocalAdminBypass(r)
-	if !localBypass && !s.adminSessionValid(r) {
-		writeOpenAIError(w, http.StatusUnauthorized, "admin authentication required")
+	identity, hasIdentity := s.sessionIdentity(r)
+	if !localBypass && !hasIdentity {
+		writeOpenAIError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
 	var payload struct {
@@ -252,6 +385,46 @@ func (s *Server) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, fmt.Sprintf("password must be at least %d characters", adminPasswordMinLen))
 		return
 	}
+
+	// Normal user: change own password (must prove current password).
+	if hasIdentity && !identity.isAdmin() {
+		if s.userStore == nil {
+			writeOpenAIError(w, http.StatusServiceUnavailable, "user store is not configured")
+			return
+		}
+		user, err := s.userStore.UserByID(identity.UserID)
+		if err != nil {
+			writeOpenAIError(w, http.StatusUnauthorized, "user not found")
+			return
+		}
+		if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(payload.CurrentPassword)); err != nil {
+			writeOpenAIError(w, http.StatusUnauthorized, "current password is incorrect")
+			return
+		}
+		hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+		if err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		user.PasswordHash = string(hash)
+		if err := s.userStore.UpdateUser(user); err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		s.logs.AddApp("info", "user password updated", user.Username)
+		writeJSON(w, http.StatusOK, adminAuthStatus{
+			Configured:    true,
+			Authenticated: true,
+			RequireAuth:   !localBypass,
+			LocalBypass:   localBypass,
+			Role:          string(user.Role),
+			Username:      user.Username,
+			UserID:        user.ID,
+		})
+		return
+	}
+
+	// Admin path (or local bypass recovery).
 	configured := s.adminAuthConfigured()
 	if configured {
 		// Non-local must prove current password. Local App may omit it for recovery.
@@ -274,6 +447,9 @@ func (s *Server) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
 		Authenticated: true,
 		RequireAuth:   !localBypass,
 		LocalBypass:   localBypass,
+		Role:          string(domain.UserRoleAdmin),
+		Username:      "admin",
+		UserID:        legacyAdminUserID,
 	})
 }
 
@@ -296,6 +472,10 @@ func (s *Server) setAdminPassword(password string) error {
 }
 
 func (s *Server) issueAdminSession(w http.ResponseWriter, r *http.Request) {
+	s.issueSession(w, r, legacyAdminUserID)
+}
+
+func (s *Server) issueSession(w http.ResponseWriter, r *http.Request, userID string) {
 	secret := ""
 	if s.adminAuth != nil {
 		secret = strings.TrimSpace(s.adminAuth.Setting(settingAdminSession))
@@ -303,7 +483,7 @@ func (s *Server) issueAdminSession(w http.ResponseWriter, r *http.Request) {
 	if secret == "" {
 		return
 	}
-	token, err := mintAdminSessionToken(secret, time.Now().Add(adminSessionTTL))
+	token, err := mintSessionToken(secret, userID, time.Now().Add(adminSessionTTL))
 	if err != nil {
 		return
 	}
@@ -340,35 +520,63 @@ func requestIsHTTPS(r *http.Request) bool {
 	return proto == "https"
 }
 
-func mintAdminSessionToken(secret string, expiry time.Time) (string, error) {
+// Session token format: v2.<base64url(userID)>.<expiryUnix>.<nonce>.<hmac>
+// Legacy (pre multi-user) format: <expiryUnix>.<nonce>.<hmac> maps to admin.
+func mintSessionToken(secret, userID string, expiry time.Time) (string, error) {
 	nonce, err := randomToken(16)
 	if err != nil {
 		return "", err
 	}
-	payload := strconv.FormatInt(expiry.Unix(), 10) + "." + nonce
+	encodedUser := base64.RawURLEncoding.EncodeToString([]byte(userID))
+	payload := "v2." + encodedUser + "." + strconv.FormatInt(expiry.Unix(), 10) + "." + nonce
 	mac := hmac.New(sha256.New, []byte(secret))
 	_, _ = mac.Write([]byte(payload))
 	sig := hex.EncodeToString(mac.Sum(nil))
 	return payload + "." + sig, nil
 }
 
-func verifyAdminSessionToken(token, secret string) bool {
+// verifySessionToken returns the embedded userID ("" for legacy admin tokens)
+// and whether the token is valid.
+func verifySessionToken(token, secret string) (string, bool) {
 	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return false
+	switch len(parts) {
+	case 5:
+		if parts[0] != "v2" {
+			return "", false
+		}
+		userBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+		if err != nil {
+			return "", false
+		}
+		expiryUnix, err := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil || time.Now().Unix() > expiryUnix {
+			return "", false
+		}
+		payload := strings.Join(parts[:4], ".")
+		mac := hmac.New(sha256.New, []byte(secret))
+		_, _ = mac.Write([]byte(payload))
+		expected := hex.EncodeToString(mac.Sum(nil))
+		if !hmac.Equal([]byte(expected), []byte(parts[4])) {
+			return "", false
+		}
+		return string(userBytes), true
+	case 3:
+		// Legacy admin session token.
+		expiryUnix, err := strconv.ParseInt(parts[0], 10, 64)
+		if err != nil || time.Now().Unix() > expiryUnix {
+			return "", false
+		}
+		payload := parts[0] + "." + parts[1]
+		mac := hmac.New(sha256.New, []byte(secret))
+		_, _ = mac.Write([]byte(payload))
+		expected := hex.EncodeToString(mac.Sum(nil))
+		if !hmac.Equal([]byte(expected), []byte(parts[2])) {
+			return "", false
+		}
+		return "", true
+	default:
+		return "", false
 	}
-	expiryUnix, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil {
-		return false
-	}
-	if time.Now().Unix() > expiryUnix {
-		return false
-	}
-	payload := parts[0] + "." + parts[1]
-	mac := hmac.New(sha256.New, []byte(secret))
-	_, _ = mac.Write([]byte(payload))
-	expected := hex.EncodeToString(mac.Sum(nil))
-	return hmac.Equal([]byte(expected), []byte(parts[2]))
 }
 
 func randomToken(n int) (string, error) {

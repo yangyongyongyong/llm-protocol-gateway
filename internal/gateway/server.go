@@ -64,6 +64,7 @@ type Server struct {
 	listenAddr              string
 	requestLogRetentionDays int
 	adminAuth               AdminAuthStore
+	userStore               UserStore
 	oauthUsageCache         *oauthUsageCache
 	requestStatsCache       *requestStatsCache
 	// oauthUsageFetchMu serializes upstream usage fetches per provider so
@@ -105,6 +106,9 @@ func NewServer(router *Router, logs *monitor.Store, stateSaver ...StateSaver) *S
 		}
 		if auth, ok := stateSaver[0].(AdminAuthStore); ok {
 			server.adminAuth = auth
+		}
+		if users, ok := stateSaver[0].(UserStore); ok {
+			server.userStore = users
 		}
 	}
 	return server
@@ -207,6 +211,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /__apikeys", s.handleCreateAPIKey)
 	mux.HandleFunc("PATCH /__apikeys/{id}", s.handleUpdateAPIKey)
 	mux.HandleFunc("DELETE /__apikeys/{id}", s.handleDeleteAPIKey)
+	mux.HandleFunc("GET /__users", s.handleListUsers)
+	mux.HandleFunc("POST /__users", s.handleCreateUser)
+	mux.HandleFunc("PATCH /__users/{id}", s.handleUpdateUser)
+	mux.HandleFunc("DELETE /__users/{id}", s.handleDeleteUser)
+	mux.HandleFunc("POST /__users/{id}/reset-password", s.handleResetUserPassword)
 	mux.HandleFunc("GET /__selfcheck/tools", s.handleSelfcheckTools)
 	mux.HandleFunc("POST /__selfcheck", s.handleSelfcheckStart)
 	mux.HandleFunc("GET /__selfcheck/{jobId}", s.handleSelfcheckStatus)
@@ -253,10 +262,15 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
+	identity := s.requestIdentity(r)
 	state := s.router.State()
 	state.Providers = redactProvidersForClient(state.Providers)
 	for index := range state.Providers {
 		enrichProviderAdapterCurl(&state.Providers[index])
+	}
+	if !identity.isAdmin() {
+		writeJSON(w, http.StatusOK, s.stateForUser(identity, state))
+		return
 	}
 	state.PublicAccess = s.withTunnelRuntime(state.PublicAccess)
 	state.RequestLogRetentionDays = s.RequestLogRetentionDays()
@@ -306,12 +320,17 @@ func redactProviderForClient(provider domain.Provider) domain.Provider {
 }
 
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
+	identity := s.requestIdentity(r)
 	query := monitor.RequestLogQuery{
 		Status:        strings.TrimSpace(r.URL.Query().Get("status")),
 		APIKeyName:    strings.TrimSpace(r.URL.Query().Get("apiKeyName")),
 		Page:          atoiDefault(r.URL.Query().Get("page"), 1),
 		PageSize:      atoiDefault(r.URL.Query().Get("pageSize"), 100),
 		IncludeBodies: parseBoolQuery(r.URL.Query().Get("includeBodies")),
+	}
+	if !identity.isAdmin() {
+		// Normal users only see logs of their own keys (empty set matches nothing).
+		query.APIKeyIDs = s.ownedKeyIDs(identity.UserID)
 	}
 	if from := strings.TrimSpace(r.URL.Query().Get("from")); from != "" {
 		if parsed, err := time.Parse(time.RFC3339, from); err == nil {
@@ -393,6 +412,22 @@ func (s *Server) handleRequestStats(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	cacheKey := from.Format(time.RFC3339) + "|" + to.Format(time.RFC3339)
+	identity := s.requestIdentity(r)
+	if !identity.isAdmin() {
+		// Per-user stats: computed from own keys only; cached per user.
+		keyIDs := s.ownedKeyIDs(identity.UserID)
+		userCacheKey := cacheKey + "|user:" + identity.UserID
+		if cached, ok := s.requestStatsCache.get(userCacheKey); ok {
+			w.Header().Set("Cache-Control", "private, max-age=5")
+			writeJSON(w, http.StatusOK, cached)
+			return
+		}
+		snapshot := s.logs.UsageStatsRangeForKeys(now, from, to, keyIDs)
+		s.requestStatsCache.set(userCacheKey, snapshot)
+		w.Header().Set("Cache-Control", "private, max-age=5")
+		writeJSON(w, http.StatusOK, snapshot)
+		return
+	}
 	if cached, ok := s.requestStatsCache.get(cacheKey); ok {
 		w.Header().Set("Cache-Control", "private, max-age=5")
 		writeJSON(w, http.StatusOK, cached)
@@ -2020,10 +2055,12 @@ func (s *Server) handleTestRoute(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListAPIKeys(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.router.State().APIKeys)
+	identity := s.requestIdentity(r)
+	writeJSON(w, http.StatusOK, keysVisibleTo(identity, s.router.State().APIKeys))
 }
 
 func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
+	identity := s.requestIdentity(r)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid api key body: "+err.Error())
@@ -2037,6 +2074,22 @@ func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 	// Absent streamEnabled defaults to true (streaming on by default).
 	if !jsonHasKey(body, "streamEnabled") {
 		key.StreamEnabled = true
+	}
+	if identity.isAdmin() {
+		// Admin may assign any owner; validate the target user exists.
+		if owner := strings.TrimSpace(key.OwnerUserID); owner != "" && s.userStore != nil {
+			if _, err := s.userStore.UserByID(owner); err != nil {
+				writeOpenAIError(w, http.StatusBadRequest, "owner user not found")
+				return
+			}
+		}
+	} else {
+		// Normal users always own their new keys and are provider-restricted.
+		key.OwnerUserID = identity.UserID
+		if err := s.validateKeyProvidersForUser(identity, key); err != nil {
+			writeOpenAIError(w, http.StatusForbidden, err.Error())
+			return
+		}
 	}
 	created, err := s.router.AddAPIKey(key)
 	if err != nil {
@@ -2054,6 +2107,22 @@ func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpdateAPIKey(w http.ResponseWriter, r *http.Request) {
+	identity := s.requestIdentity(r)
+	keyID := r.PathValue("id")
+	// Ownership check: normal users may only touch their own keys.
+	if !identity.isAdmin() {
+		owned := false
+		for _, key := range s.router.State().APIKeys {
+			if key.ID == keyID && key.OwnerUserID == identity.UserID {
+				owned = true
+				break
+			}
+		}
+		if !owned {
+			writeOpenAIError(w, http.StatusForbidden, "permission denied")
+			return
+		}
+	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid api key body: "+err.Error())
@@ -2078,10 +2147,30 @@ func (s *Server) handleUpdateAPIKey(w http.ResponseWriter, r *http.Request) {
 	} else if patch.FallbackModelOverrides == nil {
 		patch.FallbackModelOverrides = map[string]string{}
 	}
+	if !identity.isAdmin() {
+		// Provider whitelist check for role=user (route + fallbacks).
+		if err := s.validateKeyProvidersForUser(identity, patch); err != nil {
+			writeOpenAIError(w, http.StatusForbidden, err.Error())
+			return
+		}
+	}
 	updated, err := s.router.UpdateAPIKey(r.PathValue("id"), patch)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	// Owner reassignment: admin only, and only when the field is present.
+	if identity.isAdmin() && jsonHasKey(body, "ownerUserId") {
+		owner := strings.TrimSpace(patch.OwnerUserID)
+		if owner != "" && s.userStore != nil {
+			if _, err := s.userStore.UserByID(owner); err != nil {
+				writeOpenAIError(w, http.StatusBadRequest, "owner user not found")
+				return
+			}
+		}
+		if reassigned, err := s.router.UpdateAPIKeyOwner(updated.ID, owner); err == nil {
+			updated = reassigned
+		}
 	}
 	if s.apiKeyStore != nil {
 		if err := s.apiKeyStore.UpdateAPIKey(updated); err != nil {
@@ -2094,7 +2183,21 @@ func (s *Server) handleUpdateAPIKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteAPIKey(w http.ResponseWriter, r *http.Request) {
+	identity := s.requestIdentity(r)
 	keyID := r.PathValue("id")
+	if !identity.isAdmin() {
+		owned := false
+		for _, key := range s.router.State().APIKeys {
+			if key.ID == keyID && key.OwnerUserID == identity.UserID {
+				owned = true
+				break
+			}
+		}
+		if !owned {
+			writeOpenAIError(w, http.StatusForbidden, "permission denied")
+			return
+		}
+	}
 	if err := s.router.DeleteAPIKey(keyID); err != nil {
 		writeOpenAIError(w, http.StatusNotFound, err.Error())
 		return

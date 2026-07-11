@@ -145,24 +145,28 @@ func TestSetupOnceAndLogin(t *testing.T) {
 }
 
 func TestSessionTokenExpiry(t *testing.T) {
-	token, err := mintAdminSessionToken("secret", time.Now().Add(-time.Minute))
+	token, err := mintSessionToken("secret", legacyAdminUserID, time.Now().Add(-time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if verifyAdminSessionToken(token, "secret") {
+	if _, ok := verifySessionToken(token, "secret"); ok {
 		t.Fatal("expired token should be invalid")
 	}
-	token, err = mintAdminSessionToken("secret", time.Now().Add(time.Hour))
+	token, err = mintSessionToken("secret", legacyAdminUserID, time.Now().Add(time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !verifyAdminSessionToken(token, "secret") {
+	userID, ok := verifySessionToken(token, "secret")
+	if !ok {
 		t.Fatal("fresh token should be valid")
 	}
-	if verifyAdminSessionToken(token, "other") {
+	if userID != legacyAdminUserID {
+		t.Fatalf("token should carry userID, got %q", userID)
+	}
+	if _, ok := verifySessionToken(token, "other"); ok {
 		t.Fatal("wrong secret should fail")
 	}
-	if verifyAdminSessionToken(strings.Replace(token, ".", "x", 1), "secret") {
+	if _, ok := verifySessionToken(strings.Replace(token, ".", "x", 1), "secret"); ok {
 		t.Fatal("tampered token should fail")
 	}
 }

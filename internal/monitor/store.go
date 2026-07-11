@@ -496,6 +496,47 @@ func (s *Store) UsageStats(now time.Time) UsageStatsSnapshot {
 	return s.UsageStatsRange(now, dayStart, dayStart.Add(24*time.Hour))
 }
 
+// UsageStatsRangeForKeys computes usage stats from the in-memory log list,
+// restricted to the given API key IDs (per-user isolation for role=user).
+// It bypasses the day-bucket counters because those are not keyed per user.
+func (s *Store) UsageStatsRangeForKeys(now time.Time, from, to time.Time, keyIDs []string) UsageStatsSnapshot {
+	localNow := now.Local()
+	dayStart := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, localNow.Location())
+	monthStart := time.Date(localNow.Year(), localNow.Month(), 1, 0, 0, 0, 0, localNow.Location())
+	if from.IsZero() {
+		from = dayStart
+	}
+	if to.IsZero() || !to.After(from) {
+		to = from.Add(24 * time.Hour)
+	}
+	keySet := make(map[string]struct{}, len(keyIDs))
+	for _, id := range keyIDs {
+		keySet[id] = struct{}{}
+	}
+
+	s.mu.RLock()
+	logs := make([]RequestLog, 0, len(s.logs))
+	for _, item := range s.logs {
+		if _, ok := keySet[item.APIKeyID]; ok {
+			logs = append(logs, item)
+		}
+	}
+	s.mu.RUnlock()
+
+	today := s.TodayStatsFromLogs(logs, now)
+	month := aggregateLogsSince(logs, monthStart, monthStart.Format("2006-01"))
+	rangeStats := aggregateLogsInRange(logs, from, to, from.Format("2006-01-02")+" ~ "+to.Add(-time.Nanosecond).Format("2006-01-02"))
+	return UsageStatsSnapshot{
+		Today:  today,
+		Month:  month,
+		Range:  &rangeStats,
+		From:   from.Format(time.RFC3339),
+		To:     to.Format(time.RFC3339),
+		Daily:  aggregateDaily(logs, from, to),
+		Status: aggregateStatus(logs, from, to),
+	}
+}
+
 func (s *Store) UsageStatsRange(now time.Time, from, to time.Time) UsageStatsSnapshot {
 	localNow := now.Local()
 	dayStart := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, localNow.Location())
