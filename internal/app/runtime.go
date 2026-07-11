@@ -266,6 +266,7 @@ func (rt *Runtime) Start(cfg Config) error {
 		server.SyncConnectedCursorProvidersWithEmptyModels()
 		server.RebuildUsageStats()
 		server.StartOAuthUsageBackgroundRefresh(context.Background())
+		server.StartProviderFailoverRecovery(context.Background())
 		server.StartCursorModelBackgroundRefresh(context.Background())
 	}()
 

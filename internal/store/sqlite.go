@@ -172,6 +172,15 @@ func (s *Store) migrate() error {
 	if err := addColumnIfMissing(tx, "api_keys", "stream_enabled", "INTEGER NOT NULL DEFAULT 1"); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
+	if err := addColumnIfMissing(tx, "api_keys", "fallback_provider_ids", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	if err := addColumnIfMissing(tx, "api_keys", "active_provider_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	if err := addColumnIfMissing(tx, "api_keys", "fallback_model_overrides", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
 	if _, err := tx.Exec(`INSERT INTO settings (key, value) VALUES ('version', ?)
 		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, fmt.Sprintf("%d", schemaVersion)); err != nil {
 		return err
@@ -582,8 +591,85 @@ func decodeModelAliases(raw string) map[string]string {
 	return aliases
 }
 
+func encodeProviderIDList(ids []string) string {
+	if len(ids) == 0 {
+		return ""
+	}
+	raw, err := json.Marshal(ids)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
+func decodeProviderIDList(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var ids []string
+	if err := json.Unmarshal([]byte(raw), &ids); err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(ids))
+	seen := map[string]struct{}{}
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func encodeFallbackModelOverrides(overrides map[string]string) string {
+	if len(overrides) == 0 {
+		return ""
+	}
+	raw, err := json.Marshal(overrides)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
+func decodeFallbackModelOverrides(raw string) map[string]string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var overrides map[string]string
+	if err := json.Unmarshal([]byte(raw), &overrides); err != nil {
+		return nil
+	}
+	if len(overrides) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(overrides))
+	for id, model := range overrides {
+		id = strings.TrimSpace(id)
+		model = strings.TrimSpace(model)
+		if id == "" || model == "" {
+			continue
+		}
+		out[id] = model
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func (s *Store) loadAPIKeys() ([]domain.APIKey, error) {
-	rows, err := s.db.Query(`SELECT id, name, key, route_id, model_override, model_aliases, thinking_depth_override, stream_enabled, enabled, created_at, last_used_at
+	rows, err := s.db.Query(`SELECT id, name, key, route_id, model_override, model_aliases, thinking_depth_override, stream_enabled, fallback_provider_ids, fallback_model_overrides, active_provider_id, enabled, created_at, last_used_at
 		FROM api_keys ORDER BY position, id`)
 	if err != nil {
 		return nil, err
@@ -595,12 +681,17 @@ func (s *Store) loadAPIKeys() ([]domain.APIKey, error) {
 		var enabled int
 		var streamEnabled int
 		var modelAliases string
-		if err := rows.Scan(&k.ID, &k.Name, &k.Key, &k.RouteID, &k.ModelOverride, &modelAliases, &k.ThinkingDepthOverride, &streamEnabled, &enabled, &k.CreatedAt, &k.LastUsedAt); err != nil {
+		var fallbackProviderIDs string
+		var fallbackModelOverrides string
+		if err := rows.Scan(&k.ID, &k.Name, &k.Key, &k.RouteID, &k.ModelOverride, &modelAliases, &k.ThinkingDepthOverride, &streamEnabled, &fallbackProviderIDs, &fallbackModelOverrides, &k.ActiveProviderID, &enabled, &k.CreatedAt, &k.LastUsedAt); err != nil {
 			return nil, err
 		}
 		k.Enabled = enabled != 0
 		k.StreamEnabled = streamEnabled != 0
 		k.ModelAliases = decodeModelAliases(modelAliases)
+		k.FallbackProviderIDs = decodeProviderIDList(fallbackProviderIDs)
+		k.FallbackModelOverrides = decodeFallbackModelOverrides(fallbackModelOverrides)
+		k.ActiveProviderID = strings.TrimSpace(k.ActiveProviderID)
 		keys = append(keys, k)
 	}
 	return keys, rows.Err()
@@ -629,9 +720,9 @@ func (s *Store) CreateAPIKey(key domain.APIKey) error {
 		streamEnabled = 1
 	}
 	_, err := s.db.Exec(`INSERT INTO api_keys
-		(id, name, key, route_id, model_override, model_aliases, thinking_depth_override, stream_enabled, enabled, created_at, last_used_at, position)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		key.ID, key.Name, key.Key, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, streamEnabled, enabled, key.CreatedAt, key.LastUsedAt, position)
+		(id, name, key, route_id, model_override, model_aliases, thinking_depth_override, stream_enabled, fallback_provider_ids, fallback_model_overrides, active_provider_id, enabled, created_at, last_used_at, position)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		key.ID, key.Name, key.Key, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, streamEnabled, encodeProviderIDList(key.FallbackProviderIDs), encodeFallbackModelOverrides(key.FallbackModelOverrides), strings.TrimSpace(key.ActiveProviderID), enabled, key.CreatedAt, key.LastUsedAt, position)
 	return err
 }
 
@@ -645,9 +736,9 @@ func (s *Store) UpdateAPIKey(key domain.APIKey) error {
 		streamEnabled = 1
 	}
 	_, err := s.db.Exec(`UPDATE api_keys
-		SET name = ?, route_id = ?, model_override = ?, model_aliases = ?, thinking_depth_override = ?, stream_enabled = ?, enabled = ?
+		SET name = ?, route_id = ?, model_override = ?, model_aliases = ?, thinking_depth_override = ?, stream_enabled = ?, fallback_provider_ids = ?, fallback_model_overrides = ?, active_provider_id = ?, enabled = ?
 		WHERE id = ?`,
-		key.Name, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, streamEnabled, enabled, key.ID)
+		key.Name, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, streamEnabled, encodeProviderIDList(key.FallbackProviderIDs), encodeFallbackModelOverrides(key.FallbackModelOverrides), strings.TrimSpace(key.ActiveProviderID), enabled, key.ID)
 	return err
 }
 

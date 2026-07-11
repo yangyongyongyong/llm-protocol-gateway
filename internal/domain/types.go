@@ -197,10 +197,19 @@ type APIKey struct {
 	// may use SSE streaming. Default true; when false, stream:true requests are
 	// rejected. Bound to the API key (not the output endpoint) so streaming can
 	// be toggled per consumer.
-	StreamEnabled bool   `json:"streamEnabled"`
-	Enabled       bool   `json:"enabled"`
-	CreatedAt     string `json:"createdAt"`
-	LastUsedAt    string `json:"lastUsedAt,omitempty"`
+	StreamEnabled bool `json:"streamEnabled"`
+	// FallbackProviderIDs is an ordered list of backup input providers after the
+	// preferred provider on the bound route. Higher priority comes first.
+	FallbackProviderIDs []string `json:"fallbackProviderIds,omitempty"`
+	// FallbackModelOverrides maps each fallback provider id to a required fixed
+	// model replacement used when that provider is active.
+	FallbackModelOverrides map[string]string `json:"fallbackModelOverrides,omitempty"`
+	// ActiveProviderID is the provider currently used after failover. Empty
+	// means use the route's preferred provider.
+	ActiveProviderID string `json:"activeProviderId,omitempty"`
+	Enabled          bool   `json:"enabled"`
+	CreatedAt        string `json:"createdAt"`
+	LastUsedAt       string `json:"lastUsedAt,omitempty"`
 }
 
 type RouteDecision struct {

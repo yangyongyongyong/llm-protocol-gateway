@@ -503,6 +503,12 @@ func (r *Router) AddAPIKey(key domain.APIKey) (domain.APIKey, error) {
 	key.ModelOverride = strings.TrimSpace(key.ModelOverride)
 	key.ModelAliases = normalizeModelAliases(key.ModelAliases)
 	key.ThinkingDepthOverride = strings.TrimSpace(key.ThinkingDepthOverride)
+	key.FallbackProviderIDs = normalizeFallbackProviderIDs(key.FallbackProviderIDs, "")
+	key.FallbackModelOverrides = normalizeFallbackModelOverrides(key.FallbackProviderIDs, key.FallbackModelOverrides)
+	if err := validateFallbackModelOverrides(key.FallbackProviderIDs, key.FallbackModelOverrides); err != nil {
+		return domain.APIKey{}, err
+	}
+	key.ActiveProviderID = strings.TrimSpace(key.ActiveProviderID)
 	key.Enabled = true
 	if key.CreatedAt == "" {
 		key.CreatedAt = nowRFC3339()
@@ -539,10 +545,156 @@ func (r *Router) UpdateAPIKey(keyID string, patch domain.APIKey) (domain.APIKey,
 		updated.ThinkingDepthOverride = strings.TrimSpace(patch.ThinkingDepthOverride)
 		updated.Enabled = patch.Enabled
 		updated.StreamEnabled = patch.StreamEnabled
+		preferredProviderID := ""
+		if route, ok := r.routeLocked(updated.RouteID); ok {
+			preferredProviderID = route.ProviderID
+		}
+		if patch.FallbackProviderIDs != nil {
+			updated.FallbackProviderIDs = normalizeFallbackProviderIDs(patch.FallbackProviderIDs, preferredProviderID)
+			if patch.FallbackModelOverrides != nil {
+				updated.FallbackModelOverrides = normalizeFallbackModelOverrides(updated.FallbackProviderIDs, patch.FallbackModelOverrides)
+			} else {
+				updated.FallbackModelOverrides = normalizeFallbackModelOverrides(updated.FallbackProviderIDs, updated.FallbackModelOverrides)
+			}
+			if err := validateFallbackModelOverrides(updated.FallbackProviderIDs, updated.FallbackModelOverrides); err != nil {
+				return domain.APIKey{}, err
+			}
+		} else {
+			updated.FallbackProviderIDs = normalizeFallbackProviderIDs(updated.FallbackProviderIDs, preferredProviderID)
+			if patch.FallbackModelOverrides != nil {
+				updated.FallbackModelOverrides = normalizeFallbackModelOverrides(updated.FallbackProviderIDs, patch.FallbackModelOverrides)
+				if err := validateFallbackModelOverrides(updated.FallbackProviderIDs, updated.FallbackModelOverrides); err != nil {
+					return domain.APIKey{}, err
+				}
+			} else {
+				updated.FallbackModelOverrides = normalizeFallbackModelOverrides(updated.FallbackProviderIDs, updated.FallbackModelOverrides)
+			}
+		}
+		updated.ActiveProviderID = sanitizeActiveProviderID(updated.ActiveProviderID, preferredProviderID, updated.FallbackProviderIDs)
 		r.state.APIKeys[index] = updated
 		return updated, nil
 	}
 	return domain.APIKey{}, fmt.Errorf("api key %q not found", keyID)
+}
+
+// SetAPIKeyActiveProvider updates the sticky in-use provider after failover/recovery.
+func (r *Router) SetAPIKeyActiveProvider(keyID, providerID string) (domain.APIKey, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for index := range r.state.APIKeys {
+		if r.state.APIKeys[index].ID != keyID {
+			continue
+		}
+		updated := r.state.APIKeys[index]
+		preferredProviderID := ""
+		if route, ok := r.routeLocked(updated.RouteID); ok {
+			preferredProviderID = route.ProviderID
+		}
+		updated.ActiveProviderID = sanitizeActiveProviderID(strings.TrimSpace(providerID), preferredProviderID, updated.FallbackProviderIDs)
+		r.state.APIKeys[index] = updated
+		return updated, nil
+	}
+	return domain.APIKey{}, fmt.Errorf("api key %q not found", keyID)
+}
+
+func normalizeFallbackProviderIDs(ids []string, preferredProviderID string) []string {
+	preferredProviderID = strings.TrimSpace(preferredProviderID)
+	out := make([]string, 0, len(ids))
+	seen := map[string]struct{}{}
+	if preferredProviderID != "" {
+		seen[preferredProviderID] = struct{}{}
+	}
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+func normalizeFallbackModelOverrides(fallbackIDs []string, overrides map[string]string) map[string]string {
+	if len(fallbackIDs) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(fallbackIDs))
+	for _, id := range fallbackIDs {
+		model := ""
+		if overrides != nil {
+			model = strings.TrimSpace(overrides[id])
+		}
+		if model != "" {
+			out[id] = model
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func validateFallbackModelOverrides(fallbackIDs []string, overrides map[string]string) error {
+	for _, id := range fallbackIDs {
+		if overrides == nil || strings.TrimSpace(overrides[id]) == "" {
+			return fmt.Errorf("fallback provider %q requires a fixed model override", id)
+		}
+	}
+	return nil
+}
+
+func sanitizeActiveProviderID(activeID, preferredProviderID string, fallbacks []string) string {
+	activeID = strings.TrimSpace(activeID)
+	preferredProviderID = strings.TrimSpace(preferredProviderID)
+	if activeID == "" || activeID == preferredProviderID {
+		return ""
+	}
+	for _, id := range fallbacks {
+		if id == activeID {
+			return activeID
+		}
+	}
+	return ""
+}
+
+func apiKeyProviderChain(preferredProviderID string, fallbacks []string) []string {
+	preferredProviderID = strings.TrimSpace(preferredProviderID)
+	chain := make([]string, 0, 1+len(fallbacks))
+	seen := map[string]struct{}{}
+	if preferredProviderID != "" {
+		chain = append(chain, preferredProviderID)
+		seen[preferredProviderID] = struct{}{}
+	}
+	for _, id := range fallbacks {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		chain = append(chain, id)
+	}
+	return chain
+}
+
+func apiKeyEffectiveProviderIndex(activeID string, chain []string) int {
+	activeID = strings.TrimSpace(activeID)
+	if activeID == "" {
+		return 0
+	}
+	for i, id := range chain {
+		if id == activeID {
+			return i
+		}
+	}
+	return 0
 }
 
 func (r *Router) DeleteAPIKey(keyID string) error {
@@ -747,10 +899,36 @@ func (r *Router) Decide(routeID string) (domain.RouteDecision, error) {
 	if route == nil {
 		return domain.RouteDecision{}, fmt.Errorf("route %q not found", routeID)
 	}
+	return r.decideLocked(*route, route.ProviderID)
+}
 
-	provider, ok := r.providerLocked(route.ProviderID)
+// DecideForProvider builds a route decision using an overridden input provider
+// (API key failover / sticky active provider).
+func (r *Router) DecideForProvider(routeID, providerID string) (domain.RouteDecision, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var route *domain.Route
+	for i := range r.state.Routes {
+		if r.state.Routes[i].ID == routeID {
+			route = &r.state.Routes[i]
+			break
+		}
+	}
+	if route == nil {
+		return domain.RouteDecision{}, fmt.Errorf("route %q not found", routeID)
+	}
+	return r.decideLocked(*route, providerID)
+}
+
+func (r *Router) decideLocked(route domain.Route, providerID string) (domain.RouteDecision, error) {
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		providerID = route.ProviderID
+	}
+	provider, ok := r.providerLocked(providerID)
 	if !ok {
-		return domain.RouteDecision{}, fmt.Errorf("provider %q not found", route.ProviderID)
+		return domain.RouteDecision{}, fmt.Errorf("provider %q not found", providerID)
 	}
 
 	action := "convert"

@@ -316,6 +316,9 @@ type APIKey = {
   modelAliases?: Record<string, string>;
   thinkingDepthOverride?: string;
   streamEnabled?: boolean;
+  fallbackProviderIds?: string[];
+  fallbackModelOverrides?: Record<string, string>;
+  activeProviderId?: string;
   enabled: boolean;
   createdAt: string;
   lastUsedAt?: string;
@@ -877,6 +880,8 @@ function buildApiKeyPatchBody(key: APIKey, patch: Partial<APIKey> = {}) {
     thinkingDepthOverride: patch.thinkingDepthOverride ?? key.thinkingDepthOverride ?? '',
     streamEnabled: patch.streamEnabled ?? key.streamEnabled ?? true,
     enabled: patch.enabled ?? key.enabled,
+    fallbackProviderIds: patch.fallbackProviderIds ?? key.fallbackProviderIds ?? [],
+    fallbackModelOverrides: patch.fallbackModelOverrides ?? key.fallbackModelOverrides ?? {},
   };
 }
 
@@ -1638,6 +1643,8 @@ function App() {
   const [backendReconnecting, setBackendReconnecting] = useState(false);
   const [authStatus, setAuthStatus] = useState<AdminAuthStatus | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
+  // 首屏 __state 未返回前不渲染空列表，避免「暂无密钥」闪一下
+  const [stateHydrated, setStateHydrated] = useState(false);
   const [authPassword, setAuthPassword] = useState('');
   const [authPasswordConfirm, setAuthPasswordConfirm] = useState('');
   const [authBusy, setAuthBusy] = useState(false);
@@ -1672,6 +1679,8 @@ function App() {
   const [editingRouteID, setEditingRouteID] = useState('');
   const [apiKeyModalOpen, setApiKeyModalOpen] = useState(false);
   const [selectedApiKeyID, setSelectedApiKeyID] = useState('');
+  const [checkedApiKeyIDs, setCheckedApiKeyIDs] = useState<string[]>([]);
+  const apiKeyCheckAnchorRef = useRef<number | null>(null);
   const [apiKeyFilterID, setApiKeyFilterID] = useState('__all__');
   const [apiKeyProviderFilter, setApiKeyProviderFilter] = useState('__all__');
   const [apiKeyOutputProtocolFilter, setApiKeyOutputProtocolFilter] = useState('__all__');
@@ -1909,6 +1918,12 @@ function App() {
       setAuthChecked(true);
       if (connected && auth && (!auth.requireAuth || auth.authenticated)) {
         await bootstrapAuthenticatedSession();
+        setStateHydrated(true);
+        return;
+      }
+      // 需要登录时等登录成功后再 hydrate；其余情况（免登录但未连上）直接放行
+      if (!(auth && auth.requireAuth && !auth.authenticated)) {
+        setStateHydrated(true);
       }
     })();
     // Tunnel restore is async after gateway start; keep UI in sync with live
@@ -2063,6 +2078,7 @@ function App() {
         setActiveNav('input-providers');
       }
       await bootstrapAuthenticatedSession();
+      setStateHydrated(true);
       showToast(mode === 'setup' ? '管理员密码已设置' : '登录成功');
     } catch (error) {
       setAuthError(String(error));
@@ -3543,6 +3559,7 @@ function App() {
   async function updateApiKeyBinding(key: APIKey, providerId: string, outputProtocol: Protocol) {
     const currentRoute = state.routes.find((item) => item.id === key.routeId);
     if (currentRoute?.providerId === providerId && currentRoute.outputProtocol === outputProtocol) return;
+    const providerChanged = currentRoute?.providerId !== providerId;
     setSaving(true);
     try {
       const route = await ensureRouteForBinding(providerId, outputProtocol);
@@ -3551,7 +3568,8 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(buildApiKeyPatchBody(key, {
           routeId: route.id,
-          modelOverride: '',
+          // 固定模型只跟输入 Provider 相关；仅换输出协议时保留
+          ...(providerChanged ? { modelOverride: '' } : {}),
         })),
       });
       if (!response.ok) throw new Error(await response.text());
@@ -3572,6 +3590,26 @@ function App() {
       return;
     }
     await fetchProviderModels(provider.id, providerName || provider.name);
+  }
+
+  async function updateApiKeyFallbacks(key: APIKey, fallbackProviderIds: string[], fallbackModelOverrides: Record<string, string>) {
+    setSaving(true);
+    try {
+      const response = await fetch(`${API_BASE}/__apikeys/${encodeURIComponent(key.id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(buildApiKeyPatchBody(key, { fallbackProviderIds, fallbackModelOverrides })),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      showToast(`已更新备选 Provider：${key.name}`);
+      await refreshState(false);
+      await refreshAppLogs();
+    } catch (error) {
+      showToast(`更新备选 Provider 失败：${String(error)}`);
+      throw error;
+    } finally {
+      setSaving(false);
+    }
   }
 
   async function updateApiKeyField(key: APIKey, field: 'name' | 'routeId' | 'modelOverride' | 'thinkingDepthOverride' | 'streamEnabled' | 'enabled', value: string | boolean) {
@@ -3625,6 +3663,30 @@ function App() {
     }
   }
 
+  function clearApiKeyChecks() {
+    setCheckedApiKeyIDs([]);
+    apiKeyCheckAnchorRef.current = null;
+  }
+
+  function selectAllFilteredApiKeys() {
+    setCheckedApiKeyIDs(filteredApiKeys.map((key) => key.id));
+    apiKeyCheckAnchorRef.current = filteredApiKeys.length > 0 ? 0 : null;
+  }
+
+  function toggleApiKeyCheck(keyID: string, index: number, shiftKey: boolean) {
+    if (shiftKey && apiKeyCheckAnchorRef.current != null) {
+      const from = Math.min(apiKeyCheckAnchorRef.current, index);
+      const to = Math.max(apiKeyCheckAnchorRef.current, index);
+      const rangeIDs = filteredApiKeys.slice(from, to + 1).map((key) => key.id);
+      setCheckedApiKeyIDs((current) => Array.from(new Set([...current, ...rangeIDs])));
+      return;
+    }
+    setCheckedApiKeyIDs((current) => (
+      current.includes(keyID) ? current.filter((id) => id !== keyID) : [...current, keyID]
+    ));
+    apiKeyCheckAnchorRef.current = index;
+  }
+
   async function deleteApiKey(key: APIKey) {
     if (!window.confirm(`确定删除 API 密钥：${key.name}？`)) return;
     setSaving(true);
@@ -3632,6 +3694,7 @@ function App() {
       const response = await fetch(`${API_BASE}/__apikeys/${encodeURIComponent(key.id)}`, { method: 'DELETE' });
       if (!response.ok) throw new Error(await response.text());
       showToast(`已删除 API 密钥：${key.name}`);
+      setCheckedApiKeyIDs((current) => current.filter((id) => id !== key.id));
       if (selectedApiKeyID === key.id) {
         setSelectedApiKeyID('');
         setApiKeyFilterID('__all__');
@@ -3640,6 +3703,39 @@ function App() {
       await refreshAppLogs();
     } catch (error) {
       showToast(`删除 API 密钥失败：${String(error)}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function deleteCheckedApiKeys() {
+    const ids = checkedApiKeyIDs.filter((id) => (state.apiKeys || []).some((key) => key.id === id));
+    if (ids.length === 0) return;
+    if (!window.confirm(`确定删除选中的 ${ids.length} 个 API 密钥？此操作不可恢复。`)) return;
+    setSaving(true);
+    try {
+      const results = await Promise.allSettled(ids.map(async (id) => {
+        const response = await fetch(`${API_BASE}/__apikeys/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        if (!response.ok) throw new Error(await response.text() || `HTTP ${response.status}`);
+        return id;
+      }));
+      const deleted = results.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []);
+      const failed = results.length - deleted.length;
+      if (selectedApiKeyID && deleted.includes(selectedApiKeyID)) {
+        setSelectedApiKeyID('');
+        setApiKeyFilterID('__all__');
+      }
+      setCheckedApiKeyIDs((current) => current.filter((id) => !deleted.includes(id)));
+      apiKeyCheckAnchorRef.current = null;
+      await refreshState(false);
+      await refreshAppLogs();
+      if (failed > 0) {
+        showToast(`已删除 ${deleted.length} 个密钥，${failed} 个失败`);
+      } else {
+        showToast(`已删除 ${deleted.length} 个 API 密钥`);
+      }
+    } catch (error) {
+      showToast(`批量删除失败：${String(error)}`);
     } finally {
       setSaving(false);
     }
@@ -3836,6 +3932,17 @@ function App() {
     );
   }
 
+  if (!stateHydrated) {
+    return (
+      <div className="auth-shell">
+        <div className="auth-card">
+          <div className="brand-title">协议网关</div>
+          <div className="hint-line">正在加载配置…</div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <>
       <div className="shell">
@@ -3949,7 +4056,16 @@ function App() {
                   </div>
                   <div className="api-keys-toolbar-meta">
                     显示 {filteredApiKeys.length} / {(state.apiKeys || []).length} 个密钥
+                    {checkedApiKeyIDs.length > 0 ? ` · 已选 ${checkedApiKeyIDs.length}` : ''}
                   </div>
+                  {checkedApiKeyIDs.length > 0 ? (
+                    <div className="api-keys-bulk-actions">
+                      <button className="btn danger" type="button" disabled={saving} onClick={() => void deleteCheckedApiKeys()}>
+                        删除选中（{checkedApiKeyIDs.length}）
+                      </button>
+                      <button className="mini-btn" type="button" disabled={saving} onClick={clearApiKeyChecks}>清除选择</button>
+                    </div>
+                  ) : null}
                 </div>
               ) : null}
               {(state.apiKeys || []).length === 0 ? (
@@ -3959,23 +4075,60 @@ function App() {
                   <div className="api-keys-table-wrap">
                     <div className="api-keys-table">
                       <div className="api-keys-table-head">
+                        <label className="api-keys-check" title="全选当前列表" onClick={(event) => event.stopPropagation()}>
+                          <input
+                            type="checkbox"
+                            checked={filteredApiKeys.length > 0 && filteredApiKeys.every((key) => checkedApiKeyIDs.includes(key.id))}
+                            disabled={filteredApiKeys.length === 0 || saving}
+                            onChange={(event) => {
+                              if (event.target.checked) selectAllFilteredApiKeys();
+                              else clearApiKeyChecks();
+                            }}
+                            aria-label="全选当前列表"
+                          />
+                        </label>
                         <span>名称</span>
                       </div>
                       {filteredApiKeys.length === 0 ? (
                         <div className="empty-state compact">当前筛选条件下没有匹配的密钥。</div>
-                      ) : filteredApiKeys.map((key) => {
+                      ) : filteredApiKeys.map((key, index) => {
+                        const checked = checkedApiKeyIDs.includes(key.id);
                         return (
                           <button
                             type="button"
                             key={key.id}
-                            className={`api-keys-row${selectedApiKey?.id === key.id ? ' active' : ''}`}
-                            onClick={() => setSelectedApiKeyID(key.id)}
+                            className={`api-keys-row${selectedApiKey?.id === key.id ? ' active' : ''}${checked ? ' checked' : ''}`}
+                            onClick={(event) => {
+                              if (event.shiftKey) {
+                                event.preventDefault();
+                                toggleApiKeyCheck(key.id, index, true);
+                                return;
+                              }
+                              setSelectedApiKeyID(key.id);
+                            }}
                           >
+                            <label
+                              className="api-keys-check"
+                              onClick={(event) => event.stopPropagation()}
+                              onKeyDown={(event) => event.stopPropagation()}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                disabled={saving}
+                                onChange={(event) => {
+                                  const native = event.nativeEvent as MouseEvent;
+                                  toggleApiKeyCheck(key.id, index, !!native.shiftKey);
+                                }}
+                                aria-label={`选择 ${key.name}`}
+                              />
+                            </label>
                             <span className="api-keys-cell name">{key.name}</span>
                           </button>
                         );
                       })}
                     </div>
+                    <div className="api-keys-select-hint">勾选后可批量删除；Shift+点击可连续多选</div>
                   </div>
                   {selectedApiKey ? (
                     <ApiKeyDetailPanel
@@ -3992,6 +4145,7 @@ function App() {
                       onUpdateField={updateApiKeyField}
                       onUpdateBinding={updateApiKeyBinding}
                       onUpdateModelAliases={updateApiKeyModelAliases}
+                      onUpdateFallbacks={updateApiKeyFallbacks}
                       onDelete={deleteApiKey}
                       onClone={openCloneApiKeyModal}
                       onRefreshModels={refreshApiKeyModelsForProvider}
@@ -5423,7 +5577,7 @@ function App() {
               label="输出协议"
               values={fixedOutputLabels}
               value={protocolLabel(apiKeyDraft.outputProtocol)}
-              onChange={(value) => setApiKeyDraft((current) => ({ ...current, outputProtocol: protocolFromLabel(value), modelOverride: '' }))}
+              onChange={(value) => setApiKeyDraft((current) => ({ ...current, outputProtocol: protocolFromLabel(value) }))}
             />
             <ApiKeyFixedModelField
               value={apiKeyDraft.modelOverride}
@@ -5798,6 +5952,7 @@ function ApiKeyDetailPanel({
   onUpdateField,
   onUpdateBinding,
   onUpdateModelAliases,
+  onUpdateFallbacks,
   onDelete,
   onClone,
   onRefreshModels,
@@ -5816,6 +5971,7 @@ function ApiKeyDetailPanel({
   onUpdateField: (key: APIKey, field: 'name' | 'routeId' | 'modelOverride' | 'thinkingDepthOverride' | 'streamEnabled' | 'enabled', value: string | boolean) => Promise<void>;
   onUpdateBinding: (key: APIKey, providerId: string, outputProtocol: Protocol) => Promise<void>;
   onUpdateModelAliases: (key: APIKey, modelAliases: Record<string, string>) => Promise<void>;
+  onUpdateFallbacks: (key: APIKey, fallbackProviderIds: string[], fallbackModelOverrides: Record<string, string>) => Promise<void>;
   onDelete: (key: APIKey) => Promise<void>;
   onClone: (key: APIKey) => void;
   onRefreshModels: (providerId: string, providerName: string) => Promise<void>;
@@ -5827,6 +5983,13 @@ function ApiKeyDetailPanel({
   const defaultPublicBase = publicAvailable ? livePublicURL : '';
   const apiKeyClientURL = route ? apiKeyClientBaseURL(route, endpoints, defaultPublicBase) : '';
   const [clientConfigModal, setClientConfigModal] = React.useState<'opencode' | 'codex' | 'claude' | null>(null);
+  const [fallbackModalOpen, setFallbackModalOpen] = React.useState(false);
+  const fallbackIds = keyItem.fallbackProviderIds || [];
+  const fallbackModelOverrides = keyItem.fallbackModelOverrides || {};
+  const activeProviderId = keyItem.activeProviderId || binding.providerId;
+  const activeProvider = providers.find((item) => item.id === activeProviderId);
+  const usingFallback = Boolean(keyItem.activeProviderId && keyItem.activeProviderId !== binding.providerId);
+  const activeFallbackModel = usingFallback ? (fallbackModelOverrides[keyItem.activeProviderId || ''] || '') : '';
 
   function openClientConfigModal(client: 'opencode' | 'codex' | 'claude') {
     setClientConfigModal(client);
@@ -5839,6 +6002,7 @@ function ApiKeyDetailPanel({
         <div className="route-actions">
           <Badge tone={keyItem.enabled ? 'green' : 'slate'}>{keyItem.enabled ? '启用' : '禁用'}</Badge>
           <Badge tone={bindingAction === '透传' ? 'green' : 'cyan'}>{bindingAction}</Badge>
+          {usingFallback ? <Badge tone="amber">已切备选</Badge> : null}
           {route ? <CopyButton value={apiKeyClientURL} label="复制 URL" /> : null}
           <CopyButton value={keyItem.key} label="复制 Key" />
           <button className="icon-btn" onClick={() => onClone(keyItem)} title="克隆为新 API 密钥">克隆</button>
@@ -5852,7 +6016,7 @@ function ApiKeyDetailPanel({
           onSave={(name) => onUpdateField(keyItem, 'name', name)}
         />
         <div className="field">
-          <label>输入 Provider</label>
+          <label>输入 Provider（首选）</label>
           <select
             value={binding.providerId}
             disabled={saving}
@@ -5880,6 +6044,27 @@ function ApiKeyDetailPanel({
           >
             {fixedOutputLabels.map((label) => <option key={label} value={label}>{label}</option>)}
           </select>
+        </div>
+        <div className="field field-full">
+          <label>备选 Provider</label>
+          <div className="api-key-fallback-summary">
+            <div className="hint-line">
+              当前在用：{activeProvider ? providerOptionLabel(activeProvider) : '未绑定'}
+              {usingFallback ? `（已从首选故障转移${activeFallbackModel ? ` · 模型 ${activeFallbackModel}` : ''}）` : ''}
+            </div>
+            <div className="hint-line">
+              {fallbackIds.length === 0
+                ? '未配置备选。首选额度耗尽后将无法自动切换。'
+                : `备选顺序：${fallbackIds.map((id, index) => {
+                  const provider = providers.find((item) => item.id === id);
+                  const model = fallbackModelOverrides[id] || '未选模型';
+                  return `${index + 1}. ${provider ? providerOptionLabel(provider) : id} → ${model}`;
+                }).join(' ； ')}`}
+            </div>
+            <button className="btn" type="button" disabled={saving || !binding.providerId || providers.length < 2} onClick={() => setFallbackModalOpen(true)}>
+              配置备选
+            </button>
+          </div>
         </div>
         <ApiKeyFixedModelField
           value={keyItem.modelOverride || ''}
@@ -5981,7 +6166,213 @@ function ApiKeyDetailPanel({
           onToast={onToast}
         />
       ) : null}
+
+      {fallbackModalOpen ? (
+        <ApiKeyFallbackProvidersModal
+          preferredProviderId={binding.providerId}
+          providers={providers}
+          models={models}
+          selectedIds={fallbackIds}
+          modelOverrides={fallbackModelOverrides}
+          saving={saving}
+          testingProviderID={testingProviderID}
+          onRefreshModels={onRefreshModels}
+          onClose={() => setFallbackModalOpen(false)}
+          onSave={async (ids, overrides) => {
+            await onUpdateFallbacks(keyItem, ids, overrides);
+            setFallbackModalOpen(false);
+          }}
+        />
+      ) : null}
     </div>
+  );
+}
+
+function ApiKeyFallbackProvidersModal({
+  preferredProviderId,
+  providers,
+  models,
+  selectedIds,
+  modelOverrides,
+  saving,
+  testingProviderID,
+  onRefreshModels,
+  onClose,
+  onSave,
+}: {
+  preferredProviderId: string;
+  providers: Provider[];
+  models: Model[];
+  selectedIds: string[];
+  modelOverrides: Record<string, string>;
+  saving: boolean;
+  testingProviderID: string;
+  onRefreshModels: (providerId: string, providerName: string) => Promise<void>;
+  onClose: () => void;
+  onSave: (ids: string[], overrides: Record<string, string>) => Promise<void>;
+}) {
+  const candidates = providers.filter((item) => item.id !== preferredProviderId);
+  const [orderedIds, setOrderedIds] = React.useState<string[]>(() => (
+    selectedIds.filter((id) => id !== preferredProviderId && providers.some((item) => item.id === id))
+  ));
+  const [overrides, setOverrides] = React.useState<Record<string, string>>(() => {
+    const next: Record<string, string> = {};
+    for (const id of selectedIds) {
+      const model = (modelOverrides[id] || '').trim();
+      if (model) next[id] = model;
+    }
+    return next;
+  });
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState('');
+  const selectedProviders = orderedIds
+    .map((id) => candidates.find((item) => item.id === id))
+    .filter((item): item is Provider => Boolean(item));
+  const unselectedProviders = candidates.filter((item) => !orderedIds.includes(item.id));
+  const missingModelIds = orderedIds.filter((id) => !(overrides[id] || '').trim());
+
+  function toggleProvider(id: string) {
+    setError('');
+    setOrderedIds((current) => {
+      if (current.includes(id)) {
+        setOverrides((prev) => {
+          const next = { ...prev };
+          delete next[id];
+          return next;
+        });
+        return current.filter((item) => item !== id);
+      }
+      return [...current, id];
+    });
+  }
+
+  function moveProvider(id: string, delta: number) {
+    setOrderedIds((current) => {
+      const index = current.indexOf(id);
+      if (index < 0) return current;
+      const next = index + delta;
+      if (next < 0 || next >= current.length) return current;
+      const copy = [...current];
+      const [item] = copy.splice(index, 1);
+      copy.splice(next, 0, item);
+      return copy;
+    });
+  }
+
+  function setProviderModel(id: string, model: string) {
+    setError('');
+    setOverrides((current) => ({ ...current, [id]: model }));
+  }
+
+  return (
+    <Modal
+      title="配置备选 Provider"
+      description="按优先级排序（#1 在最上）。每个备选必须选择该 Provider 的固定模型替换。"
+      onClose={onClose}
+      size="wide"
+    >
+      <div className="api-key-fallback-modal">
+        <div className="hint-line">首选 Provider 不在此列表中。已选按优先级从上到下排列；保存前每个备选都要选好固定模型。</div>
+        {candidates.length === 0 ? (
+          <div className="empty-state compact">没有可配置的备选 Provider，请先添加更多输入 Provider。</div>
+        ) : (
+          <div className="api-key-fallback-list">
+            {selectedProviders.map((provider, orderIndex) => {
+              const providerModels = models.filter((model) => model.providerId === provider.id);
+              return (
+                <div className="api-key-fallback-item selected" key={provider.id}>
+                  <div className="api-key-fallback-item-main">
+                    <label className="checkbox-field">
+                      <input
+                        type="checkbox"
+                        checked
+                        disabled={busy || saving}
+                        onChange={() => toggleProvider(provider.id)}
+                      />
+                      <span>{providerOptionLabel(provider)}</span>
+                    </label>
+                    <div className="api-key-fallback-order">
+                      <span className="api-key-fallback-rank">#{orderIndex + 1}</span>
+                      <button className="mini-btn" type="button" disabled={busy || saving || orderIndex <= 0} onClick={() => moveProvider(provider.id, -1)}>上移</button>
+                      <button className="mini-btn" type="button" disabled={busy || saving || orderIndex >= selectedProviders.length - 1} onClick={() => moveProvider(provider.id, 1)}>下移</button>
+                    </div>
+                  </div>
+                  <div className="api-key-fallback-model">
+                    <label>固定模型替换（必选）</label>
+                    <div className="field-inline">
+                      <SearchableModelSelect
+                        value={overrides[provider.id] || ''}
+                        models={providerModels}
+                        disabled={busy || saving}
+                        emptyLabel="请选择该 Provider 的固定模型"
+                        onChange={(value) => setProviderModel(provider.id, value)}
+                      />
+                      <button
+                        className="mini-btn"
+                        type="button"
+                        disabled={busy || saving || testingProviderID === provider.id}
+                        onClick={() => void onRefreshModels(provider.id, provider.name)}
+                        title="刷新该 Provider 模型列表"
+                      >
+                        {testingProviderID === provider.id ? '刷新中…' : '刷新模型'}
+                      </button>
+                    </div>
+                    {!(overrides[provider.id] || '').trim() ? (
+                      <div className="hint-line error">必须为该备选选择固定模型</div>
+                    ) : (
+                      <div className="hint-line">切换到此备选时，将强制使用该模型</div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+            {unselectedProviders.map((provider) => (
+              <div className="api-key-fallback-item" key={provider.id}>
+                <label className="checkbox-field">
+                  <input
+                    type="checkbox"
+                    checked={false}
+                    disabled={busy || saving}
+                    onChange={() => toggleProvider(provider.id)}
+                  />
+                  <span>{providerOptionLabel(provider)}</span>
+                </label>
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="hint-line">
+          当前顺序：{orderedIds.length === 0 ? '（无）' : orderedIds.map((id, index) => {
+            const provider = providers.find((item) => item.id === id);
+            const model = (overrides[id] || '').trim() || '未选模型';
+            return `${index + 1}. ${provider ? providerOptionLabel(provider) : id} → ${model}`;
+          }).join(' ； ')}
+        </div>
+        {error ? <div className="hint-line error">{error}</div> : null}
+      </div>
+      <div className="actions modal-actions">
+        <button className="btn" type="button" disabled={busy || saving} onClick={onClose}>取消</button>
+        <button
+          className="btn primary"
+          type="button"
+          disabled={busy || saving || missingModelIds.length > 0}
+          onClick={() => {
+            if (missingModelIds.length > 0) {
+              setError('每个已选备选 Provider 都必须选择固定模型替换');
+              return;
+            }
+            const cleaned: Record<string, string> = {};
+            for (const id of orderedIds) {
+              cleaned[id] = (overrides[id] || '').trim();
+            }
+            setBusy(true);
+            void onSave(orderedIds, cleaned).finally(() => setBusy(false));
+          }}
+        >
+          {busy || saving ? '保存中…' : '保存备选'}
+        </button>
+      </div>
+    </Modal>
   );
 }
 

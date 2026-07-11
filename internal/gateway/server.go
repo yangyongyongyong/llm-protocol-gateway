@@ -2065,6 +2065,16 @@ func (s *Server) handleUpdateAPIKey(w http.ResponseWriter, r *http.Request) {
 	if !jsonHasKey(body, "streamEnabled") {
 		patch.StreamEnabled = true
 	}
+	if !jsonHasKey(body, "fallbackProviderIds") {
+		patch.FallbackProviderIDs = nil
+	} else if patch.FallbackProviderIDs == nil {
+		patch.FallbackProviderIDs = []string{}
+	}
+	if !jsonHasKey(body, "fallbackModelOverrides") {
+		patch.FallbackModelOverrides = nil
+	} else if patch.FallbackModelOverrides == nil {
+		patch.FallbackModelOverrides = map[string]string{}
+	}
 	updated, err := s.router.UpdateAPIKey(r.PathValue("id"), patch)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error())
@@ -2226,6 +2236,9 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	if gatewayKeyMatched {
+		decision = s.decisionForAPIKey(route, matchedKey, decision)
+	}
 
 	requestModel, _ := req["model"].(string)
 	model, _ := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
@@ -2251,7 +2264,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	var usage TokenUsage
 	var responseLog []byte
 	var ttftMs int64
-	status, usage, responseLog, err = s.executeProtocolFlow(wrapTTFTWriter(w, started, &ttftMs), r, route, decision, model, req, domain.ProtocolOpenAIChat, gatewayKeyMatched)
+	status, usage, responseLog, decision, err = s.executeProtocolFlowWithFailover(wrapTTFTWriter(w, started, &ttftMs), r, route, decision, model, req, domain.ProtocolOpenAIChat, gatewayKeyMatched, matchedKey, gatewayKeyMatched)
 	if err != nil {
 		s.logs.AddApp("error", "chat request failed", err.Error())
 		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
@@ -2314,6 +2327,9 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": err.Error(), "type": "gateway_error"}})
 		return
 	}
+	if gatewayKeyMatched {
+		decision = s.decisionForAPIKey(route, matchedKey, decision)
+	}
 
 	requestModel, _ := req["model"].(string)
 	model, _ := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
@@ -2335,7 +2351,7 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 	var usage TokenUsage
 	var responseLog []byte
 	var ttftMs int64
-	status, usage, responseLog, err = s.executeProtocolFlow(wrapTTFTWriter(w, started, &ttftMs), r, route, decision, model, req, domain.ProtocolOpenAIResponses, gatewayKeyMatched)
+	status, usage, responseLog, decision, err = s.executeProtocolFlowWithFailover(wrapTTFTWriter(w, started, &ttftMs), r, route, decision, model, req, domain.ProtocolOpenAIResponses, gatewayKeyMatched, matchedKey, gatewayKeyMatched)
 	if err != nil {
 		s.logs.AddApp("error", "responses request failed", err.Error())
 		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
@@ -2489,6 +2505,9 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	if gatewayKeyMatched {
+		decision = s.decisionForAPIKey(route, matchedKey, decision)
+	}
 
 	requestModel, _ := req["model"].(string)
 	model, _ := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
@@ -2503,7 +2522,7 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 	var usage TokenUsage
 	var responseLog []byte
 	var ttftMs int64
-	status, usage, responseLog, err = s.executeProtocolFlow(wrapTTFTWriter(w, started, &ttftMs), r, route, decision, model, req, domain.ProtocolClaude, gatewayKeyMatched)
+	status, usage, responseLog, decision, err = s.executeProtocolFlowWithFailover(wrapTTFTWriter(w, started, &ttftMs), r, route, decision, model, req, domain.ProtocolClaude, gatewayKeyMatched, matchedKey, gatewayKeyMatched)
 	if err != nil {
 		s.logs.AddApp("error", "claude messages request failed", err.Error())
 		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))

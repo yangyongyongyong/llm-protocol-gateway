@@ -305,7 +305,11 @@ func (s *Server) executeProtocolFlow(
 	clientProtocol domain.Protocol,
 	skipIncomingAuth bool,
 ) (int, TokenUsage, []byte, error) {
-	provider, err := s.router.ProviderForRoute(route)
+	providerID := strings.TrimSpace(decision.ProviderID)
+	if providerID == "" {
+		providerID = route.ProviderID
+	}
+	provider, err := s.router.ProviderByID(providerID)
 	if err != nil {
 		return 0, TokenUsage{}, nil, err
 	}
