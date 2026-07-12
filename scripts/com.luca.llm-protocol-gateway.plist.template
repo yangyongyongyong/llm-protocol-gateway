@@ -16,7 +16,7 @@
     <key>GATEWAY_ADDR</key>
     <string>0.0.0.0:18093</string>
     <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <string>__HOME__/.bun/bin:__HOME__/.local/bin:__HOME__/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

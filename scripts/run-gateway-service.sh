@@ -52,6 +52,21 @@ load_user_env() {
 }
 load_user_env
 
+# LaunchAgent PATH is minimal; ensure user-local CLIs (bun/opencode/cloudflared) are visible.
+prepend_path_if_dir() {
+  local dir="$1"
+  [[ -d "$dir" ]] || return 0
+  case ":${PATH:-}:" in
+    *":$dir:"*) ;;
+    *) export PATH="$dir:${PATH:-/usr/bin:/bin}" ;;
+  esac
+}
+prepend_path_if_dir "$HOME/.bun/bin"
+prepend_path_if_dir "$HOME/.local/bin"
+prepend_path_if_dir "$HOME/.opencode/bin"
+prepend_path_if_dir "/opt/homebrew/bin"
+prepend_path_if_dir "/usr/local/bin"
+
 if [[ ! -x "$BIN" ]] || [[ "$ROOT/cmd/gateway" -nt "$BIN" ]] || find "$ROOT/internal" -newer "$BIN" -print -quit | grep -q .; then
   echo "[gateway-service] building -> $BIN" >>"$LOG_FILE"
   (cd "$ROOT" && go build -o "$BIN" ./cmd/gateway)

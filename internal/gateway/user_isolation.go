@@ -34,6 +34,20 @@ func (s *Server) allowedProviderIDsForUser(userID string) map[string]bool {
 	return out
 }
 
+// requireProviderAccessForUser rejects normal users who were not granted the
+// given provider. Admins always pass. Returns false after writing 403.
+func (s *Server) requireProviderAccessForUser(w http.ResponseWriter, r *http.Request, providerID string) bool {
+	identity := s.requestIdentity(r)
+	if identity.isAdmin() {
+		return true
+	}
+	if !s.allowedProviderIDsForUser(identity.UserID)[providerID] {
+		writeOpenAIError(w, http.StatusForbidden, "permission denied")
+		return false
+	}
+	return true
+}
+
 // ownedKeyIDs returns the IDs of API keys owned by the given user.
 func (s *Server) ownedKeyIDs(userID string) []string {
 	ids := []string{}

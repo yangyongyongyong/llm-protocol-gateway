@@ -32,11 +32,14 @@ func isClaudeOpusModel(model string) bool {
 func claudeModelAliasEntries() []map[string]any {
 	entries := make([]map[string]any, 0, len(claudeModelAliases))
 	for alias, target := range claudeModelAliases {
+		contextLen := resolveModelContextLength(target, 0)
 		entries = append(entries, map[string]any{
-			"id":           alias,
-			"type":         "model",
-			"display_name": target,
-			"created_at":   "",
+			"id":                alias,
+			"type":              "model",
+			"display_name":      target,
+			"created_at":        "",
+			"max_input_tokens":  contextLen,
+			"max_tokens":        resolveModelMaxOutputTokens(target, contextLen),
 		})
 	}
 	return entries

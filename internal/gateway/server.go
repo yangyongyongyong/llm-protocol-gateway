@@ -224,6 +224,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /__selfcheck", s.handleSelfcheckStart)
 	mux.HandleFunc("GET /__selfcheck/{jobId}", s.handleSelfcheckStatus)
 	mux.HandleFunc("GET /v1/models", s.handleOpenAIModels)
+	mux.HandleFunc("GET /openai/v1/models", s.handleOpenAIModels)
 	mux.HandleFunc("GET /anthropic/v1/models", s.handleClaudeModels)
 	mux.HandleFunc("POST /v1/chat/completions", s.handleOpenAIChat)
 	mux.HandleFunc("POST /chat/completions", s.handleOpenAIChat)
@@ -1367,7 +1368,13 @@ func (s *Server) handleTestProvider(w http.ResponseWriter, r *http.Request) {
 	} else {
 		fallback := make([]domain.Model, 0)
 		if strings.TrimSpace(provider.DefaultModel) != "" {
-			fallback = append(fallback, domain.Model{ID: strings.TrimSpace(provider.DefaultModel), ProviderID: provider.ID, Protocol: provider.Protocol, ContextLength: 128000, InMenu: true})
+			fallback = append(fallback, domain.Model{
+				ID:            strings.TrimSpace(provider.DefaultModel),
+				ProviderID:    provider.ID,
+				Protocol:      provider.Protocol,
+				ContextLength: resolveModelContextLength(provider.DefaultModel, 0),
+				InMenu:        true,
+			})
 		}
 		healthStatus := "failed"
 		if len(fallback) > 0 {
@@ -1583,6 +1590,9 @@ func (s *Server) handleClaudeOAuthDisconnect(w http.ResponseWriter, r *http.Requ
 // OAuth usage endpoint.
 func (s *Server) handleClaudeOAuthUsage(w http.ResponseWriter, r *http.Request) {
 	providerID := r.PathValue("id")
+	if !s.requireProviderAccessForUser(w, r, providerID) {
+		return
+	}
 	provider, err := s.router.ProviderByID(providerID)
 	if err != nil {
 		writeOpenAIError(w, http.StatusNotFound, err.Error())
@@ -1640,6 +1650,9 @@ func (s *Server) handleClaudeOAuthUsage(w http.ResponseWriter, r *http.Request) 
 // buckets) for a connected cursor_oauth provider.
 func (s *Server) handleCursorOAuthUsage(w http.ResponseWriter, r *http.Request) {
 	providerID := r.PathValue("id")
+	if !s.requireProviderAccessForUser(w, r, providerID) {
+		return
+	}
 	provider, err := s.router.ProviderByID(providerID)
 	if err != nil {
 		writeOpenAIError(w, http.StatusNotFound, err.Error())
@@ -2231,12 +2244,13 @@ func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 	models := s.modelsForRequest(r)
 	data := make([]map[string]any, 0, len(models))
 	for _, model := range models {
+		contextLen := resolveModelContextLength(model.ID, model.ContextLength)
 		data = append(data, map[string]any{
 			"id":             model.ID,
 			"object":         "model",
 			"created":        0,
 			"owned_by":       model.ProviderID,
-			"context_length": model.ContextLength,
+			"context_length": contextLen,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
@@ -2262,11 +2276,14 @@ func (s *Server) handleClaudeModels(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		seen[model.ID] = true
+		contextLen := resolveModelContextLength(model.ID, model.ContextLength)
 		data = append(data, map[string]any{
-			"id":           model.ID,
-			"type":         "model",
-			"display_name": model.ID,
-			"created_at":   time.Now().UTC().Format(time.RFC3339),
+			"id":               model.ID,
+			"type":             "model",
+			"display_name":     model.ID,
+			"created_at":       time.Now().UTC().Format(time.RFC3339),
+			"max_input_tokens": contextLen,
+			"max_tokens":       resolveModelMaxOutputTokens(model.ID, contextLen),
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": data, "has_more": false})
@@ -2946,10 +2963,7 @@ func parseModelsResponse(body []byte, provider domain.Provider) ([]domain.Model,
 			continue
 		}
 		seen[id] = true
-		contextLength := item.ContextLength
-		if contextLength == 0 {
-			contextLength = 128000
-		}
+		contextLength := resolveModelContextLength(id, item.ContextLength)
 		models = append(models, domain.Model{ID: id, ProviderID: provider.ID, Protocol: provider.Protocol, ContextLength: contextLength, InMenu: true})
 	}
 	if len(models) == 0 {

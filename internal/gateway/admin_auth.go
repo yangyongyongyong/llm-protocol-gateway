@@ -127,11 +127,32 @@ func isUserAllowedPath(method, path string) bool {
 	if strings.HasPrefix(path, "/__apikeys/") {
 		return true
 	}
+	// Read-only OAuth quota panels on the Providers page (no CRUD / test).
+	if method == http.MethodGet && isUserProviderUsagePath(path) {
+		return true
+	}
 	// Static UI assets and SPA pages are served by the same handler chain.
 	if !strings.HasPrefix(path, "/__") && method == http.MethodGet {
 		return true
 	}
 	return false
+}
+
+// isUserProviderUsagePath matches GET /__providers/{id}/(claude|cursor)-oauth/usage.
+func isUserProviderUsagePath(path string) bool {
+	if !strings.HasPrefix(path, "/__providers/") {
+		return false
+	}
+	parts := strings.Split(strings.TrimPrefix(path, "/__providers/"), "/")
+	if len(parts) != 3 || strings.TrimSpace(parts[0]) == "" {
+		return false
+	}
+	switch parts[1] {
+	case "claude-oauth", "cursor-oauth":
+		return parts[2] == "usage"
+	default:
+		return false
+	}
 }
 
 func (s *Server) denyAdminAuth(w http.ResponseWriter, r *http.Request, message string) {

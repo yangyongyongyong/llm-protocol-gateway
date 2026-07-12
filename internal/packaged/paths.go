@@ -60,7 +60,7 @@ func Cloudflared() (string, error) {
 }
 
 // Bun returns the preferred bun binary path.
-// Order: GATEWAY_BUN → App Resources/bin/bun → PATH.
+// Order: GATEWAY_BUN → App Resources/bin/bun → ~/.bun/bin/bun → PATH.
 func Bun() (string, error) {
 	if v := strings.TrimSpace(os.Getenv("GATEWAY_BUN")); v != "" && fileExists(v) {
 		return v, nil
@@ -68,6 +68,17 @@ func Bun() (string, error) {
 	if res := ResourcesDir(); res != "" {
 		for _, name := range []string{"bun", "bun.exe"} {
 			candidate := filepath.Join(res, "bin", name)
+			if fileExists(candidate) {
+				return candidate, nil
+			}
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		for _, rel := range []string{
+			filepath.Join(".bun", "bin", "bun"),
+			filepath.Join(".local", "bin", "bun"),
+		} {
+			candidate := filepath.Join(home, rel)
 			if fileExists(candidate) {
 				return candidate, nil
 			}

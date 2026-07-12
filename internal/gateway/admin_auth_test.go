@@ -190,3 +190,33 @@ func TestAuthStatusPublic(t *testing.T) {
 		t.Fatalf("body=%+v", body)
 	}
 }
+
+func TestIsUserAllowedPathProviderUsage(t *testing.T) {
+	cases := []struct {
+		method string
+		path   string
+		want   bool
+	}{
+		{http.MethodGet, "/__providers/p1/claude-oauth/usage", true},
+		{http.MethodGet, "/__providers/p1/cursor-oauth/usage", true},
+		{http.MethodGet, "/__providers/p1/claude-oauth/usage?refresh=1", true}, // path only; query stripped by caller
+		{http.MethodPost, "/__providers/p1/claude-oauth/usage", false},
+		{http.MethodGet, "/__providers/p1/test", false},
+		{http.MethodPost, "/__providers/p1/test", false},
+		{http.MethodGet, "/__providers", false},
+		{http.MethodPost, "/__providers", false},
+		{http.MethodPatch, "/__providers/p1", false},
+		{http.MethodGet, "/__state", true},
+		{http.MethodGet, "/__apikeys/abc/profiles", true},
+	}
+	for _, tc := range cases {
+		path := tc.path
+		if i := strings.IndexByte(path, '?'); i >= 0 {
+			path = path[:i]
+		}
+		got := isUserAllowedPath(tc.method, path)
+		if got != tc.want {
+			t.Fatalf("%s %s: got %v want %v", tc.method, tc.path, got, tc.want)
+		}
+	}
+}

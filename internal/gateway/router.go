@@ -371,11 +371,18 @@ func normalizeProvider(provider *domain.Provider) {
 	}
 	provider.RequestAdapter = normalizeRequestAdapter(provider.RequestAdapter)
 	if len(provider.Models) == 0 && provider.DefaultModel != "" {
-		provider.Models = []domain.Model{{ID: provider.DefaultModel, ProviderID: provider.ID, Protocol: provider.Protocol, ContextLength: 128000, InMenu: true}}
+		provider.Models = []domain.Model{{
+			ID:            provider.DefaultModel,
+			ProviderID:    provider.ID,
+			Protocol:      provider.Protocol,
+			ContextLength: resolveModelContextLength(provider.DefaultModel, 0),
+			InMenu:        true,
+		}}
 	}
 	for index := range provider.Models {
 		provider.Models[index].ProviderID = provider.ID
 		provider.Models[index].Protocol = provider.Protocol
+		provider.Models[index].ContextLength = resolveModelContextLength(provider.Models[index].ID, provider.Models[index].ContextLength)
 	}
 }
 
@@ -1134,9 +1141,7 @@ func (r *Router) UpdateProviderModels(providerID string, models []domain.Model, 
 			models[modelIndex].ProviderID = providerID
 			models[modelIndex].Protocol = r.state.Providers[index].Protocol
 			models[modelIndex].InMenu = true
-			if models[modelIndex].ContextLength == 0 {
-				models[modelIndex].ContextLength = 128000
-			}
+			models[modelIndex].ContextLength = resolveModelContextLength(models[modelIndex].ID, models[modelIndex].ContextLength)
 		}
 		r.state.Providers[index].Models = models
 		if strings.TrimSpace(healthStatus) != "" {
@@ -1323,8 +1328,14 @@ func (r *Router) rebuildModelsLocked() {
 
 func rebuildModels(state *domain.GatewayState) {
 	models := make([]domain.Model, 0)
-	for _, provider := range state.Providers {
-		models = append(models, provider.Models...)
+	for pIndex := range state.Providers {
+		for mIndex := range state.Providers[pIndex].Models {
+			state.Providers[pIndex].Models[mIndex].ContextLength = resolveModelContextLength(
+				state.Providers[pIndex].Models[mIndex].ID,
+				state.Providers[pIndex].Models[mIndex].ContextLength,
+			)
+			models = append(models, state.Providers[pIndex].Models[mIndex])
+		}
 	}
 	state.Models = models
 }

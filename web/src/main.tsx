@@ -665,7 +665,7 @@ const navIcons = ['◉', '☰', '🔑', '⌘', '▣', '↗', '≡', '👥', '✓
 type NavItemID = typeof navItems[number]['id'];
 
 // 普通用户仅可访问的页面（其余仅管理员可见）
-const userAllowedNavIDs: NavItemID[] = ['api-keys', 'traffic-tokens', 'usage-stats'];
+const userAllowedNavIDs: NavItemID[] = ['input-providers', 'models-menu', 'api-keys', 'traffic-tokens', 'usage-stats'];
 
 function navPathForID(id: NavItemID) {
   return id === 'input-providers' ? '/' : `/${id}`;
@@ -1129,12 +1129,28 @@ function buildApiKeyOpenCodeConfig(key: APIKey, route: Route | undefined, endpoi
   const providerID = sanitizeClientConfigID(key.name);
   const model = resolveApiKeyModel(key, provider);
   const root = apiKeyGatewayRoot(endpoints, publicBase);
-  const useResponses = route?.outputProtocol === 'openai_responses';
-  const baseURL = useResponses ? `${root}/openai/v1` : `${root}/v1`;
-  const npm = useResponses ? '@ai-sdk/openai' : '@ai-sdk/openai-compatible';
-  const models: Record<string, { name: string }> = { [model]: { name: model } };
-  for (const alias of Object.keys(key.modelAliases || {})) {
-    if (alias.trim()) models[alias.trim()] = { name: alias.trim() };
+  const protocol = route?.outputProtocol;
+  // OpenCode 通过不同 AI SDK 包对接三种输出协议：
+  // - Claude Messages → @ai-sdk/anthropic（baseURL 需含 /v1，SDK 再拼 /messages）
+  // - OpenAI Responses → @ai-sdk/openai
+  // - OpenAI Chat → @ai-sdk/openai-compatible
+  let npm = '@ai-sdk/openai-compatible';
+  let baseURL = `${root}/v1`;
+  if (protocol === 'claude') {
+    npm = '@ai-sdk/anthropic';
+    baseURL = `${root}/anthropic/v1`;
+  } else if (protocol === 'openai_responses') {
+    npm = '@ai-sdk/openai';
+    baseURL = `${root}/openai/v1`;
+  }
+  const aliases = key.modelAliases || {};
+  const models: Record<string, { name: string; limit: { context: number; output: number } }> = {
+    [model]: { name: model, limit: openCodeModelLimit(model, provider, aliases) },
+  };
+  for (const alias of Object.keys(aliases)) {
+    const trimmed = alias.trim();
+    if (!trimmed) continue;
+    models[trimmed] = { name: trimmed, limit: openCodeModelLimit(trimmed, provider, aliases) };
   }
   const config = {
     $schema: 'https://opencode.ai/config.json',
@@ -1152,6 +1168,18 @@ function buildApiKeyOpenCodeConfig(key: APIKey, route: Route | undefined, endpoi
     },
   };
   return `${JSON.stringify(config, null, 2)}\n`;
+}
+
+function openCodeModelLimit(modelID: string, provider?: Provider, aliases?: Record<string, string>) {
+  const target = ((aliases?.[modelID] || aliases?.[modelID.trim()] || modelID) || '').trim() || modelID;
+  const listed = provider?.models?.find((item) => item.id === target || item.id === modelID);
+  const context = listed?.contextLength && listed.contextLength > 0 ? listed.contextLength : 128000;
+  const output = context >= 1_000_000
+    ? 128000
+    : context >= 200000
+      ? (/-haiku|haiku/i.test(target) ? 64000 : 128000)
+      : 65536;
+  return { context, output };
 }
 
 function buildApiKeyCodexConfig(key: APIKey, route: Route | undefined, endpoints: OutputEndpoint[], publicBase: string, provider?: Provider) {
@@ -1249,16 +1277,27 @@ function buildApiKeyClientConfig(
 
 function clientConfigProtocolHint(client: 'opencode' | 'codex' | 'claude', route?: Route) {
   if (!route) return '请先绑定输出协议';
-  if (client === 'opencode' && route.outputProtocol !== 'openai_chat' && route.outputProtocol !== 'openai_responses') {
-    return 'OpenCode 通常需要密钥输出协议为 OpenAI Chat（或 Responses）';
+  if (client === 'opencode' && route.outputProtocol !== 'openai_chat' && route.outputProtocol !== 'openai_responses' && route.outputProtocol !== 'claude') {
+    return 'OpenCode 需要密钥输出协议为 OpenAI Chat / Responses / Claude';
   }
   if (client === 'codex' && route.outputProtocol !== 'openai_responses') {
     return 'Codex 需要密钥输出协议为 OpenAI Responses';
   }
   if (client === 'claude' && route.outputProtocol !== 'claude') {
-    return 'Claude Code 需要密钥输出协议为 Claude';
+    return 'Claude Code 需要密钥输出协议为 Claude（Messages）；不支持 OpenAI Responses';
   }
   return '';
+}
+
+function clientConfigCompatible(client: 'opencode' | 'codex' | 'claude', protocol?: Protocol) {
+  if (!protocol) return false;
+  if (client === 'opencode') return protocol === 'openai_chat' || protocol === 'openai_responses' || protocol === 'claude';
+  if (client === 'codex') return protocol === 'openai_responses';
+  return protocol === 'claude';
+}
+
+function clientConfigsForProtocol(protocol?: Protocol): Array<'opencode' | 'codex' | 'claude'> {
+  return (['opencode', 'codex', 'claude'] as const).filter((client) => clientConfigCompatible(client, protocol));
 }
 
 function resolveApiKeyModel(key: APIKey, provider?: Provider) {
@@ -3409,6 +3448,11 @@ function App() {
   }
 
   async function fetchProviderModels(providerID: string, providerName: string, openModal = false) {
+    // 普通用户只读 Provider 页：禁止调用获取模型接口。
+    if (authStatus?.role === 'user') {
+      showToast('普通用户无权获取模型');
+      return;
+    }
     if (openModal) {
       setProviderModelsOpen(true);
       setProviderModelsLoading(true);
@@ -4979,26 +5023,32 @@ function App() {
               <div className="panel-header">
                 <div>
                   <h2 className="panel-title">输入 Provider</h2>
-                  <p className="panel-desc">用户自定义添加的上游 Provider。删除前会检查是否被 API 密钥引用。列表按近 3 日请求量排序。支持勾选后导出/导入配置（含 apiKeySource 与已持久化的 OAuth 元数据）。</p>
+                  <p className="panel-desc">
+                    {isNormalUser
+                      ? '仅展示管理员授权给你的上游 Provider（只读）。可查看订阅额度等信息，不可增删改或获取模型。'
+                      : '用户自定义添加的上游 Provider。删除前会检查是否被 API 密钥引用。列表按近 3 日请求量排序。支持勾选后导出/导入配置（含 apiKeySource 与已持久化的 OAuth 元数据）。'}
+                  </p>
                 </div>
-                <div className="panel-header-actions">
-                  <button className="btn" disabled={saving || selectedExportProviderIDs.length === 0} onClick={() => void exportProviders(selectedExportProviderIDs)}>导出选中{selectedExportProviderIDs.length > 0 ? ` (${selectedExportProviderIDs.length})` : ''}</button>
-                  <button className="btn" disabled={saving || sortedProviders.length === 0} onClick={() => void exportProviders()}>导出全部</button>
-                  <button className="btn" disabled={saving} onClick={() => providerImportInputRef.current?.click()}>导入</button>
-                  <button className="btn primary" disabled={saving} onClick={openProviderModal}>添加输入 Provider</button>
-                  <input
-                    ref={providerImportInputRef}
-                    type="file"
-                    accept="application/json,.json"
-                    hidden
-                    onChange={(event) => {
-                      const file = event.target.files?.[0];
-                      if (file) void importProvidersFromFile(file);
-                    }}
-                  />
-                </div>
+                {!isNormalUser ? (
+                  <div className="panel-header-actions">
+                    <button className="btn" disabled={saving || selectedExportProviderIDs.length === 0} onClick={() => void exportProviders(selectedExportProviderIDs)}>导出选中{selectedExportProviderIDs.length > 0 ? ` (${selectedExportProviderIDs.length})` : ''}</button>
+                    <button className="btn" disabled={saving || sortedProviders.length === 0} onClick={() => void exportProviders()}>导出全部</button>
+                    <button className="btn" disabled={saving} onClick={() => providerImportInputRef.current?.click()}>导入</button>
+                    <button className="btn primary" disabled={saving} onClick={openProviderModal}>添加输入 Provider</button>
+                    <input
+                      ref={providerImportInputRef}
+                      type="file"
+                      accept="application/json,.json"
+                      hidden
+                      onChange={(event) => {
+                        const file = event.target.files?.[0];
+                        if (file) void importProvidersFromFile(file);
+                      }}
+                    />
+                  </div>
+                ) : null}
               </div>
-              {sortedProviders.length > 0 ? (
+              {!isNormalUser && sortedProviders.length > 0 ? (
                 <div className="providers-toolbar">
                   <label className="checkbox-field">
                     <input
@@ -5017,7 +5067,11 @@ function App() {
                   ) : null}
                 </div>
               ) : null}
-              {sortedProviders.length === 0 ? <div className="empty-state">暂无 Provider。点击「添加输入 Provider」创建。</div> : (
+              {sortedProviders.length === 0 ? (
+                <div className="empty-state">
+                  {isNormalUser ? '暂无授权的 Provider。请联系管理员为你分配可用输入 Provider。' : '暂无 Provider。点击「添加输入 Provider」创建。'}
+                </div>
+              ) : (
                 <div className="provider-card-grid">
                   {sortedProviders.map((provider) => {
                     const usedCount = (state.apiKeys || []).filter((key) => (
@@ -5036,6 +5090,7 @@ function App() {
                         usedCount={usedCount}
                         healthStatus={provider.healthStatus || 'unchecked'}
                         testing={testingProviderID === provider.id}
+                        readOnly={isNormalUser}
                         isClaudeOAuth={provider.authType === 'claude_oauth'}
                         claudeOAuthConnected={provider.claudeOAuth?.connected}
                         isCursorOAuth={provider.authType === 'cursor_oauth'}
@@ -5055,7 +5110,7 @@ function App() {
                   })}
                 </div>
               )}
-              {selectedProvider && <div className="hint-line">当前 Provider 被 {activeProviderRouteCount} 个 API 密钥引用（含备选）。引用数不为 0 时不能删除。</div>}
+              {selectedProvider && !isNormalUser ? <div className="hint-line">当前 Provider 被 {activeProviderRouteCount} 个 API 密钥引用（含备选）。引用数不为 0 时不能删除。</div> : null}
             </div>
           </section>
           )}
@@ -5474,7 +5529,11 @@ function App() {
               <div className="panel-header">
                 <div>
                   <h2 className="panel-title">模型列表</h2>
-                  <p className="panel-desc">查看全部模型，或按输入 Provider 过滤；支持按名称关键字 / 正则检索。在 Provider 卡片点击「获取模型」可同步最新列表。</p>
+                  <p className="panel-desc">
+                    {isNormalUser
+                      ? '仅展示管理员授权给你的输入 Provider 下的模型（只读）。可按 Provider 过滤或按名称检索，不可同步/获取模型。'
+                      : '查看全部模型，或按输入 Provider 过滤；支持按名称关键字 / 正则检索。在 Provider 卡片点击「获取模型」可同步最新列表。'}
+                  </p>
                 </div>
                 <button className="btn" onClick={() => void refreshState()}>刷新列表</button>
               </div>
@@ -5519,13 +5578,17 @@ function App() {
                 </div>
               </div>
               {state.models.length === 0 ? (
-                <div className="empty-state">暂无模型。点击输入 Provider 卡片上的「获取模型」后，会根据 Provider 接口自动拉取模型列表。</div>
+                <div className="empty-state">
+                  {isNormalUser
+                    ? '暂无可用模型。若已授权 Provider，请等待管理员同步模型列表后再刷新。'
+                    : '暂无模型。点击输入 Provider 卡片上的「获取模型」后，会根据 Provider 接口自动拉取模型列表。'}
+                </div>
               ) : filteredModels.length === 0 ? (
                 <div className="empty-state">
                   {modelsSearchQuery.trim()
                     ? '没有匹配当前检索条件的模型，请调整关键字或正则。'
                     : '该 Provider 暂无模型记录。'}
-                  {!modelsSearchQuery.trim() && (() => {
+                  {!isNormalUser && !modelsSearchQuery.trim() && (() => {
                     const provider = state.providers.find((item) => item.id === modelsProviderFilter);
                     if (!provider) return null;
                     const canSync = provider.authType === 'cursor_oauth'
@@ -6828,17 +6891,21 @@ function CursorOAuthUsagePanel({ providerId, connected, compact }: { providerId:
   );
 }
 
-function ProviderCard({ active, selected, name, providerId, protocol, tone, url, usedCount, healthStatus, testing, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, onToggleSelect, onClick, onTest, onChatTest, onEdit, onClone, onDelete }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; usedCount: number; healthStatus: string; testing: boolean; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; onToggleSelect: () => void; onClick: () => void; onTest: () => void; onChatTest: () => void; onEdit: () => void; onClone: () => void; onDelete: () => void }) {
+function ProviderCard({ active, selected, name, providerId, protocol, tone, url, usedCount, healthStatus, testing, readOnly, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, onToggleSelect, onClick, onTest, onChatTest, onEdit, onClone, onDelete }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; usedCount: number; healthStatus: string; testing: boolean; readOnly?: boolean; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; onToggleSelect: () => void; onClick: () => void; onTest: () => void; onChatTest: () => void; onEdit: () => void; onClone: () => void; onDelete: () => void }) {
   const oauthConnected = isClaudeOAuth ? claudeOAuthConnected : isCursorOAuth ? cursorOAuthConnected : false;
   const showOAuthBadge = isClaudeOAuth || isCursorOAuth;
   return (
     <div className={`provider-card clickable ${active ? 'active' : ''} ${selected ? 'selected' : ''}`} onClick={onClick} role="button" tabIndex={0} onKeyDown={(event) => { if (event.key === 'Enter') onClick(); }}>
       <div className="provider-head">
         <div className="provider-title-block">
-          <label className="provider-select checkbox-field" onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
-            <input type="checkbox" checked={!!selected} onChange={onToggleSelect} aria-label={`选择 ${name}`} />
-            <span className="provider-name">{name}</span>
-          </label>
+          {readOnly ? (
+            <div className="provider-name">{name}</div>
+          ) : (
+            <label className="provider-select checkbox-field" onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
+              <input type="checkbox" checked={!!selected} onChange={onToggleSelect} aria-label={`选择 ${name}`} />
+              <span className="provider-name">{name}</span>
+            </label>
+          )}
           <div className="provider-subtitle">{providerId} · {protocol}</div>
         </div>
         <div className="provider-badges">
@@ -6854,13 +6921,15 @@ function ProviderCard({ active, selected, name, providerId, protocol, tone, url,
       <div className="provider-meta">{url}</div>
       {isClaudeOAuth && claudeOAuthConnected ? <ClaudeOAuthUsagePanel providerId={providerId} connected={claudeOAuthConnected} compact /> : null}
       {isCursorOAuth && cursorOAuthConnected ? <CursorOAuthUsagePanel providerId={providerId} connected={cursorOAuthConnected} compact /> : null}
-      <div className="provider-actions">
-        <button className="icon-btn" disabled={testing} onClick={(event) => { event.stopPropagation(); onTest(); }} title="从 Provider 接口获取可用模型">{testing ? '获取中' : '获取模型'}</button>
-        <button className="icon-btn" onClick={(event) => { event.stopPropagation(); onChatTest(); }} title="直连上游对话接口测试">对话测试</button>
-        <button className="icon-btn" onClick={(event) => { event.stopPropagation(); onEdit(); }} title="编辑 Provider">编辑</button>
-        <button className="icon-btn" onClick={(event) => { event.stopPropagation(); onClone(); }} title="克隆为新 Provider">克隆</button>
-        <button className="icon-btn danger" disabled={usedCount > 0} onClick={(event) => { event.stopPropagation(); onDelete(); }} title={usedCount > 0 ? '该 Provider 正被 API Key 引用' : '删除 Provider'}>删除</button>
-      </div>
+      {!readOnly ? (
+        <div className="provider-actions">
+          <button className="icon-btn" disabled={testing} onClick={(event) => { event.stopPropagation(); onTest(); }} title="从 Provider 接口获取可用模型">{testing ? '获取中' : '获取模型'}</button>
+          <button className="icon-btn" onClick={(event) => { event.stopPropagation(); onChatTest(); }} title="直连上游对话接口测试">对话测试</button>
+          <button className="icon-btn" onClick={(event) => { event.stopPropagation(); onEdit(); }} title="编辑 Provider">编辑</button>
+          <button className="icon-btn" onClick={(event) => { event.stopPropagation(); onClone(); }} title="克隆为新 Provider">克隆</button>
+          <button className="icon-btn danger" disabled={usedCount > 0} onClick={(event) => { event.stopPropagation(); onDelete(); }} title={usedCount > 0 ? '该 Provider 正被 API Key 引用' : '删除 Provider'}>删除</button>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -7168,27 +7237,29 @@ function ApiKeyDetailPanel({
           <label>一键复制客户端配置</label>
         </div>
         <div className="hint-line">
-          点击后复制到剪贴板，并弹窗预览配置路径与内容；可在弹窗内切换内网 / 公网域名。
+          仅显示与当前输出协议匹配的客户端。点击后复制到剪贴板，并弹窗预览配置路径与内容；可在弹窗内切换内网 / 公网域名。
         </div>
         <div className="api-key-client-config-actions">
-          <button className="btn client-config-btn" type="button" disabled={!route} onClick={() => openClientConfigModal('opencode')}>
-            复制 OpenCode 配置
-          </button>
-          <button className="btn client-config-btn" type="button" disabled={!route} onClick={() => openClientConfigModal('codex')}>
-            复制 Codex 配置
-          </button>
-          <button className="btn client-config-btn" type="button" disabled={!route} onClick={() => openClientConfigModal('claude')}>
-            复制 Claude 配置
-          </button>
+          {clientConfigsForProtocol(route?.outputProtocol).map((client) => (
+            <button
+              key={client}
+              className="btn client-config-btn"
+              type="button"
+              disabled={!route}
+              onClick={() => openClientConfigModal(client)}
+            >
+              {client === 'opencode' ? '复制 OpenCode 配置' : client === 'codex' ? '复制 Codex 配置' : '复制 Claude 配置'}
+            </button>
+          ))}
         </div>
         {route ? (
           <div className="hint-line">
-            当前输出协议：{protocolLabel(route.outputProtocol)}。
-            {[
-              clientConfigProtocolHint('opencode', route),
-              clientConfigProtocolHint('codex', route),
-              clientConfigProtocolHint('claude', route),
-            ].filter(Boolean).join(' ')}
+            当前输出协议：{protocolLabel(route.outputProtocol)}
+            {route.outputProtocol === 'openai_responses'
+              ? ' · 适配 Codex / OpenCode。'
+              : route.outputProtocol === 'claude'
+                ? ' · 适配 Claude Code / OpenCode（Messages）；不走 OpenAI Responses。'
+                : ' · 适配 OpenCode（Chat Completions）。'}
           </div>
         ) : null}
       </div>

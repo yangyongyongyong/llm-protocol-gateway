@@ -11,7 +11,7 @@ WRAPPER="$ROOT/scripts/run-gateway-service.sh"
 chmod +x "$WRAPPER" "$ROOT/scripts/ensure-gateway.sh" "$ROOT/scripts/install-launchagent.sh"
 
 mkdir -p "$HOME/Library/LaunchAgents" "$ROOT/.cache"
-sed "s|__ROOT__|${ROOT}|g" "$PLIST_SRC" >"$PLIST_DST"
+sed -e "s|__ROOT__|${ROOT}|g" -e "s|__HOME__|${HOME}|g" "$PLIST_SRC" >"$PLIST_DST"
 
 # Stop any ad-hoc gateway first so LaunchAgent owns the port.
 if [[ -f "$ROOT/.cache/gateway.pid" ]]; then
