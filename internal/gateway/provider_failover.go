@@ -254,6 +254,10 @@ func (s *Server) executeProtocolFlowWithFailover(
 			lastStatus, lastUsage, lastBody, lastErr = status, usage, nil, execErr
 			if canDefer && shouldFailoverProvider(0, nil, execErr) {
 				writer.Discard()
+				markTimingFlag(r.Context(), timingFlagFailoverRetry)
+				if t := requestTimingFrom(r.Context()); t != nil {
+					t.resetUpstreamMarks()
+				}
 				s.logs.AddApp("warn", "provider failover after transport error", fmt.Sprintf("key=%s from=%s err=%s", matchedKey.ID, providerID, execErr.Error()))
 				continue
 			}
@@ -269,6 +273,10 @@ func (s *Server) executeProtocolFlowWithFailover(
 
 		if canDefer && shouldFailoverProvider(status, respBody, nil) {
 			writer.Discard()
+			markTimingFlag(r.Context(), timingFlagFailoverRetry)
+			if t := requestTimingFrom(r.Context()); t != nil {
+				t.resetUpstreamMarks()
+			}
 			s.logs.AddApp("warn", "provider failover after upstream error", fmt.Sprintf("key=%s from=%s status=%d", matchedKey.ID, providerID, status))
 			continue
 		}

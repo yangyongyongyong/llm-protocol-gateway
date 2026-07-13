@@ -583,35 +583,28 @@ func chatErrorValueToResponses(errorValue any, model string) ([]byte, TokenUsage
 	return body, TokenUsage{}, err
 }
 
+// responsesToClaudeRequest converts Responses → Claude directly (no Chat IR).
 func responsesToClaudeRequest(responsesReq map[string]any, model string) (map[string]any, error) {
-	chatReq, err := responsesToOpenAIChatRequest(responsesReq, model)
-	if err != nil {
-		return nil, err
-	}
-	return openAIChatToClaudeRequest(chatReq, model)
+	return responsesToClaudeRequestDirect(responsesReq, model)
 }
 
+// claudeToResponsesRequest converts Claude → Responses directly (no Chat IR).
 func claudeToResponsesRequest(claudeReq map[string]any, model string) (map[string]any, error) {
-	chatReq, err := claudeRequestToOpenAIChat(claudeReq, model)
-	if err != nil {
-		return nil, err
-	}
-	return openAIChatToResponsesRequest(chatReq, model)
+	return claudeToResponsesRequestDirect(claudeReq, model)
 }
 
+// responsesToClaudeResponse converts Responses → Claude directly (no Chat IR).
 func responsesToClaudeResponse(responsesBody []byte, model string) ([]byte, TokenUsage, error) {
-	chatBody, _, err := responsesToOpenAIChatResponse(responsesBody, model)
-	if err != nil {
-		return nil, TokenUsage{}, err
-	}
-	return openAIChatResponseToClaude(chatBody, model)
+	return responsesToClaudeResponseDirect(responsesBody, model)
 }
 
 func claudeToResponsesResponse(claudeBody []byte, model string) ([]byte, TokenUsage, error) {
-	chatBody, usage, err := claudeResponseToOpenAIChat(claudeBody, model, nil)
-	if err != nil {
-		return nil, TokenUsage{}, err
-	}
-	_ = usage
-	return openAIChatToResponsesResponse(chatBody, model)
+	return claudeToResponsesResponseWithTools(claudeBody, model, nil)
+}
+
+// claudeToResponsesResponseWithTools restores the client's original tool names
+// (pre-cloaking) when converting a non-streamed Claude response back to
+// Responses. Passing nil preserves the legacy behavior.
+func claudeToResponsesResponseWithTools(claudeBody []byte, model string, clientToolNames map[string]struct{}) ([]byte, TokenUsage, error) {
+	return claudeToResponsesResponseDirect(claudeBody, model, clientToolNames)
 }

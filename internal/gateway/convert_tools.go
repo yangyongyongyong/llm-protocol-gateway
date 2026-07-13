@@ -547,6 +547,18 @@ func resolveOpenAIToolNameFromClaude(claudeName string, clientToolNames map[stri
 				return original
 			}
 		}
+		// Claude OAuth cloaking renames client tools to TitleCase
+		// (e.g. exec_command → ExecCommand) via a lossy transform that the
+		// static reverse map can't invert. Re-apply the *forward* cloaking
+		// transform to every client tool name and match, so we can restore
+		// the exact name the client (Codex) registered. Without this the
+		// client receives an unknown tool name and rejects it as
+		// "unsupported call".
+		for name := range clientToolNames {
+			if cloaked, _ := remapClaudeOAuthToolName(name); cloaked == claudeName {
+				return name
+			}
+		}
 	}
 	return reverseRemapClaudeOAuthToolName(claudeName)
 }

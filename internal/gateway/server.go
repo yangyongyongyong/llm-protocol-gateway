@@ -38,6 +38,12 @@ type APIKeyStore interface {
 	TouchAPIKey(id string, lastUsedAt string) error
 }
 
+// ProviderOAuthSaver persists just the OAuth token columns of one provider,
+// avoiding a full-state rewrite on every token refresh.
+type ProviderOAuthSaver interface {
+	UpdateProviderOAuth(providerID, accessToken, refreshToken, expiresAt, scope, accountLabel string) error
+}
+
 type RequestLogStore interface {
 	AppendRequestLog(monitor.RequestLog) error
 	AppendRequestLogWithRetention(monitor.RequestLog, int) error
@@ -55,6 +61,8 @@ type Server struct {
 	logs                    *monitor.Store
 	stateSaver              StateSaver
 	apiKeyStore             APIKeyStore
+	apiKeyToucher           *apiKeyToucher
+	providerOAuthSaver      ProviderOAuthSaver
 	requestLogStore         RequestLogStore
 	usageDailyStore         UsageDailyStore
 	tunnels                 *tunnel.Manager
@@ -96,6 +104,11 @@ func NewServer(router *Router, logs *monitor.Store, stateSaver ...StateSaver) *S
 		server.stateSaver = stateSaver[0]
 		if store, ok := stateSaver[0].(APIKeyStore); ok {
 			server.apiKeyStore = store
+			// Coalesce last_used_at writes off the request hot path.
+			server.apiKeyToucher = newAPIKeyToucher(store, 2*time.Second)
+		}
+		if pos, ok := stateSaver[0].(ProviderOAuthSaver); ok {
+			server.providerOAuthSaver = pos
 		}
 		if rls, ok := stateSaver[0].(RequestLogStore); ok {
 			server.requestLogStore = rls
@@ -223,6 +236,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /__selfcheck/tools", s.handleSelfcheckTools)
 	mux.HandleFunc("POST /__selfcheck", s.handleSelfcheckStart)
 	mux.HandleFunc("GET /__selfcheck/{jobId}", s.handleSelfcheckStatus)
+	mux.HandleFunc("POST /__selfcheck/{jobId}/retry/{caseId}", s.handleSelfcheckRetry)
 	mux.HandleFunc("GET /v1/models", s.handleOpenAIModels)
 	mux.HandleFunc("GET /openai/v1/models", s.handleOpenAIModels)
 	mux.HandleFunc("GET /anthropic/v1/models", s.handleClaudeModels)
@@ -273,11 +287,14 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	for index := range state.Providers {
 		enrichProviderAdapterCurl(&state.Providers[index])
 	}
+	// Attach live tunnel status/URLs for everyone — including role=user.
+	// Without this, regular users fall back to LAN addresses on the API-key
+	// page because tunnelRunning/livePublicURL stay empty.
+	state.PublicAccess = s.withTunnelRuntime(state.PublicAccess)
 	if !identity.isAdmin() {
 		writeJSON(w, http.StatusOK, s.stateForUser(identity, state))
 		return
 	}
-	state.PublicAccess = s.withTunnelRuntime(state.PublicAccess)
 	state.RequestLogRetentionDays = s.RequestLogRetentionDays()
 	state.WebExposed = s.router.WebExposed()
 	paths := ResolveDataPaths()
@@ -563,7 +580,7 @@ func (s *Server) rebuildUsageStatsFromLogs(since time.Time) {
 const memoryLogCap = 50000
 
 func (s *Server) recordRequestLog(started time.Time, matchedKey domain.APIKey, gatewayKeyMatched bool, routeID, providerID, model, action, protocolFlow, path string, status int, usage TokenUsage, requestBody, responseBody []byte) {
-	s.recordRequestLogEx(started, matchedKey, gatewayKeyMatched, routeID, providerID, model, action, protocolFlow, path, status, usage, 0, "", "", "", requestBody, responseBody)
+	s.recordRequestLogEx(started, matchedKey, gatewayKeyMatched, routeID, providerID, model, action, protocolFlow, path, status, usage, 0, "", "", "", nil, requestBody, responseBody)
 }
 
 func (s *Server) recordRequestLogFromRequest(r *http.Request, started time.Time, matchedKey domain.APIKey, gatewayKeyMatched bool, routeID, providerID, model, action, protocolFlow, path string, status int, usage TokenUsage, requestBody, responseBody []byte) {
@@ -574,15 +591,17 @@ func (s *Server) recordRequestLogFromRequestTTFT(r *http.Request, started time.T
 	clientHost := ""
 	clientIP := ""
 	accessSource := monitor.AccessSourceLocal
+	var timing *requestTiming
 	if r != nil {
 		clientHost = requestClientHost(r)
 		clientIP = requestClientIP(r)
 		accessSource = classifyAccessSource(clientHost, s.router.State().PublicAccess.PublicBaseURL)
+		timing = requestTimingFrom(r.Context())
 	}
-	s.recordRequestLogEx(started, matchedKey, gatewayKeyMatched, routeID, providerID, model, action, protocolFlow, path, status, usage, ttftMs, clientHost, clientIP, accessSource, requestBody, responseBody)
+	s.recordRequestLogEx(started, matchedKey, gatewayKeyMatched, routeID, providerID, model, action, protocolFlow, path, status, usage, ttftMs, clientHost, clientIP, accessSource, timing, requestBody, responseBody)
 }
 
-func (s *Server) recordRequestLogEx(started time.Time, matchedKey domain.APIKey, gatewayKeyMatched bool, routeID, providerID, model, action, protocolFlow, path string, status int, usage TokenUsage, ttftMs int64, clientHost, clientIP, accessSource string, requestBody, responseBody []byte) {
+func (s *Server) recordRequestLogEx(started time.Time, matchedKey domain.APIKey, gatewayKeyMatched bool, routeID, providerID, model, action, protocolFlow, path string, status int, usage TokenUsage, ttftMs int64, clientHost, clientIP, accessSource string, timing *requestTiming, requestBody, responseBody []byte) {
 	if usage.InputTokens == 0 && usage.OutputTokens == 0 {
 		usage = EstimateTokenUsage(requestBody, responseBody)
 	}
@@ -591,24 +610,32 @@ func (s *Server) recordRequestLogEx(started time.Time, matchedKey domain.APIKey,
 		// Non-stream (or unknown TTFT): treat total latency as a coarse TTFT.
 		ttftMs = latency
 	}
+	prepMs, preUpstreamMs, upstreamTtfbMs, gatewayOverheadMs, convertOutMs, postMs, timingFlags := timing.snapshot(ttftMs, latency)
 	entry := monitor.RequestLog{
-		Time:          started,
-		RouteID:       routeID,
-		ProviderID:    providerID,
-		Model:         model,
-		Action:        action,
-		ProtocolFlow:  protocolFlow,
-		Path:          path,
-		Status:        status,
-		InputTokens:   usage.InputTokens,
-		OutputTokens:  usage.OutputTokens,
-		CacheTokens:   usage.CacheTokens,
-		LatencyMillis: latency,
-		TTFTMillis:    ttftMs,
-		ClientHost:    clientHost,
-		ClientIP:      clientIP,
-		AccessSource:  accessSource,
-		RequestBody:   truncateForLog(requestBody, 8192),
+		Time:                  started,
+		RouteID:               routeID,
+		ProviderID:            providerID,
+		Model:                 model,
+		Action:                action,
+		ProtocolFlow:          protocolFlow,
+		Path:                  path,
+		Status:                status,
+		InputTokens:           usage.InputTokens,
+		OutputTokens:          usage.OutputTokens,
+		CacheTokens:           usage.CacheTokens,
+		LatencyMillis:         latency,
+		TTFTMillis:            ttftMs,
+		PrepMillis:            prepMs,
+		PreUpstreamMillis:     preUpstreamMs,
+		UpstreamTTFBMillis:    upstreamTtfbMs,
+		GatewayOverheadMillis: gatewayOverheadMs,
+		ConvertOutMillis:      convertOutMs,
+		PostMillis:            postMs,
+		TimingFlags:           timingFlags,
+		ClientHost:            clientHost,
+		ClientIP:              clientIP,
+		AccessSource:          accessSource,
+		RequestBody:           truncateForLog(requestBody, 8192),
 	}
 	if gatewayKeyMatched {
 		entry.APIKeyID = matchedKey.ID
@@ -1780,7 +1807,7 @@ func (s *Server) executeProviderChatHTTP(r *http.Request, provider domain.Provid
 	}
 	resolvedModel, _ := payload["model"].(string)
 	if provider.AuthType == domain.AuthTypeCursorOAuth {
-		baseURL, refreshed, bridgeErr := s.resolveCursorBridgeBaseURL(provider)
+		baseURL, refreshed, bridgeErr := s.resolveCursorBridgeBaseURL(r.Context(), provider)
 		if bridgeErr != nil {
 			return providerChatHTTPResult{Error: bridgeErr.Error(), LatencyMs: time.Since(started).Milliseconds()}
 		}
@@ -2240,6 +2267,34 @@ func (s *Server) saveState() error {
 	return s.stateSaver.Save(state)
 }
 
+// persistProviderOAuth incrementally writes just the refreshed OAuth token
+// columns for one provider when the store supports it, avoiding the heavy
+// full-state Save (which DELETEs + re-INSERTs all providers/models/routes on
+// the single shared SQLite connection and blocks request-hot-path writes).
+// Falls back to saveState when the incremental saver is unavailable.
+func (s *Server) persistProviderOAuth(providerID string, claude *domain.ClaudeOAuthCredential, cursor *domain.CursorOAuthCredential) error {
+	if s.providerOAuthSaver != nil {
+		var accessToken, refreshToken, expiresAt, scope, accountLabel string
+		switch {
+		case claude != nil:
+			accessToken = claude.AccessToken
+			refreshToken = claude.RefreshToken
+			expiresAt = claude.ExpiresAt
+			scope = claude.Scope
+			accountLabel = claude.AccountLabel
+		case cursor != nil:
+			accessToken = cursor.AccessToken
+			refreshToken = cursor.RefreshToken
+			expiresAt = cursor.ExpiresAt
+			accountLabel = cursor.AccountLabel
+		default:
+			return nil
+		}
+		return s.providerOAuthSaver.UpdateProviderOAuth(providerID, accessToken, refreshToken, expiresAt, scope, accountLabel)
+	}
+	return s.saveState()
+}
+
 func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 	models := s.modelsForRequest(r)
 	data := make([]map[string]any, 0, len(models))
@@ -2292,14 +2347,21 @@ func (s *Server) handleClaudeModels(w http.ResponseWriter, r *http.Request) {
 func (s *Server) modelsForRequest(r *http.Request) []domain.Model {
 	state := s.router.State()
 	providerID := ""
+	var matchedKey domain.APIKey
+	var hasKey bool
 	if token := extractConsumerAPIKey(r); token != "" {
-		if key, ok := s.router.APIKeyByToken(token); ok && strings.TrimSpace(key.RouteID) != "" {
-			if route, err := s.router.RouteByID(key.RouteID); err == nil {
-				providerID = route.ProviderID
+		if key, ok := s.router.APIKeyByToken(token); ok {
+			matchedKey = key
+			hasKey = true
+			if strings.TrimSpace(key.RouteID) != "" {
+				if route, err := s.router.RouteByID(key.RouteID); err == nil {
+					providerID = route.ProviderID
+				}
 			}
 		}
 	}
-	models := make([]domain.Model, 0, len(state.Models))
+	models := make([]domain.Model, 0, len(state.Models)+8)
+	seen := map[string]bool{}
 	for _, model := range state.Models {
 		if !model.InMenu {
 			continue
@@ -2308,12 +2370,51 @@ func (s *Server) modelsForRequest(r *http.Request) []domain.Model {
 			continue
 		}
 		models = append(models, model)
+		seen[strings.ToLower(strings.TrimSpace(model.ID))] = true
+	}
+	if !hasKey {
+		return models
+	}
+	// 覆盖模型与别名也要出现在 /models，避免客户端只认目录里的 slug。
+	extras := make([]string, 0, 1+len(matchedKey.ModelAliases))
+	if override := strings.TrimSpace(matchedKey.ModelOverride); override != "" {
+		extras = append(extras, override)
+	}
+	for alias := range matchedKey.ModelAliases {
+		if trimmed := strings.TrimSpace(alias); trimmed != "" {
+			extras = append(extras, trimmed)
+		}
+	}
+	for _, id := range extras {
+		key := strings.ToLower(strings.TrimSpace(id))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		contextLen := 0
+		pid := providerID
+		for _, model := range state.Models {
+			if strings.EqualFold(strings.TrimSpace(model.ID), id) {
+				contextLen = model.ContextLength
+				if pid == "" {
+					pid = model.ProviderID
+				}
+				break
+			}
+		}
+		models = append(models, domain.Model{
+			ID:            id,
+			ProviderID:    pid,
+			ContextLength: contextLen,
+			InMenu:        true,
+		})
 	}
 	return models
 }
 
 func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
+	r, _ = attachRequestTiming(r, started)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "failed to read request body")
@@ -2343,7 +2444,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 				route, err = s.router.RouteByID(key.RouteID)
 			}
 			if s.apiKeyStore != nil {
-				_ = s.apiKeyStore.TouchAPIKey(key.ID, time.Now().UTC().Format(time.RFC3339))
+				s.apiKeyToucher.Touch(key.ID)
 			}
 		}
 	}
@@ -2391,7 +2492,11 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	var usage TokenUsage
 	var responseLog []byte
 	var ttftMs int64
-	status, usage, responseLog, decision, err = s.executeProtocolFlowWithFailover(wrapTTFTWriter(w, started, &ttftMs), r, route, decision, model, req, domain.ProtocolOpenAIChat, gatewayKeyMatched, matchedKey, gatewayKeyMatched)
+	timing := requestTimingFrom(r.Context())
+	if timing != nil {
+		timing.markPrepReady()
+	}
+	status, usage, responseLog, decision, err = s.executeProtocolFlowWithFailover(wrapTTFTWriterWithTiming(w, started, &ttftMs, timing), r, route, decision, model, req, domain.ProtocolOpenAIChat, gatewayKeyMatched, matchedKey, gatewayKeyMatched)
 	if err != nil {
 		s.logs.AddApp("error", "chat request failed", err.Error())
 		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
@@ -2405,6 +2510,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
+	r, _ = attachRequestTiming(r, started)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": "failed to read request body", "type": "invalid_request_error"}})
@@ -2434,7 +2540,7 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 				route, err = s.router.RouteByID(key.RouteID)
 			}
 			if s.apiKeyStore != nil {
-				_ = s.apiKeyStore.TouchAPIKey(key.ID, time.Now().UTC().Format(time.RFC3339))
+				s.apiKeyToucher.Touch(key.ID)
 			}
 		}
 	}
@@ -2478,7 +2584,11 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 	var usage TokenUsage
 	var responseLog []byte
 	var ttftMs int64
-	status, usage, responseLog, decision, err = s.executeProtocolFlowWithFailover(wrapTTFTWriter(w, started, &ttftMs), r, route, decision, model, req, domain.ProtocolOpenAIResponses, gatewayKeyMatched, matchedKey, gatewayKeyMatched)
+	timing := requestTimingFrom(r.Context())
+	if timing != nil {
+		timing.markPrepReady()
+	}
+	status, usage, responseLog, decision, err = s.executeProtocolFlowWithFailover(wrapTTFTWriterWithTiming(w, started, &ttftMs, timing), r, route, decision, model, req, domain.ProtocolOpenAIResponses, gatewayKeyMatched, matchedKey, gatewayKeyMatched)
 	if err != nil {
 		s.logs.AddApp("error", "responses request failed", err.Error())
 		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
@@ -2523,7 +2633,7 @@ func (s *Server) handleOpenAIImagesGenerations(w http.ResponseWriter, r *http.Re
 				err = fmt.Errorf("api key %q has no route configured", key.ID)
 			}
 			if s.apiKeyStore != nil {
-				_ = s.apiKeyStore.TouchAPIKey(key.ID, time.Now().UTC().Format(time.RFC3339))
+				s.apiKeyToucher.Touch(key.ID)
 			}
 		} else {
 			err = fmt.Errorf("invalid api key")
@@ -2577,6 +2687,7 @@ func (s *Server) handleOpenAIImagesGenerations(w http.ResponseWriter, r *http.Re
 // route-resolution pattern (test header or consumer API key -> router.Decide).
 func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
+	r, _ = attachRequestTiming(r, started)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "failed to read request body")
@@ -2608,7 +2719,7 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 				err = fmt.Errorf("api key %q has no route configured", key.ID)
 			}
 			if s.apiKeyStore != nil {
-				_ = s.apiKeyStore.TouchAPIKey(key.ID, time.Now().UTC().Format(time.RFC3339))
+				s.apiKeyToucher.Touch(key.ID)
 			}
 		} else {
 			err = fmt.Errorf("invalid api key")
@@ -2649,7 +2760,11 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 	var usage TokenUsage
 	var responseLog []byte
 	var ttftMs int64
-	status, usage, responseLog, decision, err = s.executeProtocolFlowWithFailover(wrapTTFTWriter(w, started, &ttftMs), r, route, decision, model, req, domain.ProtocolClaude, gatewayKeyMatched, matchedKey, gatewayKeyMatched)
+	timing := requestTimingFrom(r.Context())
+	if timing != nil {
+		timing.markPrepReady()
+	}
+	status, usage, responseLog, decision, err = s.executeProtocolFlowWithFailover(wrapTTFTWriterWithTiming(w, started, &ttftMs, timing), r, route, decision, model, req, domain.ProtocolClaude, gatewayKeyMatched, matchedKey, gatewayKeyMatched)
 	if err != nil {
 		s.logs.AddApp("error", "claude messages request failed", err.Error())
 		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
@@ -2750,7 +2865,7 @@ func (s *Server) resolveClaudeConsumerRoute(r *http.Request) (domain.Route, doma
 		return domain.Route{}, domain.APIKey{}, false, err
 	}
 	if s.apiKeyStore != nil {
-		_ = s.apiKeyStore.TouchAPIKey(key.ID, time.Now().UTC().Format(time.RFC3339))
+		s.apiKeyToucher.Touch(key.ID)
 	}
 	return route, key, true, nil
 }
@@ -2823,7 +2938,7 @@ type providerTestResult struct {
 
 func (s *Server) fetchProviderModels(r *http.Request, provider domain.Provider, started time.Time) providerTestResult {
 	if provider.AuthType == domain.AuthTypeCursorOAuth {
-		baseURL, refreshed, err := s.resolveCursorBridgeBaseURL(provider)
+		baseURL, refreshed, err := s.resolveCursorBridgeBaseURL(r.Context(), provider)
 		if err != nil {
 			return providerTestResult{Success: false, Provider: provider.ID, LatencyMs: time.Since(started).Milliseconds(), Error: err.Error(), Models: []domain.Model{}}
 		}
@@ -3250,7 +3365,7 @@ func (s *Server) proxyOpenAIToClaudeMessages(w http.ResponseWriter, r *http.Requ
 
 	var upstreamURL string
 	if provider.AuthType == domain.AuthTypeCursorOAuth {
-		baseURL, refreshed, bridgeErr := s.resolveCursorBridgeBaseURL(provider)
+		baseURL, refreshed, bridgeErr := s.resolveCursorBridgeBaseURL(r.Context(), provider)
 		if bridgeErr != nil {
 			return 0, TokenUsage{}, nil, bridgeErr
 		}
@@ -3363,7 +3478,7 @@ func (s *Server) proxyOpenAIToClaudeMessages(w http.ResponseWriter, r *http.Requ
 func (s *Server) proxyOpenAIChat(w http.ResponseWriter, r *http.Request, provider domain.Provider, model string, body []byte, skipIncomingAuth bool) (int, TokenUsage, []byte, error) {
 	stream := requestBodyWantsStream(body)
 	if provider.AuthType == domain.AuthTypeCursorOAuth {
-		baseURL, refreshed, err := s.resolveCursorBridgeBaseURL(provider)
+		baseURL, refreshed, err := s.resolveCursorBridgeBaseURL(r.Context(), provider)
 		if err != nil {
 			return 0, TokenUsage{}, nil, err
 		}
@@ -3375,8 +3490,7 @@ func (s *Server) proxyOpenAIChat(w http.ResponseWriter, r *http.Request, provide
 		}
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("Accept", r.Header.Get("Accept"))
-		client := &http.Client{Timeout: 0}
-		response, err := client.Do(request)
+		response, err := doHTTPWithTiming(r.Context(), &http.Client{Timeout: 0}, request)
 		if err != nil {
 			return 0, TokenUsage{}, nil, err
 		}
@@ -3412,8 +3526,7 @@ func (s *Server) proxyOpenAIChat(w http.ResponseWriter, r *http.Request, provide
 	}
 	applyRequestAdapterHeaders(request, provider, model)
 
-	client := &http.Client{Timeout: 0}
-	response, err := client.Do(request)
+	response, err := doHTTPWithTiming(r.Context(), &http.Client{Timeout: 0}, request)
 	if err != nil {
 		return 0, TokenUsage{}, nil, err
 	}
@@ -3457,7 +3570,7 @@ func (s *Server) proxyOpenAIImages(w http.ResponseWriter, r *http.Request, provi
 }
 
 func (s *Server) fetchCursorBridgeImages(r *http.Request, provider domain.Provider, body []byte) (int, []byte, error) {
-	baseURL, refreshed, err := s.resolveCursorBridgeBaseURL(provider)
+	baseURL, refreshed, err := s.resolveCursorBridgeBaseURL(r.Context(), provider)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -3518,9 +3631,14 @@ func (s *Server) proxyClaudeMessages(w http.ResponseWriter, r *http.Request, pro
 		// Claude OAuth requests authenticate with a bearer access token (plus the
 		// billing marker + anthropic-beta header), never the x-api-key header
 		// used by ordinary Claude API-key providers.
+		neededRefresh := provider.ClaudeOAuth != nil && claudeTokenNeedsRefresh(provider.ClaudeOAuth)
 		refreshed, refreshErr := s.ensureFreshClaudeToken(provider)
 		if refreshErr != nil {
 			return 0, TokenUsage{}, nil, refreshErr
+		}
+		if neededRefresh {
+			markTimingFlag(r.Context(), timingFlagOAuthRefresh)
+			markTimingFlag(r.Context(), timingFlagSaveState)
 		}
 		provider = refreshed
 		request, _, err = buildClaudeOAuthRequest(r.Context(), provider, body, r.Header.Get("anthropic-beta"), true, claudeMessagesURL)
@@ -3543,8 +3661,7 @@ func (s *Server) proxyClaudeMessages(w http.ResponseWriter, r *http.Request, pro
 		applyProviderAuth(request, provider, r.Header.Get("Authorization"))
 	}
 
-	client := &http.Client{Timeout: 0}
-	response, err := client.Do(request)
+	response, err := doHTTPWithTiming(r.Context(), &http.Client{Timeout: 0}, request)
 	if err != nil {
 		return 0, TokenUsage{}, nil, err
 	}
@@ -3557,9 +3674,14 @@ func (s *Server) doClaudeProviderRequest(ctx context.Context, r *http.Request, p
 	var request *http.Request
 	var err error
 	if isOAuth {
+		neededRefresh := provider.ClaudeOAuth != nil && claudeTokenNeedsRefresh(provider.ClaudeOAuth)
 		refreshed, refreshErr := s.ensureFreshClaudeToken(provider)
 		if refreshErr != nil {
 			return nil, refreshErr
+		}
+		if neededRefresh {
+			markTimingFlag(ctx, timingFlagOAuthRefresh)
+			markTimingFlag(ctx, timingFlagSaveState)
 		}
 		provider = refreshed
 		request, _, err = buildClaudeOAuthRequest(ctx, provider, body, r.Header.Get("anthropic-beta"), false, claudeMessagesURL)
@@ -3586,8 +3708,7 @@ func (s *Server) doClaudeProviderRequest(ctx context.Context, r *http.Request, p
 	} else {
 		request.Header.Set("Accept", "application/json")
 	}
-	client := &http.Client{Timeout: 0}
-	return client.Do(request)
+	return doHTTPWithTiming(ctx, &http.Client{Timeout: 0}, request)
 }
 
 func (s *Server) proxyClaudeToOpenAIChat(w http.ResponseWriter, r *http.Request, provider domain.Provider, model string, openAIReq map[string]any, skipIncomingAuth bool) (int, TokenUsage, []byte, error) {

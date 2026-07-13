@@ -60,8 +60,7 @@ func (s *Server) doOpenAIProviderRequest(ctx context.Context, r *http.Request, p
 		model, _ = payload["model"].(string)
 	}
 	applyRequestAdapterHeaders(request, provider, model)
-	client := &http.Client{Timeout: 0}
-	return client.Do(request)
+	return doHTTPWithTiming(ctx, &http.Client{Timeout: 0}, request)
 }
 
 func (s *Server) proxyOpenAIResponses(w http.ResponseWriter, r *http.Request, provider domain.Provider, model string, body []byte, skipIncomingAuth bool) (int, TokenUsage, []byte, error) {
@@ -100,43 +99,28 @@ func (s *Server) proxyOpenAIChatToResponses(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Server) proxyResponsesToClaudeMessages(w http.ResponseWriter, r *http.Request, provider domain.Provider, model string, claudeReq map[string]any, skipIncomingAuth bool) (int, TokenUsage, []byte, error) {
-	responsesReq, err := claudeToResponsesRequest(claudeReq, model)
+	// Direct Claude↔Responses conversion (no Chat IR hop).
+	responsesReq, err := claudeToResponsesRequestDirect(claudeReq, model)
 	if err != nil {
 		return 0, TokenUsage{}, nil, err
 	}
-	return s.proxyConvertedThroughResponses(w, r, provider, model, responsesReq, skipIncomingAuth, responsesToClaudeResponse, func(w http.ResponseWriter, reader io.Reader, model string) (TokenUsage, error) {
-		bridge := &bufferResponseWriter{}
-		usage, err := streamResponsesToOpenAIChatEvents(bridge, reader, model)
-		if err != nil {
-			return usage, err
-		}
-		usage2, err := streamOpenAIChatToClaudeEvents(w, bytes.NewReader(bridge.buf.Bytes()), model)
-		if usage.InputTokens == 0 && usage.OutputTokens == 0 {
-			return usage2, err
-		}
-		return usage, err
-	})
+	return s.proxyConvertedThroughResponses(w, r, provider, model, responsesReq, skipIncomingAuth, responsesToClaudeResponseDirect, streamResponsesToClaudeEventsDirect)
 }
 
 func (s *Server) proxyClaudeToResponses(w http.ResponseWriter, r *http.Request, provider domain.Provider, model string, responsesReq map[string]any, skipIncomingAuth bool) (int, TokenUsage, []byte, error) {
-	claudeReq, err := responsesToClaudeRequest(responsesReq, model)
+	// Capture the tool names the client (e.g. Codex) actually registered so the
+	// response hop can restore them. Claude OAuth cloaking renames tools to
+	// TitleCase upstream (exec_command → ExecCommand); without the original
+	// names the client receives an unknown tool and reports "unsupported call".
+	clientToolNames := extractOpenAIToolNames(responsesReq)
+	claudeReq, err := responsesToClaudeRequestDirect(responsesReq, model)
 	if err != nil {
 		return 0, TokenUsage{}, nil, err
 	}
-	return s.proxyConvertedThroughClaude(w, r, provider, model, claudeReq, skipIncomingAuth, claudeToResponsesResponse, func(w http.ResponseWriter, reader io.Reader, model string) (TokenUsage, error) {
-		bridge := &bufferResponseWriter{}
-		usage, err := streamClaudeToOpenAIChatEvents(bridge, reader, model, nil)
-		if err != nil {
-			return usage, err
-		}
-		// Second hop always uses standard options — never Cursor quirks.
-		usage2, err := streamOpenAIChatToResponsesEventsWithOptions(
-			w, bytes.NewReader(bridge.buf.Bytes()), model, StandardChatToResponsesStreamOptions(),
-		)
-		if usage.InputTokens == 0 && usage.OutputTokens == 0 {
-			return usage2, err
-		}
-		return usage, err
+	return s.proxyConvertedThroughClaude(w, r, provider, model, claudeReq, skipIncomingAuth, func(claudeBody []byte, model string) ([]byte, TokenUsage, error) {
+		return claudeToResponsesResponseDirect(claudeBody, model, clientToolNames)
+	}, func(w http.ResponseWriter, reader io.Reader, model string) (TokenUsage, error) {
+		return streamClaudeToResponsesEventsDirect(w, reader, model, clientToolNames)
 	})
 }
 
@@ -148,6 +132,62 @@ func (b *bufferResponseWriter) Header() http.Header { return http.Header{} }
 func (b *bufferResponseWriter) WriteHeader(int)     {}
 func (b *bufferResponseWriter) Write(p []byte) (int, error) {
 	return b.buf.Write(p)
+}
+
+// pipeResponseWriter adapts an io.Writer (the write end of an io.Pipe) into an
+// http.ResponseWriter so a stream converter can write its first-hop output
+// directly into the pipe. Flush is a no-op: io.Pipe writes are synchronous
+// (they block until the reader consumes), so backpressure and real-time
+// delivery are inherent.
+type pipeResponseWriter struct {
+	w io.Writer
+}
+
+func (p *pipeResponseWriter) Header() http.Header       { return http.Header{} }
+func (p *pipeResponseWriter) WriteHeader(int)           {}
+func (p *pipeResponseWriter) Write(b []byte) (int, error) { return p.w.Write(b) }
+func (p *pipeResponseWriter) Flush()                    {}
+
+// streamTwoHop pipes a two-hop streaming protocol conversion so the second hop
+// consumes the first hop's SSE output incrementally instead of waiting for the
+// whole first hop to buffer (the old bufferResponseWriter approach, which
+// destroyed TTFT on dual-hop flows like Claude↔Responses). The first hop runs
+// in a goroutine writing into an io.Pipe; the second hop reads from it and
+// writes to the real client w.
+//
+// Usage precedence matches the previous buffered behavior: on first-hop error,
+// return its usage+error; otherwise prefer the first hop's token usage unless
+// it is zero, then fall back to the second hop's usage; the returned error is
+// the second hop's.
+func streamTwoHop(w http.ResponseWriter, upstream io.Reader, model string, firstHop, secondHop streamConverter) (TokenUsage, error) {
+	pr, pw := io.Pipe()
+	var (
+		firstUsage TokenUsage
+		firstErr   error
+		done       = make(chan struct{})
+	)
+	go func() {
+		defer close(done)
+		firstUsage, firstErr = firstHop(&pipeResponseWriter{w: pw}, upstream, model)
+		if firstErr != nil {
+			_ = pw.CloseWithError(firstErr)
+			return
+		}
+		_ = pw.Close()
+	}()
+
+	secondUsage, secondErr := secondHop(w, pr, model)
+	// Unblock the first-hop goroutine if the second hop stopped reading early.
+	_ = pr.CloseWithError(secondErr)
+	<-done
+
+	if firstErr != nil {
+		return firstUsage, firstErr
+	}
+	if firstUsage.InputTokens == 0 && firstUsage.OutputTokens == 0 {
+		return secondUsage, secondErr
+	}
+	return firstUsage, secondErr
 }
 
 type streamBridgeRecorder struct {
@@ -176,7 +216,7 @@ func (s *Server) proxyConvertedThroughChat(w http.ResponseWriter, r *http.Reques
 	model = applyProviderModelMapping(provider, model)
 	var response *http.Response
 	if provider.AuthType == domain.AuthTypeCursorOAuth {
-		baseURL, refreshed, bridgeErr := s.resolveCursorBridgeBaseURL(provider)
+		baseURL, refreshed, bridgeErr := s.resolveCursorBridgeBaseURL(r.Context(), provider)
 		if bridgeErr != nil {
 			return 0, TokenUsage{}, nil, bridgeErr
 		}
@@ -188,8 +228,7 @@ func (s *Server) proxyConvertedThroughChat(w http.ResponseWriter, r *http.Reques
 		}
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("Accept", accept)
-		client := &http.Client{Timeout: 0}
-		response, err = client.Do(request)
+		response, err = doHTTPWithTiming(r.Context(), &http.Client{Timeout: 0}, request)
 		if err != nil {
 			return 0, TokenUsage{}, nil, err
 		}

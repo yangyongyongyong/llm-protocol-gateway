@@ -30,7 +30,7 @@ const userSelectColumns = `id, username, password_hash, role, allowed_provider_i
 
 // ListUsers returns all console users ordered by creation time.
 func (s *Store) ListUsers() ([]domain.User, error) {
-	rows, err := s.db.Query(`SELECT ` + userSelectColumns + ` FROM users ORDER BY created_at, id`)
+	rows, err := s.reader().Query(`SELECT ` + userSelectColumns + ` FROM users ORDER BY created_at, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -57,7 +57,7 @@ func (s *Store) UserByUsername(username string) (domain.User, error) {
 }
 
 func (s *Store) queryOneUser(query string, arg any) (domain.User, error) {
-	rows, err := s.db.Query(query, arg)
+	rows, err := s.reader().Query(query, arg)
 	if err != nil {
 		return domain.User{}, err
 	}

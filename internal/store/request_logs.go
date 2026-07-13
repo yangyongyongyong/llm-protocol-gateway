@@ -26,9 +26,11 @@ func (s *Store) AppendRequestLogWithRetention(log monitor.RequestLog, retentionD
 	}
 	_, err := s.db.Exec(`INSERT INTO request_logs (
 		time, api_key_id, api_key_name, route_id, provider_id, model, action, protocol_flow, path,
-		status, input_tokens, output_tokens, cache_tokens, latency_ms, ttft_ms, client_host, client_ip, access_source,
+		status, input_tokens, output_tokens, cache_tokens, latency_ms, ttft_ms,
+		prep_ms, pre_upstream_ms, upstream_ttfb_ms, gateway_overhead_ms, convert_out_ms, post_ms, timing_flags,
+		client_host, client_ip, access_source,
 		error_description, request_body, response_body
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		log.Time.UTC().Format(time.RFC3339Nano),
 		log.APIKeyID,
 		log.APIKeyName,
@@ -44,6 +46,13 @@ func (s *Store) AppendRequestLogWithRetention(log monitor.RequestLog, retentionD
 		log.CacheTokens,
 		log.LatencyMillis,
 		log.TTFTMillis,
+		log.PrepMillis,
+		log.PreUpstreamMillis,
+		log.UpstreamTTFBMillis,
+		log.GatewayOverheadMillis,
+		log.ConvertOutMillis,
+		log.PostMillis,
+		log.TimingFlags,
 		log.ClientHost,
 		log.ClientIP,
 		log.AccessSource,
@@ -134,19 +143,21 @@ func (s *Store) QueryRequestLogs(query monitor.RequestLogQuery) (monitor.Request
 	whereSQL := strings.Join(where, " AND ")
 	var total int
 	countArgs := append([]any{}, args...)
-	if err := s.db.QueryRow(`SELECT COUNT(1) FROM request_logs WHERE `+whereSQL, countArgs...).Scan(&total); err != nil {
+	if err := s.reader().QueryRow(`SELECT COUNT(1) FROM request_logs WHERE `+whereSQL, countArgs...).Scan(&total); err != nil {
 		return monitor.RequestLogPage{}, err
 	}
 
 	offset := (page - 1) * pageSize
 	args = append(args, pageSize, offset)
 	selectCols := `time, api_key_id, api_key_name, route_id, provider_id, model, action, protocol_flow, path,
-		status, input_tokens, output_tokens, cache_tokens, latency_ms, ttft_ms, client_host, client_ip, access_source,
+		status, input_tokens, output_tokens, cache_tokens, latency_ms, ttft_ms,
+		prep_ms, pre_upstream_ms, upstream_ttfb_ms, gateway_overhead_ms, convert_out_ms, post_ms, timing_flags,
+		client_host, client_ip, access_source,
 		error_description`
 	if query.IncludeBodies {
 		selectCols += `, request_body, response_body`
 	}
-	rows, err := s.db.Query(`SELECT `+selectCols+`
+	rows, err := s.reader().Query(`SELECT `+selectCols+`
 		FROM request_logs WHERE `+whereSQL+` ORDER BY time DESC, id DESC LIMIT ? OFFSET ?`, args...)
 	if err != nil {
 		return monitor.RequestLogPage{}, err
@@ -176,8 +187,8 @@ func (s *Store) QueryRequestLogs(query monitor.RequestLogQuery) (monitor.Request
 func scanRequestLog(rows *sql.Rows) (monitor.RequestLog, error) {
 	var item monitor.RequestLog
 	var timeValue string
-	var ttft sql.NullInt64
-	var clientHost, clientIP, accessSource sql.NullString
+	var ttft, prep, preUp, upTTFB, overhead, convertOut, post sql.NullInt64
+	var timingFlags, clientHost, clientIP, accessSource sql.NullString
 	if err := rows.Scan(
 		&timeValue,
 		&item.APIKeyID,
@@ -194,6 +205,13 @@ func scanRequestLog(rows *sql.Rows) (monitor.RequestLog, error) {
 		&item.CacheTokens,
 		&item.LatencyMillis,
 		&ttft,
+		&prep,
+		&preUp,
+		&upTTFB,
+		&overhead,
+		&convertOut,
+		&post,
+		&timingFlags,
 		&clientHost,
 		&clientIP,
 		&accessSource,
@@ -203,33 +221,15 @@ func scanRequestLog(rows *sql.Rows) (monitor.RequestLog, error) {
 	); err != nil {
 		return monitor.RequestLog{}, err
 	}
-	parsed, parseErr := time.Parse(time.RFC3339Nano, timeValue)
-	if parseErr != nil {
-		parsed, parseErr = time.Parse(time.RFC3339, timeValue)
-	}
-	if parseErr == nil {
-		item.Time = parsed
-	}
-	if ttft.Valid {
-		item.TTFTMillis = ttft.Int64
-	}
-	if clientHost.Valid {
-		item.ClientHost = clientHost.String
-	}
-	if clientIP.Valid {
-		item.ClientIP = clientIP.String
-	}
-	if accessSource.Valid {
-		item.AccessSource = accessSource.String
-	}
+	applyRequestLogScan(&item, timeValue, ttft, prep, preUp, upTTFB, overhead, convertOut, post, timingFlags, clientHost, clientIP, accessSource)
 	return item, nil
 }
 
 func scanRequestLogSummary(rows *sql.Rows) (monitor.RequestLog, error) {
 	var item monitor.RequestLog
 	var timeValue string
-	var ttft sql.NullInt64
-	var clientHost, clientIP, accessSource sql.NullString
+	var ttft, prep, preUp, upTTFB, overhead, convertOut, post sql.NullInt64
+	var timingFlags, clientHost, clientIP, accessSource sql.NullString
 	if err := rows.Scan(
 		&timeValue,
 		&item.APIKeyID,
@@ -246,6 +246,13 @@ func scanRequestLogSummary(rows *sql.Rows) (monitor.RequestLog, error) {
 		&item.CacheTokens,
 		&item.LatencyMillis,
 		&ttft,
+		&prep,
+		&preUp,
+		&upTTFB,
+		&overhead,
+		&convertOut,
+		&post,
+		&timingFlags,
 		&clientHost,
 		&clientIP,
 		&accessSource,
@@ -253,6 +260,16 @@ func scanRequestLogSummary(rows *sql.Rows) (monitor.RequestLog, error) {
 	); err != nil {
 		return monitor.RequestLog{}, err
 	}
+	applyRequestLogScan(&item, timeValue, ttft, prep, preUp, upTTFB, overhead, convertOut, post, timingFlags, clientHost, clientIP, accessSource)
+	return item, nil
+}
+
+func applyRequestLogScan(
+	item *monitor.RequestLog,
+	timeValue string,
+	ttft, prep, preUp, upTTFB, overhead, convertOut, post sql.NullInt64,
+	timingFlags, clientHost, clientIP, accessSource sql.NullString,
+) {
 	parsed, parseErr := time.Parse(time.RFC3339Nano, timeValue)
 	if parseErr != nil {
 		parsed, parseErr = time.Parse(time.RFC3339, timeValue)
@@ -263,6 +280,27 @@ func scanRequestLogSummary(rows *sql.Rows) (monitor.RequestLog, error) {
 	if ttft.Valid {
 		item.TTFTMillis = ttft.Int64
 	}
+	if prep.Valid {
+		item.PrepMillis = prep.Int64
+	}
+	if preUp.Valid {
+		item.PreUpstreamMillis = preUp.Int64
+	}
+	if upTTFB.Valid {
+		item.UpstreamTTFBMillis = upTTFB.Int64
+	}
+	if overhead.Valid {
+		item.GatewayOverheadMillis = overhead.Int64
+	}
+	if convertOut.Valid {
+		item.ConvertOutMillis = convertOut.Int64
+	}
+	if post.Valid {
+		item.PostMillis = post.Int64
+	}
+	if timingFlags.Valid {
+		item.TimingFlags = timingFlags.String
+	}
 	if clientHost.Valid {
 		item.ClientHost = clientHost.String
 	}
@@ -272,7 +310,6 @@ func scanRequestLogSummary(rows *sql.Rows) (monitor.RequestLog, error) {
 	if accessSource.Valid {
 		item.AccessSource = accessSource.String
 	}
-	return item, nil
 }
 
 func ensureRequestLogsTable(tx *sql.Tx) error {
@@ -308,6 +345,13 @@ func ensureRequestLogsTable(tx *sql.Tx) error {
 		def  string
 	}{
 		{"ttft_ms", "INTEGER NOT NULL DEFAULT 0"},
+		{"prep_ms", "INTEGER NOT NULL DEFAULT 0"},
+		{"pre_upstream_ms", "INTEGER NOT NULL DEFAULT 0"},
+		{"upstream_ttfb_ms", "INTEGER NOT NULL DEFAULT 0"},
+		{"gateway_overhead_ms", "INTEGER NOT NULL DEFAULT 0"},
+		{"convert_out_ms", "INTEGER NOT NULL DEFAULT 0"},
+		{"post_ms", "INTEGER NOT NULL DEFAULT 0"},
+		{"timing_flags", "TEXT NOT NULL DEFAULT ''"},
 		{"client_host", "TEXT NOT NULL DEFAULT ''"},
 		{"client_ip", "TEXT NOT NULL DEFAULT ''"},
 		{"access_source", "TEXT NOT NULL DEFAULT ''"},

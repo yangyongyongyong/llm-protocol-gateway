@@ -270,9 +270,11 @@ type SelfcheckToolInfo = {
 };
 
 type SelfcheckCaseResult = {
+  caseId?: string;
   providerId: string;
   providerName: string;
   client: string;
+  kind?: string;
   protocol: string;
   model?: string;
   success: boolean;
@@ -407,6 +409,13 @@ type LogEntry = {
   cacheTokens?: number;
   latencyMs: number;
   ttftMs?: number;
+  prepMs?: number;
+  preUpstreamMs?: number;
+  upstreamTtfbMs?: number;
+  gatewayOverheadMs?: number;
+  convertOutMs?: number;
+  postMs?: number;
+  timingFlags?: string;
   clientHost?: string;
   clientIp?: string;
   accessSource?: 'lan' | 'public' | 'local' | string;
@@ -602,12 +611,29 @@ type ProviderAuthPreview = {
 
 const PROVIDER_CACHE_ROUND2_USER = '继续';
 
+/** 与网关 / Codex 对齐：low → xhigh（max 在网关侧等价于 xhigh） */
+const THINKING_DEPTH_OPTIONS = ['low', 'medium', 'high', 'xhigh'] as const;
+
+const CODEX_MODEL_CATALOG_REL = '.codex/lpg-model-catalog.json';
+const CODEX_MODEL_CATALOG_DISPLAY = `~/${CODEX_MODEL_CATALOG_REL}`;
+
 const defaultProviderChatTestOptions: ProviderChatTestOptions = {
   systemPrompt: '你数学老师,下面问你一些问题',
   userPrompt: '1+1等于几',
   thinkingField: 'reasoning_effort',
   thinkingValue: 'medium',
 };
+
+function thinkingDepthSelectOptions(includeEmpty: { value: string; label: string }) {
+  return (
+    <>
+      <option value={includeEmpty.value}>{includeEmpty.label}</option>
+      {THINKING_DEPTH_OPTIONS.map((depth) => (
+        <option key={depth} value={depth}>{depth}</option>
+      ))}
+    </>
+  );
+}
 
 function thinkingPresetsForProtocol(protocol: Protocol) {
   if (protocol === 'claude') {
@@ -623,7 +649,7 @@ function thinkingPresetsForProtocol(protocol: Protocol) {
   return {
     defaultField: 'reasoning_effort',
     fields: [
-      { key: 'reasoning_effort', label: 'reasoning_effort', presets: ['low', 'medium', 'high'], custom: true },
+      { key: 'reasoning_effort', label: 'reasoning_effort', presets: [...THINKING_DEPTH_OPTIONS], custom: true },
       { key: 'thinking.type', label: 'thinking.type', presets: ['enabled', 'disabled'], custom: true },
     ],
   };
@@ -759,6 +785,38 @@ function clearUICache(scope: string, kind: string) {
   }
 }
 
+type TrafficRankCache = {
+  providers: Record<string, number>;
+  models: Record<string, number>;
+};
+
+function trafficRanksFromMap(map: Map<string, number>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [key, value] of map) {
+    if (value > 0) out[key] = value;
+  }
+  return out;
+}
+
+function trafficRanksEqual(a: Record<string, number>, b: Record<string, number>) {
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+  for (const key of aKeys) {
+    if ((a[key] || 0) !== (b[key] || 0)) return false;
+  }
+  return true;
+}
+
+function mapFromTrafficRanks(ranks: Record<string, number> | undefined) {
+  const map = new Map<string, number>();
+  if (!ranks) return map;
+  for (const [key, value] of Object.entries(ranks)) {
+    if (value > 0) map.set(key, value);
+  }
+  return map;
+}
+
 /** 上次已登录会话：用于刷新页面时跳过「正在检查登录」闪屏。 */
 function loadBootSession(): { auth: AdminAuthStatus | null; state: GatewayState | null } {
   const auth = readUICache<AdminAuthStatus>('session', 'auth');
@@ -811,7 +869,11 @@ function formatTrafficLogDetail(log: LogEntry, providers: Provider[] = []) {
     `action: ${log.action}`,
     `protocolFlow: ${log.protocolFlow}`,
     `path: ${log.path}`,
+    `accessSource: ${log.accessSource || '-'}`,
     `latency: ${log.latencyMs}ms`,
+    `ttft: ${log.ttftMs != null ? `${log.ttftMs}ms` : '-'}`,
+    `timing: prep=${log.prepMs ?? 0}ms preUpstream=${log.preUpstreamMs ?? 0}ms upstreamTtfb=${log.upstreamTtfbMs ?? 0}ms overhead=${log.gatewayOverheadMs ?? 0}ms convertOut=${log.convertOutMs ?? 0}ms post=${log.postMs ?? 0}ms`,
+    `timingFlags: ${log.timingFlags || '-'}`,
     `tokens: in=${log.inputTokens} out=${log.outputTokens}${log.cacheTokens ? ` cache=${log.cacheTokens}` : ''}`,
   ];
   if (log.errorDescription) lines.push(`error: ${log.errorDescription}`);
@@ -1182,18 +1244,85 @@ function openCodeModelLimit(modelID: string, provider?: Provider, aliases?: Reco
   return { context, output };
 }
 
+function resolveCodexReasoningEffort(key: APIKey) {
+  const raw = (key.thinkingDepthOverride || '').trim().toLowerCase();
+  if (!raw) return 'medium';
+  if (raw === 'max') return 'xhigh';
+  if ((THINKING_DEPTH_OPTIONS as readonly string[]).includes(raw)) return raw;
+  return 'medium';
+}
+
+/** Codex 本地 model catalog：消掉 “Model metadata for `xxx` not found” */
+function buildApiKeyCodexModelCatalogJSON(key: APIKey, provider?: Provider) {
+  const primary = resolveApiKeyModel(key, provider);
+  const aliases = key.modelAliases || {};
+  const slugs = new Set<string>();
+  if (primary && primary !== 'your-model') slugs.add(primary);
+  for (const alias of Object.keys(aliases)) {
+    const trimmed = alias.trim();
+    if (trimmed) slugs.add(trimmed);
+  }
+  for (const target of Object.values(aliases)) {
+    const trimmed = (target || '').trim();
+    if (trimmed) slugs.add(trimmed);
+  }
+  if (slugs.size === 0) slugs.add(primary || 'your-model');
+
+  const reasoningLevels = THINKING_DEPTH_OPTIONS.map((effort) => ({
+    effort,
+    description:
+      effort === 'low' ? 'Fast responses with lighter reasoning'
+        : effort === 'medium' ? 'Balances speed and reasoning depth for everyday tasks'
+          : effort === 'high' ? 'Greater reasoning depth for complex problems'
+            : 'Extra high reasoning depth for complex problems',
+  }));
+  const defaultEffort = resolveCodexReasoningEffort(key);
+
+  const models = [...slugs].map((slug, index) => {
+    const limit = openCodeModelLimit(slug, provider, aliases);
+    return {
+      slug,
+      display_name: slug,
+      description: `${slug} (via LLM Protocol Gateway)`,
+      default_reasoning_level: defaultEffort,
+      supported_reasoning_levels: reasoningLevels,
+      context_window: limit.context,
+      max_context_window: limit.context,
+      shell_type: 'shell_command',
+      visibility: 'list',
+      supported_in_api: true,
+      priority: index,
+      availability_nux: null,
+      upgrade: null,
+      base_instructions: 'You are Codex, a coding agent.',
+      supports_reasoning_summaries: true,
+      support_verbosity: false,
+      default_verbosity: null,
+      apply_patch_tool_type: null,
+      truncation_policy: { mode: 'tokens', limit: 10000 },
+      supports_parallel_tool_calls: true,
+      experimental_supported_tools: [],
+      input_modalities: ['text', 'image'],
+    };
+  });
+  return `${JSON.stringify({ models }, null, 2)}\n`;
+}
+
 function buildApiKeyCodexConfig(key: APIKey, route: Route | undefined, endpoints: OutputEndpoint[], publicBase: string, provider?: Provider) {
   const providerID = sanitizeClientConfigID(key.name);
   const model = resolveApiKeyModel(key, provider);
+  const effort = resolveCodexReasoningEffort(key);
   const baseURL = `${apiKeyGatewayRoot(endpoints, publicBase)}/openai/v1`;
   const warning = !route || route.outputProtocol !== 'openai_responses'
     ? '# 注意：当前密钥输出协议不是 OpenAI Responses，请先改为「OpenAI Responses」\n'
     : '';
   return `# ~/.codex/config.toml （用户级；项目内 .codex/config.toml 不会生效 provider）
 # Codex 使用 Responses：base_url 指向网关 /openai/v1，wire_api = "responses"
+# model_catalog_json 提供覆盖模型/别名的本地元数据，避免 “Model metadata not found”
 ${warning}model_provider = "${providerID}"
 model = "${model}"
-model_reasoning_effort = "medium"
+model_reasoning_effort = "${effort}"
+model_catalog_json = "${CODEX_MODEL_CATALOG_DISPLAY}"
 
 [model_providers.${providerID}]
 name = "${key.name || providerID}"
@@ -1236,14 +1365,19 @@ function clientConfigTitle(client: 'opencode' | 'codex' | 'claude') {
   return 'Claude Code 配置';
 }
 
-/** 生成可粘贴到终端执行的覆盖脚本：备份旧文件后写入完整配置。 */
-function buildApiKeyClientConfigInstallScript(client: 'opencode' | 'codex' | 'claude', configText: string) {
+/** 生成可粘贴到终端执行的覆盖脚本：备份旧文件后写入完整配置（Codex 另写 model catalog）。 */
+function buildApiKeyClientConfigInstallScript(
+  client: 'opencode' | 'codex' | 'claude',
+  configText: string,
+  extraFiles: Array<{ rel: string; display: string; content: string }> = [],
+) {
   const rel = clientConfigHomeRelativePath(client);
   const display = clientConfigFilePath(client);
   // 避免配置正文里偶发出现相同结束标记
-  const marker = `LPG_CFG_${client.toUpperCase()}_${Date.now().toString(36)}`;
+  const stamp = Date.now().toString(36);
+  const marker = `LPG_CFG_${client.toUpperCase()}_${stamp}`;
   const body = configText.endsWith('\n') ? configText : `${configText}\n`;
-  return [
+  const lines = [
     '# 覆盖客户端配置（粘贴到终端执行即可；勿带 shebang，避免 zsh 把 ! 当历史展开）',
     'set -euo pipefail',
     `FILE="$HOME/${rel}"`,
@@ -1257,9 +1391,39 @@ function buildApiKeyClientConfigInstallScript(client: 'opencode' | 'codex' | 'cl
     body.replace(/\n$/, ''),
     marker,
     `echo "已写入: ${display}"`,
-    'echo "完成。如客户端已在运行，请重启后再试。"',
-    '',
-  ].join('\n');
+  ];
+  extraFiles.forEach((file, index) => {
+    const fileMarker = `LPG_EXTRA_${client.toUpperCase()}_${index}_${stamp}`;
+    const fileBody = file.content.endsWith('\n') ? file.content : `${file.content}\n`;
+    lines.push(
+      `EXTRA="$HOME/${file.rel}"`,
+      'mkdir -p "$(dirname "$EXTRA")"',
+      'if [ -f "$EXTRA" ]; then',
+      '  BAK="${EXTRA}.bak.$(date +%Y%m%d%H%M%S)"',
+      '  cp "$EXTRA" "$BAK"',
+      '  echo "已备份: $BAK"',
+      'fi',
+      `cat > "$EXTRA" <<'${fileMarker}'`,
+      fileBody.replace(/\n$/, ''),
+      fileMarker,
+      `echo "已写入: ${file.display}"`,
+    );
+  });
+  lines.push('echo "完成。如客户端已在运行，请重启后再试。"', '');
+  return lines.join('\n');
+}
+
+function buildApiKeyClientConfigExtras(
+  client: 'opencode' | 'codex' | 'claude',
+  key: APIKey,
+  provider?: Provider,
+): Array<{ rel: string; display: string; content: string }> {
+  if (client !== 'codex') return [];
+  return [{
+    rel: CODEX_MODEL_CATALOG_REL,
+    display: CODEX_MODEL_CATALOG_DISPLAY,
+    content: buildApiKeyCodexModelCatalogJSON(key, provider),
+  }];
 }
 
 function buildApiKeyClientConfig(
@@ -2111,9 +2275,7 @@ function App() {
   const [selectedApiKeyID, setSelectedApiKeyID] = useState('');
   const [checkedApiKeyIDs, setCheckedApiKeyIDs] = useState<string[]>([]);
   const apiKeyCheckAnchorRef = useRef<number | null>(null);
-  const [apiKeyFilterID, setApiKeyFilterID] = useState('__all__');
-  const [apiKeyProviderFilter, setApiKeyProviderFilter] = useState('__all__');
-  const [apiKeyOutputProtocolFilter, setApiKeyOutputProtocolFilter] = useState('__all__');
+  const [apiKeyKeyword, setApiKeyKeyword] = useState('');
   const [apiKeySortBy, setApiKeySortBy] = useState<'name' | 'createdAt'>('createdAt');
   const [apiKeySortDir, setApiKeySortDir] = useState<'asc' | 'desc'>('desc');
   const [selfcheckProviderIDs, setSelfcheckProviderIDs] = useState<string[]>([]);
@@ -2123,6 +2285,7 @@ function App() {
   const [selfcheckLanRoot, setSelfcheckLanRoot] = useState('');
   const [selfcheckRunning, setSelfcheckRunning] = useState(false);
   const [selfcheckJob, setSelfcheckJob] = useState<SelfcheckJobStatus | null>(null);
+  const [selfcheckRetrying, setSelfcheckRetrying] = useState<string[]>([]);
   const selfcheckPollRef = useRef<number | null>(null);
   const [providerDraft, setProviderDraft] = useState({
     name: '我的 OpenAI 对话 Provider',
@@ -2173,9 +2336,18 @@ function App() {
     () => state.endpoints.find((endpoint) => endpoint.protocol === selectedOutputProtocol) || state.endpoints.find((endpoint) => endpoint.id === selectedRoute?.outputEndpointId) || state.endpoints[0],
     [state.endpoints, selectedOutputProtocol, selectedRoute],
   );
+  // Keep traffic-based ranking, but seed counts from localStorage so the first
+  // paint after refresh matches the last session. Only re-sort when live
+  // request counts actually change (avoids the cache→stats jump).
+  const trafficRankScope = uiCacheScope(authStatus);
+  const [cachedTrafficRanks, setCachedTrafficRanks] = useState<TrafficRankCache>(() => (
+    readUICache<TrafficRankCache>(uiCacheScope(bootSession.auth), 'traffic-ranks')
+    || { providers: {}, models: {} }
+  ));
+
   const recentActivityCutoffMs = useMemo(() => Date.now() - 3 * 24 * 60 * 60 * 1000, [logs, requestStats]);
 
-  const recentProviderRequestCounts = useMemo(() => {
+  const liveProviderRequestCounts = useMemo(() => {
     const counts = new Map<string, number>();
     for (const log of logs) {
       const ts = new Date(log.time).getTime();
@@ -2184,7 +2356,6 @@ function App() {
       if (!providerID) continue;
       counts.set(providerID, (counts.get(providerID) || 0) + 1);
     }
-    // Also fold month/range stats when logs page is sparse.
     for (const item of requestStats?.range?.byProvider || requestStats?.month?.byProvider || []) {
       if (!item.providerId) continue;
       const current = counts.get(item.providerId) || 0;
@@ -2193,21 +2364,48 @@ function App() {
     return counts;
   }, [logs, requestStats, recentActivityCutoffMs]);
 
-  // Per-model request counts over the last 3 days (for models-menu ranking).
-  const recentModelRequestCounts = useMemo(() => {
+  const liveModelRequestCounts = useMemo(() => {
     const counts = new Map<string, number>();
     for (const log of logs) {
       const ts = new Date(log.time).getTime();
       if (!Number.isFinite(ts) || ts < recentActivityCutoffMs) continue;
       const modelID = (log.model || '').split('->').pop()?.trim() || log.model || '';
       if (!modelID) continue;
-      // Key by provider+model so the same model id under different providers ranks separately.
       const key = `${log.providerId || ''}::${modelID}`;
       counts.set(key, (counts.get(key) || 0) + 1);
       counts.set(modelID, (counts.get(modelID) || 0) + 1);
     }
     return counts;
   }, [logs, recentActivityCutoffMs]);
+
+  const liveTrafficReady = liveProviderRequestCounts.size > 0 || liveModelRequestCounts.size > 0
+    || Boolean(requestStats?.range?.byProvider?.length || requestStats?.month?.byProvider?.length);
+
+  useEffect(() => {
+    if (!liveTrafficReady) return;
+    const next: TrafficRankCache = {
+      providers: trafficRanksFromMap(liveProviderRequestCounts),
+      models: trafficRanksFromMap(liveModelRequestCounts),
+    };
+    if (
+      trafficRanksEqual(next.providers, cachedTrafficRanks.providers)
+      && trafficRanksEqual(next.models, cachedTrafficRanks.models)
+    ) {
+      return;
+    }
+    setCachedTrafficRanks(next);
+    writeUICache(trafficRankScope, 'traffic-ranks', next);
+  }, [liveTrafficReady, liveProviderRequestCounts, liveModelRequestCounts, trafficRankScope, cachedTrafficRanks]);
+
+  const recentProviderRequestCounts = useMemo(() => {
+    if (liveTrafficReady) return liveProviderRequestCounts;
+    return mapFromTrafficRanks(cachedTrafficRanks.providers);
+  }, [liveTrafficReady, liveProviderRequestCounts, cachedTrafficRanks.providers]);
+
+  const recentModelRequestCounts = useMemo(() => {
+    if (liveTrafficReady) return liveModelRequestCounts;
+    return mapFromTrafficRanks(cachedTrafficRanks.models);
+  }, [liveTrafficReady, liveModelRequestCounts, cachedTrafficRanks.models]);
 
   const sortedProviders = useMemo(() => {
     return [...state.providers].sort((a, b) => {
@@ -2278,20 +2476,21 @@ function App() {
 
   const filteredApiKeys = useMemo(() => {
     let keys = state.apiKeys || [];
-    if (apiKeyProviderFilter !== '__all__') {
+    const keyword = apiKeyKeyword.trim().toLowerCase();
+    if (keyword) {
       keys = keys.filter((key) => {
         const route = state.routes.find((item) => item.id === key.routeId);
-        return route?.providerId === apiKeyProviderFilter;
+        const provider = route ? state.providers.find((item) => item.id === route.providerId) : undefined;
+        const haystack = [
+          key.name,
+          key.key,
+          provider?.name || '',
+          provider ? providerOptionLabel(provider) : '',
+          route?.outputProtocol || '',
+          route ? protocolLabel(route.outputProtocol) : '',
+        ].join(' ').toLowerCase();
+        return haystack.includes(keyword);
       });
-    }
-    if (apiKeyOutputProtocolFilter !== '__all__') {
-      keys = keys.filter((key) => {
-        const route = state.routes.find((item) => item.id === key.routeId);
-        return route?.outputProtocol === apiKeyOutputProtocolFilter;
-      });
-    }
-    if (apiKeyFilterID !== '__all__') {
-      keys = keys.filter((key) => key.id === apiKeyFilterID);
     }
     const sorted = [...keys];
     const dir = apiKeySortDir === 'asc' ? 1 : -1;
@@ -2309,7 +2508,7 @@ function App() {
       return a.id.localeCompare(b.id) * dir;
     });
     return sorted;
-  }, [state.apiKeys, state.routes, apiKeyFilterID, apiKeyProviderFilter, apiKeyOutputProtocolFilter, apiKeySortBy, apiKeySortDir]);
+  }, [state.apiKeys, state.routes, state.providers, apiKeyKeyword, apiKeySortBy, apiKeySortDir]);
 
   function toggleApiKeySort(field: 'name' | 'createdAt') {
     if (apiKeySortBy === field) {
@@ -4088,11 +4287,44 @@ function App() {
     }
   }
 
+  async function retrySelfcheckCase(caseId: string) {
+    if (!selfcheckJob?.jobId || !caseId) return;
+    if (selfcheckRetrying.includes(caseId)) return;
+    setSelfcheckRetrying((prev) => [...prev, caseId]);
+    const jobId = selfcheckJob.jobId;
+    try {
+      const response = await fetch(
+        `${API_BASE}/__selfcheck/${encodeURIComponent(jobId)}/retry/${encodeURIComponent(caseId)}`,
+        { method: 'POST', credentials: 'same-origin' },
+      );
+      if (!response.ok) throw new Error(await response.text());
+      showToast('已开始重试该用例…');
+      // The retry re-opens the job; resume polling until it settles again.
+      setSelfcheckRunning(true);
+      await pollSelfcheckJob(jobId);
+      if (selfcheckPollRef.current == null) {
+        selfcheckPollRef.current = window.setInterval(() => {
+          void pollSelfcheckJob(jobId);
+        }, 1000);
+      }
+    } catch (error) {
+      showToast(`重试失败：${String(error)}`);
+    } finally {
+      setSelfcheckRetrying((prev) => prev.filter((id) => id !== caseId));
+    }
+  }
+
   function selfcheckClientLabel(client: string) {
     if (client === 'opencode') return 'OpenCode';
     if (client === 'codex') return 'Codex';
     if (client === 'claude') return 'Claude';
     return client;
+  }
+
+  function selfcheckKindLabel(kind?: string) {
+    if (kind === 'tool') return '工具调用';
+    if (kind === 'chat') return '对话';
+    return kind || '对话';
   }
 
   function providersExportFilename() {
@@ -4233,7 +4465,7 @@ function App() {
       const created = await response.json() as APIKey;
       setApiKeyModalOpen(false);
       setSelectedApiKeyID(created.id);
-      setApiKeyFilterID(created.id);
+      setApiKeyKeyword('');
       showToast(`已创建 API 密钥：${created.name}`);
       await refreshState(false);
       await refreshAppLogs();
@@ -4509,7 +4741,6 @@ function App() {
       setCheckedApiKeyIDs((current) => current.filter((id) => id !== key.id));
       if (selectedApiKeyID === key.id) {
         setSelectedApiKeyID('');
-        setApiKeyFilterID('__all__');
       }
       await refreshState(false);
       await refreshAppLogs();
@@ -4535,7 +4766,6 @@ function App() {
       const failed = results.length - deleted.length;
       if (selectedApiKeyID && deleted.includes(selectedApiKeyID)) {
         setSelectedApiKeyID('');
-        setApiKeyFilterID('__all__');
       }
       setCheckedApiKeyIDs((current) => current.filter((id) => !deleted.includes(id)));
       apiKeyCheckAnchorRef.current = null;
@@ -4838,46 +5068,14 @@ function App() {
               {(state.apiKeys || []).length > 0 ? (
                 <div className="api-keys-toolbar">
                   <div className="field api-keys-filter-field">
-                    <label>筛选密钥</label>
-                    <select
-                      value={apiKeyFilterID}
-                      onChange={(event) => {
-                        const value = event.target.value;
-                        setApiKeyFilterID(value);
-                        if (value !== '__all__') {
-                          setSelectedApiKeyID(value);
-                        }
-                      }}
-                    >
-                      <option value="__all__">全部密钥（{(state.apiKeys || []).length}）</option>
-                      {(state.apiKeys || []).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
-                    </select>
-                  </div>
-                  <div className="field api-keys-filter-field">
-                    <label>筛选 Provider</label>
-                    <select
-                      value={apiKeyProviderFilter}
-                      onChange={(event) => {
-                        setApiKeyProviderFilter(event.target.value);
-                        setApiKeyFilterID('__all__');
-                      }}
-                    >
-                      <option value="__all__">全部 Provider</option>
-                      {state.providers.map((item) => <option key={item.id} value={item.id}>{providerOptionLabel(item)}</option>)}
-                    </select>
-                  </div>
-                  <div className="field api-keys-filter-field">
-                    <label>筛选输出协议</label>
-                    <select
-                      value={apiKeyOutputProtocolFilter}
-                      onChange={(event) => {
-                        setApiKeyOutputProtocolFilter(event.target.value);
-                        setApiKeyFilterID('__all__');
-                      }}
-                    >
-                      <option value="__all__">全部输出协议</option>
-                      {fixedOutputLabels.map((label) => <option key={label} value={protocolFromLabel(label)}>{label}</option>)}
-                    </select>
+                    <label>过滤</label>
+                    <input
+                      type="search"
+                      className="api-keys-filter-search"
+                      placeholder="名称 / 密钥 / Provider / 协议"
+                      value={apiKeyKeyword}
+                      onChange={(event) => setApiKeyKeyword(event.target.value)}
+                    />
                   </div>
                   <div className="api-keys-toolbar-meta">
                     显示 {filteredApiKeys.length} / {(state.apiKeys || []).length} 个密钥
@@ -5115,7 +5313,7 @@ function App() {
           </section>
           )}
 
-          {activeNav === 'output-providers' && (
+          {activeNav === 'output-providers' && !isNormalUser && (
           <section className="section-grid">
             <div className="card panel">
               <div className="panel-header">
@@ -5329,7 +5527,7 @@ function App() {
           </section>
           )}
 
-          {activeNav === 'public-access' && (
+          {activeNav === 'public-access' && !isNormalUser && (
           <section className="section-grid public-access-grid">
             <div className="card panel" style={{ gridColumn: '1 / -1' }}>
               <div className="panel-header">
@@ -5724,7 +5922,7 @@ function App() {
                           <span className="log-provider" title={log.providerId || undefined}>{trafficLogProviderLabel(log, state.providers || [])}</span>
                           <span className="log-model">{log.model}</span>
                           <span className="log-token" title="入=总 input（含缓存命中）；缓存=cache hit">入 {log.inputTokens} · 出 {log.outputTokens} · 缓存 {log.cacheTokens || 0}</span>
-                          <span className="log-latency">{log.ttftMs != null ? `${log.ttftMs}ms` : '—'}</span>
+                          <span className="log-latency" title={log.upstreamTtfbMs || log.gatewayOverheadMs ? `upstreamTtfb=${log.upstreamTtfbMs ?? 0}ms overhead=${log.gatewayOverheadMs ?? 0}ms prep=${log.prepMs ?? 0}ms flags=${log.timingFlags || '-'}` : undefined}>{log.ttftMs != null ? `${log.ttftMs}ms` : '—'}</span>
                           <span className="log-latency">{log.latencyMs}ms</span>
                           {isTrafficLogError(log) ? (
                             <button className="mini-btn" type="button" onClick={() => void openTrafficLogDetail(log)}>详情</button>
@@ -5793,7 +5991,7 @@ function App() {
           </section>
           )}
 
-          {activeNav === 'self-check' && (
+          {activeNav === 'self-check' && !isNormalUser && (
           <section className="section-full">
             <div className="card panel">
               <div className="panel-header">
@@ -5810,7 +6008,7 @@ function App() {
                   onClick={() => void startSelfcheck()}
                 >
                   {selfcheckRunning
-                    ? `自检中… ${selfcheckJob?.completed ?? 0}/${selfcheckJob?.total ?? selfcheckProviderIDs.length * 3}`
+                    ? `自检中… ${selfcheckJob?.completed ?? 0}/${selfcheckJob?.total ?? selfcheckProviderIDs.length * 6}`
                     : '开始自检'}
                 </button>
               </div>
@@ -5906,41 +6104,63 @@ function App() {
                     <div className="selfcheck-header">
                       <span>Provider</span>
                       <span>客户端</span>
+                      <span>类型</span>
                       <span>协议</span>
+                      <span>模型</span>
                       <span>成功</span>
                       <span>内容</span>
                       <span>耗时</span>
                       <span>预览 / 错误</span>
+                      <span>操作</span>
                     </div>
                     {(selfcheckJob.results || []).length === 0 ? (
                       <div className="empty-state">等待用例完成…</div>
                     ) : (
                       [...selfcheckJob.results]
-                        .sort((a, b) => `${a.providerName}-${a.client}`.localeCompare(`${b.providerName}-${b.client}`, 'zh'))
-                        .map((row, index) => (
-                          <div className="selfcheck-row" key={`${row.providerId}-${row.client}-${index}`}>
+                        .sort((a, b) => `${a.providerName}-${a.client}-${a.kind}`.localeCompare(`${b.providerName}-${b.client}-${b.kind}`, 'zh'))
+                        .map((row, index) => {
+                          const caseId = row.caseId || `${row.providerId}|${row.client}|${row.kind || 'chat'}`;
+                          const retrying = selfcheckRetrying.includes(caseId);
+                          const passed = row.success && row.contentOK;
+                          return (
+                          <div className="selfcheck-row" key={`${caseId}-${index}`}>
                             <span className="usage-key-name">{row.providerName || row.providerId}</span>
                             <span>{selfcheckClientLabel(row.client)}</span>
+                            <span>{selfcheckKindLabel(row.kind)}</span>
                             <span>{protocolLabel(row.protocol as Protocol)}</span>
+                            <span className="selfcheck-model" title={row.model || ''}>{row.model || '—'}</span>
                             <span><Badge tone={row.success ? 'green' : 'red'}>{row.success ? '是' : '否'}</Badge></span>
                             <span><Badge tone={row.contentOK ? 'green' : 'amber'}>{row.contentOK ? 'OK' : '失败'}</Badge></span>
                             <span>{row.latencyMs} ms</span>
                             <span className="selfcheck-preview" title={row.error || row.outputPreview || ''}>
                               {row.error || row.outputPreview || '—'}
                             </span>
+                            <span>
+                              {passed ? '—' : (
+                                <button
+                                  className="mini-btn"
+                                  type="button"
+                                  disabled={retrying}
+                                  onClick={() => { void retrySelfcheckCase(caseId); }}
+                                >
+                                  {retrying ? '重试中…' : '重试'}
+                                </button>
+                              )}
+                            </span>
                           </div>
-                        ))
+                          );
+                        })
                     )}
                   </div>
                 </div>
               ) : (
-                <div className="empty-state" style={{ marginTop: 16 }}>勾选 Provider 后点击「开始自检」。每个 Provider 会并行跑 3 个客户端用例。</div>
+                <div className="empty-state" style={{ marginTop: 16 }}>勾选 Provider 后点击「开始自检」。每个 Provider 会并行跑 6 个用例（3 个客户端 × 对话/工具调用）。</div>
               )}
             </div>
           </section>
           )}
 
-          {activeNav === 'settings' && (
+          {activeNav === 'settings' && !isNormalUser && (
           <section className="section-grid settings-grid">
             <div className="settings-stack">
               <div className="card panel">
@@ -6209,10 +6429,7 @@ function App() {
             )}
             <Field label="兜底模型（可选）" value={providerDraft.defaultModel} onChange={(value) => setProviderDraft((current) => ({ ...current, defaultModel: value }))} />
             <div className="field"><label>默认思考深度（可选）</label><select value={providerDraft.defaultThinkingDepth} onChange={(event) => setProviderDraft((current) => ({ ...current, defaultThinkingDepth: event.target.value }))}>
-              <option value="">（不指定）</option>
-              <option value="low">low</option>
-              <option value="medium">medium</option>
-              <option value="high">high</option>
+              {thinkingDepthSelectOptions({ value: '', label: '（不指定）' })}
             </select></div>
           </div>
           {providerDraft.protocol === 'claude' && providerDraft.authType === 'claude_oauth' && (
@@ -6534,10 +6751,7 @@ function App() {
             <div className="field field-full">
               <label>思考深度（可选）</label>
               <select value={apiKeyDraft.thinkingDepthOverride} onChange={(event) => setApiKeyDraft((current) => ({ ...current, thinkingDepthOverride: event.target.value }))}>
-                <option value="">（不覆盖）</option>
-                <option value="low">low</option>
-                <option value="medium">medium</option>
-                <option value="high">high</option>
+                {thinkingDepthSelectOptions({ value: '', label: '（不覆盖）' })}
               </select>
             </div>
             <div className="field field-full">
@@ -7202,10 +7416,7 @@ function ApiKeyDetailPanel({
         <div className="field">
           <label>思考深度</label>
           <select value={keyItem.thinkingDepthOverride || ''} disabled={saving} onChange={(event) => void onUpdateField(keyItem, 'thinkingDepthOverride', event.target.value)}>
-            <option value="">（不覆盖）</option>
-            <option value="low">low</option>
-            <option value="medium">medium</option>
-            <option value="high">high</option>
+            {thinkingDepthSelectOptions({ value: '', label: '（不覆盖）' })}
           </select>
         </div>
         <div className="field">
@@ -7532,9 +7743,13 @@ function ApiKeyClientConfigModal({
     () => buildApiKeyClientConfig(client, keyItem, route, endpoints, effectivePublicBase, provider),
     [client, keyItem, route, endpoints, effectivePublicBase, provider],
   );
+  const configExtras = React.useMemo(
+    () => buildApiKeyClientConfigExtras(client, keyItem, provider),
+    [client, keyItem, provider],
+  );
   const installScript = React.useMemo(
-    () => buildApiKeyClientConfigInstallScript(client, configText),
-    [client, configText],
+    () => buildApiKeyClientConfigInstallScript(client, configText, configExtras),
+    [client, configText, configExtras],
   );
   const filePath = clientConfigFilePath(client);
   const gatewayRoot = apiKeyGatewayRoot(endpoints, effectivePublicBase);
@@ -7573,6 +7788,11 @@ function ApiKeyClientConfigModal({
             <div className="field-readonly code">{filePath}</div>
             <CopyButton value={filePath} label="复制路径" />
           </div>
+          {configExtras.length > 0 ? (
+            <div className="hint-line">
+              同时写入：{configExtras.map((item) => item.display).join('、')}（Codex 模型元数据，消除 Model metadata not found）
+            </div>
+          ) : null}
         </div>
 
         <div className="field">
@@ -7584,7 +7804,7 @@ function ApiKeyClientConfigModal({
               onClick={() => {
                 setNetworkMode('lan');
                 const nextConfig = buildApiKeyClientConfig(client, keyItem, route, endpoints, '', provider);
-                const nextScript = buildApiKeyClientConfigInstallScript(client, nextConfig);
+                const nextScript = buildApiKeyClientConfigInstallScript(client, nextConfig, buildApiKeyClientConfigExtras(client, keyItem, provider));
                 copyConfig(nextScript, `已复制覆盖脚本（${clientConfigTitle(client)} · 内网）`);
               }}
             >
@@ -7599,7 +7819,7 @@ function ApiKeyClientConfigModal({
                 if (!publicAvailable) return;
                 setNetworkMode('public');
                 const nextConfig = buildApiKeyClientConfig(client, keyItem, route, endpoints, publicBase, provider);
-                const nextScript = buildApiKeyClientConfigInstallScript(client, nextConfig);
+                const nextScript = buildApiKeyClientConfigInstallScript(client, nextConfig, buildApiKeyClientConfigExtras(client, keyItem, provider));
                 copyConfig(nextScript, `已复制覆盖脚本（${clientConfigTitle(client)} · 公网域名）`);
               }}
             >
@@ -7617,7 +7837,9 @@ function ApiKeyClientConfigModal({
         <div className="field">
           <label>配置覆盖脚本</label>
           <div className="hint-line">
-            终端执行后会覆盖 {filePath}；若文件已存在，会先备份为同目录 `.bak.时间戳`。
+            终端执行后会覆盖 {filePath}
+            {configExtras.length > 0 ? ` 与 ${configExtras.map((item) => item.display).join('、')}` : ''}
+            ；若文件已存在，会先备份为同目录 `.bak.时间戳`。
           </div>
           <pre className="curl-preview api-key-client-config-preview">{installScript}</pre>
         </div>

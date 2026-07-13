@@ -73,13 +73,14 @@ func (b *Bridge) findBun() (string, error) {
 }
 
 // EnsureRunning writes the access token and starts the bridge if needed.
-func (b *Bridge) EnsureRunning(accessToken string) (int, error) {
+// started is true when a new bridge process was launched.
+func (b *Bridge) EnsureRunning(accessToken string) (port int, started bool, err error) {
 	accessToken = strings.TrimSpace(accessToken)
 	if accessToken == "" {
-		return 0, fmt.Errorf("cursor access token is empty")
+		return 0, false, fmt.Errorf("cursor access token is empty")
 	}
 	if err := b.writeToken(accessToken); err != nil {
-		return 0, err
+		return 0, false, err
 	}
 
 	b.mu.Lock()
@@ -87,14 +88,14 @@ func (b *Bridge) EnsureRunning(accessToken string) (int, error) {
 
 	if b.cmd != nil && b.cmd.Process != nil && b.port > 0 {
 		if b.cmd.ProcessState == nil {
-			return b.port, nil
+			return b.port, false, nil
 		}
 	}
 
 	if err := b.startLocked(); err != nil {
-		return 0, err
+		return 0, false, err
 	}
-	return b.port, nil
+	return b.port, true, nil
 }
 
 func (b *Bridge) startLocked() error {

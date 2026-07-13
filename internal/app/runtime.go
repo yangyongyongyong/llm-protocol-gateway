@@ -170,16 +170,9 @@ func (rt *Runtime) Start(cfg Config) error {
 	if retentionDays <= 0 {
 		retentionDays = 7
 	}
-	if err := db.PruneRequestLogs(retentionDays); err != nil {
-		slog.Warn("request log prune failed", "error", err)
-	}
-	logs.PruneUsageStatsBefore(time.Now().AddDate(0, 0, -retentionDays))
-	if persisted, err := db.ListRequestLogs(1000); err != nil {
-		slog.Warn("request log restore failed", "error", err)
-	} else if len(persisted) > 0 {
-		logs.Bootstrap(persisted)
-		slog.Info("request logs restored", "count", len(persisted))
-	}
+	// Defer prune/restore off the listen critical path so public URL / health
+	// come up as soon as the HTTP server is ready (previously ~0.5–1s of SQLite
+	// log IO blocked Start before ListenAndServe).
 	state.LogLevel = ""
 
 	rt.port = cfg.Port
@@ -260,9 +253,23 @@ func (rt *Runtime) Start(cfg Config) error {
 		}
 	}()
 
+	// Restore the public tunnel immediately so user.lucadesign.uk comes back
+	// ASAP after restart. Log hydrate / usage rebuild run afterwards and must
+	// not delay tunnel bring-up.
 	go func() {
-		time.Sleep(300 * time.Millisecond)
 		server.RestorePublicAccess()
+	}()
+	go func() {
+		if err := db.PruneRequestLogs(retentionDays); err != nil {
+			slog.Warn("request log prune failed", "error", err)
+		}
+		logs.PruneUsageStatsBefore(time.Now().AddDate(0, 0, -retentionDays))
+		if persisted, err := db.ListRequestLogs(1000); err != nil {
+			slog.Warn("request log restore failed", "error", err)
+		} else if len(persisted) > 0 {
+			logs.Bootstrap(persisted)
+			slog.Info("request logs restored", "count", len(persisted))
+		}
 		server.SyncConnectedCursorProvidersWithEmptyModels()
 		server.RebuildUsageStats()
 		server.StartOAuthUsageBackgroundRefresh(context.Background())

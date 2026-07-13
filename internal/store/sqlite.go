@@ -20,8 +20,19 @@ import (
 const schemaVersion = 5
 
 type Store struct {
-	path string
-	db   *sql.DB
+	path   string
+	db     *sql.DB // writer: MaxOpenConns(1), all Exec/Begin serialize here
+	readDB *sql.DB // reader pool: WAL readers don't block the writer
+}
+
+// reader returns the read-only connection pool, falling back to the writer
+// connection when a dedicated reader wasn't opened (keeps tests / callers that
+// build a bare Store safe).
+func (s *Store) reader() *sql.DB {
+	if s.readDB != nil {
+		return s.readDB
+	}
+	return s.db
 }
 
 func Open(path string) (*Store, error) {
@@ -42,6 +53,17 @@ func Open(path string) (*Store, error) {
 	if err := os.Chmod(path, 0o600); err != nil && !os.IsNotExist(err) {
 		_ = db.Close()
 		return nil, err
+	}
+	// Dedicated read-only connection pool. In WAL mode readers never block the
+	// single writer (and vice-versa), so heavy log/usage queries stop starving
+	// request-hot-path writes that must share the single writer connection.
+	// query_only prevents accidental writes on this pool.
+	readDB, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_pragma=query_only(ON)&mode=ro")
+	if err == nil {
+		readDB.SetMaxOpenConns(4)
+		store.readDB = readDB
+	} else {
+		slog.Warn("failed to open read-only sqlite pool; falling back to writer", "error", err)
 	}
 	return store, nil
 }
@@ -78,6 +100,9 @@ func (s *Store) Path() string {
 }
 
 func (s *Store) Close() error {
+	if s.readDB != nil {
+		_ = s.readDB.Close()
+	}
 	return s.db.Close()
 }
 
@@ -478,7 +503,7 @@ func (s *Store) Save(state domain.GatewayState) error {
 }
 
 func (s *Store) loadProviders() ([]domain.Provider, error) {
-	rows, err := s.db.Query(`SELECT id, name, protocol, base_url, api_key_source, default_model, default_thinking_depth, health_status, auth_header, extra_endpoint,
+	rows, err := s.reader().Query(`SELECT id, name, protocol, base_url, api_key_source, default_model, default_thinking_depth, health_status, auth_header, extra_endpoint,
 		auth_type, oauth_access_token, oauth_refresh_token, oauth_expires_at, oauth_scope, oauth_account_label
 		FROM providers ORDER BY position, id`)
 	if err != nil {
@@ -545,7 +570,7 @@ func (s *Store) loadProviders() ([]domain.Provider, error) {
 }
 
 func (s *Store) loadModels(providerID string) ([]domain.Model, error) {
-	rows, err := s.db.Query(`SELECT id, protocol, context_length, in_menu FROM models WHERE provider_id = ? ORDER BY position, id`, providerID)
+	rows, err := s.reader().Query(`SELECT id, protocol, context_length, in_menu FROM models WHERE provider_id = ? ORDER BY position, id`, providerID)
 	if err != nil {
 		return nil, err
 	}
@@ -567,7 +592,7 @@ func (s *Store) loadModels(providerID string) ([]domain.Model, error) {
 }
 
 func (s *Store) loadRoutes() ([]domain.Route, error) {
-	rows, err := s.db.Query(`SELECT id, name, output_endpoint_id, provider_id, output_protocol, mode, enabled FROM routes ORDER BY position, id`)
+	rows, err := s.reader().Query(`SELECT id, name, output_endpoint_id, provider_id, output_protocol, mode, enabled FROM routes ORDER BY position, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -718,7 +743,7 @@ func decodeKeyProfiles(raw string) []domain.KeyProfile {
 }
 
 func (s *Store) loadAPIKeys() ([]domain.APIKey, error) {
-	rows, err := s.db.Query(`SELECT id, name, key, route_id, model_override, model_aliases, thinking_depth_override, stream_enabled, fallback_provider_ids, fallback_model_overrides, active_provider_id, owner_user_id, profiles, active_profile_id, enabled, created_at, last_used_at
+	rows, err := s.reader().Query(`SELECT id, name, key, route_id, model_override, model_aliases, thinking_depth_override, stream_enabled, fallback_provider_ids, fallback_model_overrides, active_provider_id, owner_user_id, profiles, active_profile_id, enabled, created_at, last_used_at
 		FROM api_keys ORDER BY position, id`)
 	if err != nil {
 		return nil, err
@@ -805,9 +830,26 @@ func (s *Store) TouchAPIKey(id string, lastUsedAt string) error {
 	return err
 }
 
+// UpdateProviderOAuth incrementally persists just the OAuth token columns for a
+// single provider. This avoids the full-state rewrite (Save) that DELETEs and
+// re-INSERTs every provider/model/route row on the single shared connection,
+// which serialized behind and blocked request-hot-path DB writes on every
+// token refresh.
+func (s *Store) UpdateProviderOAuth(providerID, accessToken, refreshToken, expiresAt, scope, accountLabel string) error {
+	_, err := s.db.Exec(`UPDATE providers SET
+		oauth_access_token = ?,
+		oauth_refresh_token = ?,
+		oauth_expires_at = ?,
+		oauth_scope = ?,
+		oauth_account_label = ?
+		WHERE id = ?`,
+		accessToken, refreshToken, expiresAt, scope, accountLabel, providerID)
+	return err
+}
+
 func (s *Store) setting(key string) string {
 	var value string
-	if err := s.db.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&value); err != nil {
+	if err := s.reader().QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&value); err != nil {
 		return ""
 	}
 	return value
@@ -828,7 +870,7 @@ func (s *Store) SetSetting(key, value string) error {
 // HasSetting reports whether a settings key exists (even if the value is empty).
 func (s *Store) HasSetting(key string) bool {
 	var value string
-	err := s.db.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&value)
+	err := s.reader().QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&value)
 	return err == nil
 }
 

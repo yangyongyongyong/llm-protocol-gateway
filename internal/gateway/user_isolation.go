@@ -133,8 +133,39 @@ func (s *Server) stateForUser(identity sessionIdentity, state domain.GatewayStat
 	if state.Endpoints == nil {
 		state.Endpoints = []domain.OutputEndpoint{}
 	}
-	state.PublicAccess = domain.PublicAccessSettings{}
+	// Expose only the non-secret public-access fields the user console needs to
+	// build the public/tunnel URL. Without these the API-key page falls back to
+	// the LAN address; regular users should see the same public domain the admin
+	// sees when a tunnel / custom domain is active. Secrets (tunnel token,
+	// credentials/config files, tunnel name) are deliberately dropped.
+	state.PublicAccess = publicAccessForUser(state.PublicAccess)
 	state.LogLevel = ""
 	state.DataPaths = nil
 	return state
+}
+
+// publicAccessForUser returns a redacted PublicAccessSettings that keeps just
+// enough for a role=user console to render the public/tunnel domain URL, while
+// stripping every secret / provisioning field.
+func publicAccessForUser(src domain.PublicAccessSettings) domain.PublicAccessSettings {
+	out := domain.PublicAccessSettings{
+		Enabled:         src.Enabled,
+		Mode:            src.Mode,
+		ExposeAPI:       src.ExposeAPI,
+		ExposeUI:        src.ExposeUI,
+		CustomDomain:    src.CustomDomain,
+		UIDomain:        src.UIDomain,
+		PublicBaseURL:   src.PublicBaseURL,
+		UIPublicBaseURL: src.UIPublicBaseURL,
+		Status:          src.Status,
+	}
+	if src.Tunnel != nil {
+		out.Tunnel = &domain.TunnelRuntime{
+			Status:      src.Tunnel.Status,
+			Mode:        src.Tunnel.Mode,
+			PublicURL:   src.Tunnel.PublicURL,
+			UIPublicURL: src.Tunnel.UIPublicURL,
+		}
+	}
+	return out
 }

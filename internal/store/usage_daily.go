@@ -121,7 +121,7 @@ func upsertUsageBucket(tx *sql.Tx, day, bucketType, bucketID, bucketName string,
 
 func (s *Store) LoadUsageSince(since time.Time) (map[string]monitor.UsageDayBuckets, *monitor.RequestLog, error) {
 	sinceDay := since.Local().Format("2006-01-02")
-	rows, err := s.db.Query(`SELECT day, bucket_type, bucket_id, bucket_name,
+	rows, err := s.reader().Query(`SELECT day, bucket_type, bucket_id, bucket_name,
 		request_count, input_tokens, output_tokens, cache_tokens,
 		status_2xx, status_4xx, status_5xx, status_other,
 		latency_sum, ttft_sum, ttft_count

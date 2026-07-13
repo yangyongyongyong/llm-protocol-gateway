@@ -23,12 +23,20 @@ type RequestLog struct {
 	CacheTokens      int64     `json:"cacheTokens"`  // cache-read/hit portion only
 	LatencyMillis    int64     `json:"latencyMs"`
 	TTFTMillis       int64     `json:"ttftMs,omitempty"`
-	ClientHost       string    `json:"clientHost,omitempty"`
-	ClientIP         string    `json:"clientIp,omitempty"`
-	AccessSource     string    `json:"accessSource,omitempty"` // lan | public | local
-	ErrorDescription string    `json:"errorDescription,omitempty"`
-	RequestBody      string    `json:"requestBody,omitempty"`
-	ResponseBody     string    `json:"responseBody,omitempty"`
+	// Observational latency breakdown (ms). Zero means unset / unavailable.
+	PrepMillis            int64  `json:"prepMs,omitempty"`
+	PreUpstreamMillis     int64  `json:"preUpstreamMs,omitempty"`
+	UpstreamTTFBMillis    int64  `json:"upstreamTtfbMs,omitempty"`
+	GatewayOverheadMillis int64  `json:"gatewayOverheadMs,omitempty"`
+	ConvertOutMillis      int64  `json:"convertOutMs,omitempty"`
+	PostMillis            int64  `json:"postMs,omitempty"`
+	TimingFlags           string `json:"timingFlags,omitempty"`
+	ClientHost            string `json:"clientHost,omitempty"`
+	ClientIP              string `json:"clientIp,omitempty"`
+	AccessSource          string `json:"accessSource,omitempty"` // lan | public | local
+	ErrorDescription      string `json:"errorDescription,omitempty"`
+	RequestBody           string `json:"requestBody,omitempty"`
+	ResponseBody          string `json:"responseBody,omitempty"`
 }
 
 const (

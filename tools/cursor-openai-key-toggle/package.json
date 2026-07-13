@@ -1,0 +1,47 @@
+{
+  "name": "openai-key-toggle",
+  "displayName": "OpenAI Key Toggle",
+  "description": "快捷键切换 Cursor「OpenAI API Key」开关（自定义模型 ↔ 自带模型）",
+  "version": "0.0.4",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "local.openaiKey.toggle",
+        "title": "Toggle OpenAI API Key（自定义/自带）"
+      },
+      {
+        "command": "local.openaiKey.enable",
+        "title": "Enable OpenAI API Key（自定义）"
+      },
+      {
+        "command": "local.openaiKey.disable",
+        "title": "Disable OpenAI API Key（自带）"
+      },
+      {
+        "command": "local.openaiKey.status",
+        "title": "Show OpenAI API Key Status"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "local.openaiKey.toggle",
+        "key": "ctrl+alt+shift+k",
+        "mac": "cmd+alt+shift+k"
+      }
+    ]
+  }
+}

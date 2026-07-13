@@ -13,11 +13,16 @@ type ttftResponseWriter struct {
 	http.ResponseWriter
 	started time.Time
 	ttftMs  *int64
+	timing  *requestTiming
 	wrote   bool
 }
 
 func wrapTTFTWriter(w http.ResponseWriter, started time.Time, ttftMs *int64) http.ResponseWriter {
-	return &ttftResponseWriter{ResponseWriter: w, started: started, ttftMs: ttftMs}
+	return wrapTTFTWriterWithTiming(w, started, ttftMs, nil)
+}
+
+func wrapTTFTWriterWithTiming(w http.ResponseWriter, started time.Time, ttftMs *int64, timing *requestTiming) http.ResponseWriter {
+	return &ttftResponseWriter{ResponseWriter: w, started: started, ttftMs: ttftMs, timing: timing}
 }
 
 func (w *ttftResponseWriter) Write(p []byte) (int, error) {
@@ -25,6 +30,9 @@ func (w *ttftResponseWriter) Write(p []byte) (int, error) {
 		w.wrote = true
 		if w.ttftMs != nil && *w.ttftMs <= 0 {
 			*w.ttftMs = time.Since(w.started).Milliseconds()
+		}
+		if w.timing != nil {
+			w.timing.markClientFirstWrite()
 		}
 	}
 	return w.ResponseWriter.Write(p)

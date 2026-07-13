@@ -85,6 +85,36 @@ func TestSanitizeAnthropicToolUseID(t *testing.T) {
 	}
 }
 
+func TestResolveOpenAIToolNameFromClaudeRestoresCloakedName(t *testing.T) {
+	// Codex(Responses) → Claude OAuth path: the client registers snake_case
+	// tools (exec_command, shell); OAuth cloaking rewrites them to TitleCase
+	// upstream (ExecCommand, Shell); the response hop must restore the exact
+	// client name or Codex rejects the call as "unsupported call".
+	clientToolNames := map[string]struct{}{
+		"exec_command": {},
+		"shell":        {},
+		"apply_patch":  {},
+	}
+	cloakedCases := map[string]string{
+		"ExecCommand": "exec_command",
+		"Shell":       "shell",
+		"ApplyPatch":  "apply_patch",
+	}
+	for cloaked, want := range cloakedCases {
+		if got := resolveOpenAIToolNameFromClaude(cloaked, clientToolNames); got != want {
+			t.Fatalf("resolveOpenAIToolNameFromClaude(%q)=%q want %q", cloaked, got, want)
+		}
+	}
+	// Static reverse-map names (Read) still work.
+	if got := resolveOpenAIToolNameFromClaude("Read", map[string]struct{}{"read": {}}); got != "read" {
+		t.Fatalf("resolveOpenAIToolNameFromClaude(Read)=%q want read", got)
+	}
+	// Unknown names pass through unchanged.
+	if got := resolveOpenAIToolNameFromClaude("Whatever", nil); got != "Whatever" {
+		t.Fatalf("resolveOpenAIToolNameFromClaude(Whatever)=%q want Whatever", got)
+	}
+}
+
 func TestOpenAIChatToClaudeRequestMapsToolsAndMessages(t *testing.T) {
 	openAIReq := map[string]any{
 		"model": "claude-sonnet-5",
