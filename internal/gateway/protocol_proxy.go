@@ -112,8 +112,9 @@ func (s *Server) proxyClaudeToResponses(w http.ResponseWriter, r *http.Request, 
 	// response hop can restore them. Claude OAuth cloaking renames tools to
 	// TitleCase upstream (exec_command → ExecCommand); without the original
 	// names the client receives an unknown tool and reports "unsupported call".
+	model = applyProviderModelMapping(provider, model)
 	clientToolNames := extractOpenAIToolNames(responsesReq)
-	claudeReq, err := responsesToClaudeRequestDirect(responsesReq, model)
+	claudeReq, err := responsesToClaudeRequestDirect(responsesReq, model, maxOutputTokensOverrideFrom(r.Context()))
 	if err != nil {
 		return 0, TokenUsage{}, nil, err
 	}
@@ -214,36 +215,29 @@ func (s *Server) proxyConvertedThroughChat(w http.ResponseWriter, r *http.Reques
 		accept = "text/event-stream"
 	}
 	model = applyProviderModelMapping(provider, model)
-	var response *http.Response
-	if provider.AuthType == domain.AuthTypeCursorOAuth {
-		baseURL, refreshed, bridgeErr := s.resolveCursorBridgeBaseURL(r.Context(), provider)
-		if bridgeErr != nil {
-			return 0, TokenUsage{}, nil, bridgeErr
+	send := func() (*http.Response, error) {
+		if provider.AuthType == domain.AuthTypeCursorOAuth {
+			baseURL, refreshed, bridgeErr := s.resolveCursorBridgeBaseURL(r.Context(), provider)
+			if bridgeErr != nil {
+				return nil, bridgeErr
+			}
+			provider = refreshed
+			upstreamURL := strings.TrimRight(baseURL, "/") + "/chat/completions"
+			request, reqErr := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(upstreamBody))
+			if reqErr != nil {
+				return nil, reqErr
+			}
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Accept", accept)
+			return doHTTPWithTiming(r.Context(), &http.Client{Timeout: 0}, request)
 		}
-		provider = refreshed
-		upstreamURL := strings.TrimRight(baseURL, "/") + "/chat/completions"
-		request, reqErr := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(upstreamBody))
-		if reqErr != nil {
-			return 0, TokenUsage{}, nil, reqErr
-		}
-		request.Header.Set("Content-Type", "application/json")
-		request.Header.Set("Accept", accept)
-		response, err = doHTTPWithTiming(r.Context(), &http.Client{Timeout: 0}, request)
-		if err != nil {
-			return 0, TokenUsage{}, nil, err
-		}
-	} else {
-		upstreamBody, bodyErr := applyRequestAdapterBody(provider, model, upstreamBody)
+		adaptedBody, bodyErr := applyRequestAdapterBody(provider, model, upstreamBody)
 		if bodyErr != nil {
-			return 0, TokenUsage{}, nil, bodyErr
+			return nil, bodyErr
 		}
-		response, err = s.doOpenAIProviderRequest(r.Context(), r, provider, resolveProviderChatURLWithAdapter(provider, model), upstreamBody, accept, skipIncomingAuth)
-		if err != nil {
-			return 0, TokenUsage{}, nil, err
-		}
+		return s.doOpenAIProviderRequest(r.Context(), r, provider, resolveProviderChatURLWithAdapter(provider, model), adaptedBody, accept, skipIncomingAuth)
 	}
-	defer response.Body.Close()
-	return s.finishConvertedProxy(w, response, model, stream, convert, streamConvert)
+	return s.finishConvertedProxyWithEmptyStreamRetry(w, r, model, stream, send, convert, streamConvert)
 }
 
 func (s *Server) proxyConvertedThroughResponses(w http.ResponseWriter, r *http.Request, provider domain.Provider, model string, responsesReq map[string]any, skipIncomingAuth bool, convert responseConverter, streamConvert streamConverter) (int, TokenUsage, []byte, error) {
@@ -256,12 +250,10 @@ func (s *Server) proxyConvertedThroughResponses(w http.ResponseWriter, r *http.R
 	if stream {
 		accept = "text/event-stream"
 	}
-	response, err := s.doOpenAIProviderRequest(r.Context(), r, provider, resolveProviderResponsesURL(provider, model), upstreamBody, accept, skipIncomingAuth)
-	if err != nil {
-		return 0, TokenUsage{}, nil, err
+	send := func() (*http.Response, error) {
+		return s.doOpenAIProviderRequest(r.Context(), r, provider, resolveProviderResponsesURL(provider, model), upstreamBody, accept, skipIncomingAuth)
 	}
-	defer response.Body.Close()
-	return s.finishConvertedProxy(w, response, model, stream, convert, streamConvert)
+	return s.finishConvertedProxyWithEmptyStreamRetry(w, r, model, stream, send, convert, streamConvert)
 }
 
 func (s *Server) proxyConvertedThroughClaude(w http.ResponseWriter, r *http.Request, provider domain.Provider, model string, claudeReq map[string]any, skipIncomingAuth bool, convert responseConverter, streamConvert streamConverter) (int, TokenUsage, []byte, error) {
@@ -275,40 +267,80 @@ func (s *Server) proxyConvertedThroughClaude(w http.ResponseWriter, r *http.Requ
 	if stream {
 		accept = "text/event-stream"
 	}
-	response, err := s.doClaudeProviderRequest(r.Context(), r, provider, upstreamBody, accept)
-	if err != nil {
-		return 0, TokenUsage{}, nil, err
+	send := func() (*http.Response, error) {
+		return s.doClaudeProviderRequest(r.Context(), r, provider, upstreamBody, accept)
 	}
-	defer response.Body.Close()
-	return s.finishConvertedProxy(w, response, model, stream, convert, streamConvert)
+	return s.finishConvertedProxyWithEmptyStreamRetry(w, r, model, stream, send, convert, streamConvert)
 }
 
-func (s *Server) finishConvertedProxy(w http.ResponseWriter, response *http.Response, model string, stream bool, convert responseConverter, streamConvert streamConverter) (int, TokenUsage, []byte, error) {
+type upstreamSender func() (*http.Response, error)
+
+func (s *Server) finishConvertedProxyWithEmptyStreamRetry(w http.ResponseWriter, r *http.Request, model string, stream bool, send upstreamSender, convert responseConverter, streamConvert streamConverter) (int, TokenUsage, []byte, error) {
+	attempts := 1
 	if stream {
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.WriteHeader(response.StatusCode)
+		attempts = maxUpstreamEmptyStreamAttempts
+	}
+	var lastStatus int
+	var lastUsage TokenUsage
+	var lastBody []byte
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		response, err := send()
+		if err != nil {
+			return 0, TokenUsage{}, nil, err
+		}
+		status, usage, body, finishErr, retryable := s.finishConvertedProxy(w, response, model, stream, convert, streamConvert)
+		_ = response.Body.Close()
+		lastStatus, lastUsage, lastBody, lastErr = status, usage, body, finishErr
+		if finishErr == nil || !retryable || attempt >= attempts {
+			return status, usage, body, finishErr
+		}
+		markTimingFlag(r.Context(), timingFlagEmptyStreamRetry)
+		if t := requestTimingFrom(r.Context()); t != nil {
+			t.resetUpstreamMarks()
+		}
+		if s.logs != nil {
+			s.logs.AddApp("warn", "upstream empty stream retry", fmt.Sprintf("attempt=%d/%d model=%s err=%s", attempt, attempts, model, finishErr.Error()))
+		}
+	}
+	return lastStatus, lastUsage, lastBody, lastErr
+}
+
+func (s *Server) finishConvertedProxy(w http.ResponseWriter, response *http.Response, model string, stream bool, convert responseConverter, streamConvert streamConverter) (int, TokenUsage, []byte, error, bool) {
+	if stream {
+		dw := newDeferredSSEWriter(w)
+		dw.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		dw.Header().Set("Cache-Control", "no-cache")
+		dw.Header().Set("Connection", "keep-alive")
+		dw.WriteHeader(response.StatusCode)
 		if response.StatusCode < 200 || response.StatusCode >= 300 {
 			responseBody, readErr := io.ReadAll(response.Body)
 			if readErr != nil {
-				return response.StatusCode, TokenUsage{}, nil, readErr
+				return response.StatusCode, TokenUsage{}, nil, readErr, false
 			}
 			converted, _, convErr := convert(responseBody, model)
 			if convErr != nil || len(converted) == 0 {
-				_, writeErr := w.Write(responseBody)
-				return response.StatusCode, TokenUsage{}, responseBody, writeErr
+				_, writeErr := dw.Write(responseBody)
+				return response.StatusCode, TokenUsage{}, responseBody, writeErr, false
 			}
-			_, writeErr := w.Write(converted)
-			return response.StatusCode, TokenUsage{}, converted, writeErr
+			_, writeErr := dw.Write(converted)
+			return response.StatusCode, TokenUsage{}, converted, writeErr, false
 		}
-		usage, streamErr := streamConvert(w, response.Body, model)
-		return response.StatusCode, usage, nil, streamErr
+		usage, streamErr := streamConvert(dw, response.Body, model)
+		if streamErr != nil && isEmptyUpstreamStreamError(streamErr) && !dw.WroteBody() {
+			// 尚未向客户端写出任何 SSE 字节，可安全同 Provider 重试。
+			return response.StatusCode, usage, nil, streamErr, true
+		}
+		if !dw.Committed() {
+			// 成功但转换器未写出（极少见）：仍提交状态，避免悬挂。
+			dw.commit(response.StatusCode)
+		}
+		return response.StatusCode, usage, nil, streamErr, false
 	}
 
 	responseBody, readErr := io.ReadAll(response.Body)
 	if readErr != nil {
-		return 0, TokenUsage{}, nil, readErr
+		return 0, TokenUsage{}, nil, readErr, false
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -316,22 +348,22 @@ func (s *Server) finishConvertedProxy(w http.ResponseWriter, response *http.Resp
 		if convErr != nil || len(converted) == 0 {
 			w.WriteHeader(response.StatusCode)
 			_, writeErr := w.Write(responseBody)
-			return response.StatusCode, TokenUsage{}, responseBody, writeErr
+			return response.StatusCode, TokenUsage{}, responseBody, writeErr, false
 		}
 		w.WriteHeader(response.StatusCode)
 		_, writeErr := w.Write(converted)
-		return response.StatusCode, TokenUsage{}, converted, writeErr
+		return response.StatusCode, TokenUsage{}, converted, writeErr, false
 	}
 	converted, usage, err := convert(responseBody, model)
 	if err != nil {
-		return 0, TokenUsage{}, nil, err
+		return 0, TokenUsage{}, nil, err, false
 	}
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(converted)))
 	w.WriteHeader(http.StatusOK)
 	if _, writeErr := w.Write(converted); writeErr != nil {
-		return http.StatusOK, usage, converted, writeErr
+		return http.StatusOK, usage, converted, writeErr, false
 	}
-	return http.StatusOK, usage, converted, nil
+	return http.StatusOK, usage, converted, nil, false
 }
 
 func (s *Server) executeProtocolFlow(

@@ -30,7 +30,7 @@ func TestOpenAIChatToClaudeRequestSanitizesInvalidToolUseIDs(t *testing.T) {
 			},
 		},
 	}
-	claudeReq, err := openAIChatToClaudeRequest(openAIReq, "claude-sonnet-5")
+	claudeReq, err := openAIChatToClaudeRequest(openAIReq, "claude-sonnet-5", 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestOpenAIChatToClaudeRequestMapsToolsAndMessages(t *testing.T) {
 		},
 		"tool_choice": "auto",
 	}
-	claudeReq, err := openAIChatToClaudeRequest(openAIReq, "claude-sonnet-5")
+	claudeReq, err := openAIChatToClaudeRequest(openAIReq, "claude-sonnet-5", 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

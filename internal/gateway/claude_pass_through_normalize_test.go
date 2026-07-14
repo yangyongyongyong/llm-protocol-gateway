@@ -1,6 +1,11 @@
 package gateway
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+
+	"github.com/luca/llm-protocol-gateway/internal/domain"
+)
 
 func TestNormalizeClaudePassThroughPayloadStripsVolatileFields(t *testing.T) {
 	payload := map[string]any{
@@ -74,6 +79,10 @@ func TestNormalizeClaudePassThroughPayloadStripsVolatileFields(t *testing.T) {
 	if _, exists := tool["cache_control"]; exists {
 		t.Fatalf("expected tool cache_control stripped before cloaking")
 	}
+	wantBudget := defaultClaudeMaxTokens("claude-sonnet-5")
+	if payload["max_tokens"] != wantBudget {
+		t.Fatalf("max_tokens=%#v want upstream budget %d (ignore client 1024)", payload["max_tokens"], wantBudget)
+	}
 }
 
 func TestNormalizeClaudePassThroughPayloadPreservesToolBlocks(t *testing.T) {
@@ -111,5 +120,29 @@ func TestNormalizeClaudePassThroughPayloadPreservesToolBlocks(t *testing.T) {
 	toolUse := assistantBlocks[0].(map[string]any)
 	if toolUse["name"] != "bash" || toolUse["id"] != "toolu_1" {
 		t.Fatalf("expected tool_use preserved, got %#v", toolUse)
+	}
+	wantBudget := defaultClaudeMaxTokens("claude-sonnet-5")
+	if payload["max_tokens"] != wantBudget {
+		t.Fatalf("max_tokens=%#v want %d", payload["max_tokens"], wantBudget)
+	}
+}
+
+func TestRewriteClaudeUpstreamMaxTokensIgnoresClientBudget(t *testing.T) {
+	body := []byte(`{"model":"claude-fable-5","max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`)
+	out := rewriteClaudeUpstreamMaxTokens(body, domain.Provider{}, 0)
+	var payload map[string]any
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatal(err)
+	}
+	want := defaultClaudeMaxTokens("claude-fable-5")
+	got, ok := payload["max_tokens"].(float64) // json numbers
+	if !ok {
+		if n, ok2 := payload["max_tokens"].(int); ok2 {
+			got = float64(n)
+			ok = true
+		}
+	}
+	if !ok || int(got) != want {
+		t.Fatalf("max_tokens=%#v want %d", payload["max_tokens"], want)
 	}
 }

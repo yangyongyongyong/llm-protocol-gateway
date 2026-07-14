@@ -585,7 +585,7 @@ func chatErrorValueToResponses(errorValue any, model string) ([]byte, TokenUsage
 
 // responsesToClaudeRequest converts Responses → Claude directly (no Chat IR).
 func responsesToClaudeRequest(responsesReq map[string]any, model string) (map[string]any, error) {
-	return responsesToClaudeRequestDirect(responsesReq, model)
+	return responsesToClaudeRequestDirect(responsesReq, model, 0)
 }
 
 // claudeToResponsesRequest converts Claude → Responses directly (no Chat IR).

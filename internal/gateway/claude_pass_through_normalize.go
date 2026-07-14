@@ -1,6 +1,11 @@
 package gateway
 
-import "strings"
+import (
+	"encoding/json"
+	"strings"
+
+	"github.com/luca/llm-protocol-gateway/internal/domain"
+)
 
 // normalizeClaudePassThroughPayload trims volatile client-only fields from a
 // native Claude /v1/messages body before OAuth cloaking. This mirrors the
@@ -26,10 +31,18 @@ func normalizeClaudePassThroughPayload(payload map[string]any) {
 	if toolChoice := normalizeClaudePassThroughToolChoice(payload["tool_choice"]); toolChoice != nil {
 		normalized["tool_choice"] = toolChoice
 	}
-	for _, key := range []string{"max_tokens", "stream", "temperature", "top_p", "output_config"} {
+	for _, key := range []string{"stream", "temperature", "top_p", "output_config"} {
 		if value, ok := payload[key]; ok {
 			normalized[key] = value
 		}
+	}
+	// 优先保留上游已写入的预算（rewriteClaudeUpstreamMaxTokens 会按真实模型/密钥覆盖设置）；
+	// 否则按 body 内模型自动解析，绝不沿用 Claude Code 按客户端目录填的偏小值。
+	if value, ok := payload["max_tokens"]; ok {
+		normalized["max_tokens"] = value
+	} else {
+		modelID, _ := normalized["model"].(string)
+		normalized["max_tokens"] = defaultClaudeMaxTokens(modelID)
 	}
 	if thinking, ok := payload["thinking"]; ok {
 		if normalizedThinking := normalizeClaudePassThroughThinking(thinking); normalizedThinking != nil {
@@ -42,6 +55,27 @@ func normalizeClaudePassThroughPayload(payload map[string]any) {
 	for key, value := range normalized {
 		payload[key] = value
 	}
+}
+
+// rewriteClaudeUpstreamMaxTokens 在 Claude 透传发送前，按实际上游模型写入 max_tokens，
+// 忽略 Claude Code 等客户端按「请求模型名」填的预算（模型覆盖场景会偏小截断）。
+// maxTokensOverride>0 时使用密钥级覆盖。
+func rewriteClaudeUpstreamMaxTokens(body []byte, provider domain.Provider, maxTokensOverride int) []byte {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil || payload == nil {
+		return body
+	}
+	model, _ := payload["model"].(string)
+	model = strings.TrimSpace(applyProviderModelMapping(provider, model))
+	if model != "" {
+		payload["model"] = model
+	}
+	payload["max_tokens"] = effectiveClaudeMaxTokens(model, maxTokensOverride)
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 func normalizeClaudePassThroughSystem(system any) any {

@@ -7,6 +7,52 @@ import (
 	"testing"
 )
 
+func TestOpenAIChatToClaudeRequestDefaultsMaxTokensToModelBudget(t *testing.T) {
+	openAIReq := map[string]any{
+		"model": "gpt-4o", // 客户端模型名，不得用于预算
+		"messages": []any{
+			map[string]any{"role": "user", "content": "hello"},
+		},
+		"max_tokens": 4096, // 客户端目录默认值，应被实际上游模型预算覆盖
+	}
+	claudeReq, err := openAIChatToClaudeRequest(openAIReq, "claude-fable-5", 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if claudeReq["model"] != "claude-fable-5" {
+		t.Fatalf("upstream model=%#v", claudeReq["model"])
+	}
+	got, ok := claudeReq["max_tokens"].(int)
+	if !ok {
+		t.Fatalf("expected int max_tokens, got %#v", claudeReq["max_tokens"])
+	}
+	want := defaultClaudeMaxTokens("claude-fable-5")
+	if got != want {
+		t.Fatalf("max_tokens=%d want %d (must follow upstream model, not client)", got, want)
+	}
+	if got <= 4096 {
+		t.Fatalf("default max_tokens should exceed legacy 4096 cap, got %d", got)
+	}
+}
+
+func TestOpenAIChatToClaudeRequestIgnoresClientMaxTokens(t *testing.T) {
+	openAIReq := map[string]any{
+		"model":      "some-client-alias",
+		"max_tokens": 2048,
+		"messages": []any{
+			map[string]any{"role": "user", "content": "hello"},
+		},
+	}
+	claudeReq, err := openAIChatToClaudeRequest(openAIReq, "claude-fable-5", 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := defaultClaudeMaxTokens("claude-fable-5")
+	if claudeReq["max_tokens"] != want {
+		t.Fatalf("expected upstream budget %d, got %#v", want, claudeReq["max_tokens"])
+	}
+}
+
 func TestOpenAIChatToClaudeRequestPreservesCacheControl(t *testing.T) {
 	openAIReq := map[string]any{
 		"model": "claude-sonnet-5",
@@ -33,7 +79,7 @@ func TestOpenAIChatToClaudeRequestPreservesCacheControl(t *testing.T) {
 			},
 		},
 	}
-	claudeReq, err := openAIChatToClaudeRequest(openAIReq, "claude-sonnet-5")
+	claudeReq, err := openAIChatToClaudeRequest(openAIReq, "claude-sonnet-5", 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -65,7 +111,7 @@ func TestOpenAIChatToClaudeRequestMapsReasoningEffortToAdaptiveThinking(t *testi
 		"reasoning_effort": "low",
 		"temperature":      0.5,
 	}
-	claudeReq, err := openAIChatToClaudeRequest(openAIReq, "claude-sonnet-5")
+	claudeReq, err := openAIChatToClaudeRequest(openAIReq, "claude-sonnet-5", 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -91,7 +137,7 @@ func TestOpenAIChatToClaudeRequestMapsReasoningEffortToBudgetTokensForLegacyMode
 		"reasoning_effort": "medium",
 		"temperature":      0.5,
 	}
-	claudeReq, err := openAIChatToClaudeRequest(openAIReq, "claude-haiku-4-5-20251001")
+	claudeReq, err := openAIChatToClaudeRequest(openAIReq, "claude-haiku-4-5-20251001", 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

@@ -58,6 +58,7 @@ type Runtime struct {
 	addrOverride   string // non-empty when PreferEnvAddr / Config.Addr forces host:port
 	started        bool
 	onListenChange func(addr string)
+	stopMaintenance chan struct{} // closed on Stop to end the storage maintenance loop
 }
 
 func New() *Runtime {
@@ -263,6 +264,11 @@ func (rt *Runtime) Start(cfg Config) error {
 		if err := db.PruneRequestLogs(retentionDays); err != nil {
 			slog.Warn("request log prune failed", "error", err)
 		}
+		// Reclaim disk space that pruning frees (legacy DBs convert to
+		// incremental auto_vacuum on first run; may be slow once, hence async).
+		if err := db.MaintainStorage(); err != nil {
+			slog.Warn("storage maintenance failed", "error", err)
+		}
 		logs.PruneUsageStatsBefore(time.Now().AddDate(0, 0, -retentionDays))
 		if persisted, err := db.ListRequestLogs(1000); err != nil {
 			slog.Warn("request log restore failed", "error", err)
@@ -275,10 +281,48 @@ func (rt *Runtime) Start(cfg Config) error {
 		server.StartOAuthUsageBackgroundRefresh(context.Background())
 		server.StartProviderFailoverRecovery(context.Background())
 		server.StartCursorModelBackgroundRefresh(context.Background())
+		rt.startStorageMaintenance(db, retentionDays)
 	}()
 
 	rt.started = true
 	return nil
+}
+
+// storageMaintenanceInterval 控制磁盘回收周期。日志保留窗口为天级，回收无需
+// 频繁执行；6 小时一次足以在坏 Provider 故障风暴后及时把空闲空间还给 OS，
+// 同时避免无谓 IO。
+const storageMaintenanceInterval = 6 * time.Hour
+
+// startStorageMaintenance 周期性回收 request_logs 删行后遗留的空闲页（增量
+// VACUUM）。首次维护已在启动 goroutine 内同步跑过，这里只负责稳态周期回收。
+// 随 rt.stopMaintenance（在 Stop 中关闭）退出，避免泄漏 goroutine。
+func (rt *Runtime) startStorageMaintenance(db *store.Store, retentionDays int) {
+	rt.mu.Lock()
+	if rt.stopMaintenance != nil {
+		// 已在运行（理论上不会重复启动），先关旧的。
+		close(rt.stopMaintenance)
+	}
+	stop := make(chan struct{})
+	rt.stopMaintenance = stop
+	rt.mu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(storageMaintenanceInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				if err := db.PruneRequestLogs(retentionDays); err != nil {
+					slog.Warn("periodic request log prune failed", "error", err)
+				}
+				if err := db.MaintainStorage(); err != nil {
+					slog.Warn("periodic storage maintenance failed", "error", err)
+				}
+			}
+		}
+	}()
 }
 
 // SetWebExposed rebinds the HTTP listener between loopback-only and all interfaces.
@@ -353,6 +397,10 @@ func (rt *Runtime) Stop(ctx context.Context) error {
 	defer rt.mu.Unlock()
 	if !rt.started {
 		return nil
+	}
+	if rt.stopMaintenance != nil {
+		close(rt.stopMaintenance)
+		rt.stopMaintenance = nil
 	}
 	if rt.tunnelManager != nil {
 		rt.tunnelManager.Stop()

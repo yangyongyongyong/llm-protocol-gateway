@@ -54,20 +54,23 @@ type selfcheckStartRequest struct {
 }
 
 type selfcheckCaseResult struct {
-	CaseID       string `json:"caseId"`
-	ProviderID   string `json:"providerId"`
-	ProviderName string `json:"providerName"`
-	Client       string `json:"client"`
-	Kind         string `json:"kind"`
-	Protocol     string `json:"protocol"`
-	Model        string `json:"model,omitempty"`
-	Success      bool   `json:"success"`
-	ContentOK    bool   `json:"contentOK"`
-	LatencyMs    int64  `json:"latencyMs"`
+	CaseID        string `json:"caseId"`
+	ProviderID    string `json:"providerId"`
+	ProviderName  string `json:"providerName"`
+	Client        string `json:"client"`
+	Kind          string `json:"kind"`
+	Protocol      string `json:"protocol"`
+	Model         string `json:"model,omitempty"`
+	Success       bool   `json:"success"`
+	ContentOK     bool   `json:"contentOK"`
+	LatencyMs     int64  `json:"latencyMs"`
 	OutputPreview string `json:"outputPreview,omitempty"`
-	Error        string `json:"error,omitempty"`
-	RouteID      string `json:"routeId,omitempty"`
-	APIKeyName   string `json:"apiKeyName,omitempty"`
+	Error         string `json:"error,omitempty"`
+	RouteID       string `json:"routeId,omitempty"`
+	APIKeyName    string `json:"apiKeyName,omitempty"`
+	// StartedAt / FinishedAt 为 UTC RFC3339Nano，便于与 request_logs.time 对照。
+	StartedAt  string `json:"startedAt,omitempty"`
+	FinishedAt string `json:"finishedAt,omitempty"`
 }
 
 type selfcheckJob struct {
@@ -473,7 +476,7 @@ func (s *Server) runPreparedSelfcheckCase(
 	lanRoot string,
 	item preparedCase,
 ) selfcheckCaseResult {
-	started := time.Now()
+	started := time.Now().UTC()
 	result := selfcheckCaseResult{
 		CaseID:       item.caseID,
 		ProviderID:   item.providerID,
@@ -484,11 +487,16 @@ func (s *Server) runPreparedSelfcheckCase(
 		RouteID:      item.routeID,
 		APIKeyName:   item.apiKeyName,
 		Model:        item.model,
+		StartedAt:    started.Format(time.RFC3339Nano),
+	}
+	finish := func(r selfcheckCaseResult) selfcheckCaseResult {
+		r.LatencyMs = time.Since(started).Milliseconds()
+		r.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		return r
 	}
 	if item.setupErr != "" {
 		result.Error = item.setupErr
-		result.LatencyMs = time.Since(started).Milliseconds()
-		return result
+		return finish(result)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(job.TimeoutMs)*time.Millisecond)
@@ -505,8 +513,7 @@ func (s *Server) runPreparedSelfcheckCase(
 		probe, err := newSelfcheckToolProbe()
 		if err != nil {
 			result.Error = "prepare tool probe: " + err.Error()
-			result.LatencyMs = time.Since(started).Milliseconds()
-			return result
+			return finish(result)
 		}
 		toolProbe = probe
 		prompt = probe.prompt
@@ -526,7 +533,6 @@ func (s *Server) runPreparedSelfcheckCase(
 		runErr = fmt.Errorf("unknown client %q", item.client)
 	}
 
-	result.LatencyMs = time.Since(started).Milliseconds()
 	preview := truncateSelfcheckPreview(output)
 	result.OutputPreview = preview
 	if runErr != nil {
@@ -536,7 +542,7 @@ func (s *Server) runPreparedSelfcheckCase(
 			result.OutputPreview = truncateSelfcheckPreview(runErr.Error())
 		}
 		result.ContentOK = false
-		return result
+		return finish(result)
 	}
 	result.Success = true
 	if item.kind == selfcheckKindTool {
@@ -558,7 +564,7 @@ func (s *Server) runPreparedSelfcheckCase(
 			result.Error = "response content did not look correct"
 		}
 	}
-	return result
+	return finish(result)
 }
 
 func (s *Server) ensureSelfcheckRouteAndKey(provider domain.Provider, protocol domain.Protocol) (domain.Route, domain.APIKey, string, bool, error) {
@@ -791,7 +797,8 @@ func newSelfcheckToolProbe() (*selfcheckToolProbe, error) {
 	_ = os.Remove(path)
 	prompt := fmt.Sprintf(
 		"Use your shell/file tool to create the file %s and write exactly this text into it: %s. "+
-			"Do not print the token in your reply; just perform the tool call. After writing, reply with the single word DONE.",
+			"Do not print the token itself. After the tool succeeds, you MUST reply with the single visible word DONE "+
+			"(plain text, not only a tool call).",
 		path, token,
 	)
 	return &selfcheckToolProbe{path: path, token: token, prompt: prompt}, nil
@@ -947,6 +954,9 @@ func runOpenCodeSelfcheck(ctx context.Context, caseDir, lanRoot, apiKey, model, 
 		return text, fmt.Errorf("opencode failed: %w; %s", runErr, truncateSelfcheckPreview(stderr.String()))
 	}
 	if strings.TrimSpace(text) == "" {
+		if kind == selfcheckKindTool {
+			return "(no text output)", nil
+		}
 		return "", fmt.Errorf("opencode returned empty output")
 	}
 	return text, nil
@@ -1218,6 +1228,11 @@ func runClaudeSelfcheck(ctx context.Context, caseDir, lanRoot, apiKey, model, pr
 		return text, fmt.Errorf("claude failed: %w; %s", runErr, truncateSelfcheckPreview(stderr.String()))
 	}
 	if text == "" {
+		// 工具探测以磁盘 probe 文件为准：模型可能只调 Bash/Write 不吐可见文本，
+		// Claude CLI（--output-format text）会得到空 stdout，但工具其实已成功。
+		if kind == selfcheckKindTool {
+			return "(no text output)", nil
+		}
 		return "", fmt.Errorf("claude returned empty output")
 	}
 	return text, nil

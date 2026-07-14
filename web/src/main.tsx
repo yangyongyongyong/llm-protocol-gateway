@@ -284,6 +284,8 @@ type SelfcheckCaseResult = {
   error?: string;
   routeId?: string;
   apiKeyName?: string;
+  startedAt?: string;
+  finishedAt?: string;
 };
 
 type SelfcheckJobStatus = {
@@ -330,6 +332,7 @@ type APIKey = {
   modelOverride?: string;
   modelAliases?: Record<string, string>;
   thinkingDepthOverride?: string;
+  maxOutputTokens?: number;
   streamEnabled?: boolean;
   fallbackProviderIds?: string[];
   fallbackModelOverrides?: Record<string, string>;
@@ -349,6 +352,7 @@ type KeyProfile = {
   modelOverride?: string;
   modelAliases?: Record<string, string>;
   thinkingDepthOverride?: string;
+  maxOutputTokens?: number;
   fallbackProviderIds?: string[];
   fallbackModelOverrides?: Record<string, string>;
   streamEnabled?: boolean;
@@ -359,6 +363,7 @@ type Model = {
   providerId: string;
   protocol: Protocol;
   contextLength: number;
+  maxOutputTokens?: number;
   inMenu: boolean;
 };
 
@@ -397,6 +402,7 @@ type LogEntry = {
   time: string;
   apiKeyId?: string;
   apiKeyName?: string;
+  userName?: string;
   routeId: string;
   providerId: string;
   model: string;
@@ -455,6 +461,15 @@ type ModelDayStats = {
   cacheTokens: number;
 };
 
+type UserDayStats = {
+  userId: string;
+  userName: string;
+  requestCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheTokens: number;
+};
+
 type DailyRequestPoint = {
   date: string;
   requestCount: number;
@@ -478,6 +493,7 @@ type RequestStatsSnapshot = {
     byApiKey: APIKeyDayStats[];
     byProvider?: ProviderDayStats[];
     byModel?: ModelDayStats[];
+    byUser?: UserDayStats[];
   };
   month: {
     period: string;
@@ -485,6 +501,7 @@ type RequestStatsSnapshot = {
     byApiKey: APIKeyDayStats[];
     byProvider?: ProviderDayStats[];
     byModel?: ModelDayStats[];
+    byUser?: UserDayStats[];
   };
   range?: {
     period: string;
@@ -492,6 +509,7 @@ type RequestStatsSnapshot = {
     byApiKey: APIKeyDayStats[];
     byProvider?: ProviderDayStats[];
     byModel?: ModelDayStats[];
+    byUser?: UserDayStats[];
   };
   from?: string;
   to?: string;
@@ -863,6 +881,7 @@ function formatTrafficLogDetail(log: LogEntry, providers: Provider[] = []) {
     `time: ${new Date(log.time).toLocaleString()}`,
     `status: HTTP ${log.status}`,
     `apiKey: ${trafficLogKeyLabel(log)}${log.apiKeyId ? ` (${log.apiKeyId})` : ''}`,
+    `user: ${log.userName || '-'}`,
     `route: ${log.routeId}`,
     `provider: ${trafficLogProviderLabel(log, providers)}${log.providerId ? ` (${log.providerId})` : ''}`,
     `model: ${log.model}`,
@@ -1043,6 +1062,7 @@ function buildApiKeyPatchBody(key: APIKey, patch: Partial<APIKey> = {}) {
     modelOverride: patch.modelOverride ?? key.modelOverride ?? '',
     modelAliases: patch.modelAliases ?? key.modelAliases ?? {},
     thinkingDepthOverride: patch.thinkingDepthOverride ?? key.thinkingDepthOverride ?? '',
+    maxOutputTokens: patch.maxOutputTokens ?? key.maxOutputTokens ?? 0,
     streamEnabled: patch.streamEnabled ?? key.streamEnabled ?? true,
     enabled: patch.enabled ?? key.enabled,
     fallbackProviderIds: patch.fallbackProviderIds ?? key.fallbackProviderIds ?? [],
@@ -2152,6 +2172,24 @@ function formatTokenCount(value: number) {
   return String(value);
 }
 
+function formatModelOutputBudget(n: number | undefined) {
+  if (!n || n <= 0) return '';
+  if (n >= 1_000_000) {
+    const m = n / 1_000_000;
+    return Number.isInteger(m) ? `${m}M` : `${m.toFixed(1)}M`;
+  }
+  if (n >= 1_000) {
+    const k = n / 1_000;
+    return Number.isInteger(k) ? `${k}k` : `${k.toFixed(1)}k`;
+  }
+  return String(n);
+}
+
+function modelSelectOptionLabel(model: Model) {
+  const out = formatModelOutputBudget(model.maxOutputTokens);
+  return out ? `${model.id} · out ${out}` : model.id;
+}
+
 function formatCompactCount(value: number) {
   const formatScaled = (scaled: number, unit: string) => {
     const decimals = scaled >= 100 ? 0 : scaled >= 10 ? 1 : 2;
@@ -2319,6 +2357,7 @@ function App() {
     modelOverride: '',
     modelAliases: {} as Record<string, string>,
     thinkingDepthOverride: '',
+    maxOutputTokens: 0,
     streamEnabled: true,
   });
   const [modelsProviderFilter, setModelsProviderFilter] = useState('__all__');
@@ -3040,7 +3079,7 @@ function App() {
     }
   }
 
-  function buildLogsQueryParams(page: number, includeBodies = false, fromOverride?: string, toOverride?: string) {
+  function buildLogsQueryParams(page: number, includeBodies = false, fromOverride?: string, toOverride?: string, apiKeyNameOverride?: string) {
     const params = new URLSearchParams();
     params.set('page', String(page));
     params.set('pageSize', String(LOGS_PAGE_SIZE));
@@ -3051,7 +3090,8 @@ function App() {
     const to = toOverride !== undefined ? toOverride : logsTo;
     if (from) params.set('from', from);
     if (to) params.set('to', to);
-    if (logsApiKeyName.trim()) params.set('apiKeyName', logsApiKeyName.trim());
+    const keyName = apiKeyNameOverride !== undefined ? apiKeyNameOverride.trim() : logsApiKeyName.trim();
+    if (keyName) params.set('apiKeyName', keyName);
     return params;
   }
 
@@ -3059,10 +3099,10 @@ function App() {
     return `${log.time}|${log.path}|${log.status}|${log.model}|${log.latencyMs}`;
   }
 
-  async function refreshLogs(page = logsPage, fromOverride?: string, toOverride?: string, opts?: { silent?: boolean }) {
+  async function refreshLogs(page = logsPage, fromOverride?: string, toOverride?: string, opts?: { silent?: boolean; apiKeyName?: string }) {
     if (!opts?.silent) setLogsLoading(true);
     try {
-      const response = await fetch(`${API_BASE}/__logs?${buildLogsQueryParams(page, false, fromOverride, toOverride).toString()}`, { credentials: 'same-origin' });
+      const response = await fetch(`${API_BASE}/__logs?${buildLogsQueryParams(page, false, fromOverride, toOverride, opts?.apiKeyName).toString()}`, { credentials: 'same-origin' });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json() as LogPage | LogEntry[];
       let items: LogEntry[] = [];
@@ -3088,7 +3128,8 @@ function App() {
       setDataFetchedAt(fetchedAt);
       const from = fromOverride !== undefined ? fromOverride : logsFrom;
       const to = toOverride !== undefined ? toOverride : logsTo;
-      writeUICache(uiCacheScope(authStatusRef.current), `logs:p${nextPage}:s${logsStatusFilter}:f${from}:t${to}:k${logsApiKeyName.trim()}`, {
+      const keyForCache = (opts?.apiKeyName !== undefined ? opts.apiKeyName : logsApiKeyName).trim();
+      writeUICache(uiCacheScope(authStatusRef.current), `logs:p${nextPage}:s${logsStatusFilter}:f${from}:t${to}:k${keyForCache}`, {
         items,
         total,
         page: nextPage,
@@ -3824,6 +3865,7 @@ function App() {
       modelOverride: '',
       modelAliases: {},
       thinkingDepthOverride: '',
+      maxOutputTokens: 0,
       streamEnabled: true,
     });
     setApiKeyModalOpen(true);
@@ -3838,6 +3880,7 @@ function App() {
       modelOverride: key.modelOverride || '',
       modelAliases: { ...(key.modelAliases || {}) },
       thinkingDepthOverride: key.thinkingDepthOverride || '',
+      maxOutputTokens: key.maxOutputTokens && key.maxOutputTokens > 0 ? key.maxOutputTokens : 0,
       streamEnabled: key.streamEnabled !== false,
     });
     setApiKeyModalOpen(true);
@@ -4327,6 +4370,37 @@ function App() {
     return kind || '对话';
   }
 
+  function formatSelfcheckTime(iso?: string) {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    return d.toLocaleString('zh-CN', { hour12: false });
+  }
+
+  function openSelfcheckCaseLogs(row: SelfcheckCaseResult) {
+    const keyName = (row.apiKeyName || '').trim();
+    const start = row.startedAt ? new Date(row.startedAt) : null;
+    const end = row.finishedAt ? new Date(row.finishedAt) : null;
+    const padMs = 5_000;
+    const fromDate = start && !Number.isNaN(start.getTime())
+      ? formatLocalISODate(new Date(start.getTime() - padMs))
+      : '';
+    const toDate = end && !Number.isNaN(end.getTime())
+      ? formatLocalISODate(new Date(end.getTime() + padMs))
+      : fromDate;
+    setLogsApiKeyName(keyName);
+    setLogsStatusFilter('all');
+    setLogsFrom(fromDate);
+    setLogsTo(toDate);
+    goToPage('traffic-tokens');
+    void refreshLogs(1, fromDate, toDate, { apiKeyName: keyName });
+    if (keyName) {
+      showToast(`已定位密钥「${keyName}」· ${formatSelfcheckTime(row.startedAt)}`);
+    } else {
+      showToast('已跳转 API 日志');
+    }
+  }
+
   function providersExportFilename() {
     const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
     return `providers-export-${stamp}.json`;
@@ -4457,6 +4531,7 @@ function App() {
           modelOverride: apiKeyDraft.modelOverride,
           modelAliases: apiKeyDraft.modelAliases,
           thinkingDepthOverride: apiKeyDraft.thinkingDepthOverride,
+          maxOutputTokens: apiKeyDraft.maxOutputTokens > 0 ? apiKeyDraft.maxOutputTokens : 0,
           streamEnabled: apiKeyDraft.streamEnabled,
           enabled: true,
         }),
@@ -4533,7 +4608,7 @@ function App() {
     }
   }
 
-  async function updateApiKeyField(key: APIKey, field: 'name' | 'routeId' | 'modelOverride' | 'thinkingDepthOverride' | 'streamEnabled' | 'enabled', value: string | boolean) {
+  async function updateApiKeyField(key: APIKey, field: 'name' | 'routeId' | 'modelOverride' | 'thinkingDepthOverride' | 'maxOutputTokens' | 'streamEnabled' | 'enabled', value: string | boolean | number) {
     setSaving(true);
     try {
       const patch: Partial<APIKey> = {};
@@ -4541,6 +4616,7 @@ function App() {
       if (field === 'routeId') patch.routeId = String(value);
       if (field === 'modelOverride') patch.modelOverride = String(value);
       if (field === 'thinkingDepthOverride') patch.thinkingDepthOverride = String(value);
+      if (field === 'maxOutputTokens') patch.maxOutputTokens = typeof value === 'number' ? value : Number.parseInt(String(value), 10) || 0;
       if (field === 'streamEnabled') patch.streamEnabled = Boolean(value);
       if (field === 'enabled') patch.enabled = Boolean(value);
       const response = await fetch(`${API_BASE}/__apikeys/${encodeURIComponent(key.id)}`, {
@@ -5398,6 +5474,15 @@ function App() {
                     value: item.requestCount,
                   }))}
                 />
+                {!isNormalUser && (
+                  <UsageBarChart
+                    title="按用户请求"
+                    items={(requestStats?.range?.byUser || usageToday?.byUser || []).slice(0, 8).map((item) => ({
+                      label: item.userName || item.userId || '未绑定用户',
+                      value: item.requestCount,
+                    }))}
+                  />
+                )}
                 <UsageBarChart
                   title="模型使用量排名（Token）"
                   formatValue={formatCompactCount}
@@ -5491,6 +5576,39 @@ function App() {
                   })()}
                 </div>
               </div>
+
+              {!isNormalUser && (
+                <div className="usage-table-wrap">
+                  <div className="usage-section-title">按用户（区间）</div>
+                  <div className="usage-table">
+                    <div className="usage-header">
+                      <span>用户</span>
+                      <span>区间请求</span>
+                      <span>区间 Token</span>
+                      <span>本月请求</span>
+                      <span>本月 Token</span>
+                    </div>
+                    {(() => {
+                      const rows = requestStats?.range?.byUser || usageToday?.byUser || [];
+                      if (rows.length === 0) {
+                        return <div className="empty-state">暂无用户请求记录。</div>;
+                      }
+                      return rows.map((row) => {
+                        const month = usageMonth?.byUser?.find((item) => item.userId === row.userId);
+                        return (
+                          <div className="usage-row" key={row.userId || row.userName}>
+                            <span className="usage-key-name">{row.userName || row.userId || '未绑定用户'}</span>
+                            <span>{row.requestCount}</span>
+                            <span>{formatTokenSummary(row)}</span>
+                            <span>{month?.requestCount ?? 0}</span>
+                            <span>{month ? formatTokenSummary(month) : '—'}</span>
+                          </div>
+                        );
+                      });
+                    })()}
+                  </div>
+                </div>
+              )}
 
               <div className="usage-table-wrap">
                 <div className="usage-section-title">模型使用量排名（区间，按 Token 总量）</div>
@@ -5904,6 +6022,7 @@ function App() {
                       <span>来源</span>
                       <span>IP</span>
                       <span>密钥</span>
+                      <span>用户</span>
                       <span>输入 Provider</span>
                       <span>模型</span>
                       <span>Token</span>
@@ -5919,6 +6038,7 @@ function App() {
                           <span className="log-source" title={log.clientHost || undefined}>{accessSourceLabel(log.accessSource)}</span>
                           <span className="log-ip" title={log.clientIp || undefined}>{log.clientIp || '—'}</span>
                           <span className="log-key" title={log.apiKeyId || undefined}>{trafficLogKeyLabel(log)}</span>
+                          <span className="log-user" title={log.userName || undefined}>{log.userName || '—'}</span>
                           <span className="log-provider" title={log.providerId || undefined}>{trafficLogProviderLabel(log, state.providers || [])}</span>
                           <span className="log-model">{log.model}</span>
                           <span className="log-token" title="入=总 input（含缓存命中）；缓存=cache hit">入 {log.inputTokens} · 出 {log.outputTokens} · 缓存 {log.cacheTokens || 0}</span>
@@ -6102,6 +6222,7 @@ function App() {
                   </div>
                   <div className="usage-table selfcheck-table">
                     <div className="selfcheck-header">
+                      <span>时间</span>
                       <span>Provider</span>
                       <span>客户端</span>
                       <span>类型</span>
@@ -6122,8 +6243,16 @@ function App() {
                           const caseId = row.caseId || `${row.providerId}|${row.client}|${row.kind || 'chat'}`;
                           const retrying = selfcheckRetrying.includes(caseId);
                           const passed = row.success && row.contentOK;
+                          const timeTitle = [
+                            row.startedAt ? `开始 ${row.startedAt}` : '',
+                            row.finishedAt ? `结束 ${row.finishedAt}` : '',
+                            row.apiKeyName ? `密钥 ${row.apiKeyName}` : '',
+                          ].filter(Boolean).join('\n');
                           return (
                           <div className="selfcheck-row" key={`${caseId}-${index}`}>
+                            <span className="selfcheck-time" title={timeTitle || undefined}>
+                              {formatSelfcheckTime(row.startedAt)}
+                            </span>
                             <span className="usage-key-name">{row.providerName || row.providerId}</span>
                             <span>{selfcheckClientLabel(row.client)}</span>
                             <span>{selfcheckKindLabel(row.kind)}</span>
@@ -6135,8 +6264,16 @@ function App() {
                             <span className="selfcheck-preview" title={row.error || row.outputPreview || ''}>
                               {row.error || row.outputPreview || '—'}
                             </span>
-                            <span>
-                              {passed ? '—' : (
+                            <span className="selfcheck-actions">
+                              <button
+                                className="mini-btn"
+                                type="button"
+                                disabled={!row.apiKeyName && !row.startedAt}
+                                onClick={() => openSelfcheckCaseLogs(row)}
+                              >
+                                日志
+                              </button>
+                              {passed ? null : (
                                 <button
                                   className="mini-btn"
                                   type="button"
@@ -6755,6 +6892,22 @@ function App() {
               </select>
             </div>
             <div className="field field-full">
+              <label>最大输出 Token（可选）</label>
+              <input
+                type="number"
+                min={0}
+                max={200000}
+                placeholder="0 = 自动（按模型）"
+                value={apiKeyDraft.maxOutputTokens > 0 ? apiKeyDraft.maxOutputTokens : ''}
+                onChange={(event) => {
+                  const raw = event.target.value.trim();
+                  const n = raw === '' ? 0 : Number.parseInt(raw, 10);
+                  setApiKeyDraft((current) => ({ ...current, maxOutputTokens: Number.isFinite(n) && n > 0 ? Math.min(n, 200000) : 0 }));
+                }}
+              />
+              <div className="hint-line">留空表示按模型自动解析；新模型若下拉显示偏小，可在此覆盖（上限 200000）。</div>
+            </div>
+            <div className="field field-full">
               <label>流式响应（SSE）</label>
               <label className="hint-line" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <input
@@ -7188,7 +7341,7 @@ function ApiKeyDetailPanel({
   tunnelRunning: boolean;
   livePublicURL: string;
   fixedOutputLabels: string[];
-  onUpdateField: (key: APIKey, field: 'name' | 'routeId' | 'modelOverride' | 'thinkingDepthOverride' | 'streamEnabled' | 'enabled', value: string | boolean) => Promise<void>;
+  onUpdateField: (key: APIKey, field: 'name' | 'routeId' | 'modelOverride' | 'thinkingDepthOverride' | 'maxOutputTokens' | 'streamEnabled' | 'enabled', value: string | boolean | number) => Promise<void>;
   onUpdateBinding: (key: APIKey, providerId: string, outputProtocol: Protocol) => Promise<void>;
   onUpdateModelAliases: (key: APIKey, modelAliases: Record<string, string>) => Promise<void>;
   onUpdateFallbacks: (key: APIKey, fallbackProviderIds: string[], fallbackModelOverrides: Record<string, string>) => Promise<void>;
@@ -7234,6 +7387,7 @@ function ApiKeyDetailPanel({
       modelOverride: keyItem.modelOverride,
       modelAliases: { ...(keyItem.modelAliases || {}) },
       thinkingDepthOverride: keyItem.thinkingDepthOverride,
+      maxOutputTokens: keyItem.maxOutputTokens && keyItem.maxOutputTokens > 0 ? keyItem.maxOutputTokens : 0,
       fallbackProviderIds: [...(keyItem.fallbackProviderIds || [])],
       fallbackModelOverrides: { ...(keyItem.fallbackModelOverrides || {}) },
       streamEnabled: keyItem.streamEnabled !== false,
@@ -7419,6 +7573,11 @@ function ApiKeyDetailPanel({
             {thinkingDepthSelectOptions({ value: '', label: '（不覆盖）' })}
           </select>
         </div>
+        <ApiKeyMaxOutputTokensField
+          value={keyItem.maxOutputTokens && keyItem.maxOutputTokens > 0 ? keyItem.maxOutputTokens : 0}
+          disabled={saving}
+          onSave={(n) => onUpdateField(keyItem, 'maxOutputTokens', n)}
+        />
         <div className="field">
           <label>流式响应（SSE）</label>
           <label className="hint-line" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -8128,9 +8287,9 @@ type SearchableModelOption = { id: string; label: string };
 
 function filterModelOptions(models: Model[], queryRaw: string): SearchableModelOption[] {
   const needle = queryRaw.trim().toLowerCase();
-  const options = models.map((model) => ({ id: model.id, label: model.id }));
+  const options = models.map((model) => ({ id: model.id, label: modelSelectOptionLabel(model) }));
   if (!needle) return options;
-  return options.filter((option) => option.label.toLowerCase().includes(needle));
+  return options.filter((option) => option.id.toLowerCase().includes(needle) || option.label.toLowerCase().includes(needle));
 }
 
 function SearchableModelSelect({
@@ -8161,7 +8320,10 @@ function SearchableModelSelect({
     return matchedEmpty ? [empty, ...filtered] : filtered;
   }, [emptyLabel, filtered, query]);
 
-  const displayLabel = value || emptyLabel;
+  const selectedModel = models.find((model) => model.id === value);
+  const displayLabel = value
+    ? (selectedModel ? modelSelectOptionLabel(selectedModel) : value)
+    : emptyLabel;
 
   const close = React.useCallback(() => {
     setOpen(false);
@@ -8322,8 +8484,55 @@ function ApiKeyFixedModelField({
       </div>
       <div className="hint-line">
         设置后将忽略请求体中的 model，统一替换为所选模型。
-        {models.length > 0 ? ` · 共 ${models.length} 个，点开后输入关键字筛选` : ''}
+        {models.length > 0 ? ` · 共 ${models.length} 个，点开后输入关键字筛选；选项含网关解析的 max output` : ''}
       </div>
+    </div>
+  );
+}
+
+function ApiKeyMaxOutputTokensField({
+  value,
+  disabled,
+  onSave,
+}: {
+  value: number;
+  disabled?: boolean;
+  onSave: (value: number) => Promise<void> | void;
+}) {
+  const [draft, setDraft] = React.useState(value > 0 ? String(value) : '');
+  React.useEffect(() => {
+    setDraft(value > 0 ? String(value) : '');
+  }, [value]);
+
+  function commit() {
+    const raw = draft.trim();
+    const n = raw === '' ? 0 : Number.parseInt(raw, 10);
+    const next = Number.isFinite(n) && n > 0 ? Math.min(n, 200000) : 0;
+    setDraft(next > 0 ? String(next) : '');
+    if (next === (value > 0 ? value : 0)) return;
+    void onSave(next);
+  }
+
+  return (
+    <div className="field">
+      <label>最大输出 Token</label>
+      <input
+        type="number"
+        min={0}
+        max={200000}
+        placeholder="0 = 自动（按模型）"
+        disabled={disabled}
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={() => commit()}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter') {
+            event.preventDefault();
+            (event.target as HTMLInputElement).blur();
+          }
+        }}
+      />
+      <div className="hint-line">留空或 0 按模型自动解析；填写后覆盖上游 max_tokens（上限 200000）。</div>
     </div>
   );
 }

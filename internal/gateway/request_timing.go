@@ -18,7 +18,9 @@ const (
 	timingFlagCursorBridgeStart  timingFlag = "cursor_bridge_start"
 	timingFlagDualHopBuffer      timingFlag = "dual_hop_buffer"
 	timingFlagFailoverRetry      timingFlag = "failover_retry"
+	timingFlagEmptyStreamRetry   timingFlag = "empty_stream_retry"
 	timingFlagTouchDB            timingFlag = "touch_db"
+	timingFlagThinkingRectify    timingFlag = "thinking_rectify"
 )
 
 type timingContextKey struct{}

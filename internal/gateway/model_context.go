@@ -1,6 +1,40 @@
 package gateway
 
-import "strings"
+import (
+	"context"
+	"net/http"
+	"strings"
+
+	"github.com/luca/llm-protocol-gateway/internal/domain"
+)
+
+type maxOutputTokensOverrideKey struct{}
+
+func withMaxOutputTokensOverride(ctx context.Context, n int) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	n = normalizeMaxOutputTokens(n)
+	if n <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, maxOutputTokensOverrideKey{}, n)
+}
+
+func maxOutputTokensOverrideFrom(ctx context.Context) int {
+	if ctx == nil {
+		return 0
+	}
+	n, _ := ctx.Value(maxOutputTokensOverrideKey{}).(int)
+	return normalizeMaxOutputTokens(n)
+}
+
+func attachAPIKeyMaxOutputTokens(r *http.Request, key domain.APIKey, matched bool) *http.Request {
+	if r == nil || !matched || key.MaxOutputTokens <= 0 {
+		return r
+	}
+	return r.WithContext(withMaxOutputTokensOverride(r.Context(), key.MaxOutputTokens))
+}
 
 const (
 	contextLength1M      = 1_000_000
@@ -170,4 +204,45 @@ func resolveModelMaxOutputTokens(modelID string, contextLength int) int {
 		return 64_000
 	}
 	return 65_536
+}
+
+// defaultClaudeMaxTokens 在客户端未指定 / 密钥未覆盖时使用。
+// Anthropic Messages API 要求该字段必填，无法真正“不截断”；这里取模型对外宣称的
+// 输出上限，避免历史写死 4096 误伤长 agent / 工具调用。
+func defaultClaudeMaxTokens(modelID string) int {
+	ctxLen := resolveModelContextLength(modelID, 0)
+	n := resolveModelMaxOutputTokens(modelID, ctxLen)
+	if n <= 0 {
+		return 64_000
+	}
+	return n
+}
+
+// effectiveClaudeMaxTokens 优先使用密钥级覆盖（>0），否则按实际上游模型自动解析。
+func effectiveClaudeMaxTokens(modelID string, override int) int {
+	if override > 0 {
+		return override
+	}
+	return defaultClaudeMaxTokens(modelID)
+}
+
+// normalizeMaxOutputTokens clamps a key-level override. 0 means "auto".
+func normalizeMaxOutputTokens(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	const maxAllowed = 200_000
+	if n > maxAllowed {
+		return maxAllowed
+	}
+	return n
+}
+
+// fillModelTokenBudgets sets ContextLength / MaxOutputTokens display fields for UI.
+func fillModelTokenBudgets(model *domain.Model) {
+	if model == nil {
+		return
+	}
+	model.ContextLength = resolveModelContextLength(model.ID, model.ContextLength)
+	model.MaxOutputTokens = resolveModelMaxOutputTokens(model.ID, model.ContextLength)
 }

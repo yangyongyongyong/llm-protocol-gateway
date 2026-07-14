@@ -250,7 +250,7 @@ func ensureLeadingClaudeUser(messages []map[string]any) []map[string]any {
 // responsesToClaudeRequestDirect converts a Responses request directly into an
 // Anthropic Messages request (no OpenAI-Chat intermediate). Thinking/effort
 // mapping reuses the existing Chat↔Claude helpers so behavior stays consistent.
-func responsesToClaudeRequestDirect(responsesReq map[string]any, model string) (map[string]any, error) {
+func responsesToClaudeRequestDirect(responsesReq map[string]any, model string, maxTokensOverride int) (map[string]any, error) {
 	claudeReq := map[string]any{"model": model}
 
 	if instructions := strings.TrimSpace(stringValue(responsesReq["instructions"])); instructions != "" {
@@ -268,11 +268,8 @@ func responsesToClaudeRequestDirect(responsesReq map[string]any, model string) (
 	}
 	claudeReq["messages"] = claudeMessages
 
-	if maxTokens, exists := responsesReq["max_output_tokens"]; exists {
-		claudeReq["max_tokens"] = maxTokens
-	} else {
-		claudeReq["max_tokens"] = 4096
-	}
+	// 预算按实际上游 model 参数计算；密钥覆盖 >0 时优先。忽略客户端 max_output_tokens。
+	claudeReq["max_tokens"] = effectiveClaudeMaxTokens(model, maxTokensOverride)
 	if stream, ok := responsesReq["stream"].(bool); ok && stream {
 		claudeReq["stream"] = true
 	} else {

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/luca/llm-protocol-gateway/internal/domain"
+	"github.com/luca/llm-protocol-gateway/internal/monitor"
 )
 
 // requestIdentity returns the resolved identity, defaulting to admin for
@@ -57,6 +58,79 @@ func (s *Server) ownedKeyIDs(userID string) []string {
 		}
 	}
 	return ids
+}
+
+// ownerUserIDForStats normalizes a key's OwnerUserID for usage bucketing. Legacy
+// keys with an empty owner belong to the administrator, so they collapse onto
+// the stable admin id rather than the "_anonymous" bucket.
+func ownerUserIDForStats(ownerUserID string) string {
+	if strings.TrimSpace(ownerUserID) == "" {
+		return legacyAdminUserID
+	}
+	return strings.TrimSpace(ownerUserID)
+}
+
+// resolveUserName maps a stable user id to its current display name. Renames are
+// reflected immediately because names are resolved fresh at query time. Unknown
+// / deleted users fall back to a readable label keyed by id.
+func (s *Server) resolveUserName(userID string) string {
+	switch userID {
+	case "", "_anonymous":
+		return "未绑定用户"
+	case legacyAdminUserID:
+		return "管理员"
+	}
+	if s.userStore != nil {
+		if user, err := s.userStore.UserByID(userID); err == nil {
+			if name := strings.TrimSpace(user.Username); name != "" {
+				return name
+			}
+		}
+	}
+	return "已删除用户(" + userID + ")"
+}
+
+// fillUserNames resolves display names for a byUser stat slice in place.
+func (s *Server) fillUserNames(users []monitor.UserDayStats) []monitor.UserDayStats {
+	for i := range users {
+		users[i].UserName = s.resolveUserName(users[i].UserID)
+	}
+	return users
+}
+
+// fillRequestLogUserNames resolves the owning user's display name for each
+// request log in place. It maps each log to its API key (by id, then name),
+// derives the owner user id, and resolves the current username. Names are
+// resolved fresh at query time so renames reflect immediately; a per-user-id
+// cache avoids repeated store lookups within one page.
+func (s *Server) fillRequestLogUserNames(logs []monitor.RequestLog) {
+	if len(logs) == 0 {
+		return
+	}
+	state := s.router.State()
+	keysByID := make(map[string]domain.APIKey, len(state.APIKeys))
+	keysByName := make(map[string]domain.APIKey, len(state.APIKeys))
+	for _, key := range state.APIKeys {
+		keysByID[key.ID] = key
+		if name := strings.TrimSpace(key.Name); name != "" {
+			keysByName[strings.ToLower(name)] = key
+		}
+	}
+	nameCache := make(map[string]string)
+	for i := range logs {
+		key, ok := lookupLogAPIKey(logs[i], keysByID, keysByName)
+		if !ok {
+			logs[i].UserName = "未绑定用户"
+			continue
+		}
+		userID := ownerUserIDForStats(key.OwnerUserID)
+		name, cached := nameCache[userID]
+		if !cached {
+			name = s.resolveUserName(userID)
+			nameCache[userID] = name
+		}
+		logs[i].UserName = name
+	}
 }
 
 // keysVisibleTo filters API keys per role: admins see all, users see own.

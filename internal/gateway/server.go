@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/luca/llm-protocol-gateway/internal/cursor"
 	"github.com/luca/llm-protocol-gateway/internal/domain"
@@ -374,6 +375,7 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 			if !query.IncludeBodies {
 				stripRequestLogBodies(page.Items)
 			}
+			s.fillRequestLogUserNames(page.Items)
 			writeJSON(w, http.StatusOK, page)
 			return
 		}
@@ -383,6 +385,7 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	if !query.IncludeBodies {
 		stripRequestLogBodies(page.Items)
 	}
+	s.fillRequestLogUserNames(page.Items)
 	writeJSON(w, http.StatusOK, page)
 }
 
@@ -456,9 +459,24 @@ func (s *Server) handleRequestStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	snapshot := s.logs.UsageStatsRange(now, from, to)
+	s.fillUsageUserNames(&snapshot)
 	s.requestStatsCache.set(cacheKey, snapshot)
 	w.Header().Set("Cache-Control", "private, max-age=5")
 	writeJSON(w, http.StatusOK, snapshot)
+}
+
+// fillUsageUserNames resolves display names for every byUser breakdown in the
+// snapshot. IDs are stable; names are resolved fresh so user renames reflect
+// immediately (subject only to the short response cache).
+func (s *Server) fillUsageUserNames(snapshot *monitor.UsageStatsSnapshot) {
+	if snapshot == nil {
+		return
+	}
+	snapshot.Today.ByUser = s.fillUserNames(snapshot.Today.ByUser)
+	snapshot.Month.ByUser = s.fillUserNames(snapshot.Month.ByUser)
+	if snapshot.Range != nil {
+		snapshot.Range.ByUser = s.fillUserNames(snapshot.Range.ByUser)
+	}
 }
 
 // loadRequestLogsForStats pages through persisted request logs up to limit.
@@ -561,10 +579,15 @@ func (s *Server) rebuildUsageStatsFromLogs(since time.Time) {
 	}
 	for _, log := range logs {
 		resolved := resolveRequestLogModelForUsage(s.router, log, keysByID, keysByName)
+		usageUserID := ""
+		if key, ok := lookupLogAPIKey(log, keysByID, keysByName); ok {
+			usageUserID = ownerUserIDForStats(key.OwnerUserID)
+		}
 		s.logs.ApplyUsageEventSync(monitor.UsageEvent{
 			Time:         log.Time,
 			APIKeyID:     log.APIKeyID,
 			APIKeyName:   log.APIKeyName,
+			UserID:       usageUserID,
 			ProviderID:   log.ProviderID,
 			Model:        resolved,
 			Status:       log.Status,
@@ -578,6 +601,17 @@ func (s *Server) rebuildUsageStatsFromLogs(since time.Time) {
 }
 
 const memoryLogCap = 50000
+
+// 请求/响应体日志截断上限（字节）。
+//   - 2xx 正常请求：只留精简体，够定位模型/参数即可，避免正常流量把库撑大。
+//   - 非 2xx 错误请求：放大上限，尽量保留完整请求/响应体，方便事后排查
+//     （如 thinking 签名 400、上游报错等需要看到完整上下文）。
+// SQLite TEXT 列本身无硬长度限制，这里的上限用于防止单条日志异常超长
+// （如超大 base64 图片/附件）拖垮内存缓存与 DB 写入。
+const (
+	logBodyCapOK    = 8 * 1024   // 2xx 请求体上限：8 KiB
+	logBodyCapError = 256 * 1024 // 非 2xx 请求体/响应体上限：256 KiB
+)
 
 func (s *Server) recordRequestLog(started time.Time, matchedKey domain.APIKey, gatewayKeyMatched bool, routeID, providerID, model, action, protocolFlow, path string, status int, usage TokenUsage, requestBody, responseBody []byte) {
 	s.recordRequestLogEx(started, matchedKey, gatewayKeyMatched, routeID, providerID, model, action, protocolFlow, path, status, usage, 0, "", "", "", nil, requestBody, responseBody)
@@ -611,6 +645,11 @@ func (s *Server) recordRequestLogEx(started time.Time, matchedKey domain.APIKey,
 		ttftMs = latency
 	}
 	prepMs, preUpstreamMs, upstreamTtfbMs, gatewayOverheadMs, convertOutMs, postMs, timingFlags := timing.snapshot(ttftMs, latency)
+	// 非 2xx 错误：保留更完整的请求体，方便排查；2xx 正常请求只留精简体。
+	requestBodyCap := logBodyCapOK
+	if status < 200 || status >= 300 {
+		requestBodyCap = logBodyCapError
+	}
 	entry := monitor.RequestLog{
 		Time:                  started,
 		RouteID:               routeID,
@@ -635,7 +674,7 @@ func (s *Server) recordRequestLogEx(started time.Time, matchedKey domain.APIKey,
 		ClientHost:            clientHost,
 		ClientIP:              clientIP,
 		AccessSource:          accessSource,
-		RequestBody:           truncateForLog(requestBody, 8192),
+		RequestBody:           truncateForLog(requestBody, requestBodyCap),
 	}
 	if gatewayKeyMatched {
 		entry.APIKeyID = matchedKey.ID
@@ -644,17 +683,22 @@ func (s *Server) recordRequestLogEx(started time.Time, matchedKey domain.APIKey,
 		entry.APIKeyName = "Route Test"
 	}
 	if status >= 400 || extractResponseErrorMessage(responseBody) != "" {
-		entry.ResponseBody = truncateForLog(responseBody, 16384)
+		entry.ResponseBody = truncateForLog(responseBody, logBodyCapError)
 		entry.ErrorDescription = extractResponseErrorMessage(responseBody)
 		if entry.ErrorDescription == "" && status >= 400 {
 			entry.ErrorDescription = summarizeUpstreamHTTPError(status, responseBody)
 		}
 	}
 	s.logs.Add(entry)
+	usageUserID := ""
+	if gatewayKeyMatched {
+		usageUserID = ownerUserIDForStats(matchedKey.OwnerUserID)
+	}
 	s.logs.EnqueueUsage(monitor.UsageEvent{
 		Time:         started,
 		APIKeyID:     entry.APIKeyID,
 		APIKeyName:   entry.APIKeyName,
+		UserID:       usageUserID,
 		ProviderID:   providerID,
 		Model:        model,
 		Status:       status,
@@ -678,7 +722,13 @@ func truncateForLog(data []byte, limit int) string {
 	if len(data) <= limit {
 		return string(data)
 	}
-	return string(data[:limit]) + "…(truncated)"
+	// 按 UTF-8 边界回退，避免从多字节字符中间切断产生非法序列
+	// （历史上曾导致下游 JSON/UTF-8 解析报错）。
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(data[cut]) {
+		cut--
+	}
+	return string(data[:cut]) + "…(truncated)"
 }
 
 func (s *Server) handleAppLogs(w http.ResponseWriter, r *http.Request) {
@@ -2402,12 +2452,14 @@ func (s *Server) modelsForRequest(r *http.Request) []domain.Model {
 				break
 			}
 		}
-		models = append(models, domain.Model{
+		extra := domain.Model{
 			ID:            id,
 			ProviderID:    pid,
 			ContextLength: contextLen,
 			InMenu:        true,
-		})
+		}
+		fillModelTokenBudgets(&extra)
+		models = append(models, extra)
 	}
 	return models
 }
@@ -2470,6 +2522,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	requestModel, _ := req["model"].(string)
 	model, _ := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
+	r = attachAPIKeyMaxOutputTokens(r, matchedKey, gatewayKeyMatched)
 	thinkingOverride := ""
 	if gatewayKeyMatched {
 		thinkingOverride = matchedKey.ThinkingDepthOverride
@@ -2496,16 +2549,16 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	if timing != nil {
 		timing.markPrepReady()
 	}
-	status, usage, responseLog, decision, err = s.executeProtocolFlowWithFailover(wrapTTFTWriterWithTiming(w, started, &ttftMs, timing), r, route, decision, model, req, domain.ProtocolOpenAIChat, gatewayKeyMatched, matchedKey, gatewayKeyMatched)
+	status, usage, responseLog, decision, effectiveModel, err := s.executeProtocolFlowWithFailover(wrapTTFTWriterWithTiming(w, started, &ttftMs, timing), r, route, decision, model, req, domain.ProtocolOpenAIChat, gatewayKeyMatched, matchedKey, gatewayKeyMatched)
 	if err != nil {
 		s.logs.AddApp("error", "chat request failed", err.Error())
-		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
+		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, effectiveModel, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
 		writeOpenAIError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, decision.Action, decision.ConversionLabel, r.URL.Path, status, usage, ttftMs, body, responseLog)
-	s.logs.AddApp("debug", "handled chat request", fmt.Sprintf("route=%s model=%s status=%d", route.ID, model, status))
-	slog.Info("handled chat request", "route", route.ID, "model", model, "action", decision.Action, "stream", stream)
+	s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, effectiveModel, decision.Action, decision.ConversionLabel, r.URL.Path, status, usage, ttftMs, body, responseLog)
+	s.logs.AddApp("debug", "handled chat request", fmt.Sprintf("route=%s model=%s status=%d", route.ID, effectiveModel, status))
+	slog.Info("handled chat request", "route", route.ID, "model", effectiveModel, "action", decision.Action, "stream", stream)
 }
 
 func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
@@ -2566,6 +2619,7 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 
 	requestModel, _ := req["model"].(string)
 	model, _ := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
+	r = attachAPIKeyMaxOutputTokens(r, matchedKey, gatewayKeyMatched)
 	thinkingOverride := ""
 	if gatewayKeyMatched {
 		thinkingOverride = matchedKey.ThinkingDepthOverride
@@ -2588,16 +2642,16 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 	if timing != nil {
 		timing.markPrepReady()
 	}
-	status, usage, responseLog, decision, err = s.executeProtocolFlowWithFailover(wrapTTFTWriterWithTiming(w, started, &ttftMs, timing), r, route, decision, model, req, domain.ProtocolOpenAIResponses, gatewayKeyMatched, matchedKey, gatewayKeyMatched)
+	status, usage, responseLog, decision, effectiveModel, err := s.executeProtocolFlowWithFailover(wrapTTFTWriterWithTiming(w, started, &ttftMs, timing), r, route, decision, model, req, domain.ProtocolOpenAIResponses, gatewayKeyMatched, matchedKey, gatewayKeyMatched)
 	if err != nil {
 		s.logs.AddApp("error", "responses request failed", err.Error())
-		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
+		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, effectiveModel, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": err.Error(), "type": "gateway_error"}})
 		return
 	}
-	s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, decision.Action, decision.ConversionLabel, r.URL.Path, status, usage, ttftMs, body, responseLog)
-	s.logs.AddApp("debug", "handled responses request", fmt.Sprintf("route=%s model=%s status=%d", route.ID, model, status))
-	slog.Info("handled responses request", "route", route.ID, "model", model, "action", decision.Action, "stream", stream)
+	s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, effectiveModel, decision.Action, decision.ConversionLabel, r.URL.Path, status, usage, ttftMs, body, responseLog)
+	s.logs.AddApp("debug", "handled responses request", fmt.Sprintf("route=%s model=%s status=%d", route.ID, effectiveModel, status))
+	slog.Info("handled responses request", "route", route.ID, "model", effectiveModel, "action", decision.Action, "stream", stream)
 }
 
 func (s *Server) handleOpenAIImagesGenerations(w http.ResponseWriter, r *http.Request) {
@@ -2749,6 +2803,7 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 
 	requestModel, _ := req["model"].(string)
 	model, _ := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
+	r = attachAPIKeyMaxOutputTokens(r, matchedKey, gatewayKeyMatched)
 
 	stream, _ := req["stream"].(bool)
 	if s.rejectIfStreamDisabledForKey(w, gatewayKeyMatched, matchedKey, stream, domain.ProtocolClaude) {
@@ -2764,15 +2819,15 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 	if timing != nil {
 		timing.markPrepReady()
 	}
-	status, usage, responseLog, decision, err = s.executeProtocolFlowWithFailover(wrapTTFTWriterWithTiming(w, started, &ttftMs, timing), r, route, decision, model, req, domain.ProtocolClaude, gatewayKeyMatched, matchedKey, gatewayKeyMatched)
+	status, usage, responseLog, decision, effectiveModel, err := s.executeProtocolFlowWithFailover(wrapTTFTWriterWithTiming(w, started, &ttftMs, timing), r, route, decision, model, req, domain.ProtocolClaude, gatewayKeyMatched, matchedKey, gatewayKeyMatched)
 	if err != nil {
 		s.logs.AddApp("error", "claude messages request failed", err.Error())
-		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
+		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, effectiveModel, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
 		writeClaudeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, decision.Action, decision.ConversionLabel, r.URL.Path, status, usage, ttftMs, body, responseLog)
-	s.logs.AddApp("debug", "handled claude messages request", fmt.Sprintf("route=%s model=%s status=%d stream=%v", route.ID, model, status, stream))
+	s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, effectiveModel, decision.Action, decision.ConversionLabel, r.URL.Path, status, usage, ttftMs, body, responseLog)
+	s.logs.AddApp("debug", "handled claude messages request", fmt.Sprintf("route=%s model=%s status=%d stream=%v", route.ID, effectiveModel, status, stream))
 }
 
 // handleClaudeCountTokens proxies Anthropic's token counting endpoint, which
@@ -3623,6 +3678,31 @@ func (s *Server) proxyOpenAIImagesUpstream(w http.ResponseWriter, ctx context.Co
 // unchanged. For claude_oauth providers this refreshes the access token if
 // needed, injects the billing marker, and forces the anthropic-beta header.
 func (s *Server) proxyClaudeMessages(w http.ResponseWriter, r *http.Request, provider domain.Provider, body []byte) (int, TokenUsage, []byte, error) {
+	// Claude Code 会自带 max_tokens，但网关可能已做模型覆盖；预算必须按实际上游模型。
+	body = rewriteClaudeUpstreamMaxTokens(body, provider, maxOutputTokensOverrideFrom(r.Context()))
+	response, err := s.sendClaudeMessagesUpstream(r, provider, body)
+	if err != nil {
+		return 0, TokenUsage{}, nil, err
+	}
+
+	// Thinking 签名整流：若上游因跨账号/跨 Provider 回传的历史 thinking 签名校验
+	// 失败而返回该类 400，则剥离历史 thinking 块及残留 signature 后对同一 Provider
+	// 重试一次（仅一次，对客户端透明）。历史 thinking 只是草稿纸，剥离不损失有效
+	// 上下文。非命中错误 / 非 JSON 请求 / 整流无改动时，均按原样透传，零副作用。
+	if response.StatusCode == http.StatusBadRequest {
+		if peeked, ok := s.maybeRectifyClaudeThinking(r, provider, body, response); ok {
+			response = peeked
+		}
+	}
+
+	defer response.Body.Close()
+	return writePassThroughResponse(w, response, requestBodyWantsStream(body), ParseClaudeUsage)
+}
+
+// sendClaudeMessagesUpstream builds and sends one Claude Messages request to the
+// resolved upstream (Anthropic for claude_oauth providers, provider.BaseURL for
+// regular Claude API-key providers), returning the raw response.
+func (s *Server) sendClaudeMessagesUpstream(r *http.Request, provider domain.Provider, body []byte) (*http.Response, error) {
 	isOAuth := provider.AuthType == domain.AuthTypeClaudeOAuth
 
 	var request *http.Request
@@ -3634,7 +3714,7 @@ func (s *Server) proxyClaudeMessages(w http.ResponseWriter, r *http.Request, pro
 		neededRefresh := provider.ClaudeOAuth != nil && claudeTokenNeedsRefresh(provider.ClaudeOAuth)
 		refreshed, refreshErr := s.ensureFreshClaudeToken(provider)
 		if refreshErr != nil {
-			return 0, TokenUsage{}, nil, refreshErr
+			return nil, refreshErr
 		}
 		if neededRefresh {
 			markTimingFlag(r.Context(), timingFlagOAuthRefresh)
@@ -3643,7 +3723,7 @@ func (s *Server) proxyClaudeMessages(w http.ResponseWriter, r *http.Request, pro
 		provider = refreshed
 		request, _, err = buildClaudeOAuthRequest(r.Context(), provider, body, r.Header.Get("anthropic-beta"), true, claudeMessagesURL)
 		if err != nil {
-			return 0, TokenUsage{}, nil, err
+			return nil, err
 		}
 		request.Header.Set("Accept", r.Header.Get("Accept"))
 	} else {
@@ -3653,7 +3733,7 @@ func (s *Server) proxyClaudeMessages(w http.ResponseWriter, r *http.Request, pro
 		}
 		request, err = http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
 		if err != nil {
-			return 0, TokenUsage{}, nil, err
+			return nil, err
 		}
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("Accept", r.Header.Get("Accept"))
@@ -3661,12 +3741,43 @@ func (s *Server) proxyClaudeMessages(w http.ResponseWriter, r *http.Request, pro
 		applyProviderAuth(request, provider, r.Header.Get("Authorization"))
 	}
 
-	response, err := doHTTPWithTiming(r.Context(), &http.Client{Timeout: 0}, request)
-	if err != nil {
-		return 0, TokenUsage{}, nil, err
+	return doHTTPWithTiming(r.Context(), &http.Client{Timeout: 0}, request)
+}
+
+// maybeRectifyClaudeThinking inspects a 400 response for the thinking-signature
+// error family; if matched, it strips historical thinking blocks / signatures
+// from the request and retries once against the same provider. It returns the
+// retry response (and true) when a retry was actually issued; otherwise it
+// rebuilds the original 400 response body so the caller can forward it intact.
+func (s *Server) maybeRectifyClaudeThinking(r *http.Request, provider domain.Provider, body []byte, response *http.Response) (*http.Response, bool) {
+	errBody, readErr := io.ReadAll(response.Body)
+	response.Body.Close()
+	// Always restore a readable body on the original response for the no-retry paths.
+	response.Body = io.NopCloser(bytes.NewReader(errBody))
+	if readErr != nil {
+		return response, false
 	}
-	defer response.Body.Close()
-	return writePassThroughResponse(w, response, requestBodyWantsStream(body), ParseClaudeUsage)
+	if !shouldRectifyThinkingSignature(errBody) {
+		return response, false
+	}
+	rectifiedBody, result := rectifyClaudeThinkingBody(body)
+	if !result.applied {
+		s.logs.AddApp("warn", "thinking rectifier matched but nothing to strip", fmt.Sprintf("provider=%s", provider.ID))
+		return response, false
+	}
+	s.logs.AddApp("info", "thinking signature rectifier retrying", fmt.Sprintf(
+		"provider=%s removed_thinking=%d removed_redacted=%d removed_sig=%d top_level=%t",
+		provider.ID, result.removedThinkingBlocks, result.removedRedactedThinkingBlocks,
+		result.removedSignatureFields, result.removedTopLevelThinking))
+	markTimingFlag(r.Context(), timingFlagThinkingRectify)
+	retryResp, retryErr := s.sendClaudeMessagesUpstream(r, provider, rectifiedBody)
+	if retryErr != nil {
+		s.logs.AddApp("warn", "thinking rectifier retry transport error", retryErr.Error())
+		dumpThinkingRectify(provider.ID, body, rectifiedBody, errBody, nil, retryErr, result)
+		return response, false
+	}
+	dumpThinkingRectify(provider.ID, body, rectifiedBody, errBody, retryResp, nil, result)
+	return retryResp, true
 }
 
 func (s *Server) doClaudeProviderRequest(ctx context.Context, r *http.Request, provider domain.Provider, body []byte, accept string) (*http.Response, error) {
@@ -3713,8 +3824,10 @@ func (s *Server) doClaudeProviderRequest(ctx context.Context, r *http.Request, p
 
 func (s *Server) proxyClaudeToOpenAIChat(w http.ResponseWriter, r *http.Request, provider domain.Provider, model string, openAIReq map[string]any, skipIncomingAuth bool) (int, TokenUsage, []byte, error) {
 	_ = skipIncomingAuth
+	// 确保转换与 max_tokens 预算使用 Provider 映射后的实际上游模型，而非客户端请求名。
+	model = applyProviderModelMapping(provider, model)
 	clientToolNames := extractOpenAIToolNames(openAIReq)
-	claudeReq, err := openAIChatToClaudeRequest(openAIReq, model)
+	claudeReq, err := openAIChatToClaudeRequest(openAIReq, model, maxOutputTokensOverrideFrom(r.Context()))
 	if err != nil {
 		return 0, TokenUsage{}, nil, err
 	}

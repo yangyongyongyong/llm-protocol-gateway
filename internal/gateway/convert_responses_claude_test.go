@@ -16,7 +16,7 @@ func TestResponsesToClaudeRequestDirectBasic(t *testing.T) {
 		"max_output_tokens": float64(1024),
 		"reasoning":         map[string]any{"effort": "high"},
 	}
-	claudeReq, err := responsesToClaudeRequestDirect(responsesReq, "claude-sonnet-5")
+	claudeReq, err := responsesToClaudeRequestDirect(responsesReq, "claude-sonnet-5", 0)
 	if err != nil {
 		t.Fatalf("convert: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestClaudeToResponsesDirectThinkingRoundTrip(t *testing.T) {
 		"model": "claude-sonnet-5",
 		"input": []any{reasoning, map[string]any{"type": "message", "role": "user", "content": "next"}},
 	}
-	claudeReq, err := responsesToClaudeRequestDirect(replayReq, "claude-sonnet-5")
+	claudeReq, err := responsesToClaudeRequestDirect(replayReq, "claude-sonnet-5", 0)
 	if err != nil {
 		t.Fatalf("replay convert: %v", err)
 	}

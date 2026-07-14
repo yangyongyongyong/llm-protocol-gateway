@@ -53,6 +53,9 @@ func (s *Store) ApplyUsageDelta(delta monitor.UsagePersistDelta) error {
 	if err := upsertUsageBucket(tx, delta.Day, "provider", delta.ProviderID, "", delta, false); err != nil {
 		return err
 	}
+	if err := upsertUsageBucket(tx, delta.Day, "user", delta.UserID, "", delta, false); err != nil {
+		return err
+	}
 	if delta.Model != "" {
 		if err := upsertUsageBucket(tx, delta.Day, "model", delta.Model, "", delta, false); err != nil {
 			return err
@@ -149,6 +152,7 @@ func (s *Store) LoadUsageSince(since time.Time) (map[string]monitor.UsageDayBuck
 				ByAPIKey:   make(map[string]monitor.APIKeyDayStats),
 				ByProvider: make(map[string]monitor.ProviderDayStats),
 				ByModel:    make(map[string]monitor.ModelDayStats),
+				ByUser:     make(map[string]monitor.UserDayStats),
 			}
 		}
 		stats := monitor.APIKeyDayStats{
@@ -182,6 +186,14 @@ func (s *Store) LoadUsageSince(since time.Time) (map[string]monitor.UsageDayBuck
 		case "model":
 			dayBuckets.ByModel[bucketID] = monitor.ModelDayStats{
 				Model:        bucketID,
+				RequestCount: reqCount,
+				InputTokens:  inTok,
+				OutputTokens: outTok,
+				CacheTokens:  cacheTok,
+			}
+		case "user":
+			dayBuckets.ByUser[bucketID] = monitor.UserDayStats{
+				UserID:       bucketID,
 				RequestCount: reqCount,
 				InputTokens:  inTok,
 				OutputTokens: outTok,

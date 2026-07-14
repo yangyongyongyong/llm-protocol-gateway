@@ -68,3 +68,12 @@ func TestResolveModelContextLengthGLM(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultClaudeMaxTokens(t *testing.T) {
+	if got := defaultClaudeMaxTokens("claude-fable-5"); got != 128_000 {
+		t.Fatalf("claude-fable-5: got %d want 128000", got)
+	}
+	if got := defaultClaudeMaxTokens("claude-haiku-4-5-20251001"); got != 64_000 {
+		t.Fatalf("haiku: got %d want 64000", got)
+	}
+}

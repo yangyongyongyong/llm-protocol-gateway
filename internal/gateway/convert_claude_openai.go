@@ -174,7 +174,7 @@ func claudeSystemValueFromBlocks(blocks []any) any {
 
 // openAIChatToClaudeRequest converts an OpenAI Chat Completions request body to
 // an Anthropic Messages API request, preserving cache_control on content blocks.
-func openAIChatToClaudeRequest(openAIReq map[string]any, model string) (map[string]any, error) {
+func openAIChatToClaudeRequest(openAIReq map[string]any, model string, maxTokensOverride int) (map[string]any, error) {
 	claudeReq := map[string]any{"model": model}
 	rawMessages, ok := openAIReq["messages"].([]any)
 	if !ok {
@@ -190,13 +190,10 @@ func openAIChatToClaudeRequest(openAIReq map[string]any, model string) (map[stri
 		claudeReq["system"] = systemValue
 	}
 
-	if maxTokens, exists := openAIReq["max_tokens"]; exists {
-		claudeReq["max_tokens"] = maxTokens
-	} else if maxTokens, exists := openAIReq["max_completion_tokens"]; exists {
-		claudeReq["max_tokens"] = maxTokens
-	} else {
-		claudeReq["max_tokens"] = 4096
-	}
+	// Anthropic 要求必填 max_tokens。预算必须按「实际上游模型」计算（本函数的
+	// model 参数），不能看客户端 body 里的 model / max_tokens：客户端常按别名或
+	// 错误目录写成 4096，会把长 agent 截断。密钥级覆盖 >0 时优先使用。
+	claudeReq["max_tokens"] = effectiveClaudeMaxTokens(model, maxTokensOverride)
 	if stream, ok := openAIReq["stream"].(bool); ok && stream {
 		claudeReq["stream"] = true
 	} else {

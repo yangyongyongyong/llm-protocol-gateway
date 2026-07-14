@@ -145,9 +145,11 @@ html[data-theme="dark"] .slate { color: #cbd5e1; }
 .selfcheck-provider-list { display: grid; gap: 8px; margin-top: 10px; }
 .selfcheck-provider-item { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 12px; border: 1px solid var(--border); background: var(--surface-strong); color: var(--text); }
 .selfcheck-provider-item span { color: var(--text); }
-.selfcheck-header, .selfcheck-row { display: grid; grid-template-columns: minmax(110px, 1.1fr) 84px 84px 96px minmax(120px, 1.2fr) 60px 60px 80px minmax(140px, 1.5fr) 72px; gap: 10px; align-items: center; }
+.selfcheck-header, .selfcheck-row { display: grid; grid-template-columns: minmax(132px, 0.95fr) minmax(100px, 1fr) 78px 78px 90px minmax(110px, 1.1fr) 56px 56px 72px minmax(120px, 1.3fr) 118px; gap: 10px; align-items: center; }
 .selfcheck-header { padding: 10px 14px; border-radius: 14px; background: var(--surface-strong); color: var(--muted); font-size: 12px; font-weight: 800; }
 .selfcheck-row { padding: 12px 14px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); color: var(--text); font-size: 13px; }
+.selfcheck-time { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.selfcheck-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .selfcheck-preview, .selfcheck-model { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; }
 .selfcheck-model { color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
 .usage-charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; margin-top: 16px; }
@@ -540,7 +542,7 @@ html[data-theme="dark"] .api-key-client-config-actions .client-config-btn {
 .log-row.error { background: rgba(239, 68, 68, 0.06); }
 .log-table { display: grid; gap: 8px; margin-top: 12px; width: 100%; min-width: 0; }
 .log-header, .log-row-main { display: grid; grid-template-columns: 78px 70px 92px minmax(0, 0.75fr) minmax(0, 0.9fr) minmax(0, 1.1fr) 68px 52px; gap: 10px; align-items: center; min-width: 0; }
-.traffic-log-header, .traffic-log-row { grid-template-columns: 120px 64px 56px minmax(0, 0.6fr) minmax(0, 0.5fr) minmax(0, 0.65fr) minmax(0, 0.65fr) minmax(0, 0.9fr) 60px 60px 52px; }
+.traffic-log-header, .traffic-log-row { grid-template-columns: 120px 64px 56px minmax(0, 0.6fr) minmax(0, 0.5fr) minmax(0, 0.5fr) minmax(0, 0.65fr) minmax(0, 0.65fr) minmax(0, 0.9fr) 60px 60px 52px; }
 .log-ip { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 11px; color: var(--muted); }
 .log-provider { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font-size: 12px; font-weight: 700; }
 .log-header { padding: 0 12px 2px; color: var(--subtle); font-size: 11px; font-weight: 780; letter-spacing: 0.03em; }
@@ -548,6 +550,7 @@ html[data-theme="dark"] .api-key-client-config-actions .client-config-btn {
 .log-row-sub { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); color: var(--muted); font-size: 11px; }
 .traffic-panel { width: 100%; }
 .log-key { color: #475569; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.log-user { color: var(--text); font-weight: 600; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .log-detail-placeholder { width: 56px; }
 .log-time, .log-model, .log-latency, .log-token { font-family: var(--mono); color: var(--muted); }
 .log-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); }

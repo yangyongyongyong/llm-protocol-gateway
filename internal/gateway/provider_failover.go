@@ -196,16 +196,16 @@ func (s *Server) executeProtocolFlowWithFailover(
 	skipIncomingAuth bool,
 	matchedKey domain.APIKey,
 	gatewayKeyMatched bool,
-) (int, TokenUsage, []byte, domain.RouteDecision, error) {
+) (int, TokenUsage, []byte, domain.RouteDecision, string, error) {
 	if !gatewayKeyMatched {
 		status, usage, body, err := s.executeProtocolFlow(w, r, route, decision, model, req, clientProtocol, skipIncomingAuth)
-		return status, usage, body, decision, err
+		return status, usage, body, decision, model, err
 	}
 
 	chain := apiKeyProviderChain(route.ProviderID, matchedKey.FallbackProviderIDs)
 	if len(chain) == 0 {
 		status, usage, body, err := s.executeProtocolFlow(w, r, route, decision, model, req, clientProtocol, skipIncomingAuth)
-		return status, usage, body, decision, err
+		return status, usage, body, decision, model, err
 	}
 	start := apiKeyEffectiveProviderIndex(matchedKey.ActiveProviderID, chain)
 	if start < 0 || start >= len(chain) {
@@ -217,6 +217,7 @@ func (s *Server) executeProtocolFlowWithFailover(
 	var lastBody []byte
 	var lastErr error
 	var lastDecision domain.RouteDecision = decision
+	lastModel := model
 	requestModel, _ := req["model"].(string)
 
 	for i := start; i < len(chain); i++ {
@@ -251,7 +252,7 @@ func (s *Server) executeProtocolFlowWithFailover(
 		writer := newFailoverResponseWriter(w, canDefer)
 		status, usage, body, execErr := s.executeProtocolFlow(writer, r, route, attemptDecision, attemptModel, attemptReq, clientProtocol, skipIncomingAuth)
 		if execErr != nil {
-			lastStatus, lastUsage, lastBody, lastErr = status, usage, nil, execErr
+			lastStatus, lastUsage, lastBody, lastErr, lastModel = status, usage, nil, execErr, attemptModel
 			if canDefer && shouldFailoverProvider(0, nil, execErr) {
 				writer.Discard()
 				markTimingFlag(r.Context(), timingFlagFailoverRetry)
@@ -261,15 +262,20 @@ func (s *Server) executeProtocolFlowWithFailover(
 				s.logs.AddApp("warn", "provider failover after transport error", fmt.Sprintf("key=%s from=%s err=%s", matchedKey.ID, providerID, execErr.Error()))
 				continue
 			}
-			writer.FlushError()
-			return status, usage, body, attemptDecision, execErr
+			// 尚未向客户端提交任何字节时交给上层写错误响应（例如空流重试耗尽）。
+			if !writer.passthrough && writer.buf.Len() == 0 && writer.status == 0 {
+				writer.Discard()
+			} else {
+				writer.FlushError()
+			}
+			return status, usage, body, attemptDecision, attemptModel, execErr
 		}
 
 		respBody := body
 		if len(respBody) == 0 {
 			respBody = writer.BufferedBody()
 		}
-		lastStatus, lastUsage, lastBody, lastErr = status, usage, respBody, nil
+		lastStatus, lastUsage, lastBody, lastErr, lastModel = status, usage, respBody, nil, attemptModel
 
 		if canDefer && shouldFailoverProvider(status, respBody, nil) {
 			writer.Discard()
@@ -297,13 +303,13 @@ func (s *Server) executeProtocolFlowWithFailover(
 		if !writer.passthrough {
 			writer.FlushError()
 		}
-		return status, usage, respBody, attemptDecision, nil
+		return status, usage, respBody, attemptDecision, attemptModel, nil
 	}
 
 	if lastErr != nil {
-		return lastStatus, lastUsage, lastBody, lastDecision, lastErr
+		return lastStatus, lastUsage, lastBody, lastDecision, lastModel, lastErr
 	}
-	return lastStatus, lastUsage, lastBody, lastDecision, nil
+	return lastStatus, lastUsage, lastBody, lastDecision, lastModel, nil
 }
 
 func cloneRequestMap(req map[string]any) map[string]any {
@@ -317,11 +323,16 @@ func cloneRequestMap(req map[string]any) map[string]any {
 	return out
 }
 
-// StartProviderFailoverRecovery hourly probes higher-priority providers for
-// keys stuck on a fallback, and switches back when one becomes available.
+// providerFailoverRecoveryInterval 控制回切探测周期：前置 Provider 恢复后，
+// 最多等待一个周期即可自动切回，避免长时间滞留在备用 Provider。
+const providerFailoverRecoveryInterval = 2 * time.Minute
+
+// StartProviderFailoverRecovery periodically probes higher-priority providers
+// for keys stuck on a fallback, and switches back when one becomes available.
 func (s *Server) StartProviderFailoverRecovery(ctx context.Context) {
 	go func() {
-		timer := time.NewTimer(3 * time.Minute)
+		// 启动后先等一小段，避开冷启动阶段的探测抖动。
+		timer := time.NewTimer(30 * time.Second)
 		defer timer.Stop()
 		for {
 			select {
@@ -329,7 +340,7 @@ func (s *Server) StartProviderFailoverRecovery(ctx context.Context) {
 				return
 			case <-timer.C:
 				s.recoverAPIKeyPreferredProviders(context.Background())
-				timer.Reset(time.Hour)
+				timer.Reset(providerFailoverRecoveryInterval)
 			}
 		}
 	}()
@@ -337,6 +348,8 @@ func (s *Server) StartProviderFailoverRecovery(ctx context.Context) {
 
 func (s *Server) recoverAPIKeyPreferredProviders(ctx context.Context) {
 	keys := s.router.State().APIKeys
+	// 同一周期内每个 Provider 只探测一次，多个 Key 共用同一前置 Provider 时复用结果。
+	probeCache := make(map[string]bool)
 	for _, key := range keys {
 		if !key.Enabled {
 			continue
@@ -351,15 +364,22 @@ func (s *Server) recoverAPIKeyPreferredProviders(ctx context.Context) {
 		}
 		activeIdx := apiKeyEffectiveProviderIndex(key.ActiveProviderID, chain)
 		if activeIdx <= 0 {
+			// 未处于备用状态：无需探测，零开销跳过。
 			continue
 		}
 		for i := 0; i < activeIdx; i++ {
 			providerID := chain[i]
-			provider, err := s.router.ProviderByID(providerID)
-			if err != nil {
-				continue
+			available, cached := probeCache[providerID]
+			if !cached {
+				provider, err := s.router.ProviderByID(providerID)
+				if err != nil {
+					probeCache[providerID] = false
+					continue
+				}
+				available = s.probeProviderAvailable(ctx, provider)
+				probeCache[providerID] = available
 			}
-			if !s.probeProviderAvailable(ctx, provider) {
+			if !available {
 				continue
 			}
 			desiredActive := ""

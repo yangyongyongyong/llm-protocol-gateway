@@ -18,6 +18,7 @@ type UsageEvent struct {
 	Time         time.Time
 	APIKeyID     string
 	APIKeyName   string
+	UserID       string
 	ProviderID   string
 	Model        string
 	Status       int
@@ -33,6 +34,7 @@ type usageDayStats struct {
 	byAPIKey     map[string]*APIKeyDayStats
 	byProvider   map[string]*ProviderDayStats
 	byModel      map[string]*ModelDayStats
+	byUser       map[string]*UserDayStats
 	status2xx    int64
 	status4xx    int64
 	status5xx    int64
@@ -48,6 +50,7 @@ func newUsageDayStats() *usageDayStats {
 		byAPIKey:   make(map[string]*APIKeyDayStats),
 		byProvider: make(map[string]*ProviderDayStats),
 		byModel:    make(map[string]*ModelDayStats),
+		byUser:     make(map[string]*UserDayStats),
 	}
 }
 
@@ -85,6 +88,7 @@ func (s *Store) applyUsageEventLocked(event UsageEvent) UsagePersistDelta {
 	dayKey := event.Time.Local().Format("2006-01-02")
 	keyID, keyName := normalizeAPIKeyForStats(event.APIKeyID, event.APIKeyName)
 	providerID := normalizeProviderForStats(event.ProviderID)
+	userID := normalizeUserForStats(event.UserID)
 	inputTokens, cacheTokens := normalizeUsageTokens(event.InputTokens, event.CacheTokens)
 
 	s.mu.Lock()
@@ -121,6 +125,16 @@ func (s *Store) applyUsageEventLocked(event UsageEvent) UsagePersistDelta {
 	providerStats.InputTokens += inputTokens
 	providerStats.OutputTokens += event.OutputTokens
 	providerStats.CacheTokens += cacheTokens
+
+	userStats, ok := day.byUser[userID]
+	if !ok {
+		userStats = &UserDayStats{UserID: userID}
+		day.byUser[userID] = userStats
+	}
+	userStats.RequestCount++
+	userStats.InputTokens += inputTokens
+	userStats.OutputTokens += event.OutputTokens
+	userStats.CacheTokens += cacheTokens
 
 	if model, ok := NormalizeModelForStats(event.Model); ok {
 		modelStats, ok := day.byModel[model]
@@ -179,6 +193,7 @@ func (s *Store) applyUsageEventLocked(event UsageEvent) UsagePersistDelta {
 		Day:          dayKey,
 		KeyID:        keyID,
 		KeyName:      keyName,
+		UserID:       userID,
 		ProviderID:   providerID,
 		Model:        modelForBucket,
 		StatusClass:  statusBucket(event.Status),
@@ -245,6 +260,15 @@ func normalizeProviderForStats(id string) string {
 	return strings.TrimSpace(id)
 }
 
+// normalizeUserForStats keeps the owner user id stable for bucketing. Empty
+// means the request had no owner-bound key (anonymous / local test).
+func normalizeUserForStats(id string) string {
+	if strings.TrimSpace(id) == "" {
+		return "_anonymous"
+	}
+	return strings.TrimSpace(id)
+}
+
 func statusBucket(status int) string {
 	switch {
 	case status >= 200 && status < 300:
@@ -265,13 +289,14 @@ func (s *Store) periodStatsSince(since time.Time, periodLabel string) PeriodStat
 }
 
 func (s *Store) periodStatsSinceLocked(since time.Time, periodLabel string) PeriodStatsSnapshot {
-	total, byAPIKey, byProvider, byModel := mergeUsageDays(s.usageByDay, since, time.Time{})
+	total, byAPIKey, byProvider, byModel, byUser := mergeUsageDays(s.usageByDay, since, time.Time{})
 	return PeriodStatsSnapshot{
 		Period:     periodLabel,
 		Total:      total,
 		ByAPIKey:   sortAPIKeyStats(byAPIKey),
 		ByProvider: sortProviderStats(byProvider),
 		ByModel:    sortModelDayStats(byModel),
+		ByUser:     sortUserStats(byUser),
 	}
 }
 
@@ -282,13 +307,14 @@ func (s *Store) periodStatsInRange(from, to time.Time, periodLabel string) Perio
 }
 
 func (s *Store) periodStatsInRangeLocked(from, to time.Time, periodLabel string) PeriodStatsSnapshot {
-	total, byAPIKey, byProvider, byModel := mergeUsageDays(s.usageByDay, from, to)
+	total, byAPIKey, byProvider, byModel, byUser := mergeUsageDays(s.usageByDay, from, to)
 	return PeriodStatsSnapshot{
 		Period:     periodLabel,
 		Total:      total,
 		ByAPIKey:   sortAPIKeyStats(byAPIKey),
 		ByProvider: sortProviderStats(byProvider),
 		ByModel:    sortModelDayStats(byModel),
+		ByUser:     sortUserStats(byUser),
 	}
 }
 
@@ -301,7 +327,7 @@ func (s *Store) todayStatsFromCounters(now time.Time) TodayStatsSnapshot {
 }
 
 func (s *Store) todayStatsFromCountersLocked(dayStart time.Time) TodayStatsSnapshot {
-	total, byAPIKey, byProvider, byModel := mergeUsageDays(s.usageByDay, dayStart, time.Time{})
+	total, byAPIKey, byProvider, byModel, byUser := mergeUsageDays(s.usageByDay, dayStart, time.Time{})
 	var lastRequest *RequestLog
 	if s.lastUsageRequest != nil && !s.lastUsageRequest.Time.Before(dayStart) {
 		copied := *s.lastUsageRequest
@@ -314,6 +340,7 @@ func (s *Store) todayStatsFromCountersLocked(dayStart time.Time) TodayStatsSnaps
 		ByAPIKey:    sortAPIKeyStats(byAPIKey),
 		ByProvider:  sortProviderStats(byProvider),
 		ByModel:     sortModelDayStats(byModel),
+		ByUser:      sortUserStats(byUser),
 	}
 }
 
@@ -398,7 +425,7 @@ func (s *Store) statusStatsInRangeLocked(from, to time.Time) []StatusBucketStats
 	return out
 }
 
-func mergeUsageDays(byDay map[string]*usageDayStats, from, to time.Time) (APIKeyDayStats, map[string]*APIKeyDayStats, map[string]*ProviderDayStats, map[string]*ModelDayStats) {
+func mergeUsageDays(byDay map[string]*usageDayStats, from, to time.Time) (APIKeyDayStats, map[string]*APIKeyDayStats, map[string]*ProviderDayStats, map[string]*ModelDayStats, map[string]*UserDayStats) {
 	loc := from.Location()
 	if to.IsZero() {
 		to = time.Date(9999, 1, 1, 0, 0, 0, 0, loc)
@@ -410,6 +437,7 @@ func mergeUsageDays(byDay map[string]*usageDayStats, from, to time.Time) (APIKey
 	byAPIKey := make(map[string]*APIKeyDayStats)
 	byProvider := make(map[string]*ProviderDayStats)
 	byModel := make(map[string]*ModelDayStats)
+	byUser := make(map[string]*UserDayStats)
 
 	for dayKey, dayStats := range byDay {
 		day, err := time.ParseInLocation("2006-01-02", dayKey, loc)
@@ -460,8 +488,21 @@ func mergeUsageDays(byDay map[string]*usageDayStats, from, to time.Time) (APIKey
 			out.OutputTokens += stats.OutputTokens
 			out.CacheTokens += stats.CacheTokens
 		}
+		for id, stats := range dayStats.byUser {
+			out, ok := byUser[id]
+			if !ok {
+				copied := *stats
+				out = &copied
+				byUser[id] = out
+				continue
+			}
+			out.RequestCount += stats.RequestCount
+			out.InputTokens += stats.InputTokens
+			out.OutputTokens += stats.OutputTokens
+			out.CacheTokens += stats.CacheTokens
+		}
 	}
-	return total, byAPIKey, byProvider, byModel
+	return total, byAPIKey, byProvider, byModel, byUser
 }
 
 func sortAPIKeyStats(byKey map[string]*APIKeyDayStats) []APIKeyDayStats {
@@ -524,6 +565,20 @@ func sortProviderStats(byProvider map[string]*ProviderDayStats) []ProviderDaySta
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].RequestCount == out[j].RequestCount {
 			return out[i].ProviderID < out[j].ProviderID
+		}
+		return out[i].RequestCount > out[j].RequestCount
+	})
+	return out
+}
+
+func sortUserStats(byUser map[string]*UserDayStats) []UserDayStats {
+	out := make([]UserDayStats, 0, len(byUser))
+	for _, stats := range byUser {
+		out = append(out, *stats)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].RequestCount == out[j].RequestCount {
+			return out[i].UserID < out[j].UserID
 		}
 		return out[i].RequestCount > out[j].RequestCount
 	})

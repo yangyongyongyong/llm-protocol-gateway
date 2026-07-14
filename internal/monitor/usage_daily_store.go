@@ -7,6 +7,7 @@ type UsagePersistDelta struct {
 	Day          string
 	KeyID        string
 	KeyName      string
+	UserID       string
 	ProviderID   string
 	Model        string // empty when model bucket should not increment
 	StatusClass  string // 2xx | 4xx | 5xx | other
@@ -24,6 +25,7 @@ type UsageDayBuckets struct {
 	ByAPIKey     map[string]APIKeyDayStats
 	ByProvider   map[string]ProviderDayStats
 	ByModel      map[string]ModelDayStats
+	ByUser       map[string]UserDayStats
 	Status2xx    int64
 	Status4xx    int64
 	Status5xx    int64

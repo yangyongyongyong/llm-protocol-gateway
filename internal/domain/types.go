@@ -154,11 +154,12 @@ const (
 )
 
 type Model struct {
-	ID            string   `json:"id"`
-	ProviderID    string   `json:"providerId"`
-	Protocol      Protocol `json:"protocol"`
-	ContextLength int      `json:"contextLength"`
-	InMenu        bool     `json:"inMenu"`
+	ID              string   `json:"id"`
+	ProviderID      string   `json:"providerId"`
+	Protocol        Protocol `json:"protocol"`
+	ContextLength   int      `json:"contextLength"`
+	MaxOutputTokens int      `json:"maxOutputTokens,omitempty"`
+	InMenu          bool     `json:"inMenu"`
 }
 
 type OutputEndpoint struct {
@@ -193,6 +194,9 @@ type APIKey struct {
 	ModelOverride         string            `json:"modelOverride,omitempty"`
 	ModelAliases          map[string]string `json:"modelAliases,omitempty"`
 	ThinkingDepthOverride string            `json:"thinkingDepthOverride,omitempty"`
+	// MaxOutputTokens 可选覆盖上游 max_tokens / max_output_tokens。
+	// 0 表示按实际上游模型自动解析；>0 时优先使用该值（用于新模型或临时调高/压低）。
+	MaxOutputTokens int `json:"maxOutputTokens,omitempty"`
 	// StreamEnabled controls whether requests authenticated with this API key
 	// may use SSE streaming. Default true; when false, stream:true requests are
 	// rejected. Bound to the API key (not the output endpoint) so streaming can
@@ -234,6 +238,7 @@ type KeyProfile struct {
 	ModelOverride          string            `json:"modelOverride,omitempty"`
 	ModelAliases           map[string]string `json:"modelAliases,omitempty"`
 	ThinkingDepthOverride  string            `json:"thinkingDepthOverride,omitempty"`
+	MaxOutputTokens        int               `json:"maxOutputTokens,omitempty"`
 	FallbackProviderIDs    []string          `json:"fallbackProviderIds,omitempty"`
 	FallbackModelOverrides map[string]string `json:"fallbackModelOverrides,omitempty"`
 	StreamEnabled          bool              `json:"streamEnabled"`

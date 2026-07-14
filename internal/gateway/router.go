@@ -372,17 +372,17 @@ func normalizeProvider(provider *domain.Provider) {
 	provider.RequestAdapter = normalizeRequestAdapter(provider.RequestAdapter)
 	if len(provider.Models) == 0 && provider.DefaultModel != "" {
 		provider.Models = []domain.Model{{
-			ID:            provider.DefaultModel,
-			ProviderID:    provider.ID,
-			Protocol:      provider.Protocol,
-			ContextLength: resolveModelContextLength(provider.DefaultModel, 0),
-			InMenu:        true,
+			ID:         provider.DefaultModel,
+			ProviderID: provider.ID,
+			Protocol:   provider.Protocol,
+			InMenu:     true,
 		}}
+		fillModelTokenBudgets(&provider.Models[0])
 	}
 	for index := range provider.Models {
 		provider.Models[index].ProviderID = provider.ID
 		provider.Models[index].Protocol = provider.Protocol
-		provider.Models[index].ContextLength = resolveModelContextLength(provider.Models[index].ID, provider.Models[index].ContextLength)
+		fillModelTokenBudgets(&provider.Models[index])
 	}
 }
 
@@ -510,6 +510,7 @@ func (r *Router) AddAPIKey(key domain.APIKey) (domain.APIKey, error) {
 	key.ModelOverride = strings.TrimSpace(key.ModelOverride)
 	key.ModelAliases = normalizeModelAliases(key.ModelAliases)
 	key.ThinkingDepthOverride = strings.TrimSpace(key.ThinkingDepthOverride)
+	key.MaxOutputTokens = normalizeMaxOutputTokens(key.MaxOutputTokens)
 	key.FallbackProviderIDs = normalizeFallbackProviderIDs(key.FallbackProviderIDs, "")
 	key.FallbackModelOverrides = normalizeFallbackModelOverrides(key.FallbackProviderIDs, key.FallbackModelOverrides)
 	if err := validateFallbackModelOverrides(key.FallbackProviderIDs, key.FallbackModelOverrides); err != nil {
@@ -565,6 +566,7 @@ func (r *Router) UpdateAPIKey(keyID string, patch domain.APIKey) (domain.APIKey,
 			updated.ModelAliases = normalizeModelAliases(patch.ModelAliases)
 		}
 		updated.ThinkingDepthOverride = strings.TrimSpace(patch.ThinkingDepthOverride)
+		updated.MaxOutputTokens = normalizeMaxOutputTokens(patch.MaxOutputTokens)
 		updated.Enabled = patch.Enabled
 		updated.StreamEnabled = patch.StreamEnabled
 		preferredProviderID := ""
@@ -638,6 +640,7 @@ func keyProfileFromKey(key domain.APIKey, id, name string) domain.KeyProfile {
 		ModelOverride:          key.ModelOverride,
 		ModelAliases:           cloneStringMap(key.ModelAliases),
 		ThinkingDepthOverride:  key.ThinkingDepthOverride,
+		MaxOutputTokens:        key.MaxOutputTokens,
 		FallbackProviderIDs:    cloneStringSlice(key.FallbackProviderIDs),
 		FallbackModelOverrides: cloneStringMap(key.FallbackModelOverrides),
 		StreamEnabled:          key.StreamEnabled,
@@ -742,6 +745,7 @@ func (r *Router) UpdateKeyProfile(keyID, profileID string, profile domain.KeyPro
 		merged.ModelOverride = profile.ModelOverride
 		merged.ModelAliases = profile.ModelAliases
 		merged.ThinkingDepthOverride = profile.ThinkingDepthOverride
+		merged.MaxOutputTokens = profile.MaxOutputTokens
 		merged.FallbackProviderIDs = profile.FallbackProviderIDs
 		merged.FallbackModelOverrides = profile.FallbackModelOverrides
 		merged.StreamEnabled = profile.StreamEnabled
@@ -807,6 +811,7 @@ func (r *Router) normalizeProfileLocked(profile domain.KeyProfile) domain.KeyPro
 	profile.ModelOverride = strings.TrimSpace(profile.ModelOverride)
 	profile.ModelAliases = normalizeModelAliases(profile.ModelAliases)
 	profile.ThinkingDepthOverride = strings.TrimSpace(profile.ThinkingDepthOverride)
+	profile.MaxOutputTokens = normalizeMaxOutputTokens(profile.MaxOutputTokens)
 	preferredProviderID := ""
 	if route, ok := r.routeLocked(profile.RouteID); ok {
 		preferredProviderID = route.ProviderID
@@ -828,6 +833,7 @@ func (r *Router) activateProfileLocked(key *domain.APIKey, profileID string) {
 	key.ModelOverride = strings.TrimSpace(profile.ModelOverride)
 	key.ModelAliases = normalizeModelAliases(profile.ModelAliases)
 	key.ThinkingDepthOverride = strings.TrimSpace(profile.ThinkingDepthOverride)
+	key.MaxOutputTokens = normalizeMaxOutputTokens(profile.MaxOutputTokens)
 	preferredProviderID := ""
 	if route, ok := r.routeLocked(key.RouteID); ok {
 		preferredProviderID = route.ProviderID
@@ -1141,7 +1147,7 @@ func (r *Router) UpdateProviderModels(providerID string, models []domain.Model, 
 			models[modelIndex].ProviderID = providerID
 			models[modelIndex].Protocol = r.state.Providers[index].Protocol
 			models[modelIndex].InMenu = true
-			models[modelIndex].ContextLength = resolveModelContextLength(models[modelIndex].ID, models[modelIndex].ContextLength)
+			fillModelTokenBudgets(&models[modelIndex])
 		}
 		r.state.Providers[index].Models = models
 		if strings.TrimSpace(healthStatus) != "" {
@@ -1330,10 +1336,7 @@ func rebuildModels(state *domain.GatewayState) {
 	models := make([]domain.Model, 0)
 	for pIndex := range state.Providers {
 		for mIndex := range state.Providers[pIndex].Models {
-			state.Providers[pIndex].Models[mIndex].ContextLength = resolveModelContextLength(
-				state.Providers[pIndex].Models[mIndex].ID,
-				state.Providers[pIndex].Models[mIndex].ContextLength,
-			)
+			fillModelTokenBudgets(&state.Providers[pIndex].Models[mIndex])
 			models = append(models, state.Providers[pIndex].Models[mIndex])
 		}
 	}

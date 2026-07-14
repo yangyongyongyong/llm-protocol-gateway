@@ -40,7 +40,7 @@ func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)")
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_pragma=auto_vacuum(INCREMENTAL)")
 	if err != nil {
 		return nil, err
 	}
@@ -215,6 +215,9 @@ func (s *Store) migrate() error {
 		return fmt.Errorf("migrate: %w", err)
 	}
 	if err := addColumnIfMissing(tx, "api_keys", "active_profile_id", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	if err := addColumnIfMissing(tx, "api_keys", "max_output_tokens", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
 	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS users (
@@ -743,7 +746,7 @@ func decodeKeyProfiles(raw string) []domain.KeyProfile {
 }
 
 func (s *Store) loadAPIKeys() ([]domain.APIKey, error) {
-	rows, err := s.reader().Query(`SELECT id, name, key, route_id, model_override, model_aliases, thinking_depth_override, stream_enabled, fallback_provider_ids, fallback_model_overrides, active_provider_id, owner_user_id, profiles, active_profile_id, enabled, created_at, last_used_at
+	rows, err := s.reader().Query(`SELECT id, name, key, route_id, model_override, model_aliases, thinking_depth_override, max_output_tokens, stream_enabled, fallback_provider_ids, fallback_model_overrides, active_provider_id, owner_user_id, profiles, active_profile_id, enabled, created_at, last_used_at
 		FROM api_keys ORDER BY position, id`)
 	if err != nil {
 		return nil, err
@@ -758,7 +761,7 @@ func (s *Store) loadAPIKeys() ([]domain.APIKey, error) {
 		var fallbackProviderIDs string
 		var fallbackModelOverrides string
 		var profiles string
-		if err := rows.Scan(&k.ID, &k.Name, &k.Key, &k.RouteID, &k.ModelOverride, &modelAliases, &k.ThinkingDepthOverride, &streamEnabled, &fallbackProviderIDs, &fallbackModelOverrides, &k.ActiveProviderID, &k.OwnerUserID, &profiles, &k.ActiveProfileID, &enabled, &k.CreatedAt, &k.LastUsedAt); err != nil {
+		if err := rows.Scan(&k.ID, &k.Name, &k.Key, &k.RouteID, &k.ModelOverride, &modelAliases, &k.ThinkingDepthOverride, &k.MaxOutputTokens, &streamEnabled, &fallbackProviderIDs, &fallbackModelOverrides, &k.ActiveProviderID, &k.OwnerUserID, &profiles, &k.ActiveProfileID, &enabled, &k.CreatedAt, &k.LastUsedAt); err != nil {
 			return nil, err
 		}
 		k.Enabled = enabled != 0
@@ -798,9 +801,9 @@ func (s *Store) CreateAPIKey(key domain.APIKey) error {
 		streamEnabled = 1
 	}
 	_, err := s.db.Exec(`INSERT INTO api_keys
-		(id, name, key, route_id, model_override, model_aliases, thinking_depth_override, stream_enabled, fallback_provider_ids, fallback_model_overrides, active_provider_id, owner_user_id, profiles, active_profile_id, enabled, created_at, last_used_at, position)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		key.ID, key.Name, key.Key, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, streamEnabled, encodeProviderIDList(key.FallbackProviderIDs), encodeFallbackModelOverrides(key.FallbackModelOverrides), strings.TrimSpace(key.ActiveProviderID), strings.TrimSpace(key.OwnerUserID), encodeKeyProfiles(key.Profiles), strings.TrimSpace(key.ActiveProfileID), enabled, key.CreatedAt, key.LastUsedAt, position)
+		(id, name, key, route_id, model_override, model_aliases, thinking_depth_override, max_output_tokens, stream_enabled, fallback_provider_ids, fallback_model_overrides, active_provider_id, owner_user_id, profiles, active_profile_id, enabled, created_at, last_used_at, position)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		key.ID, key.Name, key.Key, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, key.MaxOutputTokens, streamEnabled, encodeProviderIDList(key.FallbackProviderIDs), encodeFallbackModelOverrides(key.FallbackModelOverrides), strings.TrimSpace(key.ActiveProviderID), strings.TrimSpace(key.OwnerUserID), encodeKeyProfiles(key.Profiles), strings.TrimSpace(key.ActiveProfileID), enabled, key.CreatedAt, key.LastUsedAt, position)
 	return err
 }
 
@@ -814,9 +817,9 @@ func (s *Store) UpdateAPIKey(key domain.APIKey) error {
 		streamEnabled = 1
 	}
 	_, err := s.db.Exec(`UPDATE api_keys
-		SET name = ?, route_id = ?, model_override = ?, model_aliases = ?, thinking_depth_override = ?, stream_enabled = ?, fallback_provider_ids = ?, fallback_model_overrides = ?, active_provider_id = ?, owner_user_id = ?, profiles = ?, active_profile_id = ?, enabled = ?
+		SET name = ?, route_id = ?, model_override = ?, model_aliases = ?, thinking_depth_override = ?, max_output_tokens = ?, stream_enabled = ?, fallback_provider_ids = ?, fallback_model_overrides = ?, active_provider_id = ?, owner_user_id = ?, profiles = ?, active_profile_id = ?, enabled = ?
 		WHERE id = ?`,
-		key.Name, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, streamEnabled, encodeProviderIDList(key.FallbackProviderIDs), encodeFallbackModelOverrides(key.FallbackModelOverrides), strings.TrimSpace(key.ActiveProviderID), strings.TrimSpace(key.OwnerUserID), encodeKeyProfiles(key.Profiles), strings.TrimSpace(key.ActiveProfileID), enabled, key.ID)
+		key.Name, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, key.MaxOutputTokens, streamEnabled, encodeProviderIDList(key.FallbackProviderIDs), encodeFallbackModelOverrides(key.FallbackModelOverrides), strings.TrimSpace(key.ActiveProviderID), strings.TrimSpace(key.OwnerUserID), encodeKeyProfiles(key.Profiles), strings.TrimSpace(key.ActiveProfileID), enabled, key.ID)
 	return err
 }
 

@@ -11,6 +11,9 @@ type RequestLog struct {
 	Time             time.Time `json:"time"`
 	APIKeyID         string    `json:"apiKeyId,omitempty"`
 	APIKeyName       string    `json:"apiKeyName,omitempty"`
+	// UserName is a transient display field resolved at query time from the
+	// owning API key's user id (not persisted). Renames reflect immediately.
+	UserName         string    `json:"userName,omitempty"`
 	RouteID          string    `json:"routeId"`
 	ProviderID       string    `json:"providerId"`
 	Model            string    `json:"model"`
@@ -84,6 +87,18 @@ type ProviderDayStats struct {
 	CacheTokens  int64  `json:"cacheTokens"`
 }
 
+// UserDayStats aggregates token/request usage for one owner user id. UserID is
+// stable (keys are bucketed by their OwnerUserID); UserName is resolved for
+// display at query time so renames never corrupt historical aggregates.
+type UserDayStats struct {
+	UserID       string `json:"userId"`
+	UserName     string `json:"userName"`
+	RequestCount int64  `json:"requestCount"`
+	InputTokens  int64  `json:"inputTokens"`
+	OutputTokens int64  `json:"outputTokens"`
+	CacheTokens  int64  `json:"cacheTokens"`
+}
+
 // ModelDayStats aggregates request/token usage for one model id.
 type ModelDayStats struct {
 	Model        string `json:"model"`
@@ -100,6 +115,7 @@ type TodayStatsSnapshot struct {
 	ByAPIKey    []APIKeyDayStats   `json:"byApiKey"`
 	ByProvider  []ProviderDayStats `json:"byProvider"`
 	ByModel     []ModelDayStats    `json:"byModel"`
+	ByUser      []UserDayStats     `json:"byUser,omitempty"`
 }
 
 type PeriodStatsSnapshot struct {
@@ -108,6 +124,7 @@ type PeriodStatsSnapshot struct {
 	ByAPIKey   []APIKeyDayStats   `json:"byApiKey"`
 	ByProvider []ProviderDayStats `json:"byProvider"`
 	ByModel    []ModelDayStats    `json:"byModel"`
+	ByUser     []UserDayStats     `json:"byUser,omitempty"`
 }
 
 type DailyRequestPoint struct {
@@ -196,6 +213,10 @@ func (s *Store) BootstrapUsageDays(days map[string]UsageDayBuckets, last *Reques
 		for id, stats := range buckets.ByModel {
 			copied := stats
 			day.byModel[id] = &copied
+		}
+		for id, stats := range buckets.ByUser {
+			copied := stats
+			day.byUser[id] = &copied
 		}
 		s.usageByDay[dayKey] = day
 	}
