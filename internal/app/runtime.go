@@ -217,6 +217,8 @@ func (rt *Runtime) Start(cfg Config) error {
 	state.WebExposed = rt.webExposed
 	router := gateway.NewRouter(state)
 	server := gateway.NewServer(router, logs, db)
+	// 上次自检若被 kill/重启打断，selfcheck-* 密钥会残留；启动时扫一遍。
+	server.SweepSelfcheckLeftovers()
 	server.SetCursorBridge(cursor.NewBridge(cursor.FindRepoRoot()))
 	server.SetWebExposedChangeHandler(func(enabled bool) error {
 		return rt.SetWebExposed(enabled)

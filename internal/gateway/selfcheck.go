@@ -328,6 +328,7 @@ func (s *Server) handleSelfcheckRetry(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) runSelfcheckJob(job *selfcheckJob, providerIDs []string) {
+	routeIDs := make(map[string]struct{})
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			job.mu.Lock()
@@ -336,6 +337,8 @@ func (s *Server) runSelfcheckJob(job *selfcheckJob, providerIDs []string) {
 			job.FinishedAt = time.Now().UTC().Format(time.RFC3339)
 			job.mu.Unlock()
 		}
+		// 无论成功、失败、panic 或进程即将退出前跑完本函数，都扫掉 selfcheck-* 密钥。
+		s.cleanupSelfcheckArtifacts(routeIDs)
 	}()
 
 	cases := make([]preparedCase, 0, len(providerIDs)*selfcheckCasesPerProvider)
@@ -367,6 +370,9 @@ func (s *Server) runSelfcheckJob(job *selfcheckJob, providerIDs []string) {
 				apiKeyName = key.Name
 				apiKey = key.Key
 				model = m
+			}
+			if routeCreated && routeID != "" {
+				routeIDs[routeID] = struct{}{}
 			}
 			// Each (provider, client) yields two cases: chat + tool call.
 			for _, kind := range []selfcheckCaseKind{selfcheckKindChat, selfcheckKindTool} {
@@ -414,17 +420,6 @@ func (s *Server) runSelfcheckJob(job *selfcheckJob, providerIDs []string) {
 	}
 	wg.Wait()
 
-	// Clean up the transient routes/keys self-check relies on so the API-key list
-	// doesn't accumulate `selfcheck-*` entries. We sweep *all* selfcheck-prefixed
-	// keys (they are always throwaway), plus any routes this run created.
-	routeIDs := make(map[string]struct{})
-	for _, item := range cases {
-		if item.routeCreated && item.routeID != "" {
-			routeIDs[item.routeID] = struct{}{}
-		}
-	}
-	s.cleanupSelfcheckArtifacts(routeIDs)
-
 	job.mu.Lock()
 	job.Status = "done"
 	job.FinishedAt = time.Now().UTC().Format(time.RFC3339)
@@ -462,13 +457,19 @@ func (s *Server) cleanupSelfcheckArtifacts(routeIDs map[string]struct{}) {
 		routeRemoved = true
 		s.logs.AddApp("info", "selfcheck route removed", id)
 	}
-	// Persist deletions. apiKeyStore covers key rows directly; saveState covers
-	// route removals (and key removals when there's no apiKeyStore).
-	if routeRemoved || (keyRemoved && s.apiKeyStore == nil) {
+	// Persist deletions. Always save when anything changed so in-memory/router
+	// snapshots cannot resurrect selfcheck keys after a crash/restart.
+	if keyRemoved || routeRemoved {
 		if err := s.saveState(); err != nil {
 			s.logs.AddApp("warn", "selfcheck cleanup save failed", err.Error())
 		}
 	}
+}
+
+// SweepSelfcheckLeftovers removes any leftover selfcheck-* API keys (and orphan
+// routes created solely for them) after a crash/restart interrupted a prior run.
+func (s *Server) SweepSelfcheckLeftovers() {
+	s.cleanupSelfcheckArtifacts(nil)
 }
 
 func (s *Server) runPreparedSelfcheckCase(

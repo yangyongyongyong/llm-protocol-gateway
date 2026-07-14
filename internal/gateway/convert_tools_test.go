@@ -504,3 +504,96 @@ func TestOpenAIChatResponseToClaudeMapsToolCalls(t *testing.T) {
 		t.Fatalf("expected tool_use block, got %#v", block)
 	}
 }
+
+func TestResponsesToOpenAIChatMergesAssistantPreambleWithFunctionCall(t *testing.T) {
+	responsesReq := map[string]any{
+		"model": "glm-4.5",
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": "create the file then say DONE"},
+				},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "assistant",
+				"content": []any{
+					map[string]any{"type": "output_text", "text": "I'll create the file and write the text into it."},
+				},
+			},
+			map[string]any{
+				"type":      "function_call",
+				"call_id":   "tool-d70e0bedc9a64a3bab978b0afccd27d3",
+				"name":      "exec_command",
+				"arguments": `{"cmd":"echo ok > /tmp/x"}`,
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "tool-d70e0bedc9a64a3bab978b0afccd27d3",
+				"output":  "Process exited with code 0",
+			},
+		},
+	}
+	chatReq, err := responsesToOpenAIChatRequest(responsesReq, "glm-4.5")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	rawMessages, ok := chatReq["messages"].([]any)
+	if !ok {
+		t.Fatalf("expected messages array, got %#v", chatReq["messages"])
+	}
+	if len(rawMessages) != 3 {
+		t.Fatalf("expected 3 chat messages (user, assistant+tools, tool), got %d: %#v", len(rawMessages), rawMessages)
+	}
+	assistant, _ := rawMessages[1].(map[string]any)
+	if assistant["role"] != "assistant" {
+		t.Fatalf("expected assistant, got %#v", assistant)
+	}
+	if stringValue(assistant["content"]) != "I'll create the file and write the text into it." {
+		t.Fatalf("expected preamble content preserved, got %#v", assistant["content"])
+	}
+	toolCalls, ok := assistant["tool_calls"].([]any)
+	if !ok || len(toolCalls) != 1 {
+		t.Fatalf("expected one tool_call on same assistant message, got %#v", assistant["tool_calls"])
+	}
+	toolMsg, _ := rawMessages[2].(map[string]any)
+	if toolMsg["role"] != "tool" || toolMsg["tool_call_id"] != "tool-d70e0bedc9a64a3bab978b0afccd27d3" {
+		t.Fatalf("expected matching tool result, got %#v", toolMsg)
+	}
+}
+
+func TestResponsesToOpenAIChatAppendsParallelFunctionCalls(t *testing.T) {
+	responsesReq := map[string]any{
+		"model": "glm-4.5",
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": "run both"},
+			map[string]any{
+				"type":      "function_call",
+				"call_id":   "call_a",
+				"name":      "exec_command",
+				"arguments": `{"cmd":"a"}`,
+			},
+			map[string]any{
+				"type":      "function_call",
+				"call_id":   "call_b",
+				"name":      "exec_command",
+				"arguments": `{"cmd":"b"}`,
+			},
+		},
+	}
+	chatReq, err := responsesToOpenAIChatRequest(responsesReq, "glm-4.5")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	rawMessages := chatReq["messages"].([]any)
+	if len(rawMessages) != 2 {
+		t.Fatalf("expected user + one assistant, got %d", len(rawMessages))
+	}
+	assistant := rawMessages[1].(map[string]any)
+	toolCalls := assistant["tool_calls"].([]any)
+	if len(toolCalls) != 2 {
+		t.Fatalf("expected 2 tool_calls, got %#v", toolCalls)
+	}
+}

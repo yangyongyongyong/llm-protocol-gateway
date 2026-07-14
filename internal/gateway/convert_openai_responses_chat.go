@@ -279,6 +279,38 @@ func normalizeResponsesContentForChat(content any) any {
 	}
 }
 
+// appendChatFunctionCall folds a Responses function_call into Chat Completions
+// history. Codex/Responses often emit a preceding assistant message item (preamble
+// text) and a separate function_call item; many OpenAI-compatible upstreams
+// (including GLM) expect a single assistant message with both content and
+// tool_calls. Splitting them can yield empty streams or off-topic continuations.
+func appendChatFunctionCall(messages []map[string]any, callID, name, arguments string) []map[string]any {
+	toolCall := map[string]any{
+		"id":   callID,
+		"type": "function",
+		"function": map[string]any{
+			"name":      name,
+			"arguments": arguments,
+		},
+	}
+	if n := len(messages); n > 0 {
+		last := messages[n-1]
+		if stringValue(last["role"]) == "assistant" {
+			if raw, ok := last["tool_calls"].([]any); ok {
+				last["tool_calls"] = append(raw, toolCall)
+				return messages
+			}
+			last["tool_calls"] = []any{toolCall}
+			return messages
+		}
+	}
+	return append(messages, map[string]any{
+		"role":       "assistant",
+		"content":    nil,
+		"tool_calls": []any{toolCall},
+	})
+}
+
 func chatMessagesFromResponsesInput(input any) ([]map[string]any, error) {
 	messages := make([]map[string]any, 0, 8)
 	switch typed := input.(type) {
@@ -318,18 +350,7 @@ func chatMessagesFromResponsesInput(input any) ([]map[string]any, error) {
 				if callID == "" || name == "" {
 					continue
 				}
-				messages = append(messages, map[string]any{
-					"role":    "assistant",
-					"content": nil,
-					"tool_calls": []any{map[string]any{
-						"id":   callID,
-						"type": "function",
-						"function": map[string]any{
-							"name":      name,
-							"arguments": stringValue(entry["arguments"]),
-						},
-					}},
-				})
+				messages = appendChatFunctionCall(messages, callID, name, stringValue(entry["arguments"]))
 				continue
 			}
 			if itemType == "function_call_output" {
