@@ -234,6 +234,28 @@ func normalizeClaudePassThroughToolResultContent(content any) any {
 	}
 }
 
+// claudeServerToolType reports Anthropic built-in / server tools (web_search_*,
+// bash_*, text_editor_*, computer_*, code_execution_*, …). These use `type` as
+// the discriminator and must NOT receive a synthetic input_schema — upstream
+// returns 400 "…input_schema: Extra inputs are not permitted".
+func claudeServerToolType(toolType string) bool {
+	toolType = strings.TrimSpace(toolType)
+	return toolType != "" && toolType != "custom"
+}
+
+// serverToolPassthroughKeys are fields Anthropic accepts on built-in tools.
+// Anything else (cache_control, input_schema, …) is dropped for cache stability
+// and schema compliance.
+var claudeServerToolPassthroughKeys = []string{
+	"name",
+	"max_uses",
+	"allowed_domains",
+	"blocked_domains",
+	"user_location",
+	"allowed_callers",
+	"defer_loading",
+}
+
 func normalizeClaudePassThroughTools(raw []any) []any {
 	out := make([]any, 0, len(raw))
 	for _, item := range raw {
@@ -241,8 +263,20 @@ func normalizeClaudePassThroughTools(raw []any) []any {
 		if !ok {
 			continue
 		}
+		toolType := stringValue(tool["type"])
+		if claudeServerToolType(toolType) {
+			normalized := map[string]any{"type": toolType}
+			for _, key := range claudeServerToolPassthroughKeys {
+				if value, ok := tool[key]; ok {
+					normalized[key] = value
+				}
+			}
+			out = append(out, normalized)
+			continue
+		}
+
 		normalized := map[string]any{}
-		if toolType := stringValue(tool["type"]); toolType != "" {
+		if toolType != "" {
 			normalized["type"] = toolType
 		}
 		if name := stringValue(tool["name"]); name != "" {

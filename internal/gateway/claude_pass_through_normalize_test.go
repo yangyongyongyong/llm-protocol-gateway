@@ -146,3 +146,96 @@ func TestRewriteClaudeUpstreamMaxTokensIgnoresClientBudget(t *testing.T) {
 		t.Fatalf("max_tokens=%#v want %d", payload["max_tokens"], want)
 	}
 }
+
+func TestNormalizeClaudePassThroughToolsKeepsWebSearchWithoutInputSchema(t *testing.T) {
+	payload := map[string]any{
+		"model": "claude-sonnet-5",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "search something"},
+		},
+		"tools": []any{
+			map[string]any{
+				"type":          "web_search_20250305",
+				"name":          "web_search",
+				"max_uses":      8,
+				"cache_control": map[string]any{"type": "ephemeral"},
+				// Client/gateway must not invent this; Anthropic rejects it on server tools.
+				"input_schema": map[string]any{"type": "object", "properties": map[string]any{}},
+			},
+			map[string]any{
+				"name":        "bash",
+				"description": "run shell",
+				"input_schema": map[string]any{
+					"type": "object",
+				},
+			},
+		},
+		"max_tokens": 1024,
+	}
+	normalizeClaudePassThroughPayload(payload)
+
+	tools := payload["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("tools len=%d want 2: %#v", len(tools), tools)
+	}
+	webSearch := tools[0].(map[string]any)
+	if webSearch["type"] != "web_search_20250305" {
+		t.Fatalf("web_search type=%#v", webSearch["type"])
+	}
+	if webSearch["name"] != "web_search" {
+		t.Fatalf("web_search name=%#v", webSearch["name"])
+	}
+	if webSearch["max_uses"] != 8 {
+		t.Fatalf("web_search max_uses=%#v want 8", webSearch["max_uses"])
+	}
+	if _, exists := webSearch["input_schema"]; exists {
+		t.Fatalf("server tool must not keep/inject input_schema, got %#v", webSearch)
+	}
+	if _, exists := webSearch["cache_control"]; exists {
+		t.Fatalf("server tool cache_control should be stripped, got %#v", webSearch)
+	}
+
+	custom := tools[1].(map[string]any)
+	if custom["name"] != "bash" {
+		t.Fatalf("custom tool name=%#v", custom["name"])
+	}
+	if custom["input_schema"] == nil {
+		t.Fatalf("custom tool must keep input_schema")
+	}
+}
+
+func TestNormalizeClaudePassThroughToolsInjectsSchemaOnlyForCustomTools(t *testing.T) {
+	tools := normalizeClaudePassThroughTools([]any{
+		map[string]any{
+			"type":     "web_search_20250305",
+			"name":     "web_search",
+			"max_uses": float64(3),
+		},
+		map[string]any{
+			"name": "no_schema_custom",
+		},
+		map[string]any{
+			"type": "custom",
+			"name": "typed_custom",
+		},
+	})
+	if len(tools) != 3 {
+		t.Fatalf("tools len=%d want 3", len(tools))
+	}
+	web := tools[0].(map[string]any)
+	if _, ok := web["input_schema"]; ok {
+		t.Fatalf("web_search got input_schema: %#v", web)
+	}
+	if web["max_uses"] != float64(3) {
+		t.Fatalf("max_uses=%#v", web["max_uses"])
+	}
+	for i, label := range []string{"no_schema_custom", "typed_custom"} {
+		custom := tools[i+1].(map[string]any)
+		if custom["name"] != label {
+			t.Fatalf("tool[%d] name=%#v want %s", i+1, custom["name"], label)
+		}
+		if custom["input_schema"] == nil {
+			t.Fatalf("tool[%d] missing default input_schema: %#v", i+1, custom)
+		}
+	}
+}

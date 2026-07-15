@@ -57,14 +57,38 @@ func contentBlockArrayHasCacheControl(blocks []any) bool {
 	return false
 }
 
+// stripClaudeThinkingBlocks removes Anthropic thinking / redacted_thinking
+// blocks. OpenAI-compatible Chat upstreams (GLM, DeepSeek, …) reject
+// content[].type=thinking with 400 "type type error".
+func stripClaudeThinkingBlocks(blocks []any) []any {
+	if len(blocks) == 0 {
+		return blocks
+	}
+	out := make([]any, 0, len(blocks))
+	for _, block := range blocks {
+		item, ok := block.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch stringValue(item["type"]) {
+		case "thinking", "redacted_thinking":
+			continue
+		default:
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
 // normalizeClaudeContentForOpenAI preserves structured content blocks (and
 // cache_control) when converting Claude requests to OpenAI Chat format.
+// Thinking blocks are dropped — Chat upstreams do not accept them.
 func normalizeClaudeContentForOpenAI(content any) any {
 	switch typed := content.(type) {
 	case string:
 		return typed
 	case []any:
-		blocks := cloneContentBlocks(typed)
+		blocks := stripClaudeThinkingBlocks(cloneContentBlocks(typed))
 		if len(blocks) == 0 {
 			return ""
 		}

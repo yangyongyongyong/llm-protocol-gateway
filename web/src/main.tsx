@@ -901,6 +901,27 @@ function formatTrafficLogDetail(log: LogEntry, providers: Provider[] = []) {
   return lines.join('\n');
 }
 
+function formatSelfcheckCaseDetail(row: SelfcheckCaseResult) {
+  const lines = [
+    '=== 自检用例详情 ===',
+    `Provider: ${row.providerName || row.providerId}`,
+    `客户端: ${row.client}`,
+    `类型: ${row.kind || 'chat'}`,
+    `协议: ${row.protocol}`,
+    `模型: ${row.model || '-'}`,
+    `密钥: ${row.apiKeyName || '-'}`,
+    `路由: ${row.routeId || '-'}`,
+    `请求成功: ${row.success ? '是' : '否'}`,
+    `内容校验: ${row.contentOK ? 'OK' : '失败'}`,
+    `耗时: ${row.latencyMs} ms`,
+    `开始: ${row.startedAt || '-'}`,
+    `结束: ${row.finishedAt || '-'}`,
+  ];
+  if (row.error) lines.push('', '--- 错误详情 ---', row.error);
+  if (row.outputPreview) lines.push('', '--- 输出预览 ---', row.outputPreview);
+  return lines.join('\n');
+}
+
 function formatRouteTestDiagnostics(result: RouteTestResult) {
   const diagnostics = result.diagnostics;
   const lines: string[] = ['=== Route Test Diagnostics ==='];
@@ -2236,6 +2257,7 @@ function App() {
   const authStatusRef = useRef<AdminAuthStatus | null>(null);
   const [trafficLogDetail, setTrafficLogDetail] = useState<LogEntry | null>(null);
   const [trafficLogDetailLoading, setTrafficLogDetailLoading] = useState(false);
+  const [selfcheckCaseDetail, setSelfcheckCaseDetail] = useState<SelfcheckCaseResult | null>(null);
   const [requestStats, setRequestStats] = useState<RequestStatsSnapshot | null>(null);
   const [monthlyDaily, setMonthlyDaily] = useState<DailyRequestPoint[]>([]);
   const [appLogs, setAppLogs] = useState<AppLogEntry[]>([]);
@@ -4378,27 +4400,7 @@ function App() {
   }
 
   function openSelfcheckCaseLogs(row: SelfcheckCaseResult) {
-    const keyName = (row.apiKeyName || '').trim();
-    const start = row.startedAt ? new Date(row.startedAt) : null;
-    const end = row.finishedAt ? new Date(row.finishedAt) : null;
-    const padMs = 5_000;
-    const fromDate = start && !Number.isNaN(start.getTime())
-      ? formatLocalISODate(new Date(start.getTime() - padMs))
-      : '';
-    const toDate = end && !Number.isNaN(end.getTime())
-      ? formatLocalISODate(new Date(end.getTime() + padMs))
-      : fromDate;
-    setLogsApiKeyName(keyName);
-    setLogsStatusFilter('all');
-    setLogsFrom(fromDate);
-    setLogsTo(toDate);
-    goToPage('traffic-tokens');
-    void refreshLogs(1, fromDate, toDate, { apiKeyName: keyName });
-    if (keyName) {
-      showToast(`已定位密钥「${keyName}」· ${formatSelfcheckTime(row.startedAt)}`);
-    } else {
-      showToast('已跳转 API 日志');
-    }
+    setSelfcheckCaseDetail(row);
   }
 
   function providersExportFilename() {
@@ -6265,14 +6267,15 @@ function App() {
                               {row.error || row.outputPreview || '—'}
                             </span>
                             <span className="selfcheck-actions">
-                              <button
-                                className="mini-btn"
-                                type="button"
-                                disabled={!row.apiKeyName && !row.startedAt}
-                                onClick={() => openSelfcheckCaseLogs(row)}
-                              >
-                                日志
-                              </button>
+                              {passed ? null : (
+                                <button
+                                  className="mini-btn"
+                                  type="button"
+                                  onClick={() => openSelfcheckCaseLogs(row)}
+                                >
+                                  日志
+                                </button>
+                              )}
                               {passed ? null : (
                                 <button
                                   className="mini-btn"
@@ -6452,6 +6455,30 @@ function App() {
           </div>
           <div className="actions modal-actions">
             <button className="btn" onClick={() => setTrafficLogDetail(null)}>关闭</button>
+          </div>
+        </Modal>
+      )}
+
+      {selfcheckCaseDetail && (
+        <Modal
+          title="自检用例错误详情"
+          description="展示该失败用例的完整错误信息与输出预览，便于排查。"
+          onClose={() => setSelfcheckCaseDetail(null)}
+        >
+          <div className="test-result-card fail">
+            <div className="test-result-head">
+              <Badge tone="red">{selfcheckClientLabel(selfcheckCaseDetail.client)} · {selfcheckKindLabel(selfcheckCaseDetail.kind)}</Badge>
+              <span>{selfcheckCaseDetail.providerName || selfcheckCaseDetail.providerId} · {protocolLabel(selfcheckCaseDetail.protocol as Protocol)} · {selfcheckCaseDetail.model || '-'} · {selfcheckCaseDetail.latencyMs}ms</span>
+            </div>
+            {selfcheckCaseDetail.error ? <div className="hint-line error">{selfcheckCaseDetail.error}</div> : null}
+            <div className="field-label-row">
+              <label>完整诊断信息</label>
+              <CopyButton value={formatSelfcheckCaseDetail(selfcheckCaseDetail)} label="复制全部" />
+            </div>
+            <pre className="json-preview">{formatSelfcheckCaseDetail(selfcheckCaseDetail)}</pre>
+          </div>
+          <div className="actions modal-actions">
+            <button className="btn" onClick={() => setSelfcheckCaseDetail(null)}>关闭</button>
           </div>
         </Modal>
       )}
