@@ -107,6 +107,9 @@ type Provider struct {
 	// CursorOAuth holds the OAuth token pair for AuthType == "cursor_oauth"
 	// providers. Nil/omitted when not in OAuth mode.
 	CursorOAuth *CursorOAuthCredential `json:"cursorOAuth,omitempty"`
+	// ChatGPTOAuth holds the ChatGPT/Codex CLI OAuth token pair for
+	// AuthType == "chatgpt_oauth" providers (sub2api prior art).
+	ChatGPTOAuth *ChatGPTOAuthCredential `json:"chatgptOAuth,omitempty"`
 	// RequestAdapter is an optional provider-level request rewrite template
 	// (URL/headers/body/model mapping). Nil means use built-in protocol logic.
 	RequestAdapter *RequestAdapter `json:"requestAdapter,omitempty"`
@@ -147,10 +150,23 @@ type CursorOAuthCredential struct {
 	Connected    bool   `json:"connected,omitempty"`
 }
 
+// ChatGPTOAuthCredential holds a ChatGPT (Codex CLI) OAuth token pair used to
+// call chatgpt.com/backend-api/codex/responses. Secrets must never reach the
+// frontend (see gateway.redactProviderForClient).
+type ChatGPTOAuthCredential struct {
+	AccessToken      string `json:"accessToken,omitempty"`
+	RefreshToken     string `json:"refreshToken,omitempty"`
+	ExpiresAt        string `json:"expiresAt,omitempty"` // RFC3339
+	AccountLabel     string `json:"accountLabel,omitempty"` // email / plan
+	ChatGPTAccountID string `json:"chatgptAccountId,omitempty"`
+	Connected        bool   `json:"connected,omitempty"`
+}
+
 const (
 	AuthTypeAPIKey       = "api_key"
 	AuthTypeClaudeOAuth  = "claude_oauth"
 	AuthTypeCursorOAuth  = "cursor_oauth"
+	AuthTypeChatGPTOAuth = "chatgpt_oauth"
 )
 
 type Model struct {
@@ -202,6 +218,14 @@ type APIKey struct {
 	// rejected. Bound to the API key (not the output endpoint) so streaming can
 	// be toggled per consumer.
 	StreamEnabled bool `json:"streamEnabled"`
+	// CodexKeepOfficialLogin controls whether the generated Codex config.toml
+	// provider table mimics the built-in official "openai" provider shape
+	// (name = "OpenAI", supports_websockets = true) so Codex's own official
+	// feature gates (plugin marketplace, mobile remote control) keep matching
+	// while base_url / experimental_bearer_token still point at this gateway.
+	// It never touches ~/.codex/auth.json. Default false; bound per API key so
+	// the choice survives across "复制 Codex 配置" dialog opens.
+	CodexKeepOfficialLogin bool `json:"codexKeepOfficialLogin,omitempty"`
 	// FallbackProviderIDs is an ordered list of backup input providers after the
 	// preferred provider on the bound route. Higher priority comes first.
 	FallbackProviderIDs []string `json:"fallbackProviderIds,omitempty"`
@@ -307,6 +331,18 @@ type GatewayState struct {
 	WebExposed bool `json:"webExposed"`
 	// DataPaths is runtime-only (not persisted); absolute paths for backup/analysis.
 	DataPaths *DataPaths `json:"dataPaths,omitempty"`
+	// CursorBridge is the live local gRPC bridge status; runtime-only, not persisted.
+	CursorBridge *CursorBridgeRuntime `json:"cursorBridge,omitempty"`
+}
+
+// CursorBridgeRuntime mirrors the local cursor-bridge subprocess for status responses.
+type CursorBridgeRuntime struct {
+	Status    string `json:"status"`
+	Port      int    `json:"port,omitempty"`
+	PID       int    `json:"pid,omitempty"`
+	Message   string `json:"message,omitempty"`
+	StartedAt string `json:"startedAt,omitempty"`
+	CheckedAt string `json:"checkedAt,omitempty"`
 }
 
 type MetricsSnapshot struct {

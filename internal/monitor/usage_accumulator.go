@@ -505,6 +505,106 @@ func mergeUsageDays(byDay map[string]*usageDayStats, from, to time.Time) (APIKey
 	return total, byAPIKey, byProvider, byModel, byUser
 }
 
+// mergeUsageDaysForKeys sums only the by-api-key buckets that belong to keySet.
+// Used for role=user stats so historical days match admin by-user / by-key views.
+func mergeUsageDaysForKeys(byDay map[string]*usageDayStats, from, to time.Time, keySet map[string]struct{}) (APIKeyDayStats, map[string]*APIKeyDayStats) {
+	loc := from.Location()
+	if to.IsZero() {
+		to = time.Date(9999, 1, 1, 0, 0, 0, 0, loc)
+	}
+	fromDay := time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, loc)
+	toDay := time.Date(to.Year(), to.Month(), to.Day(), 0, 0, 0, 0, loc)
+
+	total := APIKeyDayStats{APIKeyName: "全部"}
+	byAPIKey := make(map[string]*APIKeyDayStats)
+	if len(keySet) == 0 {
+		return total, byAPIKey
+	}
+
+	for dayKey, dayStats := range byDay {
+		day, err := time.ParseInLocation("2006-01-02", dayKey, loc)
+		if err != nil || day.Before(fromDay) || !day.Before(toDay) {
+			continue
+		}
+		for id, stats := range dayStats.byAPIKey {
+			if _, ok := keySet[id]; !ok {
+				continue
+			}
+			total.RequestCount += stats.RequestCount
+			total.InputTokens += stats.InputTokens
+			total.OutputTokens += stats.OutputTokens
+			total.CacheTokens += stats.CacheTokens
+
+			out, ok := byAPIKey[id]
+			if !ok {
+				copied := *stats
+				byAPIKey[id] = &copied
+				continue
+			}
+			out.RequestCount += stats.RequestCount
+			out.InputTokens += stats.InputTokens
+			out.OutputTokens += stats.OutputTokens
+			out.CacheTokens += stats.CacheTokens
+		}
+	}
+	return total, byAPIKey
+}
+
+func periodStatsForKeysLocked(byDay map[string]*usageDayStats, from, to time.Time, keySet map[string]struct{}, periodLabel string) PeriodStatsSnapshot {
+	total, byAPIKey := mergeUsageDaysForKeys(byDay, from, to, keySet)
+	return PeriodStatsSnapshot{
+		Period:   periodLabel,
+		Total:    total,
+		ByAPIKey: sortAPIKeyStats(byAPIKey),
+	}
+}
+
+func dailyStatsForKeysLocked(byDay map[string]*usageDayStats, from, to time.Time, keySet map[string]struct{}) []DailyRequestPoint {
+	loc := from.Location()
+	byDayOut := map[string]*DailyRequestPoint{}
+	for day := time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, loc); day.Before(to); day = day.AddDate(0, 0, 1) {
+		label := day.Format("2006-01-02")
+		byDayOut[label] = &DailyRequestPoint{Date: label}
+	}
+	if len(keySet) == 0 {
+		out := make([]DailyRequestPoint, 0, len(byDayOut))
+		for _, point := range byDayOut {
+			out = append(out, *point)
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].Date < out[j].Date })
+		return out
+	}
+
+	fromDay := time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, loc)
+	toDay := time.Date(to.Year(), to.Month(), to.Day(), 0, 0, 0, 0, loc)
+	for dayKey, dayStats := range byDay {
+		day, err := time.ParseInLocation("2006-01-02", dayKey, loc)
+		if err != nil || day.Before(fromDay) || !day.Before(toDay) {
+			continue
+		}
+		point, ok := byDayOut[dayKey]
+		if !ok {
+			point = &DailyRequestPoint{Date: dayKey}
+			byDayOut[dayKey] = point
+		}
+		for id, stats := range dayStats.byAPIKey {
+			if _, allowed := keySet[id]; !allowed {
+				continue
+			}
+			point.RequestCount += stats.RequestCount
+			point.InputTokens += stats.InputTokens
+			point.OutputTokens += stats.OutputTokens
+			point.CacheTokens += stats.CacheTokens
+		}
+	}
+	out := make([]DailyRequestPoint, 0, len(byDayOut))
+	for _, point := range byDayOut {
+		out = append(out, *point)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Date < out[j].Date })
+	return out
+}
+
 func sortAPIKeyStats(byKey map[string]*APIKeyDayStats) []APIKeyDayStats {
 	out := make([]APIKeyDayStats, 0, len(byKey))
 	for _, stats := range byKey {

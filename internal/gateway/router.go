@@ -286,7 +286,8 @@ func (r *Router) AddProvider(provider domain.Provider) (domain.Provider, error) 
 	// requirement for those modes only.
 	if provider.BaseURL == "" &&
 		provider.AuthType != domain.AuthTypeClaudeOAuth &&
-		provider.AuthType != domain.AuthTypeCursorOAuth {
+		provider.AuthType != domain.AuthTypeCursorOAuth &&
+		provider.AuthType != domain.AuthTypeChatGPTOAuth {
 		return domain.Provider{}, fmt.Errorf("provider baseUrl is required")
 	}
 	if provider.ID == "" {
@@ -362,6 +363,11 @@ func normalizeProvider(provider *domain.Provider) {
 		// Cursor OAuth providers proxy through the local gRPC bridge at request time.
 		provider.Protocol = domain.ProtocolOpenAIChat
 		provider.BaseURL = ""
+	}
+	if provider.AuthType == domain.AuthTypeChatGPTOAuth {
+		// ChatGPT OAuth providers call Codex CLI upstream (chatgpt.com/backend-api).
+		provider.Protocol = domain.ProtocolOpenAIResponses
+		provider.BaseURL = chatgptCodexResponsesURL
 	}
 	if provider.HealthStatus == "" {
 		provider.HealthStatus = "unchecked"
@@ -569,6 +575,7 @@ func (r *Router) UpdateAPIKey(keyID string, patch domain.APIKey) (domain.APIKey,
 		updated.MaxOutputTokens = normalizeMaxOutputTokens(patch.MaxOutputTokens)
 		updated.Enabled = patch.Enabled
 		updated.StreamEnabled = patch.StreamEnabled
+		updated.CodexKeepOfficialLogin = patch.CodexKeepOfficialLogin
 		preferredProviderID := ""
 		if route, ok := r.routeLocked(updated.RouteID); ok {
 			preferredProviderID = route.ProviderID
@@ -1117,6 +1124,47 @@ func (r *Router) ClearProviderCursorOAuth(providerID string) (domain.Provider, e
 		}
 		updated := r.state.Providers[index]
 		updated.CursorOAuth = nil
+		normalizeProvider(&updated)
+		r.state.Providers[index] = updated
+		return updated, nil
+	}
+	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+}
+
+// SetProviderChatGPTOAuth stores (or replaces) the ChatGPT OAuth credential for
+// a provider and forces it into chatgpt_oauth auth mode.
+func (r *Router) SetProviderChatGPTOAuth(providerID string, credential domain.ChatGPTOAuthCredential) (domain.Provider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID != providerID {
+			continue
+		}
+		updated := r.state.Providers[index]
+		updated.AuthType = domain.AuthTypeChatGPTOAuth
+		credentialCopy := credential
+		updated.ChatGPTOAuth = &credentialCopy
+		normalizeProvider(&updated)
+		r.state.Providers[index] = updated
+		return updated, nil
+	}
+	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+}
+
+// ClearProviderChatGPTOAuth removes the stored ChatGPT OAuth credential (logout)
+// while leaving the provider in chatgpt_oauth auth mode so the user can
+// reconnect without re-configuring the provider.
+func (r *Router) ClearProviderChatGPTOAuth(providerID string) (domain.Provider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID != providerID {
+			continue
+		}
+		updated := r.state.Providers[index]
+		updated.ChatGPTOAuth = nil
 		normalizeProvider(&updated)
 		r.state.Providers[index] = updated
 		return updated, nil

@@ -158,11 +158,16 @@ func inputItemsFromChatMessages(messages []any) ([]any, string, error) {
 }
 
 func setResponsesInput(responsesReq map[string]any, inputItems []any) {
-	if len(inputItems) == 1 {
-		if item, ok := inputItems[0].(map[string]any); ok && stringValue(item["role"]) == "user" {
-			if text, ok := item["content"].(string); ok {
-				responsesReq["input"] = text
-				return
+	// Always keep a list. Some Responses backends (notably ChatGPT Codex) reject
+	// a bare string input with `{"detail":"Input must be a list"}`.
+	for _, item := range inputItems {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if text, ok := entry["content"].(string); ok {
+			entry["content"] = []any{
+				map[string]any{"type": "input_text", "text": text},
 			}
 		}
 	}
@@ -202,7 +207,7 @@ func openAIChatToResponsesRequest(chatReq map[string]any, model string) (map[str
 	if depth := normalizeReasoningEffort(stringValue(chatReq["reasoning_effort"])); depth != "" {
 		responsesReq["reasoning"] = map[string]any{"effort": depth}
 	}
-	copyToolsFieldDirect(chatReq, responsesReq)
+	copyChatToolsToResponses(chatReq, responsesReq)
 	return responsesReq, nil
 }
 
@@ -444,6 +449,9 @@ func responsesToOpenAIChatResponse(responsesBody []byte, model string) ([]byte, 
 	}
 	if errorValue, ok := payload["error"]; ok {
 		return responsesErrorValueToOpenAI(errorValue, model)
+	}
+	if detail := strings.TrimSpace(stringValue(payload["detail"])); detail != "" {
+		return responsesErrorValueToOpenAI(detail, model)
 	}
 
 	text := strings.TrimSpace(stringValue(payload["output_text"]))

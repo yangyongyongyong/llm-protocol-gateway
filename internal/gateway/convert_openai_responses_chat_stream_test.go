@@ -199,3 +199,72 @@ func TestStreamOpenAIChatToResponsesEventsIntegrationShape(t *testing.T) {
 		t.Fatalf("expected final output_text Hi!, got:\n%s", got)
 	}
 }
+
+func TestStreamResponsesToOpenAIChatEventsEmitsToolCalls(t *testing.T) {
+	upstream := strings.Join([]string{
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","call_id":"call_bash_1","name":"bash","arguments":""}}`,
+		``,
+		`event: response.function_call_arguments.delta`,
+		`data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"command\":\"ls\"}"}`,
+		``,
+		`event: response.function_call_arguments.done`,
+		`data: {"type":"response.function_call_arguments.done","item_id":"fc_1","arguments":"{\"command\":\"ls\"}"}`,
+		``,
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"function_call","call_id":"call_bash_1","name":"bash","arguments":"{\"command\":\"ls\"}"}],"usage":{"input_tokens":10,"output_tokens":5}}}`,
+		``,
+	}, "\n")
+
+	rec := httptest.NewRecorder()
+	usage, err := streamResponsesToOpenAIChatEvents(rec, strings.NewReader(upstream), "gpt-5.4-mini")
+	if err != nil {
+		t.Fatalf("streamResponsesToOpenAIChatEvents: %v", err)
+	}
+	if usage.InputTokens != 10 || usage.OutputTokens != 5 {
+		t.Fatalf("usage=%+v", usage)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"tool_calls"`) {
+		t.Fatalf("expected tool_calls in stream, got:\n%s", body)
+	}
+	if !strings.Contains(body, `"name":"bash"`) {
+		t.Fatalf("expected bash tool name, got:\n%s", body)
+	}
+	if !strings.Contains(body, `"arguments":"{\"command\":\"ls\"}"`) {
+		t.Fatalf("expected tool arguments, got:\n%s", body)
+	}
+	if strings.Contains(body, `"content":"{\"command\"`) {
+		t.Fatalf("arguments leaked into content:\n%s", body)
+	}
+	if !strings.Contains(body, `"finish_reason":"tool_calls"`) {
+		t.Fatalf("expected finish_reason tool_calls, got:\n%s", body)
+	}
+}
+
+func TestStreamResponsesToOpenAIChatEventsDoesNotLeakArgsAsContent(t *testing.T) {
+	// No event: lines — type only in data payload (common upstream shape).
+	upstream := strings.Join([]string{
+		`data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"command\":\"echo hi\"}"}`,
+		``,
+		`data: {"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"bash"}}`,
+		``,
+		`data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"command\":\"echo hi\"}"}`,
+		``,
+		`data: {"type":"response.completed","response":{"status":"completed","output":[]}}`,
+		``,
+	}, "\n")
+
+	rec := httptest.NewRecorder()
+	_, err := streamResponsesToOpenAIChatEvents(rec, strings.NewReader(upstream), "gpt-5.4-mini")
+	if err != nil {
+		t.Fatalf("err=%v body=%s", err, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Count(body, `"content":"{\"command\"`) > 0 {
+		t.Fatalf("arguments leaked into content:\n%s", body)
+	}
+	if !strings.Contains(body, `"tool_calls"`) || !strings.Contains(body, `"name":"bash"`) {
+		t.Fatalf("expected tool_calls, got:\n%s", body)
+	}
+}

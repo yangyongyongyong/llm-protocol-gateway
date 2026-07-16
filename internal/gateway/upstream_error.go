@@ -76,6 +76,12 @@ func errorValueOrBody(payload map[string]any, status int, body []byte) any {
 		if errorValue, ok := payload["error"]; ok && errorValue != nil {
 			return errorValue
 		}
+		if detail := strings.TrimSpace(stringValue(payload["detail"])); detail != "" {
+			return map[string]any{
+				"type":    "api_error",
+				"message": detail,
+			}
+		}
 	}
 	return map[string]any{
 		"type":    "api_error",

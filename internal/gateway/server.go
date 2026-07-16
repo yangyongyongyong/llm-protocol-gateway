@@ -69,6 +69,7 @@ type Server struct {
 	tunnels                 *tunnel.Manager
 	pendingClaudeOAuth      *claudeOAuthPendingStore
 	pendingCursorOAuth      *cursorOAuthPendingStore
+	pendingChatGPTOAuth     *chatgptOAuthPendingStore
 	cursorBridge            *cursor.Bridge
 	listenAddr              string
 	requestLogRetentionDays int
@@ -94,6 +95,7 @@ func NewServer(router *Router, logs *monitor.Store, stateSaver ...StateSaver) *S
 		logs:                    logs,
 		pendingClaudeOAuth:      newClaudeOAuthPendingStore(),
 		pendingCursorOAuth:      newCursorOAuthPendingStore(),
+		pendingChatGPTOAuth:     newChatGPTOAuthPendingStore(),
 		oauthUsageCache:         newOAuthUsageCache(),
 		requestStatsCache:       newRequestStatsCache(),
 		requestLogRetentionDays: 7,
@@ -216,6 +218,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /__providers/{id}/cursor-oauth/status", s.handleCursorOAuthStatus)
 	mux.HandleFunc("POST /__providers/{id}/cursor-oauth/disconnect", s.handleCursorOAuthDisconnect)
 	mux.HandleFunc("GET /__providers/{id}/cursor-oauth/usage", s.handleCursorOAuthUsage)
+	mux.HandleFunc("POST /__providers/{id}/chatgpt-oauth/start", s.handleChatGPTOAuthStart)
+	mux.HandleFunc("GET /__providers/{id}/chatgpt-oauth/status", s.handleChatGPTOAuthStatus)
+	mux.HandleFunc("GET /auth/callback", s.handleChatGPTOAuthCallback)
+	mux.HandleFunc("POST /__providers/{id}/chatgpt-oauth/complete", s.handleChatGPTOAuthComplete)
+	mux.HandleFunc("POST /__providers/{id}/chatgpt-oauth/disconnect", s.handleChatGPTOAuthDisconnect)
+	mux.HandleFunc("GET /__providers/{id}/chatgpt-oauth/usage", s.handleChatGPTOAuthUsage)
 	mux.HandleFunc("DELETE /__providers/{id}", s.handleDeleteProvider)
 	mux.HandleFunc("POST /__routes", s.handleCreateRoute)
 	mux.HandleFunc("PATCH /__routes/{id}", s.handleUpdateRoute)
@@ -292,6 +300,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	// Without this, regular users fall back to LAN addresses on the API-key
 	// page because tunnelRunning/livePublicURL stay empty.
 	state.PublicAccess = s.withTunnelRuntime(state.PublicAccess)
+	state.CursorBridge = s.cursorBridgeRuntime()
 	if !identity.isAdmin() {
 		writeJSON(w, http.StatusOK, s.stateForUser(identity, state))
 		return
@@ -332,6 +341,14 @@ func redactProviderForClient(provider domain.Provider) domain.Provider {
 	if provider.CursorOAuth != nil {
 		original := provider.CursorOAuth
 		provider.CursorOAuth = &domain.CursorOAuthCredential{
+			ExpiresAt:    original.ExpiresAt,
+			AccountLabel: original.AccountLabel,
+			Connected:    strings.TrimSpace(original.AccessToken) != "" && strings.TrimSpace(original.RefreshToken) != "",
+		}
+	}
+	if provider.ChatGPTOAuth != nil {
+		original := provider.ChatGPTOAuth
+		provider.ChatGPTOAuth = &domain.ChatGPTOAuthCredential{
 			ExpiresAt:    original.ExpiresAt,
 			AccountLabel: original.AccountLabel,
 			Connected:    strings.TrimSpace(original.AccessToken) != "" && strings.TrimSpace(original.RefreshToken) != "",
@@ -1783,11 +1800,85 @@ func (s *Server) handleCursorOAuthUsage(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, report)
 }
 
+// handleChatGPTOAuthUsage returns ChatGPT/Codex quota (WHAM usage) for a
+// connected chatgpt_oauth provider. Free-tier accounts are included.
+func (s *Server) handleChatGPTOAuthUsage(w http.ResponseWriter, r *http.Request) {
+	providerID := r.PathValue("id")
+	if !s.requireProviderAccessForUser(w, r, providerID) {
+		return
+	}
+	provider, err := s.router.ProviderByID(providerID)
+	if err != nil {
+		writeOpenAIError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if provider.AuthType != domain.AuthTypeChatGPTOAuth {
+		writeJSON(w, http.StatusOK, ChatGPTOAuthUsageReport{Available: false, Error: "provider is not using ChatGPT OAuth"})
+		return
+	}
+	if provider.ChatGPTOAuth == nil || strings.TrimSpace(provider.ChatGPTOAuth.RefreshToken) == "" {
+		writeJSON(w, http.StatusOK, ChatGPTOAuthUsageReport{Available: false, Error: "ChatGPT OAuth 未连接"})
+		return
+	}
+
+	cacheKey := "chatgpt:" + providerID
+	forceRefresh := strings.EqualFold(r.URL.Query().Get("refresh"), "1") || strings.EqualFold(r.URL.Query().Get("refresh"), "true")
+	if forceRefresh {
+		s.oauthUsageCache.invalidate(cacheKey)
+	} else if cached, ok := s.oauthUsageCache.getAllowStale(cacheKey); ok {
+		if report, ok := cached.(ChatGPTOAuthUsageReport); ok {
+			s.maybeRefreshChatGPTOAuthUsageAsync(providerID)
+			writeJSON(w, http.StatusOK, report)
+			return
+		}
+	}
+
+	unlock := s.lockOAuthUsageFetch(cacheKey)
+	defer unlock()
+	if !forceRefresh {
+		if cached, ok := s.oauthUsageCache.get(cacheKey); ok {
+			if report, ok := cached.(ChatGPTOAuthUsageReport); ok {
+				writeJSON(w, http.StatusOK, report)
+				return
+			}
+		}
+	}
+
+	refreshed, err := s.ensureFreshChatGPTToken(provider)
+	if err != nil {
+		writeJSON(w, http.StatusOK, ChatGPTOAuthUsageReport{Available: false, Error: err.Error()})
+		return
+	}
+	report, err := fetchChatGPTOAuthUsage(r.Context(), refreshed)
+	if err != nil {
+		writeJSON(w, http.StatusOK, ChatGPTOAuthUsageReport{Available: false, Error: err.Error()})
+		return
+	}
+	if report.Available {
+		s.oauthUsageCache.set(cacheKey, report)
+	}
+	writeJSON(w, http.StatusOK, report)
+}
+
 func (s *Server) lockOAuthUsageFetch(key string) func() {
 	muAny, _ := s.oauthUsageFetchMu.LoadOrStore(key, &sync.Mutex{})
 	mu := muAny.(*sync.Mutex)
 	mu.Lock()
 	return mu.Unlock
+}
+
+func (s *Server) tryLockOAuthUsageFetch(key string) bool {
+	muAny, _ := s.oauthUsageFetchMu.LoadOrStore(key, &sync.Mutex{})
+	mu := muAny.(*sync.Mutex)
+	return mu.TryLock()
+}
+
+func (s *Server) unlockOAuthUsageFetch(key string) {
+	muAny, ok := s.oauthUsageFetchMu.Load(key)
+	if !ok {
+		return
+	}
+	muAny.(*sync.Mutex).Unlock()
 }
 
 func (s *Server) handleProviderChatTest(w http.ResponseWriter, r *http.Request) {
@@ -2322,7 +2413,7 @@ func (s *Server) saveState() error {
 // full-state Save (which DELETEs + re-INSERTs all providers/models/routes on
 // the single shared SQLite connection and blocks request-hot-path writes).
 // Falls back to saveState when the incremental saver is unavailable.
-func (s *Server) persistProviderOAuth(providerID string, claude *domain.ClaudeOAuthCredential, cursor *domain.CursorOAuthCredential) error {
+func (s *Server) persistProviderOAuth(providerID string, claude *domain.ClaudeOAuthCredential, cursor *domain.CursorOAuthCredential, chatgpt *domain.ChatGPTOAuthCredential) error {
 	if s.providerOAuthSaver != nil {
 		var accessToken, refreshToken, expiresAt, scope, accountLabel string
 		switch {
@@ -2337,6 +2428,12 @@ func (s *Server) persistProviderOAuth(providerID string, claude *domain.ClaudeOA
 			refreshToken = cursor.RefreshToken
 			expiresAt = cursor.ExpiresAt
 			accountLabel = cursor.AccountLabel
+		case chatgpt != nil:
+			accessToken = chatgpt.AccessToken
+			refreshToken = chatgpt.RefreshToken
+			expiresAt = chatgpt.ExpiresAt
+			scope = chatgpt.ChatGPTAccountID
+			accountLabel = chatgpt.AccountLabel
 		default:
 			return nil
 		}
@@ -3025,6 +3122,38 @@ func (s *Server) fetchProviderModels(r *http.Request, provider domain.Provider, 
 		return providerTestResult{Success: true, Provider: provider.ID, ModelsURL: modelsURL, Status: response.StatusCode, LatencyMs: time.Since(started).Milliseconds(), Models: models, Preview: preview}
 	}
 
+	if provider.AuthType == domain.AuthTypeChatGPTOAuth {
+		if provider.ChatGPTOAuth == nil || strings.TrimSpace(provider.ChatGPTOAuth.RefreshToken) == "" {
+			return providerTestResult{Success: false, Provider: provider.ID, LatencyMs: time.Since(started).Milliseconds(), Error: "ChatGPT OAuth 未连接", Models: []domain.Model{}}
+		}
+		refreshed, err := s.ensureFreshChatGPTToken(provider)
+		if err != nil {
+			return providerTestResult{Success: false, Provider: provider.ID, LatencyMs: time.Since(started).Milliseconds(), Error: err.Error(), Models: []domain.Model{}}
+		}
+		provider = refreshed
+		modelsURL := chatgptCodexBaseURL + "/codex/models?client_version=" + chatgptCodexCLIVersion
+		models, fetchErr := fetchChatGPTOAuthModels(r.Context(), provider)
+		if fetchErr != nil {
+			models = defaultChatGPTOAuthModels(provider.ID)
+			return providerTestResult{
+				Success:   true,
+				Provider:  provider.ID,
+				ModelsURL: modelsURL,
+				LatencyMs: time.Since(started).Milliseconds(),
+				Models:    models,
+				Preview:   "chatgpt oauth fallback model list: " + fetchErr.Error(),
+			}
+		}
+		return providerTestResult{
+			Success:   true,
+			Provider:  provider.ID,
+			ModelsURL: modelsURL,
+			LatencyMs: time.Since(started).Milliseconds(),
+			Models:    models,
+			Preview:   fmt.Sprintf("chatgpt oauth models=%d", len(models)),
+		}
+	}
+
 	modelsURL, err := deriveModelsURL(provider)
 	if err != nil {
 		return providerTestResult{Success: false, Provider: provider.ID, LatencyMs: time.Since(started).Milliseconds(), Error: err.Error(), Models: []domain.Model{}}
@@ -3163,6 +3292,9 @@ func extractResponseErrorMessage(responseBody []byte) string {
 			return formatAPIErrorMessage(item)
 		}
 		return strings.TrimSpace(fmt.Sprint(errorValue))
+	}
+	if detail := strings.TrimSpace(stringValue(payload["detail"])); detail != "" {
+		return detail
 	}
 	if payload["type"] == "error" {
 		if errorValue, ok := payload["error"].(map[string]any); ok {

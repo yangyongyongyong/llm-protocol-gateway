@@ -60,3 +60,29 @@ func TestSelfcheckKeyName(t *testing.T) {
 		t.Fatalf("got %q want %q", got, want)
 	}
 }
+
+func TestNormalizeSelfcheckModels(t *testing.T) {
+	t.Parallel()
+	got := normalizeSelfcheckModels(map[string]string{
+		"chatgpt账号": " gpt-5.6-terra ",
+		"other":      "x",
+		"":           "y",
+		"empty":      "  ",
+	}, []string{"chatgpt账号", "empty"})
+	if len(got) != 1 || got["chatgpt账号"] != "gpt-5.6-terra" {
+		t.Fatalf("got %#v", got)
+	}
+}
+
+func TestResolveSelfcheckModelPrefersRequest(t *testing.T) {
+	t.Parallel()
+	got := resolveSelfcheckModel(
+		domain.APIKey{ModelOverride: "from-key"},
+		domain.Provider{DefaultModel: "from-provider", Models: []domain.Model{{ID: "listed"}}},
+		"from-request",
+	)
+	if got != "from-request" {
+		t.Fatalf("got %q", got)
+	}
+}
+

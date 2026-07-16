@@ -1,0 +1,11 @@
+# Cursor 索引/搜索排除：避免 .cache 等临时目录拖慢 workspace
+.cache/
+web/node_modules/
+web/dist/
+bin/
+desktop/build/
+desktop/frontend/node_modules/
+desktop/frontend/dist/
+*.db
+*.db-shm
+*.db-wal

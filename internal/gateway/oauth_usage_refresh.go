@@ -39,6 +39,10 @@ func (s *Server) refreshAllOAuthUsage(ctx context.Context) {
 			if provider.CursorOAuth != nil && strings.TrimSpace(provider.CursorOAuth.RefreshToken) != "" {
 				s.refreshCursorOAuthUsage(provider.ID)
 			}
+		case domain.AuthTypeChatGPTOAuth:
+			if provider.ChatGPTOAuth != nil && strings.TrimSpace(provider.ChatGPTOAuth.RefreshToken) != "" {
+				s.refreshChatGPTOAuthUsage(provider.ID)
+			}
 		}
 	}
 }
@@ -47,6 +51,75 @@ func (s *Server) refreshClaudeOAuthUsage(providerID string) {
 	cacheKey := "claude:" + providerID
 	unlock := s.lockOAuthUsageFetch(cacheKey)
 	defer unlock()
+	s.refreshClaudeOAuthUsageHoldingLock(providerID)
+}
+
+func (s *Server) refreshCursorOAuthUsage(providerID string) {
+	cacheKey := "cursor:" + providerID
+	unlock := s.lockOAuthUsageFetch(cacheKey)
+	defer unlock()
+	s.refreshCursorOAuthUsageHoldingLock(providerID)
+}
+
+func (s *Server) maybeRefreshClaudeOAuthUsageAsync(providerID string) {
+	cacheKey := "claude:" + providerID
+	if !s.oauthUsageCache.needsRefresh(cacheKey) {
+		return
+	}
+	// Skip if a fetch is already running (avoid goroutine pile-up under multi-tab stampede).
+	if !s.tryLockOAuthUsageFetch(cacheKey) {
+		return
+	}
+	go func() {
+		defer s.unlockOAuthUsageFetch(cacheKey)
+		s.refreshClaudeOAuthUsageHoldingLock(providerID)
+	}()
+}
+
+func (s *Server) maybeRefreshCursorOAuthUsageAsync(providerID string) {
+	cacheKey := "cursor:" + providerID
+	if !s.oauthUsageCache.needsRefresh(cacheKey) {
+		return
+	}
+	if !s.tryLockOAuthUsageFetch(cacheKey) {
+		return
+	}
+	go func() {
+		defer s.unlockOAuthUsageFetch(cacheKey)
+		s.refreshCursorOAuthUsageHoldingLock(providerID)
+	}()
+}
+
+func (s *Server) refreshChatGPTOAuthUsage(providerID string) {
+	cacheKey := "chatgpt:" + providerID
+	unlock := s.lockOAuthUsageFetch(cacheKey)
+	defer unlock()
+	s.refreshChatGPTOAuthUsageHoldingLock(providerID)
+}
+
+func (s *Server) maybeRefreshChatGPTOAuthUsageAsync(providerID string) {
+	cacheKey := "chatgpt:" + providerID
+	if !s.oauthUsageCache.needsRefresh(cacheKey) {
+		return
+	}
+	if !s.tryLockOAuthUsageFetch(cacheKey) {
+		return
+	}
+	go func() {
+		defer s.unlockOAuthUsageFetch(cacheKey)
+		s.refreshChatGPTOAuthUsageHoldingLock(providerID)
+	}()
+}
+
+// refreshClaudeOAuthUsageHoldingLock runs the Claude usage fetch while the
+// caller already holds lockOAuthUsageFetch("claude:"+providerID).
+func (s *Server) refreshClaudeOAuthUsageHoldingLock(providerID string) {
+	cacheKey := "claude:" + providerID
+	// Coalesce stampedes: many UI tabs may race after fresh TTL; only the first
+	// holder that still sees a stale cache should hit Anthropic.
+	if !s.oauthUsageCache.needsRefresh(cacheKey) {
+		return
+	}
 
 	provider, err := s.router.ProviderByID(providerID)
 	if err != nil {
@@ -67,10 +140,13 @@ func (s *Server) refreshClaudeOAuthUsage(providerID string) {
 	}
 }
 
-func (s *Server) refreshCursorOAuthUsage(providerID string) {
+// refreshCursorOAuthUsageHoldingLock runs the Cursor usage fetch while the
+// caller already holds lockOAuthUsageFetch("cursor:"+providerID).
+func (s *Server) refreshCursorOAuthUsageHoldingLock(providerID string) {
 	cacheKey := "cursor:" + providerID
-	unlock := s.lockOAuthUsageFetch(cacheKey)
-	defer unlock()
+	if !s.oauthUsageCache.needsRefresh(cacheKey) {
+		return
+	}
 
 	provider, err := s.router.ProviderByID(providerID)
 	if err != nil {
@@ -91,16 +167,27 @@ func (s *Server) refreshCursorOAuthUsage(providerID string) {
 	}
 }
 
-func (s *Server) maybeRefreshClaudeOAuthUsageAsync(providerID string) {
-	if !s.oauthUsageCache.needsRefresh("claude:" + providerID) {
+func (s *Server) refreshChatGPTOAuthUsageHoldingLock(providerID string) {
+	cacheKey := "chatgpt:" + providerID
+	if !s.oauthUsageCache.needsRefresh(cacheKey) {
 		return
 	}
-	go s.refreshClaudeOAuthUsage(providerID)
-}
 
-func (s *Server) maybeRefreshCursorOAuthUsageAsync(providerID string) {
-	if !s.oauthUsageCache.needsRefresh("cursor:" + providerID) {
+	provider, err := s.router.ProviderByID(providerID)
+	if err != nil {
 		return
 	}
-	go s.refreshCursorOAuthUsage(providerID)
+	refreshed, err := s.ensureFreshChatGPTToken(provider)
+	if err != nil {
+		slog.Debug("chatgpt oauth usage refresh skipped", "provider", providerID, "error", err)
+		return
+	}
+	report, err := fetchChatGPTOAuthUsage(context.Background(), refreshed)
+	if err != nil {
+		slog.Debug("chatgpt oauth usage refresh failed", "provider", providerID, "error", err)
+		return
+	}
+	if report.Available {
+		s.oauthUsageCache.set(cacheKey, report)
+	}
 }

@@ -143,8 +143,14 @@ html[data-theme="dark"] .slate { color: #cbd5e1; }
 .usage-section-title { margin-bottom: 10px; font-size: 13px; font-weight: 800; color: var(--text); }
 .usage-table { display: grid; gap: 8px; }
 .selfcheck-provider-list { display: grid; gap: 8px; margin-top: 10px; }
-.selfcheck-provider-item { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 12px; border: 1px solid var(--border); background: var(--surface-strong); color: var(--text); }
+.selfcheck-provider-item { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(180px, 1fr); gap: 10px; align-items: center; padding: 10px 12px; border-radius: 12px; border: 1px solid var(--border); background: var(--surface-strong); color: var(--text); }
+.selfcheck-provider-check { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .selfcheck-provider-item span { color: var(--text); }
+.selfcheck-provider-model { min-width: 0; }
+.selfcheck-provider-model .searchable-select { width: 100%; }
+@media (max-width: 720px) {
+  .selfcheck-provider-item { grid-template-columns: 1fr; }
+}
 .selfcheck-header, .selfcheck-row { display: grid; grid-template-columns: minmax(132px, 0.95fr) minmax(100px, 1fr) 78px 78px 90px minmax(110px, 1.1fr) 56px 56px 72px minmax(120px, 1.3fr) 118px; gap: 10px; align-items: center; }
 .selfcheck-header { padding: 10px 14px; border-radius: 14px; background: var(--surface-strong); color: var(--muted); font-size: 12px; font-weight: 800; }
 .selfcheck-row { padding: 12px 14px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); color: var(--text); font-size: 13px; }

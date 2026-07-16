@@ -525,9 +525,16 @@ func (s *Store) UsageStats(now time.Time) UsageStatsSnapshot {
 	return s.UsageStatsRange(now, dayStart, dayStart.Add(24*time.Hour))
 }
 
-// UsageStatsRangeForKeys computes usage stats from the in-memory log list,
-// restricted to the given API key IDs (per-user isolation for role=user).
-// It bypasses the day-bucket counters because those are not keyed per user.
+// UsageStatsRangeForKeys computes usage stats restricted to the given API key IDs
+// (per-user isolation for role=user).
+//
+// Totals / by-api-key / daily token counts come from persisted day-bucket
+// counters (same source as admin stats), filtered by key ID — NOT from the
+// in-memory request-log ring buffer. Using only s.logs made "today" look right
+// while "yesterday" under-counted once older rows aged out of memory.
+//
+// ByProvider / ByModel / Status are still best-effort from in-memory logs
+// because day buckets do not store those dimensions per API key.
 func (s *Store) UsageStatsRangeForKeys(now time.Time, from, to time.Time, keyIDs []string) UsageStatsSnapshot {
 	localNow := now.Local()
 	dayStart := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, localNow.Location())
@@ -540,30 +547,93 @@ func (s *Store) UsageStatsRangeForKeys(now time.Time, from, to time.Time, keyIDs
 	}
 	keySet := make(map[string]struct{}, len(keyIDs))
 	for _, id := range keyIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
 		keySet[id] = struct{}{}
 	}
 
 	s.mu.RLock()
-	logs := make([]RequestLog, 0, len(s.logs))
-	for _, item := range s.logs {
-		if _, ok := keySet[item.APIKeyID]; ok {
-			logs = append(logs, item)
+	todayPeriod := periodStatsForKeysLocked(s.usageByDay, dayStart, time.Time{}, keySet, dayStart.Format("2006-01-02"))
+	month := periodStatsForKeysLocked(s.usageByDay, monthStart, time.Time{}, keySet, monthStart.Format("2006-01"))
+	rangeStats := periodStatsForKeysLocked(s.usageByDay, from, to, keySet, from.Format("2006-01-02")+" ~ "+to.Add(-time.Nanosecond).Format("2006-01-02"))
+	daily := dailyStatsForKeysLocked(s.usageByDay, from, to, keySet)
+	lastRequest := lastUsageRequestForKeysLocked(s.lastUsageRequest, s.logs, keySet, dayStart)
+
+	// Provider/model/status lack per-key day buckets; fall back to memory logs.
+	logs := make([]RequestLog, 0)
+	if len(keySet) > 0 {
+		for _, item := range s.logs {
+			if _, ok := keySet[item.APIKeyID]; ok {
+				logs = append(logs, item)
+			}
 		}
 	}
 	s.mu.RUnlock()
 
-	today := s.TodayStatsFromLogs(logs, now)
-	month := aggregateLogsSince(logs, monthStart, monthStart.Format("2006-01"))
-	rangeStats := aggregateLogsInRange(logs, from, to, from.Format("2006-01-02")+" ~ "+to.Add(-time.Nanosecond).Format("2006-01-02"))
+	today := TodayStatsSnapshot{
+		Date:        dayStart.Format("2006-01-02"),
+		Total:       todayPeriod.Total,
+		LastRequest: lastRequest,
+		ByAPIKey:    todayPeriod.ByAPIKey,
+		ByProvider:  aggregateByProvider(filterLogsInRange(logs, dayStart, dayStart.Add(24*time.Hour)), time.Time{}),
+		ByModel:     aggregateByModel(filterLogsInRange(logs, dayStart, dayStart.Add(24*time.Hour)), time.Time{}),
+		ByUser:      todayPeriod.ByUser,
+	}
+	month.ByProvider = aggregateByProvider(filterLogsInRange(logs, monthStart, time.Time{}), time.Time{})
+	month.ByModel = aggregateByModel(filterLogsInRange(logs, monthStart, time.Time{}), time.Time{})
+	rangeStats.ByProvider = aggregateByProvider(filterLogsInRange(logs, from, to), time.Time{})
+	rangeStats.ByModel = aggregateByModel(filterLogsInRange(logs, from, to), time.Time{})
+
 	return UsageStatsSnapshot{
 		Today:  today,
 		Month:  month,
 		Range:  &rangeStats,
 		From:   from.Format(time.RFC3339),
 		To:     to.Format(time.RFC3339),
-		Daily:  aggregateDaily(logs, from, to),
+		Daily:  daily,
 		Status: aggregateStatus(logs, from, to),
 	}
+}
+
+func filterLogsInRange(logs []RequestLog, from, to time.Time) []RequestLog {
+	if len(logs) == 0 {
+		return nil
+	}
+	out := make([]RequestLog, 0, len(logs))
+	for i := range logs {
+		log := logs[i]
+		if !from.IsZero() && log.Time.Before(from) {
+			continue
+		}
+		if !to.IsZero() && !log.Time.Before(to) {
+			continue
+		}
+		out = append(out, log)
+	}
+	return out
+}
+
+func lastUsageRequestForKeysLocked(last *RequestLog, logs []RequestLog, keySet map[string]struct{}, dayStart time.Time) *RequestLog {
+	if last != nil && !last.Time.Before(dayStart) {
+		if _, ok := keySet[last.APIKeyID]; ok {
+			copied := *last
+			return &copied
+		}
+	}
+	for i := range logs {
+		log := logs[i]
+		if log.Time.Before(dayStart) {
+			continue
+		}
+		if _, ok := keySet[log.APIKeyID]; !ok {
+			continue
+		}
+		copied := log
+		return &copied
+	}
+	return nil
 }
 
 func (s *Store) UsageStatsRange(now time.Time, from, to time.Time) UsageStatsSnapshot {

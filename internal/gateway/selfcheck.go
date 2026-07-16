@@ -48,9 +48,11 @@ const (
 const selfcheckCasesPerProvider = 6
 
 type selfcheckStartRequest struct {
-	ProviderIDs []string `json:"providerIds"`
-	TimeoutMs   int      `json:"timeoutMs"`
-	Prompt      string   `json:"prompt"`
+	ProviderIDs []string          `json:"providerIds"`
+	TimeoutMs   int               `json:"timeoutMs"`
+	Prompt      string            `json:"prompt"`
+	// Models maps providerID → model id used for that provider's cases.
+	Models map[string]string `json:"models,omitempty"`
 }
 
 type selfcheckCaseResult struct {
@@ -74,17 +76,19 @@ type selfcheckCaseResult struct {
 }
 
 type selfcheckJob struct {
-	ID         string               `json:"jobId"`
-	Status     string               `json:"status"` // running | done | error
-	Prompt     string               `json:"prompt"`
-	TimeoutMs  int                  `json:"timeoutMs"`
-	LANRoot    string               `json:"lanRoot"`
-	StartedAt  string               `json:"startedAt"`
-	FinishedAt string               `json:"finishedAt,omitempty"`
-	Error      string               `json:"error,omitempty"`
+	ID         string                `json:"jobId"`
+	Status     string                `json:"status"` // running | done | error
+	Prompt     string                `json:"prompt"`
+	TimeoutMs  int                   `json:"timeoutMs"`
+	LANRoot    string                `json:"lanRoot"`
+	StartedAt  string                `json:"startedAt"`
+	FinishedAt string                `json:"finishedAt,omitempty"`
+	Error      string                `json:"error,omitempty"`
 	Results    []selfcheckCaseResult `json:"results"`
-	Total      int                  `json:"total"`
-	Completed  int                  `json:"completed"`
+	Total      int                   `json:"total"`
+	Completed  int                   `json:"completed"`
+	// Models mirrors the start request's per-provider model picks.
+	Models map[string]string `json:"models,omitempty"`
 
 	mu sync.Mutex
 	// cases retains the prepared route/key/model per CaseID so a single failing
@@ -186,6 +190,7 @@ func (s *Server) handleSelfcheckStart(w http.ResponseWriter, r *http.Request) {
 		StartedAt: time.Now().UTC().Format(time.RFC3339),
 		Results:   make([]selfcheckCaseResult, 0, len(providerIDs)*selfcheckCasesPerProvider),
 		Total:     len(providerIDs) * selfcheckCasesPerProvider,
+		Models:    normalizeSelfcheckModels(req.Models, providerIDs),
 		cases:     make(map[string]preparedCase),
 		running:   make(map[string]struct{}),
 	}
@@ -278,7 +283,13 @@ func (s *Server) handleSelfcheckRetry(w http.ResponseWriter, r *http.Request) {
 	// job finished. Re-prepare against the current provider state.
 	if item.setupErr == "" {
 		if provider, found := findProvider(s.router.State(), item.providerID); found {
-			if route, key, model, created, err := s.ensureSelfcheckRouteAndKey(provider, item.protocol); err == nil {
+			preferredModel := strings.TrimSpace(item.model)
+			if job.Models != nil {
+				if picked := strings.TrimSpace(job.Models[item.providerID]); picked != "" {
+					preferredModel = picked
+				}
+			}
+			if route, key, model, created, err := s.ensureSelfcheckRouteAndKey(provider, item.protocol, preferredModel); err == nil {
 				item.routeID = route.ID
 				item.apiKeyName = key.Name
 				item.apiKey = key.Key
@@ -360,9 +371,13 @@ func (s *Server) runSelfcheckJob(job *selfcheckJob, providerIDs []string) {
 		} {
 			var routeID, apiKeyName, apiKey, model, setupErr string
 			routeCreated := false
+			preferredModel := ""
+			if job.Models != nil {
+				preferredModel = strings.TrimSpace(job.Models[providerID])
+			}
 			if !ok {
 				setupErr = "provider not found"
-			} else if route, key, m, created, err := s.ensureSelfcheckRouteAndKey(provider, pair.protocol); err != nil {
+			} else if route, key, m, created, err := s.ensureSelfcheckRouteAndKey(provider, pair.protocol, preferredModel); err != nil {
 				setupErr = err.Error()
 			} else {
 				routeID = route.ID
@@ -568,7 +583,34 @@ func (s *Server) runPreparedSelfcheckCase(
 	return finish(result)
 }
 
-func (s *Server) ensureSelfcheckRouteAndKey(provider domain.Provider, protocol domain.Protocol) (domain.Route, domain.APIKey, string, bool, error) {
+func normalizeSelfcheckModels(raw map[string]string, providerIDs []string) map[string]string {
+	if len(raw) == 0 || len(providerIDs) == 0 {
+		return nil
+	}
+	allowed := make(map[string]struct{}, len(providerIDs))
+	for _, id := range providerIDs {
+		allowed[id] = struct{}{}
+	}
+	out := make(map[string]string, len(raw))
+	for providerID, model := range raw {
+		providerID = strings.TrimSpace(providerID)
+		model = strings.TrimSpace(model)
+		if providerID == "" || model == "" {
+			continue
+		}
+		if _, ok := allowed[providerID]; !ok {
+			continue
+		}
+		out[providerID] = model
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func (s *Server) ensureSelfcheckRouteAndKey(provider domain.Provider, protocol domain.Protocol, preferredModel string) (domain.Route, domain.APIKey, string, bool, error) {
+	preferredModel = strings.TrimSpace(preferredModel)
 	state := s.router.State()
 	routeCreated := false
 	route, found := findRouteForProviderProtocol(state, provider.ID, protocol)
@@ -594,12 +636,16 @@ func (s *Server) ensureSelfcheckRouteAndKey(provider domain.Provider, protocol d
 	keyName := selfcheckKeyName(provider.ID, protocol)
 	state = s.router.State()
 	if key, ok := findAPIKeyByName(state, keyName); ok {
-		if key.RouteID != route.ID || !key.Enabled {
+		modelOverride := strings.TrimSpace(key.ModelOverride)
+		if preferredModel != "" {
+			modelOverride = preferredModel
+		}
+		if key.RouteID != route.ID || !key.Enabled || key.ModelOverride != modelOverride {
 			updated, err := s.router.UpdateAPIKey(key.ID, domain.APIKey{
 				RouteID:       route.ID,
 				Enabled:       true,
 				StreamEnabled: true,
-				ModelOverride: key.ModelOverride,
+				ModelOverride: modelOverride,
 			})
 			if err != nil {
 				return domain.Route{}, domain.APIKey{}, "", false, fmt.Errorf("update selfcheck key: %w", err)
@@ -611,7 +657,7 @@ func (s *Server) ensureSelfcheckRouteAndKey(provider domain.Provider, protocol d
 			}
 			key = updated
 		}
-		model := resolveSelfcheckModel(key, provider)
+		model := resolveSelfcheckModel(key, provider, preferredModel)
 		return route, key, model, routeCreated, nil
 	}
 
@@ -620,6 +666,7 @@ func (s *Server) ensureSelfcheckRouteAndKey(provider domain.Provider, protocol d
 		RouteID:       route.ID,
 		Enabled:       true,
 		StreamEnabled: true,
+		ModelOverride: preferredModel,
 	})
 	if err != nil {
 		return domain.Route{}, domain.APIKey{}, "", false, fmt.Errorf("create selfcheck key: %w", err)
@@ -632,11 +679,14 @@ func (s *Server) ensureSelfcheckRouteAndKey(provider domain.Provider, protocol d
 		return domain.Route{}, domain.APIKey{}, "", false, err
 	}
 	s.logs.AddApp("info", "selfcheck api key created", created.ID)
-	model := resolveSelfcheckModel(created, provider)
+	model := resolveSelfcheckModel(created, provider, preferredModel)
 	return route, created, model, routeCreated, nil
 }
 
-func resolveSelfcheckModel(key domain.APIKey, provider domain.Provider) string {
+func resolveSelfcheckModel(key domain.APIKey, provider domain.Provider, preferredModel string) string {
+	if model := strings.TrimSpace(preferredModel); model != "" {
+		return model
+	}
 	if model := strings.TrimSpace(key.ModelOverride); model != "" {
 		return model
 	}

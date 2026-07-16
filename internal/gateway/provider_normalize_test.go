@@ -39,3 +39,20 @@ func TestNormalizeProviderForcesClaudeOAuthToClaude(t *testing.T) {
 		t.Fatalf("unexpected base URL: %q", provider.BaseURL)
 	}
 }
+
+func TestNormalizeProviderForcesChatGPTOAuthToOpenAIResponses(t *testing.T) {
+	provider := domain.Provider{
+		ID:       "chatgpt-pro",
+		Name:     "ChatGPT Pro",
+		AuthType: domain.AuthTypeChatGPTOAuth,
+		Protocol: domain.ProtocolOpenAIChat,
+		BaseURL:  "https://example.invalid",
+	}
+	normalizeProvider(&provider)
+	if provider.Protocol != domain.ProtocolOpenAIResponses {
+		t.Fatalf("expected openai_responses, got %q", provider.Protocol)
+	}
+	if provider.BaseURL != chatgptCodexResponsesURL {
+		t.Fatalf("unexpected base URL: %q", provider.BaseURL)
+	}
+}

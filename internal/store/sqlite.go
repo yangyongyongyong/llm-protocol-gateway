@@ -220,6 +220,10 @@ func (s *Store) migrate() error {
 	if err := addColumnIfMissing(tx, "api_keys", "max_output_tokens", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
+	// Codex config-copy dialog: per-key "keep official login" toggle, off by default.
+	if err := addColumnIfMissing(tx, "api_keys", "codex_keep_official_login", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
 	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS users (
 		id TEXT PRIMARY KEY,
 		username TEXT NOT NULL UNIQUE,
@@ -410,6 +414,14 @@ func (s *Store) Save(state domain.GatewayState) error {
 				expiresAt = provider.CursorOAuth.ExpiresAt
 				accountLabel = provider.CursorOAuth.AccountLabel
 			}
+		case domain.AuthTypeChatGPTOAuth:
+			if provider.ChatGPTOAuth != nil {
+				accessToken = provider.ChatGPTOAuth.AccessToken
+				refreshToken = provider.ChatGPTOAuth.RefreshToken
+				expiresAt = provider.ChatGPTOAuth.ExpiresAt
+				scope = provider.ChatGPTOAuth.ChatGPTAccountID
+				accountLabel = provider.ChatGPTOAuth.AccountLabel
+			}
 		}
 		if _, err := tx.Exec(`INSERT INTO providers
 			(id, name, protocol, base_url, api_key_source, default_model, default_thinking_depth, health_status, auth_header, extra_endpoint, position,
@@ -541,6 +553,16 @@ func (s *Store) loadProviders() ([]domain.Provider, error) {
 					RefreshToken: refreshToken,
 					ExpiresAt:    expiresAt,
 					AccountLabel: accountLabel,
+				}
+			}
+		case domain.AuthTypeChatGPTOAuth:
+			if accessToken != "" || refreshToken != "" {
+				p.ChatGPTOAuth = &domain.ChatGPTOAuthCredential{
+					AccessToken:      accessToken,
+					RefreshToken:     refreshToken,
+					ExpiresAt:        expiresAt,
+					ChatGPTAccountID: scope,
+					AccountLabel:     accountLabel,
 				}
 			}
 		default:
@@ -746,7 +768,7 @@ func decodeKeyProfiles(raw string) []domain.KeyProfile {
 }
 
 func (s *Store) loadAPIKeys() ([]domain.APIKey, error) {
-	rows, err := s.reader().Query(`SELECT id, name, key, route_id, model_override, model_aliases, thinking_depth_override, max_output_tokens, stream_enabled, fallback_provider_ids, fallback_model_overrides, active_provider_id, owner_user_id, profiles, active_profile_id, enabled, created_at, last_used_at
+	rows, err := s.reader().Query(`SELECT id, name, key, route_id, model_override, model_aliases, thinking_depth_override, max_output_tokens, stream_enabled, codex_keep_official_login, fallback_provider_ids, fallback_model_overrides, active_provider_id, owner_user_id, profiles, active_profile_id, enabled, created_at, last_used_at
 		FROM api_keys ORDER BY position, id`)
 	if err != nil {
 		return nil, err
@@ -757,15 +779,17 @@ func (s *Store) loadAPIKeys() ([]domain.APIKey, error) {
 		var k domain.APIKey
 		var enabled int
 		var streamEnabled int
+		var codexKeepOfficialLogin int
 		var modelAliases string
 		var fallbackProviderIDs string
 		var fallbackModelOverrides string
 		var profiles string
-		if err := rows.Scan(&k.ID, &k.Name, &k.Key, &k.RouteID, &k.ModelOverride, &modelAliases, &k.ThinkingDepthOverride, &k.MaxOutputTokens, &streamEnabled, &fallbackProviderIDs, &fallbackModelOverrides, &k.ActiveProviderID, &k.OwnerUserID, &profiles, &k.ActiveProfileID, &enabled, &k.CreatedAt, &k.LastUsedAt); err != nil {
+		if err := rows.Scan(&k.ID, &k.Name, &k.Key, &k.RouteID, &k.ModelOverride, &modelAliases, &k.ThinkingDepthOverride, &k.MaxOutputTokens, &streamEnabled, &codexKeepOfficialLogin, &fallbackProviderIDs, &fallbackModelOverrides, &k.ActiveProviderID, &k.OwnerUserID, &profiles, &k.ActiveProfileID, &enabled, &k.CreatedAt, &k.LastUsedAt); err != nil {
 			return nil, err
 		}
 		k.Enabled = enabled != 0
 		k.StreamEnabled = streamEnabled != 0
+		k.CodexKeepOfficialLogin = codexKeepOfficialLogin != 0
 		k.ModelAliases = decodeModelAliases(modelAliases)
 		k.FallbackProviderIDs = decodeProviderIDList(fallbackProviderIDs)
 		k.FallbackModelOverrides = decodeFallbackModelOverrides(fallbackModelOverrides)
@@ -800,10 +824,14 @@ func (s *Store) CreateAPIKey(key domain.APIKey) error {
 	if key.StreamEnabled {
 		streamEnabled = 1
 	}
+	codexKeepOfficialLogin := 0
+	if key.CodexKeepOfficialLogin {
+		codexKeepOfficialLogin = 1
+	}
 	_, err := s.db.Exec(`INSERT INTO api_keys
-		(id, name, key, route_id, model_override, model_aliases, thinking_depth_override, max_output_tokens, stream_enabled, fallback_provider_ids, fallback_model_overrides, active_provider_id, owner_user_id, profiles, active_profile_id, enabled, created_at, last_used_at, position)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		key.ID, key.Name, key.Key, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, key.MaxOutputTokens, streamEnabled, encodeProviderIDList(key.FallbackProviderIDs), encodeFallbackModelOverrides(key.FallbackModelOverrides), strings.TrimSpace(key.ActiveProviderID), strings.TrimSpace(key.OwnerUserID), encodeKeyProfiles(key.Profiles), strings.TrimSpace(key.ActiveProfileID), enabled, key.CreatedAt, key.LastUsedAt, position)
+		(id, name, key, route_id, model_override, model_aliases, thinking_depth_override, max_output_tokens, stream_enabled, codex_keep_official_login, fallback_provider_ids, fallback_model_overrides, active_provider_id, owner_user_id, profiles, active_profile_id, enabled, created_at, last_used_at, position)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		key.ID, key.Name, key.Key, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, key.MaxOutputTokens, streamEnabled, codexKeepOfficialLogin, encodeProviderIDList(key.FallbackProviderIDs), encodeFallbackModelOverrides(key.FallbackModelOverrides), strings.TrimSpace(key.ActiveProviderID), strings.TrimSpace(key.OwnerUserID), encodeKeyProfiles(key.Profiles), strings.TrimSpace(key.ActiveProfileID), enabled, key.CreatedAt, key.LastUsedAt, position)
 	return err
 }
 
@@ -816,10 +844,14 @@ func (s *Store) UpdateAPIKey(key domain.APIKey) error {
 	if key.StreamEnabled {
 		streamEnabled = 1
 	}
+	codexKeepOfficialLogin := 0
+	if key.CodexKeepOfficialLogin {
+		codexKeepOfficialLogin = 1
+	}
 	_, err := s.db.Exec(`UPDATE api_keys
-		SET name = ?, route_id = ?, model_override = ?, model_aliases = ?, thinking_depth_override = ?, max_output_tokens = ?, stream_enabled = ?, fallback_provider_ids = ?, fallback_model_overrides = ?, active_provider_id = ?, owner_user_id = ?, profiles = ?, active_profile_id = ?, enabled = ?
+		SET name = ?, route_id = ?, model_override = ?, model_aliases = ?, thinking_depth_override = ?, max_output_tokens = ?, stream_enabled = ?, codex_keep_official_login = ?, fallback_provider_ids = ?, fallback_model_overrides = ?, active_provider_id = ?, owner_user_id = ?, profiles = ?, active_profile_id = ?, enabled = ?
 		WHERE id = ?`,
-		key.Name, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, key.MaxOutputTokens, streamEnabled, encodeProviderIDList(key.FallbackProviderIDs), encodeFallbackModelOverrides(key.FallbackModelOverrides), strings.TrimSpace(key.ActiveProviderID), strings.TrimSpace(key.OwnerUserID), encodeKeyProfiles(key.Profiles), strings.TrimSpace(key.ActiveProfileID), enabled, key.ID)
+		key.Name, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, key.MaxOutputTokens, streamEnabled, codexKeepOfficialLogin, encodeProviderIDList(key.FallbackProviderIDs), encodeFallbackModelOverrides(key.FallbackModelOverrides), strings.TrimSpace(key.ActiveProviderID), strings.TrimSpace(key.OwnerUserID), encodeKeyProfiles(key.Profiles), strings.TrimSpace(key.ActiveProfileID), enabled, key.ID)
 	return err
 }
 

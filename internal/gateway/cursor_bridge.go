@@ -43,3 +43,26 @@ func (s *Server) resolveCursorBridgeBaseURL(ctx context.Context, provider domain
 func (s *Server) SetCursorBridge(bridge *cursor.Bridge) {
 	s.cursorBridge = bridge
 }
+
+// StopCursorBridge stops the managed bridge subprocess and its health watch.
+func (s *Server) StopCursorBridge() {
+	if s.cursorBridge != nil {
+		s.cursorBridge.Stop()
+	}
+}
+
+// cursorBridgeRuntime returns the live bridge snapshot for /__state.
+func (s *Server) cursorBridgeRuntime() *domain.CursorBridgeRuntime {
+	if s.cursorBridge == nil {
+		return &domain.CursorBridgeRuntime{Status: cursor.BridgeStatusStopped}
+	}
+	snap := s.cursorBridge.Snapshot()
+	return &domain.CursorBridgeRuntime{
+		Status:    snap.Status,
+		Port:      snap.Port,
+		PID:       snap.PID,
+		Message:   snap.Message,
+		StartedAt: snap.StartedAt,
+		CheckedAt: snap.CheckedAt,
+	}
+}

@@ -416,7 +416,7 @@ func (s *Server) ensureFreshClaudeToken(provider domain.Provider) (domain.Provid
 	if err != nil {
 		return provider, err
 	}
-	if err := s.persistProviderOAuth(updated.ID, updated.ClaudeOAuth, nil); err != nil {
+	if err := s.persistProviderOAuth(updated.ID, updated.ClaudeOAuth, nil, nil); err != nil {
 		s.logs.AddApp("warn", "failed to persist refreshed claude oauth token", err.Error())
 	}
 	return updated, nil

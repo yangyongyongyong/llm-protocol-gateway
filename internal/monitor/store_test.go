@@ -253,3 +253,57 @@ func TestApplyUsageEventSyncOpenAIInclusiveInput(t *testing.T) {
 		t.Fatalf("expected ~80%% hit rate, got %.2f%%", rate)
 	}
 }
+
+// Regression: role=user stats must read day buckets, not only the in-memory log
+// ring. Yesterday's traffic can age out of s.logs while usageByDay still has it
+// (admin view stays correct via byUser / day counters).
+func TestUsageStatsRangeForKeysUsesDayBucketsNotOnlyMemoryLogs(t *testing.T) {
+	store := NewStore()
+	yesterday := time.Date(2026, 7, 15, 18, 0, 0, 0, time.Local)
+	today := time.Date(2026, 7, 16, 10, 0, 0, 0, time.Local)
+	from := time.Date(2026, 7, 15, 0, 0, 0, 0, time.Local)
+	to := time.Date(2026, 7, 17, 0, 0, 0, 0, time.Local)
+
+	store.ApplyUsageEventSync(UsageEvent{
+		Time: yesterday, APIKeyID: "key-a", APIKeyName: "A", UserID: "user-a",
+		ProviderID: "p1", Model: "m1", Status: 200,
+		InputTokens: 100, OutputTokens: 20,
+	})
+	store.ApplyUsageEventSync(UsageEvent{
+		Time: today, APIKeyID: "key-a", APIKeyName: "A", UserID: "user-a",
+		ProviderID: "p1", Model: "m1", Status: 200,
+		InputTokens: 50, OutputTokens: 10,
+	})
+	store.ApplyUsageEventSync(UsageEvent{
+		Time: yesterday, APIKeyID: "key-b", APIKeyName: "B", UserID: "user-b",
+		ProviderID: "p1", Model: "m1", Status: 200,
+		InputTokens: 999, OutputTokens: 99,
+	})
+
+	// Drop in-memory logs so a log-only implementation would report zeros for yesterday.
+	store.mu.Lock()
+	store.logs = nil
+	store.mu.Unlock()
+
+	snap := store.UsageStatsRangeForKeys(today, from, to, []string{"key-a"})
+	if snap.Range == nil || snap.Range.Total.RequestCount != 2 {
+		t.Fatalf("range total=%+v", snap.Range)
+	}
+	if snap.Range.Total.InputTokens != 150 || snap.Range.Total.OutputTokens != 30 {
+		t.Fatalf("range tokens in=%d out=%d", snap.Range.Total.InputTokens, snap.Range.Total.OutputTokens)
+	}
+	if snap.Today.Total.RequestCount != 1 || snap.Today.Total.InputTokens != 50 {
+		t.Fatalf("today=%+v", snap.Today.Total)
+	}
+
+	var yesterdayPoint *DailyRequestPoint
+	for i := range snap.Daily {
+		if snap.Daily[i].Date == "2026-07-15" {
+			yesterdayPoint = &snap.Daily[i]
+			break
+		}
+	}
+	if yesterdayPoint == nil || yesterdayPoint.RequestCount != 1 || yesterdayPoint.InputTokens != 100 {
+		t.Fatalf("yesterday daily=%+v", yesterdayPoint)
+	}
+}

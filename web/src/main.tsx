@@ -68,6 +68,15 @@ type TunnelRuntime = {
   pid?: number;
 };
 
+type CursorBridgeRuntime = {
+  status: 'stopped' | 'starting' | 'healthy' | 'unhealthy' | 'restarting' | string;
+  port?: number;
+  pid?: number;
+  message?: string;
+  startedAt?: string;
+  checkedAt?: string;
+};
+
 type PublicAccessSettings = {
   enabled: boolean;
   provider: string;
@@ -96,6 +105,12 @@ type ClaudeOAuthInfo = {
 };
 
 type CursorOAuthInfo = {
+  connected?: boolean;
+  expiresAt?: string;
+  accountLabel?: string;
+};
+
+type ChatGPTOAuthInfo = {
   connected?: boolean;
   expiresAt?: string;
   accountLabel?: string;
@@ -131,6 +146,22 @@ type CursorOAuthUsageReport = {
   planName?: string;
   message?: string;
   buckets?: CursorOAuthUsageBucket[];
+};
+
+type ChatGPTOAuthUsageBucket = {
+  label: string;
+  utilization: number;
+  detail?: string;
+  resetsAt?: string;
+};
+
+type ChatGPTOAuthUsageReport = {
+  available: boolean;
+  error?: string;
+  fetchedAt?: string;
+  planName?: string;
+  message?: string;
+  buckets?: ChatGPTOAuthUsageBucket[];
 };
 
 type RequestAdapter = {
@@ -247,9 +278,10 @@ type Provider = {
   defaultThinkingDepth?: string;
   models?: Model[];
   healthStatus: string;
-  authType?: 'api_key' | 'claude_oauth' | 'cursor_oauth';
+  authType?: 'api_key' | 'claude_oauth' | 'cursor_oauth' | 'chatgpt_oauth';
   claudeOAuth?: ClaudeOAuthInfo;
   cursorOAuth?: CursorOAuthInfo;
+  chatgptOAuth?: ChatGPTOAuthInfo;
   requestAdapter?: RequestAdapter;
 };
 
@@ -334,6 +366,8 @@ type APIKey = {
   thinkingDepthOverride?: string;
   maxOutputTokens?: number;
   streamEnabled?: boolean;
+  // Codex「复制配置」弹窗内“保持账号登录”开关，绑定到具体 key，跨次打开弹窗保留。
+  codexKeepOfficialLogin?: boolean;
   fallbackProviderIds?: string[];
   fallbackModelOverrides?: Record<string, string>;
   activeProviderId?: string;
@@ -396,6 +430,7 @@ type GatewayState = {
   /** When true, HTTP binds 0.0.0.0 (LAN / tunnel). When false, loopback only. */
   webExposed?: boolean;
   dataPaths?: DataPaths;
+  cursorBridge?: CursorBridgeRuntime;
 };
 
 type LogEntry = {
@@ -803,6 +838,58 @@ function clearUICache(scope: string, kind: string) {
   }
 }
 
+/** 自检页偏好：无 TTL，按登录身份永久保存在本机。 */
+const SELFCHECK_PREFS_PREFIX = 'llm-gateway-selfcheck-prefs:v1:';
+
+type SelfcheckPrefs = {
+  providerIds?: string[];
+  models?: Record<string, string>;
+  timeoutSec?: number;
+  prompt?: string;
+};
+
+function readSelfcheckPrefs(scope: string): SelfcheckPrefs | null {
+  try {
+    const raw = localStorage.getItem(`${SELFCHECK_PREFS_PREFIX}${scope}`);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as SelfcheckPrefs;
+    if (!parsed || typeof parsed !== 'object') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writeSelfcheckPrefs(scope: string, prefs: SelfcheckPrefs) {
+  try {
+    localStorage.setItem(`${SELFCHECK_PREFS_PREFIX}${scope}`, JSON.stringify(prefs));
+  } catch {
+    // quota / private mode — ignore
+  }
+}
+
+function defaultSelfcheckModelForProvider(provider: Provider, models: Model[]): string {
+  const listed = models.filter((model) => model.providerId === provider.id);
+  return listed[0]?.id?.trim()
+    || provider.defaultModel?.trim()
+    || provider.models?.find((model) => model.id?.trim())?.id?.trim()
+    || '';
+}
+
+function modelsForSelfcheckProvider(provider: Provider, allModels: Model[]): Model[] {
+  const listed = allModels.filter((model) => model.providerId === provider.id);
+  if (listed.length > 0) return listed;
+  const fallbackID = provider.defaultModel?.trim();
+  if (!fallbackID) return [];
+  return [{
+    id: fallbackID,
+    providerId: provider.id,
+    protocol: provider.protocol,
+    contextLength: 0,
+    inMenu: true,
+  }];
+}
+
 type TrafficRankCache = {
   providers: Record<string, number>;
   models: Record<string, number>;
@@ -1034,6 +1121,24 @@ function healthStatusLabel(status: string) {
   }
 }
 
+function cursorBridgeStatusLabel(status?: string) {
+  switch (status) {
+    case 'healthy': return 'bridge 正常';
+    case 'starting': return 'bridge 启动中';
+    case 'restarting': return 'bridge 重启中';
+    case 'unhealthy': return 'bridge 异常';
+    case 'stopped': return 'bridge 未启动';
+    default: return status ? `bridge ${status}` : 'bridge 未启动';
+  }
+}
+
+function cursorBridgeTone(status?: string): BadgeTone {
+  if (status === 'healthy') return 'green';
+  if (status === 'starting' || status === 'restarting') return 'amber';
+  if (status === 'unhealthy') return 'red';
+  return 'slate';
+}
+
 function tunnelStatusLabel(status?: string) {
   switch (status) {
     case 'running': return '运行中';
@@ -1085,6 +1190,7 @@ function buildApiKeyPatchBody(key: APIKey, patch: Partial<APIKey> = {}) {
     thinkingDepthOverride: patch.thinkingDepthOverride ?? key.thinkingDepthOverride ?? '',
     maxOutputTokens: patch.maxOutputTokens ?? key.maxOutputTokens ?? 0,
     streamEnabled: patch.streamEnabled ?? key.streamEnabled ?? true,
+    codexKeepOfficialLogin: patch.codexKeepOfficialLogin ?? key.codexKeepOfficialLogin ?? false,
     enabled: patch.enabled ?? key.enabled,
     fallbackProviderIds: patch.fallbackProviderIds ?? key.fallbackProviderIds ?? [],
     fallbackModelOverrides: patch.fallbackModelOverrides ?? key.fallbackModelOverrides ?? {},
@@ -1349,7 +1455,7 @@ function buildApiKeyCodexModelCatalogJSON(key: APIKey, provider?: Provider) {
   return `${JSON.stringify({ models }, null, 2)}\n`;
 }
 
-function buildApiKeyCodexConfig(key: APIKey, route: Route | undefined, endpoints: OutputEndpoint[], publicBase: string, provider?: Provider) {
+function buildApiKeyCodexConfig(key: APIKey, route: Route | undefined, endpoints: OutputEndpoint[], publicBase: string, provider?: Provider, keepOfficialLogin?: boolean) {
   const providerID = sanitizeClientConfigID(key.name);
   const model = resolveApiKeyModel(key, provider);
   const effort = resolveCodexReasoningEffort(key);
@@ -1357,20 +1463,28 @@ function buildApiKeyCodexConfig(key: APIKey, route: Route | undefined, endpoints
   const warning = !route || route.outputProtocol !== 'openai_responses'
     ? '# 注意：当前密钥输出协议不是 OpenAI Responses，请先改为「OpenAI Responses」\n'
     : '';
+  // 保持账号登录：让该 provider 表在 Codex 眼里“长得像官方 openai” provider
+  // （name / supports_websockets 对齐官方形状），使 Codex 官方特性门控（插件市场、
+  // 移动端远程控制等）继续命中；不改 base_url / experimental_bearer_token，
+  // 实际模型流量仍打到本网关。全程不写 ~/.codex/auth.json（本工具从未写过该文件）。
+  const providerName = keepOfficialLogin ? 'OpenAI' : (key.name || providerID);
+  const keepOfficialComment = keepOfficialLogin
+    ? '# 保持账号登录已开启：name/supports_websockets 已对齐官方 provider 形状\n'
+    : '';
   return `# ~/.codex/config.toml （用户级；项目内 .codex/config.toml 不会生效 provider）
 # Codex 使用 Responses：base_url 指向网关 /openai/v1，wire_api = "responses"
 # model_catalog_json 提供覆盖模型/别名的本地元数据，避免 “Model metadata not found”
-${warning}model_provider = "${providerID}"
+${warning}${keepOfficialComment}model_provider = "${providerID}"
 model = "${model}"
 model_reasoning_effort = "${effort}"
 model_catalog_json = "${CODEX_MODEL_CATALOG_DISPLAY}"
 
 [model_providers.${providerID}]
-name = "${key.name || providerID}"
+name = "${providerName}"
 base_url = "${baseURL}"
 wire_api = "responses"
 requires_openai_auth = true
-experimental_bearer_token = "${key.key}"
+${keepOfficialLogin ? 'supports_websockets = true\n' : ''}experimental_bearer_token = "${key.key}"
 `;
 }
 
@@ -1474,9 +1588,10 @@ function buildApiKeyClientConfig(
   endpoints: OutputEndpoint[],
   publicBase: string,
   provider?: Provider,
+  keepOfficialLogin?: boolean,
 ) {
   if (client === 'opencode') return buildApiKeyOpenCodeConfig(key, route, endpoints, publicBase, provider);
-  if (client === 'codex') return buildApiKeyCodexConfig(key, route, endpoints, publicBase, provider);
+  if (client === 'codex') return buildApiKeyCodexConfig(key, route, endpoints, publicBase, provider, keepOfficialLogin);
   return buildApiKeyClaudeConfig(key, route, endpoints, publicBase, provider);
 }
 
@@ -1655,6 +1770,12 @@ function buildProviderChatCurl(provider: Provider, model: string, options: Provi
     const payload = buildProviderChatPayload(resolvedModel, buildProviderChatMessages(options));
     const body = JSON.stringify(payload, null, 2);
     return `curl -s 'http://127.0.0.1:<cursor-bridge-port>/v1/chat/completions' \\\n  -H 'Content-Type: application/json' \\\n  -d '${body.replace(/'/g, `'\\''`)}'`;
+  }
+  if (provider.authType === 'chatgpt_oauth') {
+    const resolvedModel = model.trim() || provider.defaultModel || 'gpt-5.2';
+    const payload = buildProviderChatPayload(resolvedModel, buildProviderChatMessages(options));
+    const body = JSON.stringify(payload, null, 2);
+    return `curl -s 'https://chatgpt.com/backend-api/codex/responses' \\\n  -H 'Content-Type: application/json' \\\n  -H 'Authorization: Bearer <oauth-access-token (server-managed)>' \\\n  -H 'ChatGPT-Account-ID: <account-id>' \\\n  -d '${body.replace(/'/g, `'\\''`)}'`;
   }
   const upstreamURL = resolveProviderChatURL(provider, model);
   const round1 = buildChatTestCurl(upstreamURL, buildProviderChatPayload(model, buildProviderChatMessages(options)), auth);
@@ -2338,9 +2459,24 @@ function App() {
   const [apiKeyKeyword, setApiKeyKeyword] = useState('');
   const [apiKeySortBy, setApiKeySortBy] = useState<'name' | 'createdAt'>('createdAt');
   const [apiKeySortDir, setApiKeySortDir] = useState<'asc' | 'desc'>('desc');
-  const [selfcheckProviderIDs, setSelfcheckProviderIDs] = useState<string[]>([]);
-  const [selfcheckTimeoutSec, setSelfcheckTimeoutSec] = useState(90);
-  const [selfcheckPrompt, setSelfcheckPrompt] = useState('1+1等于几');
+  const [selfcheckProviderIDs, setSelfcheckProviderIDs] = useState<string[]>(() => {
+    const prefs = readSelfcheckPrefs(uiCacheScope(bootSession.auth));
+    return Array.isArray(prefs?.providerIds) ? prefs!.providerIds!.filter(Boolean) : [];
+  });
+  const [selfcheckModels, setSelfcheckModels] = useState<Record<string, string>>(() => {
+    const prefs = readSelfcheckPrefs(uiCacheScope(bootSession.auth));
+    return prefs?.models && typeof prefs.models === 'object' ? { ...prefs.models } : {};
+  });
+  const [selfcheckTimeoutSec, setSelfcheckTimeoutSec] = useState(() => {
+    const prefs = readSelfcheckPrefs(uiCacheScope(bootSession.auth));
+    const value = Number(prefs?.timeoutSec);
+    return Number.isFinite(value) && value >= 5 && value <= 600 ? value : 90;
+  });
+  const [selfcheckPrompt, setSelfcheckPrompt] = useState(() => {
+    const prefs = readSelfcheckPrefs(uiCacheScope(bootSession.auth));
+    const prompt = prefs?.prompt?.trim();
+    return prompt || '1+1等于几';
+  });
   const [selfcheckTools, setSelfcheckTools] = useState<SelfcheckToolInfo[]>([]);
   const [selfcheckLanRoot, setSelfcheckLanRoot] = useState('');
   const [selfcheckRunning, setSelfcheckRunning] = useState(false);
@@ -2354,7 +2490,7 @@ function App() {
     apiKeySource: '',
     defaultModel: '',
     defaultThinkingDepth: '',
-    authType: 'api_key' as 'api_key' | 'claude_oauth' | 'cursor_oauth',
+    authType: 'api_key' as 'api_key' | 'claude_oauth' | 'cursor_oauth' | 'chatgpt_oauth',
     requestAdapterJSON: '',
   });
   const [claudeOAuthState, setClaudeOAuthState] = useState('');
@@ -2367,6 +2503,11 @@ function App() {
   const [cursorOAuthError, setCursorOAuthError] = useState('');
   const [cursorOAuthFlowId, setCursorOAuthFlowId] = useState('');
   const [cursorOAuthPolling, setCursorOAuthPolling] = useState(false);
+  const [chatgptOAuthCode, setChatgptOAuthCode] = useState('');
+  const [chatgptOAuthBusy, setChatgptOAuthBusy] = useState(false);
+  const [chatgptOAuthError, setChatgptOAuthError] = useState('');
+  const [chatgptOAuthFlowId, setChatgptOAuthFlowId] = useState('');
+  const [chatgptOAuthPolling, setChatgptOAuthPolling] = useState(false);
   const [routeDraft, setRouteDraft] = useState({
     name: '新建对话路由',
     providerId: '',
@@ -2485,6 +2626,7 @@ function App() {
       if (providerIDs.has(provider.id)) return true;
       if (provider.authType === 'cursor_oauth' && provider.cursorOAuth?.connected) return true;
       if (provider.authType === 'claude_oauth' && provider.claudeOAuth?.connected) return true;
+      if (provider.authType === 'chatgpt_oauth' && provider.chatgptOAuth?.connected) return true;
       return false;
     });
   }, [state.models, sortedProviders]);
@@ -2756,6 +2898,37 @@ function App() {
     if (activeNav !== 'self-check') return;
     void refreshSelfcheckTools();
   }, [activeNav]);
+
+  useEffect(() => {
+    // 自检勾选 Provider / 模型 / 超时 / Prompt 永久写入本机，刷新后仍保留。
+    writeSelfcheckPrefs(uiCacheScope(authStatus), {
+      providerIds: selfcheckProviderIDs,
+      models: selfcheckModels,
+      timeoutSec: selfcheckTimeoutSec,
+      prompt: selfcheckPrompt,
+    });
+  }, [authStatus, selfcheckProviderIDs, selfcheckModels, selfcheckTimeoutSec, selfcheckPrompt]);
+
+  useEffect(() => {
+    // Provider 被删除时，同步清掉自检勾选与模型记忆里的脏 ID。
+    const known = new Set(sortedProviders.map((provider) => provider.id));
+    setSelfcheckProviderIDs((current) => {
+      const next = current.filter((id) => known.has(id));
+      return next.length === current.length ? current : next;
+    });
+    setSelfcheckModels((current) => {
+      let changed = false;
+      const next: Record<string, string> = {};
+      for (const [providerID, model] of Object.entries(current)) {
+        if (!known.has(providerID)) {
+          changed = true;
+          continue;
+        }
+        next[providerID] = model;
+      }
+      return changed ? next : current;
+    });
+  }, [sortedProviders]);
 
   useEffect(() => {
     if (activeNav !== 'users') return;
@@ -3589,6 +3762,10 @@ function App() {
         showToast(result.success ? `对话测试成功：HTTP ${result.status}` : `对话测试未通过：${result.status || result.error || 'unknown'}`);
       } else {
         const providerPath = `${API_BASE}/__providers/${encodeURIComponent(chatTestContext.id)}`;
+        const provider = state.providers.find((item) => item.id === chatTestContext.id);
+        // ChatGPT OAuth / pure Responses providers only support the main chat-test path.
+        const supportsExtraTests = provider?.authType !== 'chatgpt_oauth'
+          && provider?.protocol !== 'openai_responses';
         const baseBody = {
           model: chatTestModel.trim(),
           systemPrompt: providerChatOptions.systemPrompt,
@@ -3599,31 +3776,38 @@ function App() {
           thinkingField: providerChatOptions.thinkingField,
           thinkingValue: providerChatOptions.thinkingValue,
         };
-        const [mainResponse, cacheResponse, thinkingResponse] = await Promise.all([
-          fetch(`${providerPath}/chat-test`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(baseBody),
-          }),
-          fetch(`${providerPath}/cache-test`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(baseBody),
-          }),
-          fetch(`${providerPath}/thinking-test`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(thinkingBody),
-          }),
-        ]);
+        const mainResponse = await fetch(`${providerPath}/chat-test`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(baseBody),
+        });
         const result = await mainResponse.json() as RouteTestResult;
-        const cacheResult = await cacheResponse.json() as ProviderCacheTestResult;
-        const thinkingResult = await thinkingResponse.json() as ProviderThinkingTestResult;
         setChatTestResult(result);
-        setCacheTestResult(cacheResult);
-        setThinkingTestResult(thinkingResult);
-        setCacheTestOpen(true);
-        setThinkingTestOpen(true);
+        if (supportsExtraTests) {
+          const [cacheResponse, thinkingResponse] = await Promise.all([
+            fetch(`${providerPath}/cache-test`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(baseBody),
+            }),
+            fetch(`${providerPath}/thinking-test`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(thinkingBody),
+            }),
+          ]);
+          const cacheResult = await cacheResponse.json() as ProviderCacheTestResult;
+          const thinkingResult = await thinkingResponse.json() as ProviderThinkingTestResult;
+          setCacheTestResult(cacheResult);
+          setThinkingTestResult(thinkingResult);
+          setCacheTestOpen(true);
+          setThinkingTestOpen(true);
+        } else {
+          setCacheTestResult(null);
+          setThinkingTestResult(null);
+          setCacheTestOpen(false);
+          setThinkingTestOpen(false);
+        }
         showToast(result.success ? `对话测试成功：HTTP ${result.status}` : `对话测试未通过：${result.status || result.error || 'unknown'}`);
       }
       if (activeNav === 'traffic-tokens' && logsFetchedOnce) {
@@ -3666,7 +3850,9 @@ function App() {
       kind: 'provider',
       id: provider.id,
       title: `Provider 对话测试 · ${provider.name}`,
-      description: '直连上游 Provider 的对话接口，验证 Provider 本身是否可用。运行测试时将自动执行 Cache 与 Thinking 后台测试。',
+      description: provider.authType === 'chatgpt_oauth' || provider.protocol === 'openai_responses'
+        ? '直连上游 Provider 的对话接口，验证 Provider 本身是否可用。'
+        : '直连上游 Provider 的对话接口，验证 Provider 本身是否可用。运行测试时将自动执行 Cache 与 Thinking 后台测试。',
       curlLabel: '上游 curl 预览',
       endpointLabel: 'upstream',
     });
@@ -3683,7 +3869,7 @@ function App() {
     setCacheTestOpen(false);
     setThinkingTestOpen(false);
     setChatTestOpen(true);
-    if (provider.authType === 'claude_oauth' || provider.authType === 'cursor_oauth') return;
+    if (provider.authType === 'claude_oauth' || provider.authType === 'cursor_oauth' || provider.authType === 'chatgpt_oauth') return;
     void fetch(`${API_BASE}/__providers/${encodeURIComponent(provider.id)}/auth-preview`)
       .then(async (response) => {
         if (!response.ok) return;
@@ -3771,6 +3957,14 @@ function App() {
     setCursorOAuthPolling(false);
   }
 
+  function resetChatGPTOAuthFlowState() {
+    setChatgptOAuthCode('');
+    setChatgptOAuthBusy(false);
+    setChatgptOAuthError('');
+    setChatgptOAuthFlowId('');
+    setChatgptOAuthPolling(false);
+  }
+
   function resetClaudeOAuthFlowState() {
     setClaudeOAuthState('');
     setClaudeOAuthCode('');
@@ -3794,12 +3988,14 @@ function App() {
     });
     resetClaudeOAuthFlowState();
     resetCursorOAuthFlowState();
+    resetChatGPTOAuthFlowState();
     setProviderModalOpen(true);
   }
 
-  function resolveProviderAuthType(provider: Provider): 'api_key' | 'claude_oauth' | 'cursor_oauth' {
+  function resolveProviderAuthType(provider: Provider): 'api_key' | 'claude_oauth' | 'cursor_oauth' | 'chatgpt_oauth' {
     if (provider.authType === 'claude_oauth') return 'claude_oauth';
     if (provider.authType === 'cursor_oauth') return 'cursor_oauth';
+    if (provider.authType === 'chatgpt_oauth') return 'chatgpt_oauth';
     return 'api_key';
   }
 
@@ -3822,6 +4018,7 @@ function App() {
     });
     resetClaudeOAuthFlowState();
     resetCursorOAuthFlowState();
+    resetChatGPTOAuthFlowState();
     setProviderModalOpen(true);
   }
 
@@ -3846,6 +4043,7 @@ function App() {
     });
     resetClaudeOAuthFlowState();
     resetCursorOAuthFlowState();
+    resetChatGPTOAuthFlowState();
     setProviderModalOpen(true);
   }
 
@@ -3934,6 +4132,7 @@ function App() {
     try {
       const isClaudeOAuth = providerDraft.protocol === 'claude' && providerDraft.authType === 'claude_oauth';
       const isCursorOAuth = providerDraft.protocol === 'openai_chat' && providerDraft.authType === 'cursor_oauth';
+      const isChatGPTOAuth = providerDraft.protocol === 'openai_responses' && providerDraft.authType === 'chatgpt_oauth';
       let requestAdapter: RequestAdapter | null = null;
       const adapterRaw = providerDraft.requestAdapterJSON.trim();
       if (adapterRaw) {
@@ -3951,7 +4150,7 @@ function App() {
         defaultModel: providerDraft.defaultModel,
         defaultThinkingDepth: providerDraft.defaultThinkingDepth,
         authHeader: providerDraft.protocol === 'claude' ? 'x-api-key' : 'Authorization',
-        authType: isClaudeOAuth ? 'claude_oauth' : isCursorOAuth ? 'cursor_oauth' : 'api_key',
+        authType: isClaudeOAuth ? 'claude_oauth' : isCursorOAuth ? 'cursor_oauth' : isChatGPTOAuth ? 'chatgpt_oauth' : 'api_key',
         requestAdapter,
       };
       const response = await fetch(editingProviderID ? `${API_BASE}/__providers/${encodeURIComponent(editingProviderID)}` : `${API_BASE}/__providers`, {
@@ -3966,10 +4165,13 @@ function App() {
       setEditingProviderID('');
       resetClaudeOAuthFlowState();
       resetCursorOAuthFlowState();
+      resetChatGPTOAuthFlowState();
       if (wasCreate && isClaudeOAuth) {
         showToast(`已添加输入 Provider：${saved.name}。在列表中点击编辑可连接 Claude 账号。`);
       } else if (wasCreate && isCursorOAuth) {
         showToast(`已添加输入 Provider：${saved.name}。在列表中点击编辑可连接 Cursor 账号。`);
+      } else if (wasCreate && isChatGPTOAuth) {
+        showToast(`已添加输入 Provider：${saved.name}。在列表中点击编辑可连接 ChatGPT 账号。`);
       } else {
         showToast(wasCreate ? `已添加输入 Provider：${saved.name}` : `已更新输入 Provider：${saved.name}`);
       }
@@ -4199,6 +4401,106 @@ function App() {
     }
   }
 
+  async function pollChatGPTOAuthStatus(flowId: string) {
+    const deadline = Date.now() + 15 * 60 * 1000;
+    setChatgptOAuthPolling(true);
+    try {
+      while (Date.now() < deadline) {
+        const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(editingProviderID!)}/chatgpt-oauth/status?flowId=${encodeURIComponent(flowId)}`);
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(text || 'oauth status check failed');
+        }
+        const data = await response.json() as { status: string; message?: string };
+        if (data.status === 'connected') {
+          const providerID = editingProviderID!;
+          resetChatGPTOAuthFlowState();
+          await fetchProviderModels(providerID, 'chatgpt', false);
+          await refreshState(false);
+          showToast('ChatGPT 账号已连接，模型列表已同步');
+          return;
+        }
+        if (data.status === 'error') {
+          throw new Error(data.message || 'Authorization failed');
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 1500));
+      }
+      throw new Error('授权超时，请重试');
+    } finally {
+      setChatgptOAuthPolling(false);
+    }
+  }
+
+  async function startChatGPTOAuthConnect() {
+    if (!editingProviderID) return;
+    setChatgptOAuthBusy(true);
+    setChatgptOAuthError('');
+    try {
+      const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(editingProviderID)}/chatgpt-oauth/start`, { method: 'POST' });
+      if (!response.ok) throw new Error(await response.text());
+      const data = await response.json() as { authUrl: string; flowId?: string };
+      if (data.flowId) setChatgptOAuthFlowId(data.flowId);
+      const opened = window.open(data.authUrl, '_blank', 'noopener,noreferrer');
+      if (!opened) {
+        setChatgptOAuthError('浏览器拦截了弹窗，请复制授权链接手动打开。');
+      }
+      try {
+        await navigator.clipboard.writeText(data.authUrl);
+        if (opened) showToast('已打开 ChatGPT 授权页面，完成后将自动连接');
+      } catch {
+        if (opened) showToast('已打开 ChatGPT 授权页面');
+      }
+      if (data.flowId) {
+        setChatgptOAuthBusy(false);
+        await pollChatGPTOAuthStatus(data.flowId);
+      }
+    } catch (error) {
+      setChatgptOAuthError(String(error));
+    } finally {
+      setChatgptOAuthBusy(false);
+    }
+  }
+
+  async function completeChatGPTOAuthConnect() {
+    if (!editingProviderID) return;
+    setChatgptOAuthBusy(true);
+    setChatgptOAuthError('');
+    try {
+      if (!chatgptOAuthCode.trim()) throw new Error('请粘贴授权 code 或完整回调 URL');
+      const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(editingProviderID)}/chatgpt-oauth/complete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: chatgptOAuthCode }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data?.error?.message || data?.error || 'connect failed');
+      resetChatGPTOAuthFlowState();
+      showToast('ChatGPT 账号连接成功');
+      await refreshState(false);
+    } catch (error) {
+      setChatgptOAuthError(String(error));
+    } finally {
+      setChatgptOAuthBusy(false);
+    }
+  }
+
+  async function disconnectChatGPTOAuth() {
+    if (!editingProviderID) return;
+    setChatgptOAuthBusy(true);
+    setChatgptOAuthError('');
+    try {
+      const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(editingProviderID)}/chatgpt-oauth/disconnect`, { method: 'POST' });
+      if (!response.ok) throw new Error(await response.text());
+      resetChatGPTOAuthFlowState();
+      showToast('已断开 ChatGPT 账号连接');
+      await refreshState(false);
+    } catch (error) {
+      setChatgptOAuthError(String(error));
+    } finally {
+      setChatgptOAuthBusy(false);
+    }
+  }
+
   async function refreshApiKeyDraftModels() {
     if (!apiKeyDraft.providerId) {
       showToast('请先选择输入 Provider');
@@ -4259,19 +4561,59 @@ function App() {
   }
 
   function toggleSelfcheckProvider(providerID: string) {
+    const selecting = !selfcheckProviderIDs.includes(providerID);
     setSelfcheckProviderIDs((current) => (
-      current.includes(providerID)
-        ? current.filter((id) => id !== providerID)
-        : [...current, providerID]
+      selecting
+        ? [...current, providerID]
+        : current.filter((id) => id !== providerID)
     ));
+    if (selecting) {
+      const provider = sortedProviders.find((item) => item.id === providerID);
+      if (provider) {
+        setSelfcheckModels((current) => {
+          if (current[providerID]?.trim()) return current;
+          const fallback = defaultSelfcheckModelForProvider(provider, state.models);
+          if (!fallback) return current;
+          return { ...current, [providerID]: fallback };
+        });
+      }
+    }
   }
 
   function selectAllSelfcheckProviders() {
     setSelfcheckProviderIDs(sortedProviders.map((provider) => provider.id));
+    setSelfcheckModels((current) => {
+      const next = { ...current };
+      let changed = false;
+      for (const provider of sortedProviders) {
+        if (next[provider.id]?.trim()) continue;
+        const fallback = defaultSelfcheckModelForProvider(provider, state.models);
+        if (!fallback) continue;
+        next[provider.id] = fallback;
+        changed = true;
+      }
+      return changed ? next : current;
+    });
   }
 
   function clearSelfcheckProviders() {
     setSelfcheckProviderIDs([]);
+  }
+
+  function selfcheckModelForProvider(provider: Provider) {
+    const saved = selfcheckModels[provider.id]?.trim();
+    if (saved) return saved;
+    return defaultSelfcheckModelForProvider(provider, state.models);
+  }
+
+  function setSelfcheckModelForProvider(providerID: string, model: string) {
+    setSelfcheckModels((current) => {
+      const next = { ...current };
+      const trimmed = model.trim();
+      if (!trimmed) delete next[providerID];
+      else next[providerID] = trimmed;
+      return next;
+    });
   }
 
   async function refreshSelfcheckTools() {
@@ -4325,6 +4667,12 @@ function App() {
       return;
     }
     const timeoutMs = Math.max(5, Math.min(600, selfcheckTimeoutSec || 90)) * 1000;
+    const models: Record<string, string> = {};
+    for (const providerID of selfcheckProviderIDs) {
+      const provider = sortedProviders.find((item) => item.id === providerID);
+      const model = (provider ? selfcheckModelForProvider(provider) : selfcheckModels[providerID] || '').trim();
+      if (model) models[providerID] = model;
+    }
     setSelfcheckRunning(true);
     setSelfcheckJob(null);
     stopSelfcheckPolling();
@@ -4337,6 +4685,7 @@ function App() {
           providerIds: selfcheckProviderIDs,
           timeoutMs,
           prompt: selfcheckPrompt.trim() || '1+1等于几',
+          models,
         }),
       });
       if (!response.ok) throw new Error(await response.text());
@@ -4610,7 +4959,7 @@ function App() {
     }
   }
 
-  async function updateApiKeyField(key: APIKey, field: 'name' | 'routeId' | 'modelOverride' | 'thinkingDepthOverride' | 'maxOutputTokens' | 'streamEnabled' | 'enabled', value: string | boolean | number) {
+  async function updateApiKeyField(key: APIKey, field: 'name' | 'routeId' | 'modelOverride' | 'thinkingDepthOverride' | 'maxOutputTokens' | 'streamEnabled' | 'codexKeepOfficialLogin' | 'enabled', value: string | boolean | number) {
     setSaving(true);
     try {
       const patch: Partial<APIKey> = {};
@@ -4620,6 +4969,7 @@ function App() {
       if (field === 'thinkingDepthOverride') patch.thinkingDepthOverride = String(value);
       if (field === 'maxOutputTokens') patch.maxOutputTokens = typeof value === 'number' ? value : Number.parseInt(String(value), 10) || 0;
       if (field === 'streamEnabled') patch.streamEnabled = Boolean(value);
+      if (field === 'codexKeepOfficialLogin') patch.codexKeepOfficialLogin = Boolean(value);
       if (field === 'enabled') patch.enabled = Boolean(value);
       const response = await fetch(`${API_BASE}/__apikeys/${encodeURIComponent(key.id)}`, {
         method: 'PATCH',
@@ -5362,7 +5712,7 @@ function App() {
                         providerId={provider.id}
                         protocol={protocolLabel(provider.protocol)}
                         tone={protocolTone(provider.protocol)}
-                        url={provider.authType === 'claude_oauth' ? 'Claude OAuth (api.anthropic.com)' : provider.authType === 'cursor_oauth' ? 'Cursor OAuth (本地 gRPC bridge)' : `${provider.baseUrl} · ${provider.apiKeySource || '透传客户端 Authorization'}`}
+                        url={provider.authType === 'claude_oauth' ? 'Claude OAuth (api.anthropic.com)' : provider.authType === 'cursor_oauth' ? 'Cursor OAuth (本地 gRPC bridge)' : provider.authType === 'chatgpt_oauth' ? 'ChatGPT OAuth (chatgpt.com/codex)' : `${provider.baseUrl} · ${provider.apiKeySource || '透传客户端 Authorization'}`}
                         usedCount={usedCount}
                         healthStatus={provider.healthStatus || 'unchecked'}
                         testing={testingProviderID === provider.id}
@@ -5371,6 +5721,9 @@ function App() {
                         claudeOAuthConnected={provider.claudeOAuth?.connected}
                         isCursorOAuth={provider.authType === 'cursor_oauth'}
                         cursorOAuthConnected={provider.cursorOAuth?.connected}
+                        isChatGPTOAuth={provider.authType === 'chatgpt_oauth'}
+                        chatgptOAuthConnected={provider.chatgptOAuth?.connected}
+                        cursorBridge={provider.authType === 'cursor_oauth' ? state.cursorBridge : undefined}
                         onToggleSelect={() => toggleExportProviderSelection(provider.id)}
                         onClick={() => {
                           setSelectedProviderID(provider.id);
@@ -5913,6 +6266,8 @@ function App() {
                       ? !!provider.cursorOAuth?.connected
                       : provider.authType === 'claude_oauth'
                         ? !!provider.claudeOAuth?.connected
+                        : provider.authType === 'chatgpt_oauth'
+                          ? !!provider.chatgptOAuth?.connected
                         : true;
                     if (!canSync) return <div className="hint-line">请先完成 OAuth 连接后再同步模型。</div>;
                     return (
@@ -6120,7 +6475,7 @@ function App() {
                 <div>
                   <h2 className="panel-title">自检</h2>
                   <p className="panel-desc">
-                    对勾选的输入 Provider，并行用 OpenCode（Chat）、Codex（Responses）、Claude CLI 走局域网网关探测，并校验回答内容是否像「1+1=2」。
+                    对勾选的输入 Provider，并行用 OpenCode（Chat）、Codex（Responses）、Claude CLI 走局域网网关探测，并校验回答内容是否像「1+1=2」。每个 Provider 可单独选择模型，选择会永久记在本机。
                   </p>
                 </div>
                 <button
@@ -6199,18 +6554,37 @@ function App() {
                 <div className="empty-state">暂无输入 Provider，请先在「输入 Provider」页添加。</div>
               ) : (
                 <div className="selfcheck-provider-list">
-                  {sortedProviders.map((provider) => (
-                    <label className="checkbox-field selfcheck-provider-item" key={provider.id}>
-                      <input
-                        type="checkbox"
-                        checked={selfcheckProviderIDs.includes(provider.id)}
-                        disabled={selfcheckRunning}
-                        onChange={() => toggleSelfcheckProvider(provider.id)}
-                      />
-                      <span>{providerOptionLabel(provider)}</span>
-                      <Badge tone={protocolTone(provider.protocol)}>{protocolLabel(provider.protocol)}</Badge>
-                    </label>
-                  ))}
+                  {sortedProviders.map((provider) => {
+                    const selected = selfcheckProviderIDs.includes(provider.id);
+                    const modelOptions = modelsForSelfcheckProvider(provider, state.models);
+                    return (
+                      <div className="selfcheck-provider-item" key={provider.id}>
+                        <label className="checkbox-field selfcheck-provider-check">
+                          <input
+                            type="checkbox"
+                            checked={selected}
+                            disabled={selfcheckRunning}
+                            onChange={() => toggleSelfcheckProvider(provider.id)}
+                          />
+                          <span>{providerOptionLabel(provider)}</span>
+                          <Badge tone={protocolTone(provider.protocol)}>{protocolLabel(provider.protocol)}</Badge>
+                        </label>
+                        <div
+                          className="selfcheck-provider-model"
+                          onClick={(event) => event.stopPropagation()}
+                          onMouseDown={(event) => event.stopPropagation()}
+                        >
+                          <SearchableModelSelect
+                            value={selfcheckModelForProvider(provider)}
+                            models={modelOptions}
+                            disabled={selfcheckRunning || !selected}
+                            emptyLabel={modelOptions.length ? '选择模型' : '无可用模型'}
+                            onChange={(value) => setSelfcheckModelForProvider(provider.id, value)}
+                          />
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
 
@@ -6535,7 +6909,7 @@ function App() {
       )}
 
       {providerModalOpen && (
-        <Modal title={editingProviderID ? '编辑输入 Provider' : '创建输入 Provider'} description="API Key Source 可留空：留空时透传客户端 Authorization；也可直接填 sk-xxx，或填 env:VAR_NAME / literal:sk-xxx。Fallback Model 只在模型接口不可用时兜底。" onClose={() => { setProviderModalOpen(false); setEditingProviderID(''); resetClaudeOAuthFlowState(); resetCursorOAuthFlowState(); }}>
+        <Modal title={editingProviderID ? '编辑输入 Provider' : '创建输入 Provider'} description="API Key Source 可留空：留空时透传客户端 Authorization；也可直接填 sk-xxx，或填 env:VAR_NAME / literal:sk-xxx。Fallback Model 只在模型接口不可用时兜底。" onClose={() => { setProviderModalOpen(false); setEditingProviderID(''); resetClaudeOAuthFlowState(); resetCursorOAuthFlowState(); resetChatGPTOAuthFlowState(); }}>
           <div className="form-grid modal-form">
             <Field label="Provider 名称" value={providerDraft.name} onChange={(value) => setProviderDraft((current) => ({ ...current, name: value }))} />
             <SelectField
@@ -6545,6 +6919,8 @@ function App() {
                   ? ['OpenAI Chat']
                   : providerDraft.authType === 'claude_oauth'
                     ? ['Claude']
+                    : providerDraft.authType === 'chatgpt_oauth'
+                      ? ['OpenAI Responses']
                     : fixedOutputLabels
               }
               value={protocolLabel(providerDraft.protocol)}
@@ -6560,6 +6936,9 @@ function App() {
             )}
             {providerDraft.authType === 'claude_oauth' && (
               <div className="hint-line">Claude OAuth 上游固定为 Claude 协议。</div>
+            )}
+            {providerDraft.authType === 'chatgpt_oauth' && (
+              <div className="hint-line">ChatGPT OAuth 上游固定为 OpenAI Responses（chatgpt.com/backend-api/codex/responses）。</div>
             )}
             {providerDraft.protocol === 'claude' && (
               <SelectField
@@ -6585,7 +6964,19 @@ function App() {
                 }))}
               />
             )}
-            {!(providerDraft.protocol === 'claude' && providerDraft.authType === 'claude_oauth') && !(providerDraft.protocol === 'openai_chat' && providerDraft.authType === 'cursor_oauth') && (
+            {providerDraft.protocol === 'openai_responses' && (
+              <SelectField
+                label="连接方式"
+                values={['API Key', '登录 ChatGPT 账号 (OAuth)']}
+                value={providerDraft.authType === 'chatgpt_oauth' ? '登录 ChatGPT 账号 (OAuth)' : 'API Key'}
+                onChange={(value) => setProviderDraft((current) => ({
+                  ...current,
+                  authType: value === '登录 ChatGPT 账号 (OAuth)' ? 'chatgpt_oauth' : 'api_key',
+                  protocol: value === '登录 ChatGPT 账号 (OAuth)' ? 'openai_responses' : current.protocol,
+                }))}
+              />
+            )}
+            {!(providerDraft.protocol === 'claude' && providerDraft.authType === 'claude_oauth') && !(providerDraft.protocol === 'openai_chat' && providerDraft.authType === 'cursor_oauth') && !(providerDraft.protocol === 'openai_responses' && providerDraft.authType === 'chatgpt_oauth') && (
               <>
                 <Field fullWidth label="Base URL" value={providerDraft.baseUrl} onChange={(value) => setProviderDraft((current) => ({ ...current, baseUrl: value }))} />
                 <Field fullWidth label="API Key Source（可选）" value={providerDraft.apiKeySource} onChange={(value) => setProviderDraft((current) => ({ ...current, apiKeySource: value }))} />
@@ -6654,6 +7045,42 @@ function App() {
                     <div className="hint-line">点击连接后跳转 Cursor 授权页，在浏览器完成登录后网关会自动轮询并完成连接。</div>
                     <button className="btn primary" disabled={cursorOAuthBusy || cursorOAuthPolling} onClick={() => void startCursorOAuthConnect()}>{cursorOAuthBusy || cursorOAuthPolling ? '等待授权…' : '连接 Cursor 账号'}</button>
                     {cursorOAuthError && <div className="hint-line error">{cursorOAuthError}</div>}
+                  </>
+                );
+              })()}
+            </div>
+          )}
+          {providerDraft.protocol === 'openai_responses' && providerDraft.authType === 'chatgpt_oauth' && (
+            <div className="claude-oauth-panel">
+              {!editingProviderID ? (
+                <div className="hint-line">保存后即可连接 ChatGPT 账号（OAuth 连接需要先创建 Provider 获得 ID）。</div>
+              ) : (() => {
+                const editingProvider = state.providers.find((item) => item.id === editingProviderID);
+                const connected = editingProvider?.chatgptOAuth?.connected;
+                if (connected) {
+                  return (
+                    <>
+                      <div className="hint-line">已连接{editingProvider?.chatgptOAuth?.accountLabel ? ` · ${editingProvider.chatgptOAuth.accountLabel}` : ''}{editingProvider?.chatgptOAuth?.expiresAt ? ` · 过期时间：${editingProvider.chatgptOAuth.expiresAt}` : ''} · 模型 {editingProvider?.models?.length ?? 0} 个</div>
+                      <ChatGPTOAuthUsagePanel providerId={editingProviderID} connected />
+                      <div className="actions" style={{ gap: 8 }}>
+                        <button className="btn" disabled={testingProviderID === editingProviderID} onClick={() => void fetchProviderModels(editingProviderID, editingProvider?.name || '', true)}>{testingProviderID === editingProviderID ? '同步中…' : '同步模型'}</button>
+                        <button className="btn danger" disabled={chatgptOAuthBusy} onClick={() => void disconnectChatGPTOAuth()}>{chatgptOAuthBusy ? '处理中…' : '断开连接'}</button>
+                      </div>
+                    </>
+                  );
+                }
+                return (
+                  <>
+                    <div className="hint-line">点击连接后跳转 ChatGPT 授权，完成后会回调 localhost:1455/auth/callback 并自动连接（若 1455 端口被占用，请用手动粘贴 code）。</div>
+                    <button className="btn primary" disabled={chatgptOAuthBusy || chatgptOAuthPolling} onClick={() => void startChatGPTOAuthConnect()}>{chatgptOAuthBusy || chatgptOAuthPolling ? '等待授权…' : '连接 ChatGPT 账号'}</button>
+                    <details className="hint-line">
+                      <summary>手动粘贴 code（备用）</summary>
+                      <div className="field-inline" style={{ marginTop: 8 }}>
+                        <input placeholder="粘贴 code 或完整回调 URL" value={chatgptOAuthCode} onChange={(event) => setChatgptOAuthCode(event.target.value)} />
+                        <button className="mini-btn" disabled={chatgptOAuthBusy || !chatgptOAuthCode.trim()} onClick={() => void completeChatGPTOAuthConnect()}>{chatgptOAuthBusy ? '连接中…' : '完成连接'}</button>
+                      </div>
+                    </details>
+                    {chatgptOAuthError && <div className="hint-line error">{chatgptOAuthError}</div>}
                   </>
                 );
               })()}
@@ -6745,8 +7172,12 @@ function App() {
               <>
                 <Field label="系统提示词" value={providerChatOptions.systemPrompt} onChange={(value) => setProviderChatOptions((current) => ({ ...current, systemPrompt: value }))} />
                 <Field label="用户提示词" value={providerChatOptions.userPrompt} onChange={(value) => setProviderChatOptions((current) => ({ ...current, userPrompt: value }))} />
-                <div className="hint-line">点击「运行测试」将同时执行主对话、Cache（两轮会话）与 Thinking 测试；后两者结果在弹窗中展示。</div>
-                {chatTestProvider && providerThinkingPresets ? (
+                <div className="hint-line">
+                  {chatTestProvider?.authType === 'chatgpt_oauth' || chatTestProvider?.protocol === 'openai_responses'
+                    ? '点击「运行测试」将执行主对话测试（ChatGPT OAuth / Responses 不跑 Cache / Thinking）。'
+                    : '点击「运行测试」将同时执行主对话、Cache（两轮会话）与 Thinking 测试；后两者结果在弹窗中展示。'}
+                </div>
+                {chatTestProvider && providerThinkingPresets && chatTestProvider.authType !== 'chatgpt_oauth' && chatTestProvider.protocol !== 'openai_responses' ? (
                   <>
                     <div className="field">
                       <label>Thinking 字段（{protocolLabel(chatTestProvider.protocol)}）</label>
@@ -6802,7 +7233,7 @@ function App() {
                 <CopyButton value={chatTestCurl} label="复制 curl" />
               </div>
               <div className="hint-line">目标 URL：{chatTestEndpointURL}</div>
-              {chatTestContext.kind === 'provider' && chatTestProvider?.authType !== 'claude_oauth' && chatTestProvider?.authType !== 'cursor_oauth' && !providerAuthPreview?.value ? (
+              {chatTestContext.kind === 'provider' && chatTestProvider?.authType !== 'claude_oauth' && chatTestProvider?.authType !== 'cursor_oauth' && chatTestProvider?.authType !== 'chatgpt_oauth' && !providerAuthPreview?.value ? (
                 <div className="hint-line">未解析到 Provider 鉴权值；若使用 env: 变量，请确认网关进程环境变量已设置。</div>
               ) : null}
               <pre className="curl-preview">{chatTestCurl}</pre>
@@ -7239,7 +7670,7 @@ function CursorOAuthUsagePanel({ providerId, connected, compact }: { providerId:
   return (
     <div className={`claude-usage-panel cursor-usage-panel${compact ? ' compact' : ''}`} onClick={(event) => event.stopPropagation()}>
       <div className="claude-usage-title">
-        <span>Cursor 订阅额度</span>
+        <span>Cursor 订阅额度{report?.planName ? ` · ${report.planName}` : ''}</span>
         <span className="claude-usage-actions">
           {loading ? <span className="claude-usage-status">刷新中…</span> : report?.fetchedAt ? <span className="claude-usage-status">更新于 {formatClaudeUsageResetAt(report.fetchedAt)}</span> : null}
           <button
@@ -7285,9 +7716,72 @@ function CursorOAuthUsagePanel({ providerId, connected, compact }: { providerId:
   );
 }
 
-function ProviderCard({ active, selected, name, providerId, protocol, tone, url, usedCount, healthStatus, testing, readOnly, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, onToggleSelect, onClick, onTest, onChatTest, onEdit, onClone, onDelete }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; usedCount: number; healthStatus: string; testing: boolean; readOnly?: boolean; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; onToggleSelect: () => void; onClick: () => void; onTest: () => void; onChatTest: () => void; onEdit: () => void; onClone: () => void; onDelete: () => void }) {
-  const oauthConnected = isClaudeOAuth ? claudeOAuthConnected : isCursorOAuth ? cursorOAuthConnected : false;
-  const showOAuthBadge = isClaudeOAuth || isCursorOAuth;
+function ChatGPTOAuthUsagePanel({ providerId, connected, compact }: { providerId: string; connected?: boolean; compact?: boolean }) {
+  const { report, loading, refresh } = useOAuthUsageReport<ChatGPTOAuthUsageReport>(
+    Boolean(connected),
+    `/__providers/${encodeURIComponent(providerId)}/chatgpt-oauth/usage`,
+  );
+
+  if (!connected) return null;
+
+  const buckets = report?.buckets || [];
+
+  return (
+    <div className={`claude-usage-panel chatgpt-usage-panel${compact ? ' compact' : ''}`} onClick={(event) => event.stopPropagation()}>
+      <div className="claude-usage-title">
+        <span>ChatGPT Codex 额度{report?.planName ? ` · ${report.planName}` : ''}</span>
+        <span className="claude-usage-actions">
+          {loading ? <span className="claude-usage-status">刷新中…</span> : report?.fetchedAt ? <span className="claude-usage-status">更新于 {formatClaudeUsageResetAt(report.fetchedAt)}</span> : null}
+          <button
+            type="button"
+            className="btn btn-tiny"
+            disabled={loading}
+            onClick={(event) => {
+              event.stopPropagation();
+              void refresh();
+            }}
+          >
+            刷新
+          </button>
+        </span>
+      </div>
+      {!report ? (
+        <div className="claude-usage-empty">{loading ? '正在拉取额度…' : '暂无额度数据'}</div>
+      ) : !report.available ? (
+        <div className="claude-usage-empty error">{report.error || '额度不可用'}</div>
+      ) : buckets.length === 0 ? (
+        <div className="claude-usage-empty">{report.message || '未返回额度桶数据'}</div>
+      ) : (
+        <div className="claude-usage-grid">
+          {report.message ? <div className="claude-usage-reset">{report.message}</div> : null}
+          {buckets.map((bucket, index) => {
+            const percent = Math.min(100, Math.max(0, bucket.utilization ?? 0));
+            return (
+              <div className="claude-usage-row" key={`${bucket.label}-${index}`}>
+                <div className="claude-usage-head">
+                  <span>{bucket.label}</span>
+                  <span>{percent.toFixed(0)}%</span>
+                </div>
+                <div className="claude-usage-track">
+                  <div className={`claude-usage-fill ${claudeUsageFillTone(percent)}`} style={{ width: `${percent}%` }} />
+                </div>
+                {bucket.detail ? <div className="claude-usage-reset">{bucket.detail}</div> : null}
+                {bucket.resetsAt ? <div className="claude-usage-reset">重置：{formatClaudeUsageResetAt(bucket.resetsAt)}</div> : null}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ProviderCard({ active, selected, name, providerId, protocol, tone, url, usedCount, healthStatus, testing, readOnly, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, cursorBridge, onToggleSelect, onClick, onTest, onChatTest, onEdit, onClone, onDelete }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; usedCount: number; healthStatus: string; testing: boolean; readOnly?: boolean; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; cursorBridge?: CursorBridgeRuntime; onToggleSelect: () => void; onClick: () => void; onTest: () => void; onChatTest: () => void; onEdit: () => void; onClone: () => void; onDelete: () => void }) {
+  const oauthConnected = isClaudeOAuth ? claudeOAuthConnected : isCursorOAuth ? cursorOAuthConnected : isChatGPTOAuth ? chatgptOAuthConnected : false;
+  const showOAuthBadge = isClaudeOAuth || isCursorOAuth || isChatGPTOAuth;
+  const bridgeHint = cursorBridge?.port
+    ? ` · :${cursorBridge.port}${cursorBridge.message ? ` · ${cursorBridge.message}` : ''}`
+    : (cursorBridge?.message ? ` · ${cursorBridge.message}` : '');
   return (
     <div className={`provider-card clickable ${active ? 'active' : ''} ${selected ? 'selected' : ''}`} onClick={onClick} role="button" tabIndex={0} onKeyDown={(event) => { if (event.key === 'Enter') onClick(); }}>
       <div className="provider-head">
@@ -7309,12 +7803,20 @@ function ProviderCard({ active, selected, name, providerId, protocol, tone, url,
           ) : (
             <Badge tone={healthTone(healthStatus)}>{healthStatusLabel(healthStatus)}</Badge>
           )}
+          {isCursorOAuth ? (
+            <span title={cursorBridge?.checkedAt ? `上次探活：${cursorBridge.checkedAt}${bridgeHint}` : (bridgeHint || undefined)}>
+              <Badge tone={cursorBridgeTone(cursorBridge?.status)}>
+                {cursorBridgeStatusLabel(cursorBridge?.status)}
+              </Badge>
+            </span>
+          ) : null}
           <Badge tone={usedCount > 0 ? 'amber' : 'slate'}>{usedCount} 个 API Key</Badge>
         </div>
       </div>
-      <div className="provider-meta">{url}</div>
+      <div className="provider-meta">{url}{isCursorOAuth && cursorBridge?.port ? ` · 127.0.0.1:${cursorBridge.port}` : ''}</div>
       {isClaudeOAuth && claudeOAuthConnected ? <ClaudeOAuthUsagePanel providerId={providerId} connected={claudeOAuthConnected} compact /> : null}
       {isCursorOAuth && cursorOAuthConnected ? <CursorOAuthUsagePanel providerId={providerId} connected={cursorOAuthConnected} compact /> : null}
+      {isChatGPTOAuth && chatgptOAuthConnected ? <ChatGPTOAuthUsagePanel providerId={providerId} connected={chatgptOAuthConnected} compact /> : null}
       {!readOnly ? (
         <div className="provider-actions">
           <button className="icon-btn" disabled={testing} onClick={(event) => { event.stopPropagation(); onTest(); }} title="从 Provider 接口获取可用模型">{testing ? '获取中' : '获取模型'}</button>
@@ -7368,7 +7870,7 @@ function ApiKeyDetailPanel({
   tunnelRunning: boolean;
   livePublicURL: string;
   fixedOutputLabels: string[];
-  onUpdateField: (key: APIKey, field: 'name' | 'routeId' | 'modelOverride' | 'thinkingDepthOverride' | 'maxOutputTokens' | 'streamEnabled' | 'enabled', value: string | boolean | number) => Promise<void>;
+  onUpdateField: (key: APIKey, field: 'name' | 'routeId' | 'modelOverride' | 'thinkingDepthOverride' | 'maxOutputTokens' | 'streamEnabled' | 'codexKeepOfficialLogin' | 'enabled', value: string | boolean | number) => Promise<void>;
   onUpdateBinding: (key: APIKey, providerId: string, outputProtocol: Protocol) => Promise<void>;
   onUpdateModelAliases: (key: APIKey, modelAliases: Record<string, string>) => Promise<void>;
   onUpdateFallbacks: (key: APIKey, fallbackProviderIds: string[], fallbackModelOverrides: Record<string, string>) => Promise<void>;
@@ -7688,6 +8190,7 @@ function ApiKeyDetailPanel({
           publicAvailable={publicAvailable}
           onClose={() => setClientConfigModal(null)}
           onToast={onToast}
+          onUpdateField={onUpdateField}
         />
       ) : null}
 
@@ -7911,6 +8414,7 @@ function ApiKeyClientConfigModal({
   publicAvailable,
   onClose,
   onToast,
+  onUpdateField,
 }: {
   client: 'opencode' | 'codex' | 'claude';
   keyItem: APIKey;
@@ -7922,12 +8426,15 @@ function ApiKeyClientConfigModal({
   publicAvailable: boolean;
   onClose: () => void;
   onToast?: (message: string) => void;
+  onUpdateField?: (key: APIKey, field: 'name' | 'routeId' | 'modelOverride' | 'thinkingDepthOverride' | 'maxOutputTokens' | 'streamEnabled' | 'codexKeepOfficialLogin' | 'enabled', value: string | boolean | number) => Promise<void>;
 }) {
   const [networkMode, setNetworkMode] = React.useState<'lan' | 'public'>(publicAvailable ? 'public' : 'lan');
+  // 绑定到具体 key（而非只在本次弹窗会话内），跨次打开保留上次选择。
+  const [keepOfficialLogin, setKeepOfficialLogin] = React.useState(() => keyItem.codexKeepOfficialLogin ?? false);
   const effectivePublicBase = networkMode === 'public' && publicAvailable ? publicBase : '';
   const configText = React.useMemo(
-    () => buildApiKeyClientConfig(client, keyItem, route, endpoints, effectivePublicBase, provider),
-    [client, keyItem, route, endpoints, effectivePublicBase, provider],
+    () => buildApiKeyClientConfig(client, keyItem, route, endpoints, effectivePublicBase, provider, keepOfficialLogin),
+    [client, keyItem, route, endpoints, effectivePublicBase, provider, keepOfficialLogin],
   );
   const configExtras = React.useMemo(
     () => buildApiKeyClientConfigExtras(client, keyItem, provider),
@@ -7989,7 +8496,7 @@ function ApiKeyClientConfigModal({
               type="button"
               onClick={() => {
                 setNetworkMode('lan');
-                const nextConfig = buildApiKeyClientConfig(client, keyItem, route, endpoints, '', provider);
+                const nextConfig = buildApiKeyClientConfig(client, keyItem, route, endpoints, '', provider, keepOfficialLogin);
                 const nextScript = buildApiKeyClientConfigInstallScript(client, nextConfig, buildApiKeyClientConfigExtras(client, keyItem, provider));
                 copyConfig(nextScript, `已复制覆盖脚本（${clientConfigTitle(client)} · 内网）`);
               }}
@@ -8004,7 +8511,7 @@ function ApiKeyClientConfigModal({
               onClick={() => {
                 if (!publicAvailable) return;
                 setNetworkMode('public');
-                const nextConfig = buildApiKeyClientConfig(client, keyItem, route, endpoints, publicBase, provider);
+                const nextConfig = buildApiKeyClientConfig(client, keyItem, route, endpoints, publicBase, provider, keepOfficialLogin);
                 const nextScript = buildApiKeyClientConfigInstallScript(client, nextConfig, buildApiKeyClientConfigExtras(client, keyItem, provider));
                 copyConfig(nextScript, `已复制覆盖脚本（${clientConfigTitle(client)} · 公网域名）`);
               }}
@@ -8017,6 +8524,30 @@ function ApiKeyClientConfigModal({
             {!publicAvailable ? ' · 公网域名不可用（请先在「公网访问」开启隧道/域名）' : ''}
           </div>
         </div>
+
+        {client === 'codex' ? (
+          <div className="field">
+            <label>保持账号登录</label>
+            <label className="hint-line" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <input
+                type="checkbox"
+                checked={keepOfficialLogin}
+                onChange={(event) => {
+                  const next = event.target.checked;
+                  setKeepOfficialLogin(next);
+                  const nextConfig = buildApiKeyClientConfig(client, keyItem, route, endpoints, effectivePublicBase, provider, next);
+                  const nextScript = buildApiKeyClientConfigInstallScript(client, nextConfig, buildApiKeyClientConfigExtras(client, keyItem, provider));
+                  copyConfig(nextScript, `已复制覆盖脚本（${clientConfigTitle(client)} · ${next ? '保持账号登录' : '不保留'}）`);
+                  // 持久化到该 key，下次打开弹窗（甚至换设备/刷新页面）自动恢复这次的选择。
+                  void onUpdateField?.(keyItem, 'codexKeepOfficialLogin', next);
+                }}
+              />
+              开启后 provider 表会对齐 Codex 官方 provider 形状（name = "OpenAI"、supports_websockets = true），
+              尽量保留 Codex 官方插件市场 / 移动端远程控制；不写入也不影响 ~/.codex/auth.json，实际模型流量仍走本网关。
+              默认关闭；若不需要这些官方能力可保持关闭。
+            </label>
+          </div>
+        ) : null}
 
         {protocolHint ? <div className="hint-line error">{protocolHint}</div> : null}
 

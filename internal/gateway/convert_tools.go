@@ -473,6 +473,137 @@ func copyToolsFieldDirect(source map[string]any, target map[string]any) {
 	}
 }
 
+// openAIChatToolToResponses flattens a Chat Completions tool into Responses form
+// ({type:"function", name, parameters}). Codex / ChatGPT Responses reject nested
+// `function.name` with: Missing required parameter: 'tools[0].name'.
+func openAIChatToolToResponses(tool map[string]any) map[string]any {
+	if tool == nil {
+		return nil
+	}
+	if functionValue, ok := tool["function"].(map[string]any); ok {
+		name := stringValue(functionValue["name"])
+		if name == "" {
+			return nil
+		}
+		out := map[string]any{"type": "function", "name": name}
+		if description := stringValue(functionValue["description"]); description != "" {
+			out["description"] = description
+		}
+		out["parameters"] = claudeToolInputSchema(functionValue["parameters"], functionValue["input_schema"])
+		if strict, exists := functionValue["strict"]; exists {
+			out["strict"] = strict
+		} else if strict, exists := tool["strict"]; exists {
+			out["strict"] = strict
+		}
+		return out
+	}
+
+	toolType := strings.TrimSpace(strings.ToLower(stringValue(tool["type"])))
+	switch toolType {
+	case "", "function", "custom":
+		name := stringValue(tool["name"])
+		if name == "" {
+			if customValue, ok := tool["custom"].(map[string]any); ok {
+				name = stringValue(customValue["name"])
+			}
+		}
+		if name == "" {
+			return nil
+		}
+		out := map[string]any{"type": "function", "name": name}
+		if description := stringValue(tool["description"]); description != "" {
+			out["description"] = description
+		} else if customValue, ok := tool["custom"].(map[string]any); ok {
+			if description := stringValue(customValue["description"]); description != "" {
+				out["description"] = description
+			}
+		}
+		schemaCandidates := []any{tool["parameters"], tool["input_schema"]}
+		if customValue, ok := tool["custom"].(map[string]any); ok {
+			schemaCandidates = append(schemaCandidates, customValue["parameters"], customValue["input_schema"])
+		}
+		out["parameters"] = claudeToolInputSchema(schemaCandidates...)
+		if strict, exists := tool["strict"]; exists {
+			out["strict"] = strict
+		}
+		return out
+	default:
+		// Built-ins (web_search, file_search, ...) — pass through when already flat.
+		if cloned := cloneAnyMap(tool); cloned != nil {
+			return cloned
+		}
+		return nil
+	}
+}
+
+// openAIChatToolChoiceToResponses maps Chat Completions tool_choice into Responses.
+func openAIChatToolChoiceToResponses(choice any) any {
+	switch typed := choice.(type) {
+	case string:
+		return typed
+	case map[string]any:
+		choiceType := strings.TrimSpace(strings.ToLower(stringValue(typed["type"])))
+		switch choiceType {
+		case "auto", "none", "required":
+			return choiceType
+		case "function":
+			name := ""
+			if functionValue, ok := typed["function"].(map[string]any); ok {
+				name = stringValue(functionValue["name"])
+			}
+			if name == "" {
+				name = stringValue(typed["name"])
+			}
+			if name == "" {
+				return nil
+			}
+			return map[string]any{"type": "function", "name": name}
+		default:
+			if name := stringValue(typed["name"]); name != "" {
+				return map[string]any{"type": "function", "name": name}
+			}
+			return cloneAnyMap(typed)
+		}
+	default:
+		return nil
+	}
+}
+
+func openAIChatToolsToResponses(tools []any) []any {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]any, 0, len(tools))
+	for _, item := range tools {
+		tool, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if converted := openAIChatToolToResponses(tool); converted != nil {
+			out = append(out, converted)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// copyChatToolsToResponses writes Chat Completions tools/tool_choice onto a
+// Responses request using the flat Responses tool shape.
+func copyChatToolsToResponses(source map[string]any, target map[string]any) {
+	if rawTools, exists := source["tools"]; exists {
+		if converted := openAIChatToolsToResponses(asMapSlice(rawTools)); len(converted) > 0 {
+			target["tools"] = converted
+		}
+	}
+	if rawChoice, exists := source["tool_choice"]; exists {
+		if converted := openAIChatToolChoiceToResponses(rawChoice); converted != nil {
+			target["tool_choice"] = converted
+		}
+	}
+}
+
 func openAIToolCallsToClaudeBlocks(toolCalls []any) []any {
 	blocks := make([]any, 0, len(toolCalls))
 	for _, item := range toolCalls {

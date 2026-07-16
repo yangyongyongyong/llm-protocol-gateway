@@ -576,13 +576,143 @@ func streamResponsesToOpenAIChatEvents(w http.ResponseWriter, reader io.Reader, 
 	resolvedModel := strings.TrimSpace(model)
 	usage := TokenUsage{}
 	roleSent := false
+	sawAny := false
+	textSeen := false
+	finishReason := "stop"
+	toolIndexByCallID := map[string]int{}
+	toolIndexByItemID := map[string]int{}
+	argsSeenByIndex := map[int]bool{}
+	nextToolIndex := 0
+
+	emitChunk := func(delta map[string]any, finish string) error {
+		sawAny = true
+		choice := map[string]any{"index": 0, "delta": delta}
+		if finish != "" {
+			choice["finish_reason"] = finish
+		}
+		return writeOpenAISSEChunk(w, map[string]any{
+			"id":      chunkID,
+			"object":  "chat.completion.chunk",
+			"created": time.Now().Unix(),
+			"model":   firstNonEmpty(resolvedModel, model),
+			"choices": []map[string]any{choice},
+		})
+	}
+
+	emitText := func(text string) error {
+		if text == "" {
+			return nil
+		}
+		textSeen = true
+		delta := map[string]any{"content": text}
+		if !roleSent {
+			delta["role"] = "assistant"
+			roleSent = true
+		}
+		return emitChunk(delta, "")
+	}
+
+	resolveToolIndex := func(callID, itemID string) (int, bool) {
+		if callID != "" {
+			if idx, ok := toolIndexByCallID[sanitizeResponsesCallID(callID)]; ok {
+				return idx, true
+			}
+		}
+		if itemID != "" {
+			if idx, ok := toolIndexByItemID[itemID]; ok {
+				return idx, true
+			}
+		}
+		if len(toolIndexByCallID) == 1 {
+			for _, only := range toolIndexByCallID {
+				return only, true
+			}
+		}
+		return 0, false
+	}
+
+	emitToolStart := func(callID, itemID, name string) error {
+		callID = sanitizeResponsesCallID(callID)
+		if callID == "" {
+			callID = sanitizeResponsesCallID(itemID)
+		}
+		if callID == "" || name == "" {
+			return nil
+		}
+		if _, exists := toolIndexByCallID[callID]; exists {
+			return nil
+		}
+		idx := nextToolIndex
+		nextToolIndex++
+		toolIndexByCallID[callID] = idx
+		if itemID != "" {
+			toolIndexByItemID[itemID] = idx
+		}
+		finishReason = "tool_calls"
+		delta := map[string]any{
+			"tool_calls": []any{
+				map[string]any{
+					"index": idx,
+					"id":    callID,
+					"type":  "function",
+					"function": map[string]any{
+						"name":      name,
+						"arguments": "",
+					},
+				},
+			},
+		}
+		if !roleSent {
+			delta["role"] = "assistant"
+			delta["content"] = nil
+			roleSent = true
+		}
+		return emitChunk(delta, "")
+	}
+
+	emitToolArgs := func(callID, itemID, partial string) error {
+		if partial == "" {
+			return nil
+		}
+		idx, ok := resolveToolIndex(callID, itemID)
+		if !ok {
+			return nil
+		}
+		argsSeenByIndex[idx] = true
+		finishReason = "tool_calls"
+		return emitChunk(map[string]any{
+			"tool_calls": []any{
+				map[string]any{
+					"index": idx,
+					"function": map[string]any{
+						"arguments": partial,
+					},
+				},
+			},
+		}, "")
+	}
+
+	emitFullArgsIfMissing := func(callID, itemID, args string) error {
+		if args == "" {
+			return nil
+		}
+		idx, ok := resolveToolIndex(callID, itemID)
+		if !ok || argsSeenByIndex[idx] {
+			return nil
+		}
+		return emitToolArgs(callID, itemID, args)
+	}
 
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	eventName := ""
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, ":") {
+		if line == "" {
+			eventName = ""
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
 			continue
 		}
 
@@ -615,7 +745,17 @@ func streamResponsesToOpenAIChatEvents(w http.ResponseWriter, reader io.Reader, 
 			}
 			return usage, fmt.Errorf("%s", errText)
 		}
+		if detail := strings.TrimSpace(stringValue(chunk["detail"])); detail != "" && eventName == "" {
+			openAIBody, _, convErr := responsesErrorValueToOpenAI(detail, resolvedModel)
+			if convErr == nil && len(openAIBody) > 0 {
+				_, _ = w.Write(openAIBody)
+			}
+			return usage, fmt.Errorf("%s", detail)
+		}
 
+		if eventName == "" {
+			eventName = strings.TrimSpace(stringValue(chunk["type"]))
+		}
 		if chunkUsage := ParseResponsesUsage([]byte(payload)); chunkUsage.InputTokens > 0 || chunkUsage.OutputTokens > 0 || chunkUsage.CacheTokens > 0 {
 			usage = chunkUsage
 		}
@@ -631,48 +771,99 @@ func streamResponsesToOpenAIChatEvents(w http.ResponseWriter, reader io.Reader, 
 			}
 		}
 
-		text := ""
 		switch eventName {
 		case "response.output_text.delta":
-			text = stringValue(chunk["delta"])
+			if err := emitText(stringValue(chunk["delta"])); err != nil {
+				return usage, err
+			}
 		case "response.output_text.done":
-			text = stringValue(chunk["text"])
-		case "response.completed":
+			// Already streamed via deltas.
+		case "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done":
+			// Keep reasoning out of Chat content so tool clients don't treat it as the answer.
+		case "response.output_item.added":
+			if item, ok := chunk["item"].(map[string]any); ok {
+				if stringValue(item["type"]) == "function_call" {
+					if err := emitToolStart(stringValue(item["call_id"]), stringValue(item["id"]), stringValue(item["name"])); err != nil {
+						return usage, err
+					}
+				}
+			}
+		case "response.function_call_arguments.delta":
+			if err := emitToolArgs(stringValue(chunk["call_id"]), stringValue(chunk["item_id"]), stringValue(chunk["delta"])); err != nil {
+				return usage, err
+			}
+		case "response.function_call_arguments.done":
+			if item, ok := chunk["item"].(map[string]any); ok && stringValue(item["type"]) == "function_call" {
+				callID := stringValue(item["call_id"])
+				itemID := stringValue(item["id"])
+				if err := emitToolStart(callID, itemID, stringValue(item["name"])); err != nil {
+					return usage, err
+				}
+				if err := emitFullArgsIfMissing(callID, itemID, stringValue(item["arguments"])); err != nil {
+					return usage, err
+				}
+			} else {
+				callID := stringValue(chunk["call_id"])
+				itemID := stringValue(chunk["item_id"])
+				if name := stringValue(chunk["name"]); name != "" {
+					if err := emitToolStart(callID, itemID, name); err != nil {
+						return usage, err
+					}
+				}
+				if err := emitFullArgsIfMissing(callID, itemID, stringValue(chunk["arguments"])); err != nil {
+					return usage, err
+				}
+			}
+		case "response.output_item.done":
+			if item, ok := chunk["item"].(map[string]any); ok && stringValue(item["type"]) == "function_call" {
+				callID := stringValue(item["call_id"])
+				itemID := stringValue(item["id"])
+				if err := emitToolStart(callID, itemID, stringValue(item["name"])); err != nil {
+					return usage, err
+				}
+				if err := emitFullArgsIfMissing(callID, itemID, stringValue(item["arguments"])); err != nil {
+					return usage, err
+				}
+				finishReason = "tool_calls"
+			}
+		case "response.completed", "response.incomplete", "response.failed":
 			if response, ok := chunk["response"].(map[string]any); ok {
-				text = stringValue(response["output_text"])
-				if text == "" {
-					text = responsesOutputText(response["output"])
+				if !textSeen {
+					text := strings.TrimSpace(stringValue(response["output_text"]))
+					if text == "" {
+						text = strings.TrimSpace(responsesOutputText(response["output"]))
+					}
+					if err := emitText(text); err != nil {
+						return usage, err
+					}
+				}
+				if outputItems, ok := response["output"].([]any); ok {
+					for _, raw := range outputItems {
+						item, ok := raw.(map[string]any)
+						if !ok || stringValue(item["type"]) != "function_call" {
+							continue
+						}
+						callID := stringValue(item["call_id"])
+						itemID := stringValue(item["id"])
+						if err := emitToolStart(callID, itemID, stringValue(item["name"])); err != nil {
+							return usage, err
+						}
+						if err := emitFullArgsIfMissing(callID, itemID, stringValue(item["arguments"])); err != nil {
+							return usage, err
+						}
+					}
 				}
 			}
 		default:
-			text = stringValue(chunk["delta"])
-			if text == "" {
-				text = stringValue(chunk["text"])
-			}
-		}
-		if text == "" {
-			continue
-		}
-
-		delta := map[string]any{"content": text}
-		if !roleSent {
-			delta["role"] = "assistant"
-			roleSent = true
-		}
-		if err := writeOpenAISSEChunk(w, map[string]any{
-			"id":      chunkID,
-			"object":  "chat.completion.chunk",
-			"created": time.Now().Unix(),
-			"model":   firstNonEmpty(resolvedModel, model),
-			"choices": []map[string]any{{"index": 0, "delta": delta}},
-		}); err != nil {
-			return usage, err
+			// Ignore unknown events. Do NOT treat arbitrary "delta" fields as
+			// assistant content — function_call_arguments.delta would otherwise
+			// leak JSON arguments into the chat text stream.
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return usage, err
 	}
-	if !roleSent {
+	if !sawAny {
 		return usage, fmt.Errorf("responses stream ended without any text deltas")
 	}
 	finalChunk := map[string]any{
@@ -680,7 +871,7 @@ func streamResponsesToOpenAIChatEvents(w http.ResponseWriter, reader io.Reader, 
 		"object":  "chat.completion.chunk",
 		"created": time.Now().Unix(),
 		"model":   firstNonEmpty(resolvedModel, model),
-		"choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}},
+		"choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": finishReason}},
 	}
 	if usage.InputTokens > 0 || usage.OutputTokens > 0 {
 		finalChunk["usage"] = map[string]any{

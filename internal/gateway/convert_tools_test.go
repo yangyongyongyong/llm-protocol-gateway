@@ -597,3 +597,48 @@ func TestResponsesToOpenAIChatAppendsParallelFunctionCalls(t *testing.T) {
 		t.Fatalf("expected 2 tool_calls, got %#v", toolCalls)
 	}
 }
+
+func TestOpenAIChatToResponsesFlattensNestedTools(t *testing.T) {
+	chatReq := map[string]any{
+		"model": "gpt-5.6-terra",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "write a file"},
+		},
+		"tools": []any{
+			map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name":        "apply_patch",
+					"description": "edit files",
+					"parameters": map[string]any{
+						"type":       "object",
+						"properties": map[string]any{},
+					},
+				},
+			},
+		},
+		"tool_choice": map[string]any{
+			"type":     "function",
+			"function": map[string]any{"name": "apply_patch"},
+		},
+	}
+	responsesReq, err := openAIChatToResponsesRequest(chatReq, "gpt-5.6-terra")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools, ok := responsesReq["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("tools=%#v", responsesReq["tools"])
+	}
+	tool := tools[0].(map[string]any)
+	if stringValue(tool["name"]) != "apply_patch" {
+		t.Fatalf("expected flat name, got %#v", tool)
+	}
+	if _, nested := tool["function"]; nested {
+		t.Fatalf("function nest should be flattened: %#v", tool)
+	}
+	choice, _ := responsesReq["tool_choice"].(map[string]any)
+	if stringValue(choice["name"]) != "apply_patch" {
+		t.Fatalf("tool_choice=%#v", responsesReq["tool_choice"])
+	}
+}

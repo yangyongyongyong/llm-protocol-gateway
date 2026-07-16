@@ -219,7 +219,9 @@ func (rt *Runtime) Start(cfg Config) error {
 	server := gateway.NewServer(router, logs, db)
 	// 上次自检若被 kill/重启打断，selfcheck-* 密钥会残留；启动时扫一遍。
 	server.SweepSelfcheckLeftovers()
-	server.SetCursorBridge(cursor.NewBridge(cursor.FindRepoRoot()))
+	bridge := cursor.NewBridge(cursor.FindRepoRoot())
+	server.SetCursorBridge(bridge)
+	bridge.StartHealthWatch(context.Background())
 	server.SetWebExposedChangeHandler(func(enabled bool) error {
 		return rt.SetWebExposed(enabled)
 	})
@@ -406,6 +408,9 @@ func (rt *Runtime) Stop(ctx context.Context) error {
 	}
 	if rt.tunnelManager != nil {
 		rt.tunnelManager.Stop()
+	}
+	if rt.server != nil {
+		rt.server.StopCursorBridge()
 	}
 	var shutdownErr error
 	if rt.httpServer != nil {

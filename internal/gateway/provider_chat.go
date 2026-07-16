@@ -1,8 +1,10 @@
 package gateway
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -308,6 +310,9 @@ func (s *Server) testProviderChat(r *http.Request, providerID string, req provid
 	if provider.Protocol == domain.ProtocolClaude && provider.AuthType == domain.AuthTypeClaudeOAuth {
 		return s.testClaudeOAuthProviderChat(r, provider, req, started)
 	}
+	if provider.AuthType == domain.AuthTypeChatGPTOAuth {
+		return s.testChatGPTOAuthProviderChat(r, provider, req, started)
+	}
 	if provider.Protocol != domain.ProtocolOpenAIChat {
 		return map[string]any{
 			"success":    false,
@@ -361,6 +366,98 @@ func (s *Server) testProviderChat(r *http.Request, providerID string, req provid
 	}, http.StatusOK
 }
 
+func (s *Server) testChatGPTOAuthProviderChat(r *http.Request, provider domain.Provider, req providerChatTestRequest, started time.Time) (map[string]any, int) {
+	refreshed, err := s.ensureFreshChatGPTToken(provider)
+	if err != nil {
+		return map[string]any{
+			"success":    false,
+			"providerId": provider.ID,
+			"error":      err.Error(),
+			"latencyMs":  time.Since(started).Milliseconds(),
+		}, http.StatusOK
+	}
+	provider = refreshed
+
+	model := strings.TrimSpace(req.Model)
+	if model == "" {
+		model = strings.TrimSpace(provider.DefaultModel)
+	}
+	if model == "" && len(provider.Models) > 0 {
+		model = provider.Models[0].ID
+	}
+	if model == "" {
+		model = "gpt-5.6-terra"
+	}
+
+	userPrompt := strings.TrimSpace(req.UserPrompt)
+	if userPrompt == "" {
+		userPrompt = "ping"
+	}
+	payload := map[string]any{
+		"model": model,
+		"input": []map[string]any{
+			{
+				"role": "user",
+				"content": []map[string]any{
+					{"type": "input_text", "text": userPrompt},
+				},
+			},
+		},
+		"store":  false,
+		"stream": true,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return map[string]any{"success": false, "providerId": provider.ID, "error": err.Error(), "latencyMs": time.Since(started).Milliseconds()}, http.StatusOK
+	}
+
+	httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, chatgptCodexResponsesURL, bytes.NewReader(body))
+	if err != nil {
+		return map[string]any{"success": false, "providerId": provider.ID, "error": err.Error(), "latencyMs": time.Since(started).Milliseconds()}, http.StatusOK
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
+	applyChatGPTCodexHeaders(httpReq, provider)
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		s.logs.AddApp("error", "chatgpt oauth chat test failed", err.Error())
+		return map[string]any{
+			"success":     false,
+			"providerId":  provider.ID,
+			"model":       model,
+			"targetUrl":   chatgptCodexResponsesURL,
+			"requestBody": string(body),
+			"error":       err.Error(),
+			"latencyMs":   time.Since(started).Milliseconds(),
+		}, http.StatusOK
+	}
+	defer resp.Body.Close()
+	responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+	preview := strings.TrimSpace(strings.ReplaceAll(string(responseBody), "\n", " "))
+	if len(preview) > 900 {
+		preview = preview[:900]
+	}
+	success := resp.StatusCode >= 200 && resp.StatusCode < 300
+	if !success {
+		s.logs.AddApp("error", "chatgpt oauth chat test failed", fmt.Sprintf("status=%d preview=%s", resp.StatusCode, preview))
+	} else {
+		s.logs.AddApp("info", "chatgpt oauth chat test completed", fmt.Sprintf("provider=%s status=%d latency=%dms", provider.ID, resp.StatusCode, time.Since(started).Milliseconds()))
+	}
+	return map[string]any{
+		"success":      success,
+		"providerId":   provider.ID,
+		"model":        model,
+		"status":       resp.StatusCode,
+		"latencyMs":    time.Since(started).Milliseconds(),
+		"preview":      preview,
+		"responseBody": string(responseBody),
+		"targetUrl":    chatgptCodexResponsesURL,
+		"requestBody":  string(body),
+	}, http.StatusOK
+}
+
 func (s *Server) testProviderCacheChat(r *http.Request, providerID string, req providerChatTestRequest, started time.Time) (map[string]any, int) {
 	provider, err := s.router.ProviderByID(providerID)
 	if err != nil {
@@ -368,6 +465,15 @@ func (s *Server) testProviderCacheChat(r *http.Request, providerID string, req p
 	}
 	if provider.Protocol == domain.ProtocolClaude {
 		return s.testClaudeProviderCacheChat(r, provider, req, started)
+	}
+	if provider.AuthType == domain.AuthTypeChatGPTOAuth || provider.Protocol == domain.ProtocolOpenAIResponses {
+		return map[string]any{
+			"success":    true,
+			"skipped":    true,
+			"providerId": provider.ID,
+			"summary":    "ChatGPT OAuth / Responses provider skips Cache test",
+			"latencyMs":  time.Since(started).Milliseconds(),
+		}, http.StatusOK
 	}
 	if provider.Protocol != domain.ProtocolOpenAIChat {
 		return map[string]any{"success": false, "providerId": provider.ID, "error": "Cache test supports OpenAI Chat and Claude providers only"}, http.StatusOK
@@ -522,6 +628,17 @@ func (s *Server) testProviderThinkingChat(r *http.Request, providerID string, re
 			"responseBody":    round.ResponseBody,
 			"targetUrl":       round.TargetURL,
 			"error":           round.Error,
+		}, http.StatusOK
+	}
+
+	if provider.AuthType == domain.AuthTypeChatGPTOAuth || provider.Protocol == domain.ProtocolOpenAIResponses {
+		return map[string]any{
+			"success":         true,
+			"skipped":         true,
+			"providerId":      provider.ID,
+			"model":           model,
+			"thinkingOptions": thinkingOptions,
+			"summary":         "ChatGPT OAuth / Responses provider skips Thinking test",
 		}, http.StatusOK
 	}
 

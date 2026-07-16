@@ -37,6 +37,19 @@ func resolveProviderResponsesURL(provider domain.Provider, model string) string 
 }
 
 func (s *Server) doOpenAIProviderRequest(ctx context.Context, r *http.Request, provider domain.Provider, upstreamURL string, body []byte, accept string, skipIncomingAuth bool) (*http.Response, error) {
+	if provider.AuthType == domain.AuthTypeChatGPTOAuth {
+		refreshed, err := s.ensureFreshChatGPTToken(provider)
+		if err != nil {
+			return nil, err
+		}
+		provider = refreshed
+		prepared, _, prepErr := prepareChatGPTCodexRequestBody(body)
+		if prepErr != nil {
+			return nil, prepErr
+		}
+		body = prepared
+		accept = "text/event-stream"
+	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -47,12 +60,16 @@ func (s *Server) doOpenAIProviderRequest(ctx context.Context, r *http.Request, p
 	} else {
 		request.Header.Set("Accept", "application/json")
 	}
-	applyProviderAuth(request, provider, func() string {
-		if skipIncomingAuth {
-			return ""
-		}
-		return r.Header.Get("Authorization")
-	}())
+	if provider.AuthType == domain.AuthTypeChatGPTOAuth {
+		applyChatGPTCodexHeaders(request, provider)
+	} else {
+		applyProviderAuth(request, provider, func() string {
+			if skipIncomingAuth {
+				return ""
+			}
+			return r.Header.Get("Authorization")
+		}())
+	}
 	// Extract model from body for header placeholder substitution when possible.
 	model := ""
 	var payload map[string]any
@@ -65,12 +82,17 @@ func (s *Server) doOpenAIProviderRequest(ctx context.Context, r *http.Request, p
 
 func (s *Server) proxyOpenAIResponses(w http.ResponseWriter, r *http.Request, provider domain.Provider, model string, body []byte, skipIncomingAuth bool) (int, TokenUsage, []byte, error) {
 	upstreamURL := resolveProviderResponsesURL(provider, model)
+	clientStream := requestBodyWantsStream(body)
+	if provider.AuthType == domain.AuthTypeChatGPTOAuth {
+		// Upstream Codex always streams; pass SSE through to the client.
+		clientStream = true
+	}
 	response, err := s.doOpenAIProviderRequest(r.Context(), r, provider, upstreamURL, body, r.Header.Get("Accept"), skipIncomingAuth)
 	if err != nil {
 		return 0, TokenUsage{}, nil, err
 	}
 	defer response.Body.Close()
-	return writePassThroughResponse(w, response, requestBodyWantsStream(body), ParseResponsesUsage)
+	return writePassThroughResponse(w, response, clientStream, ParseResponsesUsage)
 }
 
 func (s *Server) proxyResponsesToOpenAIChat(w http.ResponseWriter, r *http.Request, provider domain.Provider, model string, openAIReq map[string]any, skipIncomingAuth bool) (int, TokenUsage, []byte, error) {
@@ -242,6 +264,11 @@ func (s *Server) proxyConvertedThroughChat(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) proxyConvertedThroughResponses(w http.ResponseWriter, r *http.Request, provider domain.Provider, model string, responsesReq map[string]any, skipIncomingAuth bool, convert responseConverter, streamConvert streamConverter) (int, TokenUsage, []byte, error) {
 	stream, _ := responsesReq["stream"].(bool)
+	if provider.AuthType == domain.AuthTypeChatGPTOAuth {
+		responsesReq["store"] = false
+		responsesReq["stream"] = true
+		stream = true
+	}
 	upstreamBody, err := json.Marshal(responsesReq)
 	if err != nil {
 		return 0, TokenUsage{}, nil, err

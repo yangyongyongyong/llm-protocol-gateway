@@ -129,7 +129,7 @@ func prepareProviderForImport(provider domain.Provider) (domain.Provider, error)
 		provider.AuthType = domain.AuthTypeAPIKey
 	}
 	switch provider.AuthType {
-	case domain.AuthTypeAPIKey, domain.AuthTypeClaudeOAuth, domain.AuthTypeCursorOAuth:
+	case domain.AuthTypeAPIKey, domain.AuthTypeClaudeOAuth, domain.AuthTypeCursorOAuth, domain.AuthTypeChatGPTOAuth:
 	default:
 		return domain.Provider{}, fmt.Errorf("unsupported authType %q", provider.AuthType)
 	}
@@ -142,12 +142,14 @@ func prepareProviderForImport(provider domain.Provider) (domain.Provider, error)
 	}
 	if provider.BaseURL == "" &&
 		provider.AuthType != domain.AuthTypeClaudeOAuth &&
-		provider.AuthType != domain.AuthTypeCursorOAuth {
+		provider.AuthType != domain.AuthTypeCursorOAuth &&
+		provider.AuthType != domain.AuthTypeChatGPTOAuth {
 		return domain.Provider{}, fmt.Errorf("provider baseUrl is required")
 	}
 
 	provider.ClaudeOAuth = sanitizeImportedClaudeOAuth(provider.ClaudeOAuth)
 	provider.CursorOAuth = sanitizeImportedCursorOAuth(provider.CursorOAuth)
+	provider.ChatGPTOAuth = sanitizeImportedChatGPTOAuth(provider.ChatGPTOAuth)
 	if provider.RequestAdapter != nil {
 		// Drop generated display-only curl; it is rebuilt on read.
 		adapter := *provider.RequestAdapter
@@ -210,6 +212,34 @@ func sanitizeImportedCursorOAuth(cred *domain.CursorOAuthCredential) *domain.Cur
 		RefreshToken: refresh,
 		ExpiresAt:    expires,
 		AccountLabel: label,
+	}
+}
+
+func sanitizeImportedChatGPTOAuth(cred *domain.ChatGPTOAuthCredential) *domain.ChatGPTOAuthCredential {
+	if cred == nil {
+		return nil
+	}
+	access := strings.TrimSpace(cred.AccessToken)
+	refresh := strings.TrimSpace(cred.RefreshToken)
+	expires := strings.TrimSpace(cred.ExpiresAt)
+	accountID := strings.TrimSpace(cred.ChatGPTAccountID)
+	label := strings.TrimSpace(cred.AccountLabel)
+	if access == "" && refresh == "" {
+		if expires == "" && accountID == "" && label == "" && !cred.Connected {
+			return nil
+		}
+		return &domain.ChatGPTOAuthCredential{
+			ExpiresAt:    expires,
+			AccountLabel: label,
+			Connected:    false,
+		}
+	}
+	return &domain.ChatGPTOAuthCredential{
+		AccessToken:      access,
+		RefreshToken:     refresh,
+		ExpiresAt:        expires,
+		ChatGPTAccountID: accountID,
+		AccountLabel:     label,
 	}
 }
 

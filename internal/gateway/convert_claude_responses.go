@@ -219,56 +219,7 @@ func claudeToResponsesRequestDirect(claudeReq map[string]any, model string) (map
 	chatCarrier := map[string]any{}
 	copyToolsField(claudeReq, chatCarrier, false)
 	copyToolChoiceField(claudeReq, chatCarrier, false)
-	if rawTools, ok := chatCarrier["tools"].([]any); ok && len(rawTools) > 0 {
-		tools := make([]any, 0, len(rawTools))
-		for _, item := range rawTools {
-			tool, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			fn, _ := tool["function"].(map[string]any)
-			name := stringValue(fn["name"])
-			if name == "" {
-				continue
-			}
-			out := map[string]any{"type": "function", "name": name}
-			if desc := stringValue(fn["description"]); desc != "" {
-				out["description"] = desc
-			}
-			if params, ok := fn["parameters"]; ok {
-				out["parameters"] = params
-			} else {
-				out["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}}
-			}
-			tools = append(tools, out)
-		}
-		if len(tools) > 0 {
-			responsesReq["tools"] = tools
-		}
-	}
-	if choice, exists := chatCarrier["tool_choice"]; exists {
-		switch typed := choice.(type) {
-		case string:
-			responsesReq["tool_choice"] = typed
-		case map[string]any:
-			choiceType := stringValue(typed["type"])
-			switch choiceType {
-			case "function":
-				name := ""
-				if fn, ok := typed["function"].(map[string]any); ok {
-					name = stringValue(fn["name"])
-				}
-				if name == "" {
-					name = stringValue(typed["name"])
-				}
-				if name != "" {
-					responsesReq["tool_choice"] = map[string]any{"type": "function", "name": name}
-				}
-			default:
-				responsesReq["tool_choice"] = typed
-			}
-		}
-	}
+	copyChatToolsToResponses(chatCarrier, responsesReq)
 
 	return responsesReq, nil
 }
@@ -303,6 +254,9 @@ func responsesToClaudeResponseDirect(responsesBody []byte, model string) ([]byte
 	}
 	if errorValue, ok := payload["error"]; ok {
 		return responsesErrorValueToClaudeDirect(errorValue, model)
+	}
+	if detail := strings.TrimSpace(stringValue(payload["detail"])); detail != "" {
+		return responsesErrorValueToClaudeDirect(detail, model)
 	}
 
 	content := make([]any, 0, 4)

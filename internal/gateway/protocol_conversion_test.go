@@ -73,8 +73,21 @@ func TestOpenAIChatToResponsesRequest(t *testing.T) {
 	if responsesReq["instructions"] != "be helpful" {
 		t.Fatalf("expected instructions, got %#v", responsesReq["instructions"])
 	}
-	if responsesReq["input"] != "hello" {
-		t.Fatalf("expected simple user input, got %#v", responsesReq["input"])
+	input, ok := responsesReq["input"].([]any)
+	if !ok || len(input) != 1 {
+		t.Fatalf("expected list user input, got %#v", responsesReq["input"])
+	}
+	entry, _ := input[0].(map[string]any)
+	if stringValue(entry["role"]) != "user" {
+		t.Fatalf("expected user role, got %#v", entry)
+	}
+	content, _ := entry["content"].([]any)
+	if len(content) == 0 {
+		t.Fatalf("expected typed content, got %#v", entry["content"])
+	}
+	part, _ := content[0].(map[string]any)
+	if stringValue(part["type"]) != "input_text" || stringValue(part["text"]) != "hello" {
+		t.Fatalf("expected input_text hello, got %#v", part)
 	}
 	reasoning, ok := responsesReq["reasoning"].(map[string]any)
 	if !ok || reasoning["effort"] != "medium" {
