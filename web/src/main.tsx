@@ -811,6 +811,8 @@ function normalizeGatewayState(data: Partial<GatewayState> | null | undefined, c
 const UI_CACHE_PREFIX = 'llm-gateway-ui-cache:v1:';
 const UI_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const LOGS_PAGE_SIZE = 10;
+// API 密钥列表每页最多显示 30 个，密钥多时翻页浏览。
+const API_KEYS_PAGE_SIZE = 30;
 // 与后端 internal/gateway/user_isolation.go 里的 logOwnerFilterAdmin 保持一致。
 const LOG_OWNER_FILTER_ADMIN = '_admin';
 
@@ -2627,6 +2629,11 @@ function App() {
   const [checkedApiKeyIDs, setCheckedApiKeyIDs] = useState<string[]>([]);
   const apiKeyCheckAnchorRef = useRef<number | null>(null);
   const [apiKeyKeyword, setApiKeyKeyword] = useState('');
+  // 多维筛选：所属用户（仅管理员可见）、输入 Provider、输出协议；空数组 = 全部。
+  const [apiKeyOwnerFilter, setApiKeyOwnerFilter] = useState<string[]>([]);
+  const [apiKeyProviderFilter, setApiKeyProviderFilter] = useState<string[]>([]);
+  const [apiKeyProtocolFilter, setApiKeyProtocolFilter] = useState<string[]>([]);
+  const [apiKeyPage, setApiKeyPage] = useState(1);
   const [apiKeySortBy, setApiKeySortBy] = useState<'name' | 'createdAt'>('createdAt');
   const [apiKeySortDir, setApiKeySortDir] = useState<'asc' | 'desc'>('desc');
   const [selfcheckProviderIDs, setSelfcheckProviderIDs] = useState<string[]>(() => {
@@ -2851,18 +2858,22 @@ function App() {
     let keys = state.apiKeys || [];
     const keyword = apiKeyKeyword.trim().toLowerCase();
     if (keyword) {
+      // 名称筛选框只匹配名称与密钥本身；Provider / 协议 / 用户走各自的多选筛选。
+      keys = keys.filter((key) => `${key.name} ${key.key}`.toLowerCase().includes(keyword));
+    }
+    if (apiKeyOwnerFilter.length > 0) {
+      keys = keys.filter((key) => apiKeyOwnerFilter.includes((key.ownerUserId || '').trim() || LOG_OWNER_FILTER_ADMIN));
+    }
+    if (apiKeyProviderFilter.length > 0) {
       keys = keys.filter((key) => {
         const route = state.routes.find((item) => item.id === key.routeId);
-        const provider = route ? state.providers.find((item) => item.id === route.providerId) : undefined;
-        const haystack = [
-          key.name,
-          key.key,
-          provider?.name || '',
-          provider ? providerOptionLabel(provider) : '',
-          route?.outputProtocol || '',
-          route ? protocolLabel(route.outputProtocol) : '',
-        ].join(' ').toLowerCase();
-        return haystack.includes(keyword);
+        return route ? apiKeyProviderFilter.includes(route.providerId) : false;
+      });
+    }
+    if (apiKeyProtocolFilter.length > 0) {
+      keys = keys.filter((key) => {
+        const route = state.routes.find((item) => item.id === key.routeId);
+        return route ? apiKeyProtocolFilter.includes(route.outputProtocol) : false;
       });
     }
     const sorted = [...keys];
@@ -2881,7 +2892,18 @@ function App() {
       return a.id.localeCompare(b.id) * dir;
     });
     return sorted;
-  }, [state.apiKeys, state.routes, state.providers, apiKeyKeyword, apiKeySortBy, apiKeySortDir]);
+  }, [state.apiKeys, state.routes, apiKeyKeyword, apiKeyOwnerFilter, apiKeyProviderFilter, apiKeyProtocolFilter, apiKeySortBy, apiKeySortDir]);
+
+  // 分页展示：每页最多 API_KEYS_PAGE_SIZE 个；页码越界时自动收敛到最后一页。
+  const apiKeyTotalPages = Math.max(1, Math.ceil(filteredApiKeys.length / API_KEYS_PAGE_SIZE));
+  const currentApiKeyPage = Math.min(apiKeyPage, apiKeyTotalPages);
+  const apiKeyPageStart = (currentApiKeyPage - 1) * API_KEYS_PAGE_SIZE;
+  const pagedApiKeys = filteredApiKeys.slice(apiKeyPageStart, apiKeyPageStart + API_KEYS_PAGE_SIZE);
+
+  // 过滤/排序变化时回到第 1 页，避免停留在不存在的页。
+  useEffect(() => {
+    setApiKeyPage(1);
+  }, [apiKeyKeyword, apiKeyOwnerFilter, apiKeyProviderFilter, apiKeyProtocolFilter, apiKeySortBy, apiKeySortDir]);
 
   function toggleApiKeySort(field: 'name' | 'createdAt') {
     if (apiKeySortBy === field) {
@@ -5715,17 +5737,44 @@ function App() {
               {(state.apiKeys || []).length > 0 ? (
                 <div className="api-keys-toolbar">
                   <div className="field api-keys-filter-field">
-                    <label>过滤</label>
+                    <label>名称</label>
                     <input
                       type="search"
                       className="api-keys-filter-search"
-                      placeholder="名称 / 密钥 / Provider / 协议"
+                      placeholder="名称 / 密钥"
                       value={apiKeyKeyword}
                       onChange={(event) => setApiKeyKeyword(event.target.value)}
                     />
                   </div>
+                  {!isNormalUser ? (
+                    <MultiSelectFilter
+                      label="所属用户"
+                      options={[
+                        { id: LOG_OWNER_FILTER_ADMIN, label: '管理员' },
+                        ...consoleUsers.filter((user) => user.role !== 'admin').map((user) => ({ id: user.id, label: user.username })),
+                      ]}
+                      selected={apiKeyOwnerFilter}
+                      onChange={setApiKeyOwnerFilter}
+                      allLabel="全部用户"
+                    />
+                  ) : null}
+                  <MultiSelectFilter
+                    label="输入 Provider"
+                    options={state.providers.map((provider) => ({ id: provider.id, label: providerOptionLabel(provider) }))}
+                    selected={apiKeyProviderFilter}
+                    onChange={setApiKeyProviderFilter}
+                    allLabel="全部 Provider"
+                  />
+                  <MultiSelectFilter
+                    label="输出协议"
+                    options={(['openai_chat', 'openai_responses', 'claude'] as Protocol[]).map((protocol) => ({ id: protocol, label: protocolLabel(protocol) }))}
+                    selected={apiKeyProtocolFilter}
+                    onChange={setApiKeyProtocolFilter}
+                    allLabel="全部协议"
+                  />
                   <div className="api-keys-toolbar-meta">
                     显示 {filteredApiKeys.length} / {(state.apiKeys || []).length} 个密钥
+                    {apiKeyTotalPages > 1 ? ` · 第 ${currentApiKeyPage} / ${apiKeyTotalPages} 页` : ''}
                     {checkedApiKeyIDs.length > 0 ? ` · 已选 ${checkedApiKeyIDs.length}` : ''}
                   </div>
                   {checkedApiKeyIDs.length > 0 ? (
@@ -5776,7 +5825,9 @@ function App() {
                       </div>
                       {filteredApiKeys.length === 0 ? (
                         <div className="empty-state compact">当前筛选条件下没有匹配的密钥。</div>
-                      ) : filteredApiKeys.map((key, index) => {
+                      ) : pagedApiKeys.map((key, pageIndex) => {
+                        // index 基于 filteredApiKeys 全局序号，保证 Shift 连选跨页也正确。
+                        const index = apiKeyPageStart + pageIndex;
                         const checked = checkedApiKeyIDs.includes(key.id);
                         const createdLabel = key.createdAt
                           ? (() => {
@@ -5824,6 +5875,15 @@ function App() {
                         );
                       })}
                     </div>
+                    {apiKeyTotalPages > 1 ? (
+                      <div className="hint-line" style={{ display: 'flex', gap: 12, alignItems: 'center', justifyContent: 'space-between' }}>
+                        <span>第 {currentApiKeyPage} / {apiKeyTotalPages} 页 · 每页 {API_KEYS_PAGE_SIZE} 个</span>
+                        <span style={{ display: 'flex', gap: 8 }}>
+                          <button className="mini-btn" type="button" disabled={currentApiKeyPage <= 1} onClick={() => setApiKeyPage(currentApiKeyPage - 1)}>上一页</button>
+                          <button className="mini-btn" type="button" disabled={currentApiKeyPage >= apiKeyTotalPages} onClick={() => setApiKeyPage(currentApiKeyPage + 1)}>下一页</button>
+                        </span>
+                      </div>
+                    ) : null}
                     <div className="api-keys-select-hint">勾选后可批量删除；Shift+点击可连续多选</div>
                   </div>
                   {selectedApiKey ? (
@@ -9226,6 +9286,152 @@ function filterModelOptions(models: Model[], queryRaw: string): SearchableModelO
   const options = models.map((model) => ({ id: model.id, label: modelSelectOptionLabel(model) }));
   if (!needle) return options;
   return options.filter((option) => option.id.toLowerCase().includes(needle) || option.label.toLowerCase().includes(needle));
+}
+
+type MultiFilterOption = { id: string; label: string };
+
+// MultiSelectFilter：下拉多选 + 文本快捷过滤合一的筛选框（复用
+// searchable-select 样式，参考 SearchableModelSelect 的交互）。收起时输入框
+// 展示已选摘要，展开时变成关键字过滤；点击选项切换勾选且菜单保持展开。
+function MultiSelectFilter({ label, options, selected, onChange, allLabel }: {
+  label: string;
+  options: MultiFilterOption[];
+  selected: string[];
+  onChange: (next: string[]) => void;
+  allLabel?: string;
+}) {
+  const rootRef = React.useRef<HTMLDivElement | null>(null);
+  const inputRef = React.useRef<HTMLInputElement | null>(null);
+  const listRef = React.useRef<HTMLDivElement | null>(null);
+  const [open, setOpen] = React.useState(false);
+  const [query, setQuery] = React.useState('');
+  const [highlight, setHighlight] = React.useState(0);
+
+  const filtered = React.useMemo(() => {
+    const keyword = query.trim().toLowerCase();
+    if (!keyword) return options;
+    return options.filter((option) => option.label.toLowerCase().includes(keyword) || option.id.toLowerCase().includes(keyword));
+  }, [options, query]);
+
+  const displayLabel = React.useMemo(() => {
+    if (selected.length === 0) return allLabel || '全部';
+    const labels = selected.map((id) => options.find((option) => option.id === id)?.label || id);
+    const joined = labels.join('、');
+    return joined.length > 24 ? `已选 ${selected.length} 项` : joined;
+  }, [selected, options, allLabel]);
+
+  const close = React.useCallback(() => {
+    setOpen(false);
+    setQuery('');
+    setHighlight(0);
+  }, []);
+
+  const toggleOption = React.useCallback((id: string) => {
+    onChange(selected.includes(id) ? selected.filter((item) => item !== id) : [...selected, id]);
+  }, [onChange, selected]);
+
+  React.useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) close();
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    return () => document.removeEventListener('mousedown', onPointerDown);
+  }, [close, open]);
+
+  React.useEffect(() => {
+    setHighlight(0);
+  }, [query, open]);
+
+  React.useEffect(() => {
+    if (!open || !listRef.current) return;
+    const active = listRef.current.querySelector<HTMLElement>('[data-active="true"]');
+    active?.scrollIntoView({ block: 'nearest' });
+  }, [highlight, open, filtered]);
+
+  const onKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      if (!open) { setOpen(true); return; }
+      setHighlight((prev) => (filtered.length === 0 ? 0 : (prev + 1) % filtered.length));
+      return;
+    }
+    if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (!open) { setOpen(true); return; }
+      setHighlight((prev) => (filtered.length === 0 ? 0 : (prev - 1 + filtered.length) % filtered.length));
+      return;
+    }
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      if (!open) { setOpen(true); return; }
+      const option = filtered[highlight];
+      if (option) toggleOption(option.id);
+      return;
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      close();
+    }
+  };
+
+  return (
+    <div className="field api-keys-filter-field">
+      <label>{label}</label>
+      <div className={`searchable-select${open ? ' open' : ''}`} ref={rootRef}>
+        <input
+          ref={inputRef}
+          className="searchable-select-input"
+          type="text"
+          role="combobox"
+          aria-expanded={open}
+          aria-autocomplete="list"
+          value={open ? query : displayLabel}
+          placeholder={open ? '输入关键字过滤…' : (allLabel || '全部')}
+          onFocus={() => { setOpen(true); setQuery(''); }}
+          onClick={() => { setOpen(true); }}
+          onChange={(event) => { setOpen(true); setQuery(event.target.value); }}
+          onKeyDown={onKeyDown}
+        />
+        {open ? (
+          <div className="searchable-select-menu" role="listbox" aria-multiselectable="true" ref={listRef}>
+            {selected.length > 0 ? (
+              <button
+                type="button"
+                className="searchable-select-option multi-clear"
+                onMouseDown={(event) => { event.preventDefault(); onChange([]); }}
+              >
+                清除筛选（显示全部）
+              </button>
+            ) : null}
+            {filtered.length === 0 ? (
+              <div className="searchable-select-empty">无匹配项</div>
+            ) : filtered.map((option, index) => {
+              const checked = selected.includes(option.id);
+              return (
+                <button
+                  key={option.id}
+                  type="button"
+                  role="option"
+                  aria-selected={checked}
+                  data-active={index === highlight ? 'true' : 'false'}
+                  className={`searchable-select-option${checked ? ' selected' : ''}${index === highlight ? ' active' : ''}`}
+                  onMouseEnter={() => setHighlight(index)}
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    toggleOption(option.id);
+                  }}
+                >
+                  <span className={`multi-check${checked ? ' on' : ''}`}>{checked ? '✓' : ''}</span>
+                  {option.label}
+                </button>
+              );
+            })}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
 }
 
 function SearchableModelSelect({

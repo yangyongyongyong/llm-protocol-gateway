@@ -303,7 +303,10 @@ html[data-theme="dark"] .usage-calendar-day.edge { background: #3b82f6; color: #
 .route-card .api-key-call-example { margin-top: 12px; padding-top: 12px; border-top: 1px solid rgba(15, 23, 42, 0.08); }
 .api-keys-panel { width: 100%; }
 .api-keys-toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px 16px; margin-bottom: 16px; }
-.api-keys-filter-field { min-width: 220px; flex: 1 1 220px; max-width: 320px; margin: 0; }
+.api-keys-filter-field { min-width: 180px; flex: 1 1 180px; max-width: 280px; margin: 0; }
+.api-keys-filter-field .searchable-select-input { min-height: 42px; }
+.multi-check { display: inline-block; width: 16px; margin-right: 6px; font-weight: 900; color: var(--accent, #2563eb); }
+.searchable-select-option.multi-clear { color: var(--muted); font-weight: 700; border-bottom: 1px solid var(--border, rgba(127,127,127,0.25)); }
 .api-keys-toolbar-meta { margin-left: auto; color: var(--muted); font-size: 12px; font-weight: 700; padding-bottom: 10px; }
 .api-keys-bulk-actions { display: flex; align-items: center; gap: 8px; padding-bottom: 6px; }
 .api-keys-layout { display: grid; grid-template-columns: minmax(220px, 280px) minmax(0, 1fr); gap: 12px; align-items: start; }
