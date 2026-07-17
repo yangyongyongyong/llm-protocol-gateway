@@ -745,7 +745,7 @@ const navItems = [
   { id: 'input-providers', label: '输入 Provider' },
   { id: 'models-menu', label: '模型列表' },
   { id: 'api-keys', label: 'API 密钥' },
-  { id: 'output-providers', label: '输出 Provider' },
+  { id: 'output-providers', label: '接入地址' },
   { id: 'usage-stats', label: '用量统计' },
   { id: 'public-access', label: '公网访问' },
   { id: 'traffic-tokens', label: 'API 日志' },
@@ -755,6 +755,9 @@ const navItems = [
 ] as const;
 const navIcons = ['◉', '☰', '🔑', '⌘', '▣', '↗', '≡', '👥', '✓', '⚙'];
 type NavItemID = typeof navItems[number]['id'];
+
+// 核心配置项：新用户只需依次配好这两个即可使用，侧边栏置顶并加底色区分。
+const coreNavIDs: NavItemID[] = ['input-providers', 'api-keys'];
 
 // 普通用户仅可访问的页面（其余仅管理员可见）
 const userAllowedNavIDs: NavItemID[] = ['input-providers', 'models-menu', 'api-keys', 'traffic-tokens', 'usage-stats'];
@@ -1127,6 +1130,16 @@ function routeActionLabel(action: string) {
 
 function testResultBadge(success?: boolean) {
   return success ? '成功' : '失败 / 跳过';
+}
+
+// 卡片上只展示密钥掩码；完整值仅在编辑弹窗可见（编辑权限已限创建人/管理员）。
+function maskApiKeySource(source?: string): string {
+  const value = (source || '').trim();
+  if (!value) return '透传客户端 Authorization';
+  if (value.startsWith('env:')) return value;
+  const raw = value.startsWith('literal:') ? value.slice('literal:'.length) : value;
+  if (raw.length <= 8) return '密钥 ••••';
+  return `${raw.slice(0, 4)}••••${raw.slice(-4)}`;
 }
 
 function healthStatusLabel(status: string) {
@@ -4103,7 +4116,7 @@ function App() {
     setChatTestContext({
       kind: 'route',
       id: route.id,
-      title: `输出 Provider 对话测试 · ${route.name}`,
+      title: `路由对话测试 · ${route.name}`,
       description: '测试网关转发后的输出接口（客户端实际调用的 URL）。',
       curlLabel: '网关 curl 预览',
       endpointLabel: 'gateway',
@@ -5632,7 +5645,12 @@ function App() {
   const authSetupMode = Boolean(needsAuthGate && authStatus && !authStatus.configured);
   // 普通用户角色：仅显示 API 密钥 / 流量 / 用量三个页面
   const isNormalUser = Boolean(authStatus?.authenticated && authStatus.role === 'user');
-  const visibleNavItems = isNormalUser ? navItems.filter((item) => userAllowedNavIDs.includes(item.id)) : navItems;
+  const roleNavItems = isNormalUser ? navItems.filter((item) => userAllowedNavIDs.includes(item.id)) : navItems;
+  // 「输入 Provider」「API 密钥」置顶，其余保持原顺序。
+  const visibleNavItems = [
+    ...roleNavItems.filter((item) => coreNavIDs.includes(item.id)),
+    ...roleNavItems.filter((item) => !coreNavIDs.includes(item.id)),
+  ];
 
   if (!authChecked) {
     return null;
@@ -5717,6 +5735,18 @@ function App() {
               <div className="brand-title">协议网关</div>
               <div className="brand-subtitle">协议入 · 协议出</div>
             </div>
+            <a
+              className="brand-github"
+              href="https://github.com/yangyongyongyong/llm-protocol-gateway"
+              target="_blank"
+              rel="noreferrer"
+              title="GitHub · yangyongyongyong/llm-protocol-gateway"
+              aria-label="打开 GitHub 仓库"
+            >
+              <svg viewBox="0 0 16 16" width="20" height="20" fill="currentColor" aria-hidden="true">
+                <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z" />
+              </svg>
+            </a>
           </div>
 
           {(backendConnected === false || backendReconnecting) && (
@@ -5738,7 +5768,7 @@ function App() {
               const index = navItems.findIndex((navItem) => navItem.id === item.id);
               return (
               <a
-                className={`nav-item ${activeNav === item.id ? 'active' : ''}`}
+                className={`nav-item ${coreNavIDs.includes(item.id) ? 'core' : ''} ${activeNav === item.id ? 'active' : ''}`}
                 href={navPathForID(item.id)}
                 key={item.id}
                 onClick={(event) => {
@@ -6062,7 +6092,7 @@ function App() {
                         providerId={provider.id}
                         protocol={protocolLabel(provider.protocol)}
                         tone={protocolTone(provider.protocol)}
-                        url={provider.authType === 'claude_oauth' ? 'Claude OAuth (api.anthropic.com)' : provider.authType === 'cursor_oauth' ? 'Cursor OAuth (本地 gRPC bridge)' : provider.authType === 'chatgpt_oauth' ? 'ChatGPT OAuth (chatgpt.com/codex)' : `${provider.baseUrl} · ${provider.apiKeySource || '透传客户端 Authorization'}`}
+                        url={provider.authType === 'claude_oauth' ? 'Claude OAuth (api.anthropic.com)' : provider.authType === 'cursor_oauth' ? 'Cursor OAuth (本地 gRPC bridge)' : provider.authType === 'chatgpt_oauth' ? 'ChatGPT OAuth (chatgpt.com/codex)' : `${provider.baseUrl} · ${maskApiKeySource(provider.apiKeySource)}`}
                         usedCount={usedCount}
                         healthStatus={provider.healthStatus || 'unchecked'}
                         nextRetryAt={provider.nextRetryAt}
@@ -6071,6 +6101,9 @@ function App() {
                         selectable={!isNormalUser}
                         providerDisabled={!!provider.disabled}
                         onToggleEnabled={!isNormalUser ? () => void toggleProviderEnabled(provider) : undefined}
+                        subtitle={(provider.authType === 'claude_oauth' && provider.claudeOAuth?.accountLabel)
+                          || (provider.authType === 'chatgpt_oauth' && provider.chatgptOAuth?.accountLabel)
+                          || undefined}
                         isClaudeOAuth={provider.authType === 'claude_oauth'}
                         claudeOAuthConnected={provider.claudeOAuth?.connected}
                         isCursorOAuth={provider.authType === 'cursor_oauth'}
@@ -6109,8 +6142,8 @@ function App() {
             <div className="card panel">
               <div className="panel-header">
                 <div>
-                  <h2 className="panel-title">固定输出 Provider</h2>
-                  <p className="panel-desc">应用固定提供三种输出协议入口；公网访问在「公网访问」页统一配置。流式开关已移至 API Key（与 Key 绑定）。</p>
+                  <h2 className="panel-title">接入地址</h2>
+                  <p className="panel-desc">网关对外的三种协议接入地址（复制给客户端使用）；公网访问在「公网访问」页统一配置。流式开关已移至 API Key（与 Key 绑定）。</p>
                 </div>
                 <Badge tone={publicStatusTone(publicAccess.status)}>{publicAccessStatusLabel(publicAccess.status)}</Badge>
               </div>
@@ -7738,7 +7771,7 @@ function App() {
       )}
 
       {routeModalOpen && (
-        <Modal title={editingRouteID ? '编辑路由' : '创建路由'} description={editingRouteID ? '可临时切换输入 Provider 或输出协议，保存后立即生效。' : '路由只描述协议转发：自定义输入 Provider → 固定输出 Provider。模型与思考深度覆盖请在「API 密钥」页按密钥配置。'} onClose={() => { setRouteModalOpen(false); setEditingRouteID(''); }}>
+        <Modal title={editingRouteID ? '编辑路由' : '创建路由'} description={editingRouteID ? '可临时切换输入 Provider 或输出协议，保存后立即生效。' : '路由只描述协议转发：自定义输入 Provider → 固定输出协议。模型与思考深度覆盖请在「API 密钥」页按密钥配置。'} onClose={() => { setRouteModalOpen(false); setEditingRouteID(''); }}>
           <div className="form-grid modal-form">
             <Field label="路由名称" value={routeDraft.name} onChange={(value) => setRouteDraft((current) => ({ ...current, name: value }))} />
             <div className="field">
@@ -7973,7 +8006,7 @@ function RouteCard({ active, name, tone, status, meta, flow, onClick, onTest, on
           <Badge tone={tone}>{status}</Badge>
           <button className="icon-btn" onClick={(event) => { event.stopPropagation(); onEdit(); }} title="编辑路由">编辑</button>
           <button className="icon-btn" onClick={(event) => { event.stopPropagation(); onClone(); }} title="克隆为新路由">克隆</button>
-          <button className="icon-btn" onClick={(event) => { event.stopPropagation(); onTest(); }} title="输出 Provider 对话测试">对话测试</button>
+          <button className="icon-btn" onClick={(event) => { event.stopPropagation(); onTest(); }} title="路由对话测试">对话测试</button>
           <button className="icon-btn danger" onClick={(event) => { event.stopPropagation(); onDelete(); }} title="删除路由">删除</button>
         </div>
       </div>
@@ -8295,7 +8328,7 @@ function ChatGPTOAuthUsagePanel({ providerId, connected, compact }: { providerId
   );
 }
 
-function ProviderCard({ active, selected, name, providerId, protocol, tone, url, usedCount, healthStatus, nextRetryAt, testing, readOnly, selectable, providerDisabled, onToggleEnabled, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, cursorBridge, authorizedUserCount, onShowUsers, onToggleSelect, onClick, onTest, onChatTest, onEdit, onClone, onDelete }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; usedCount: number; healthStatus: string; nextRetryAt?: string; testing: boolean; readOnly?: boolean; selectable?: boolean; providerDisabled?: boolean; onToggleEnabled?: () => void; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; cursorBridge?: CursorBridgeRuntime; authorizedUserCount?: number; onShowUsers?: () => void; onToggleSelect: () => void; onClick: () => void; onTest: () => void; onChatTest: () => void; onEdit: () => void; onClone: () => void; onDelete: () => void }) {
+function ProviderCard({ active, selected, name, providerId, protocol, tone, url, usedCount, healthStatus, nextRetryAt, testing, readOnly, selectable, providerDisabled, onToggleEnabled, subtitle, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, cursorBridge, authorizedUserCount, onShowUsers, onToggleSelect, onClick, onTest, onChatTest, onEdit, onClone, onDelete }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; usedCount: number; healthStatus: string; nextRetryAt?: string; testing: boolean; readOnly?: boolean; selectable?: boolean; providerDisabled?: boolean; onToggleEnabled?: () => void; subtitle?: string; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; cursorBridge?: CursorBridgeRuntime; authorizedUserCount?: number; onShowUsers?: () => void; onToggleSelect: () => void; onClick: () => void; onTest: () => void; onChatTest: () => void; onEdit: () => void; onClone: () => void; onDelete: () => void }) {
   const oauthConnected = isClaudeOAuth ? claudeOAuthConnected : isCursorOAuth ? cursorOAuthConnected : isChatGPTOAuth ? chatgptOAuthConnected : false;
   const showOAuthBadge = isClaudeOAuth || isCursorOAuth || isChatGPTOAuth;
   const isUnavailable = healthStatus === 'unavailable';
@@ -8316,7 +8349,7 @@ function ProviderCard({ active, selected, name, providerId, protocol, tone, url,
           ) : (
             <div className="provider-name">{name}</div>
           )}
-          <div className="provider-subtitle">{providerId} · {protocol}</div>
+          <div className="provider-subtitle">{subtitle || `${providerId} · ${protocol}`}</div>
         </div>
         <div className="provider-badges">
           {providerDisabled ? <Badge tone="red">已禁用</Badge> : null}

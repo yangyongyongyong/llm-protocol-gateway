@@ -285,6 +285,7 @@ func (rt *Runtime) Start(cfg Config) error {
 		server.StartOAuthUsageBackgroundRefresh(context.Background())
 		server.StartProviderFailoverRecovery(context.Background())
 		server.StartUserActivityFlush(context.Background())
+		server.BackfillClaudeOAuthAccountLabels()
 		server.StartCursorModelBackgroundRefresh(context.Background())
 		rt.startStorageMaintenance(db, retentionDays)
 	}()

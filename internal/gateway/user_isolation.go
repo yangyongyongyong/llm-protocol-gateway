@@ -246,6 +246,11 @@ func (s *Server) stateForUser(identity sessionIdentity, state domain.GatewayStat
 	providers := make([]domain.Provider, 0)
 	for _, provider := range state.Providers {
 		if allowed[provider.ID] {
+			// 非本人创建的 Provider 对普通用户隐去密钥明文（只留掩码展示）；
+			// 自己创建的保留完整值，编辑弹窗需要回填。
+			if strings.TrimSpace(provider.OwnerUserID) != identity.UserID {
+				provider.APIKeySource = maskAPIKeySource(provider.APIKeySource)
+			}
 			providers = append(providers, provider)
 		}
 	}
@@ -277,6 +282,20 @@ func (s *Server) stateForUser(identity sessionIdentity, state domain.GatewayStat
 	state.LogLevel = ""
 	state.DataPaths = nil
 	return state
+}
+
+// maskAPIKeySource hides key material for display: env: references are not
+// secrets and stay readable; literal/raw keys keep only a short prefix/suffix.
+func maskAPIKeySource(source string) string {
+	source = strings.TrimSpace(source)
+	if source == "" || strings.HasPrefix(source, "env:") {
+		return source
+	}
+	value := strings.TrimPrefix(source, "literal:")
+	if len(value) <= 8 {
+		return "••••"
+	}
+	return value[:4] + "••••" + value[len(value)-4:]
 }
 
 // publicAccessForUser returns a redacted PublicAccessSettings that keeps just

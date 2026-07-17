@@ -296,6 +296,56 @@ type claudeOAuthTokenResponse struct {
 	TokenType    string `json:"token_type"`
 }
 
+// fetchClaudeOAuthProfileLabel queries api.anthropic.com/api/oauth/profile
+// with the OAuth access token and builds a human account label like
+// "luca.yang@tuya.com · Tuya". Best-effort: callers treat errors as "no label".
+func fetchClaudeOAuthProfileLabel(accessToken string) (string, error) {
+	accessToken = strings.TrimSpace(accessToken)
+	if accessToken == "" {
+		return "", fmt.Errorf("empty access token")
+	}
+	request, err := http.NewRequest(http.MethodGet, "https://api.anthropic.com/api/oauth/profile", nil)
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("Authorization", "Bearer "+accessToken)
+	request.Header.Set("anthropic-beta", "oauth-2025-04-20")
+	client := &http.Client{Timeout: 15 * time.Second}
+	response, err := client.Do(request)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("profile endpoint status %d", response.StatusCode)
+	}
+	var payload struct {
+		Account struct {
+			Email       string `json:"email"`
+			DisplayName string `json:"display_name"`
+		} `json:"account"`
+		Organization struct {
+			Name string `json:"name"`
+		} `json:"organization"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		return "", err
+	}
+	parts := []string{}
+	if email := strings.TrimSpace(payload.Account.Email); email != "" {
+		parts = append(parts, email)
+	} else if name := strings.TrimSpace(payload.Account.DisplayName); name != "" {
+		parts = append(parts, name)
+	}
+	if org := strings.TrimSpace(payload.Organization.Name); org != "" {
+		parts = append(parts, org)
+	}
+	if len(parts) == 0 {
+		return "", fmt.Errorf("profile has no account identity")
+	}
+	return strings.Join(parts, " · "), nil
+}
+
 // exchangeClaudeOAuthCode exchanges an authorization code + PKCE verifier for
 // an access/refresh token pair at the Claude OAuth token endpoint.
 func exchangeClaudeOAuthCode(code, verifier, state, redirectURI string) (domain.ClaudeOAuthCredential, error) {
@@ -408,6 +458,12 @@ func (s *Server) ensureFreshClaudeToken(provider domain.Provider) (domain.Provid
 		refreshed.RefreshToken = provider.ClaudeOAuth.RefreshToken
 	}
 	refreshed.AccountLabel = provider.ClaudeOAuth.AccountLabel
+	if strings.TrimSpace(refreshed.AccountLabel) == "" {
+		// 老连接没存过账号信息：借 token 刷新的时机补齐。
+		if label, labelErr := fetchClaudeOAuthProfileLabel(refreshed.AccessToken); labelErr == nil {
+			refreshed.AccountLabel = label
+		}
+	}
 	if strings.TrimSpace(refreshed.Scope) == "" {
 		refreshed.Scope = provider.ClaudeOAuth.Scope
 	}
@@ -430,6 +486,10 @@ func (s *Server) finishClaudeOAuthExchange(providerID, flowID string, pending cl
 		}
 		return err
 	}
+	// 连接成功后顺带拉取账号信息（email · 组织），用于控制台展示；失败不阻塞连接。
+	if label, labelErr := fetchClaudeOAuthProfileLabel(credential.AccessToken); labelErr == nil {
+		credential.AccountLabel = label
+	}
 	_, err = s.router.SetProviderClaudeOAuth(providerID, credential)
 	if err != nil {
 		if flowID != "" {
@@ -449,6 +509,34 @@ func (s *Server) finishClaudeOAuthExchange(providerID, flowID string, pending cl
 	}
 	s.logs.AddApp("info", "claude oauth connected", providerID)
 	return nil
+}
+
+// BackfillClaudeOAuthAccountLabels fills missing account labels for already
+// connected Claude OAuth providers (one-shot at startup; older connections
+// were created before the profile fetch existed).
+func (s *Server) BackfillClaudeOAuthAccountLabels() {
+	go func() {
+		for _, provider := range s.router.State().Providers {
+			if provider.AuthType != domain.AuthTypeClaudeOAuth || provider.ClaudeOAuth == nil {
+				continue
+			}
+			if strings.TrimSpace(provider.ClaudeOAuth.AccessToken) == "" || strings.TrimSpace(provider.ClaudeOAuth.AccountLabel) != "" {
+				continue
+			}
+			label, err := fetchClaudeOAuthProfileLabel(provider.ClaudeOAuth.AccessToken)
+			if err != nil {
+				continue
+			}
+			credential := *provider.ClaudeOAuth
+			credential.AccountLabel = label
+			if updated, err := s.router.SetProviderClaudeOAuth(provider.ID, credential); err == nil {
+				if err := s.persistProviderOAuth(updated.ID, updated.ClaudeOAuth, nil, nil); err != nil {
+					s.logs.AddApp("warn", "failed to persist claude oauth account label", err.Error())
+				}
+				s.logs.AddApp("info", "claude oauth account label backfilled", fmt.Sprintf("provider=%s label=%s", provider.ID, label))
+			}
+		}
+	}()
 }
 
 func (s *Server) claudeOAuthCallbackURL() string {
