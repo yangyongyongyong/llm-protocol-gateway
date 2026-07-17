@@ -2996,7 +2996,12 @@ function App() {
 
   useEffect(() => {
     if (activeNav !== 'traffic-tokens') return;
-    // 先用缓存秒开，再静默拉最新；页可见时每 5s 自动刷新
+    // 先用缓存秒开，再静默拉最新；只有第 1 页会每 5s 自动刷新。
+    // 原因：日志按时间倒序做 offset 分页，翻到第 2 页及以后本质是“偏移量 10~20”
+    // 这样一个位置窗口。如果继续自动刷新，新请求不断从最前面插入会导致这个窗口
+    // 对应的内容整体后移——用户正在看的行会被不断顶掉/替换，表现就是“翻页后日志
+    // 抖动乱跳”。锁定在第 1 页之外的页时只做一次性拉取（导航到该页/翻页/应用筛选
+    // 时触发），不再自动轮询；第 1 页保持原来的实时自动刷新。
     const scope = uiCacheScope(authStatusRef.current);
     const kind = `logs:p${logsPage}:s${logsStatusFilter}:f${logsFrom}:t${logsTo}:k${logsApiKeyName.trim()}`;
     const cached = readUICache<{ items: LogEntry[]; total: number; page: number; fetchedAt?: string }>(scope, kind);
@@ -3011,6 +3016,7 @@ function App() {
       }
     }
     void refreshLogs(logsPage, undefined, undefined, { silent: Boolean(cached?.items?.length) });
+    if (logsPage !== 1) return;
     const timer = window.setInterval(() => {
       if (document.visibilityState === 'hidden') return;
       void refreshLogs(logsPage, undefined, undefined, { silent: true });
@@ -6512,7 +6518,7 @@ function App() {
                       <span />
                     </div>
                     {logs.map((log, index) => (
-                      <div className={`log-row${isTrafficLogError(log) ? ' error' : ''}`} key={`${log.time}-${index}`}>
+                      <div className={`log-row${isTrafficLogError(log) ? ' error' : ''}`} key={trafficLogMatchKey(log)}>
                         <div className="log-row-main traffic-log-row">
                           <span className="log-time">{new Date(log.time).toLocaleString()}</span>
                           <Badge tone={statusTone(log.status)}>{log.status}</Badge>
@@ -6535,7 +6541,10 @@ function App() {
                       </div>
                     ))}
                     <div className="hint-line" style={{ display: 'flex', gap: 12, alignItems: 'center', justifyContent: 'space-between' }}>
-                      <span>共 {logsTotal} 条 · 第 {logsPage} 页 · 每页 {LOGS_PAGE_SIZE} 条</span>
+                      <span>
+                        共 {logsTotal} 条 · 第 {logsPage} 页 · 每页 {LOGS_PAGE_SIZE} 条
+                        {logsPage > 1 ? ' · 当前页不自动刷新（避免新日志把翻页顶得乱跳），需要看最新请回到第 1 页' : ''}
+                      </span>
                       <span style={{ display: 'flex', gap: 8 }}>
                         <button className="mini-btn" type="button" disabled={logsPage <= 1} onClick={() => void refreshLogs(logsPage - 1)}>上一页</button>
                         <button className="mini-btn" type="button" disabled={logsPage * LOGS_PAGE_SIZE >= logsTotal} onClick={() => void refreshLogs(logsPage + 1)}>下一页</button>
