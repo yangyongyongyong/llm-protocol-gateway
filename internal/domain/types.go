@@ -94,6 +94,12 @@ type Provider struct {
 	DefaultThinkingDepth string   `json:"defaultThinkingDepth,omitempty"`
 	Models               []Model  `json:"models"`
 	HealthStatus         string   `json:"healthStatus"`
+	// NextRetryAt is a runtime-only hint (RFC3339) shown by the console when
+	// HealthStatus == "unavailable": a live upstream request just failed
+	// against this provider, and the background recovery loop
+	// (see gateway.StartProviderFailoverRecovery) will re-probe it at this
+	// time. Computed at response time in handleState; never persisted.
+	NextRetryAt          string   `json:"nextRetryAt,omitempty"`
 	AuthHeader           string   `json:"authHeader"`
 	ExtraEndpoint        string   `json:"extraEndpoint,omitempty"`
 	// AuthType selects the provider's authentication mode. "" and "api_key"

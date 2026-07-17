@@ -418,6 +418,9 @@ html[data-theme="dark"] .api-key-client-config-actions .client-config-btn {
 .provider-name { font-size: 16px; line-height: 1.25; white-space: normal; overflow: visible; text-overflow: unset; }
 .provider-subtitle { margin-top: 4px; color: var(--muted); font-size: 12px; font-family: var(--mono); }
 .provider-badges { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; flex-shrink: 0; }
+.provider-retry-hint { color: #991b1b; font-size: 11px; font-weight: 700; white-space: nowrap; }
+.provider-users-badge { cursor: pointer; display: inline-flex; }
+.provider-users-badge:hover .badge { filter: brightness(0.94); }
 .provider-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
 .protocol-pair { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
 .protocol-arrow { color: var(--subtle); font-weight: 900; }

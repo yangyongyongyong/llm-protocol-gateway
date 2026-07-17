@@ -278,6 +278,10 @@ type Provider = {
   defaultThinkingDepth?: string;
   models?: Model[];
   healthStatus: string;
+  // nextRetryAt (RFC3339): set by the backend only while healthStatus ===
+  // 'unavailable' — a live upstream request just failed against this
+  // provider, and the background recovery loop will re-probe it at this time.
+  nextRetryAt?: string;
   authType?: 'api_key' | 'claude_oauth' | 'cursor_oauth' | 'chatgpt_oauth';
   claudeOAuth?: ClaudeOAuthInfo;
   cursorOAuth?: CursorOAuthInfo;
@@ -1118,9 +1122,38 @@ function healthStatusLabel(status: string) {
     case 'failed': return '失败';
     case 'degraded': return '降级';
     case 'standby': return '待机';
+    case 'unavailable': return '异常';
     case 'unchecked': return '未检测';
     default: return status || '未检测';
   }
+}
+
+// retrySecondsLabel renders a live "N秒后重试" / "N分N秒后重试" countdown from
+// an RFC3339 nextRetryAt timestamp, matching the backend's periodic
+// background recovery probe (see gateway.StartProviderFailoverRecovery).
+function retrySecondsLabel(nextRetryAt: string | undefined, nowMs: number): string | null {
+  if (!nextRetryAt) return null;
+  const target = new Date(nextRetryAt).getTime();
+  if (Number.isNaN(target)) return null;
+  const remainingMs = target - nowMs;
+  if (remainingMs <= 0) return '即将重试';
+  const totalSeconds = Math.ceil(remainingMs / 1000);
+  if (totalSeconds < 60) return `${totalSeconds}秒后重试`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return seconds > 0 ? `${minutes}分${seconds}秒后重试` : `${minutes}分钟后重试`;
+}
+
+// useNowTick re-renders every second so retry countdowns stay live between
+// the 5s /__state polls, without needing per-provider timers.
+function useNowTick(enabled: boolean, intervalMs = 1000): number {
+  const [now, setNow] = React.useState(() => Date.now());
+  React.useEffect(() => {
+    if (!enabled) return undefined;
+    const timer = window.setInterval(() => setNow(Date.now()), intervalMs);
+    return () => window.clearInterval(timer);
+  }, [enabled, intervalMs]);
+  return now;
 }
 
 function cursorBridgeStatusLabel(status?: string) {
@@ -1937,6 +1970,7 @@ function statusTone(status?: number): BadgeTone {
 function healthTone(status: string): BadgeTone {
   if (status === 'healthy') return 'green';
   if (status === 'failed') return 'red';
+  if (status === 'unavailable') return 'red';
   if (status === 'degraded') return 'amber';
   if (status === 'standby') return 'blue';
   return 'slate';
@@ -2554,6 +2588,9 @@ function App() {
   const [userFormPassword, setUserFormPassword] = useState('');
   const [userFormProviders, setUserFormProviders] = useState<string[]>([]);
   const [userFormBusy, setUserFormBusy] = useState(false);
+  // Provider 用户权限弹窗（仅管理员）：查看/新增/移除哪些普通用户可用某个输入 Provider。
+  const [providerUsersModalID, setProviderUsersModalID] = useState<string | null>(null);
+  const [providerUsersBusyID, setProviderUsersBusyID] = useState('');
   const [adminCurrentPassword, setAdminCurrentPassword] = useState('');
   const [adminNewPassword, setAdminNewPassword] = useState('');
   const [adminNewPasswordConfirm, setAdminNewPasswordConfirm] = useState('');
@@ -3086,6 +3123,14 @@ function App() {
     void refreshConsoleUsers();
   }, [activeNav, authStatus?.role]);
 
+  // 管理员打开输入 Provider 页时加载用户列表，用于 Provider 卡片上的
+  // 「N 个用户」权限徽标与用户权限弹窗；普通用户无权限也无需拉取。
+  useEffect(() => {
+    if (activeNav !== 'input-providers') return;
+    if (authStatus?.role === 'user') return;
+    void refreshConsoleUsers();
+  }, [activeNav, authStatus?.role]);
+
   // 普通用户访问未授权页面时强制跳回 API 密钥页
   useEffect(() => {
     if (!authStatus?.authenticated || authStatus.role !== 'user') return;
@@ -3261,6 +3306,31 @@ function App() {
       // 非管理员或后端异常时静默
     } finally {
       setUsersLoading(false);
+    }
+  }
+
+  // 授予/移除某个普通用户对指定输入 Provider 的使用权限（管理员专用，
+  // 复用 PATCH /__users/{id} 的 allowedProviderIds 字段）。
+  async function updateUserProviderPermission(user: ConsoleUser, providerId: string, grant: boolean) {
+    setProviderUsersBusyID(user.id);
+    try {
+      const current = user.allowedProviderIds || [];
+      const next = grant
+        ? Array.from(new Set([...current, providerId]))
+        : current.filter((id) => id !== providerId);
+      const response = await fetch(`${API_BASE}/__users/${encodeURIComponent(user.id)}`, {
+        method: 'PATCH',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ allowedProviderIds: next }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      await refreshConsoleUsers();
+      showToast(grant ? `已为 ${user.username} 开通权限` : `已移除 ${user.username} 的权限`);
+    } catch (error) {
+      showToast(`更新用户权限失败：${String(error)}`);
+    } finally {
+      setProviderUsersBusyID('');
     }
   }
 
@@ -5861,6 +5931,7 @@ function App() {
                         url={provider.authType === 'claude_oauth' ? 'Claude OAuth (api.anthropic.com)' : provider.authType === 'cursor_oauth' ? 'Cursor OAuth (本地 gRPC bridge)' : provider.authType === 'chatgpt_oauth' ? 'ChatGPT OAuth (chatgpt.com/codex)' : `${provider.baseUrl} · ${provider.apiKeySource || '透传客户端 Authorization'}`}
                         usedCount={usedCount}
                         healthStatus={provider.healthStatus || 'unchecked'}
+                        nextRetryAt={provider.nextRetryAt}
                         testing={testingProviderID === provider.id}
                         readOnly={isNormalUser}
                         isClaudeOAuth={provider.authType === 'claude_oauth'}
@@ -5870,6 +5941,12 @@ function App() {
                         isChatGPTOAuth={provider.authType === 'chatgpt_oauth'}
                         chatgptOAuthConnected={provider.chatgptOAuth?.connected}
                         cursorBridge={provider.authType === 'cursor_oauth' ? state.cursorBridge : undefined}
+                        authorizedUserCount={!isNormalUser
+                          ? consoleUsers.filter((user) => user.role !== 'admin' && (user.allowedProviderIds || []).includes(provider.id)).length
+                          : undefined}
+                        onShowUsers={!isNormalUser
+                          ? () => { setProviderUsersModalID(provider.id); void refreshConsoleUsers(); }
+                          : undefined}
                         onToggleSelect={() => toggleExportProviderSelection(provider.id)}
                         onClick={() => {
                           setSelectedProviderID(provider.id);
@@ -7573,6 +7650,70 @@ function App() {
         </Modal>
       )}
 
+      {providerUsersModalID && !isNormalUser && (() => {
+        const modalProvider = state.providers.find((item) => item.id === providerUsersModalID);
+        if (!modalProvider) return null;
+        const normalUsers = consoleUsers.filter((user) => user.role !== 'admin');
+        const authorizedUsers = normalUsers.filter((user) => (user.allowedProviderIds || []).includes(modalProvider.id));
+        const candidateUsers = normalUsers.filter((user) => !(user.allowedProviderIds || []).includes(modalProvider.id));
+        return (
+          <Modal
+            title={`用户权限 · ${modalProvider.name}`}
+            description="管理哪些普通用户可以使用该输入 Provider。管理员账号不受此限制，始终可用全部 Provider。"
+            onClose={() => setProviderUsersModalID(null)}
+          >
+            <div className="field field-full">
+              <label>已授权用户（{authorizedUsers.length}）</label>
+              {authorizedUsers.length === 0 ? <div className="hint-line">暂无用户被授权使用该 Provider。</div> : null}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {authorizedUsers.map((user) => (
+                  <div key={user.id} className="hint-line" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                    <span>
+                      <span style={{ fontWeight: 700 }}>{user.username}</span>
+                      <span className={user.enabled ? 'ok' : 'err'} style={{ marginLeft: 8 }}>{user.enabled ? '启用' : '禁用'}</span>
+                    </span>
+                    <button
+                      className="mini-btn danger"
+                      type="button"
+                      disabled={providerUsersBusyID === user.id}
+                      onClick={() => void updateUserProviderPermission(user, modalProvider.id, false)}
+                    >
+                      {providerUsersBusyID === user.id ? '处理中…' : '移除权限'}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="field field-full" style={{ marginTop: 12 }}>
+              <label>新增授权</label>
+              {normalUsers.length === 0 ? <div className="hint-line">暂无普通用户账号，可先到「用户管理」页新建。</div> : null}
+              {normalUsers.length > 0 && candidateUsers.length === 0 ? <div className="hint-line">所有普通用户均已授权。</div> : null}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {candidateUsers.map((user) => (
+                  <div key={user.id} className="hint-line" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                    <span>
+                      <span style={{ fontWeight: 700 }}>{user.username}</span>
+                      <span className={user.enabled ? 'ok' : 'err'} style={{ marginLeft: 8 }}>{user.enabled ? '启用' : '禁用'}</span>
+                    </span>
+                    <button
+                      className="mini-btn"
+                      type="button"
+                      disabled={providerUsersBusyID === user.id}
+                      onClick={() => void updateUserProviderPermission(user, modalProvider.id, true)}
+                    >
+                      {providerUsersBusyID === user.id ? '处理中…' : '新增权限'}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="actions modal-actions">
+              <button className="btn" onClick={() => setProviderUsersModalID(null)}>关闭</button>
+            </div>
+          </Modal>
+        );
+      })()}
+
       {userModalOpen && (
         <Modal
           title={editingUserID ? '编辑用户' : '新建用户'}
@@ -7959,9 +8100,12 @@ function ChatGPTOAuthUsagePanel({ providerId, connected, compact }: { providerId
   );
 }
 
-function ProviderCard({ active, selected, name, providerId, protocol, tone, url, usedCount, healthStatus, testing, readOnly, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, cursorBridge, onToggleSelect, onClick, onTest, onChatTest, onEdit, onClone, onDelete }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; usedCount: number; healthStatus: string; testing: boolean; readOnly?: boolean; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; cursorBridge?: CursorBridgeRuntime; onToggleSelect: () => void; onClick: () => void; onTest: () => void; onChatTest: () => void; onEdit: () => void; onClone: () => void; onDelete: () => void }) {
+function ProviderCard({ active, selected, name, providerId, protocol, tone, url, usedCount, healthStatus, nextRetryAt, testing, readOnly, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, cursorBridge, authorizedUserCount, onShowUsers, onToggleSelect, onClick, onTest, onChatTest, onEdit, onClone, onDelete }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; usedCount: number; healthStatus: string; nextRetryAt?: string; testing: boolean; readOnly?: boolean; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; cursorBridge?: CursorBridgeRuntime; authorizedUserCount?: number; onShowUsers?: () => void; onToggleSelect: () => void; onClick: () => void; onTest: () => void; onChatTest: () => void; onEdit: () => void; onClone: () => void; onDelete: () => void }) {
   const oauthConnected = isClaudeOAuth ? claudeOAuthConnected : isCursorOAuth ? cursorOAuthConnected : isChatGPTOAuth ? chatgptOAuthConnected : false;
   const showOAuthBadge = isClaudeOAuth || isCursorOAuth || isChatGPTOAuth;
+  const isUnavailable = healthStatus === 'unavailable';
+  const now = useNowTick(isUnavailable && !!nextRetryAt);
+  const retryLabel = isUnavailable ? retrySecondsLabel(nextRetryAt, now) : null;
   const bridgeHint = cursorBridge?.port
     ? ` · :${cursorBridge.port}${cursorBridge.message ? ` · ${cursorBridge.message}` : ''}`
     : (cursorBridge?.message ? ` · ${cursorBridge.message}` : '');
@@ -7986,6 +8130,7 @@ function ProviderCard({ active, selected, name, providerId, protocol, tone, url,
           ) : (
             <Badge tone={healthTone(healthStatus)}>{healthStatusLabel(healthStatus)}</Badge>
           )}
+          {retryLabel ? <span className="provider-retry-hint" title="后台会周期性自动重试探测该 Provider">{retryLabel}</span> : null}
           {isCursorOAuth ? (
             <span title={cursorBridge?.checkedAt ? `上次探活：${cursorBridge.checkedAt}${bridgeHint}` : (bridgeHint || undefined)}>
               <Badge tone={cursorBridgeTone(cursorBridge?.status)}>
@@ -7994,6 +8139,18 @@ function ProviderCard({ active, selected, name, providerId, protocol, tone, url,
             </span>
           ) : null}
           <Badge tone={usedCount > 0 ? 'amber' : 'slate'}>{usedCount} 个 API Key</Badge>
+          {onShowUsers && authorizedUserCount != null ? (
+            <span
+              className="provider-users-badge"
+              role="button"
+              tabIndex={0}
+              title="查看/管理有权限使用该 Provider 的用户（仅管理员）"
+              onClick={(event) => { event.stopPropagation(); onShowUsers(); }}
+              onKeyDown={(event) => { if (event.key === 'Enter') { event.stopPropagation(); onShowUsers(); } }}
+            >
+              <Badge tone={authorizedUserCount > 0 ? 'blue' : 'slate'}>{authorizedUserCount} 个用户</Badge>
+            </span>
+          ) : null}
         </div>
       </div>
       <div className="provider-meta">{url}{isCursorOAuth && cursorBridge?.port ? ` · 127.0.0.1:${cursorBridge.port}` : ''}</div>

@@ -87,6 +87,14 @@ type Server struct {
 	// selfcheckJobs holds in-memory async self-check jobs (CLI smoke tests).
 	selfcheckMu   sync.Mutex
 	selfcheckJobs map[string]*selfcheckJob
+
+	// providerAvailability tracks providers that a live upstream request found
+	// unavailable (quota/auth/5xx/transport-error per shouldFailoverProvider),
+	// keyed by provider ID -> the next time the background recovery loop
+	// (StartProviderFailoverRecovery) will re-probe it. Runtime-only, never
+	// persisted; cleared as soon as a live request or probe succeeds again.
+	providerAvailabilityMu sync.Mutex
+	providerAvailability   map[string]time.Time
 }
 
 func NewServer(router *Router, logs *monitor.Store, stateSaver ...StateSaver) *Server {
@@ -295,6 +303,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	state.Providers = redactProvidersForClient(state.Providers)
 	for index := range state.Providers {
 		enrichProviderAdapterCurl(&state.Providers[index])
+		s.applyProviderAvailability(&state.Providers[index])
 	}
 	// Attach live tunnel status/URLs for everyone — including role=user.
 	// Without this, regular users fall back to LAN addresses on the API-key

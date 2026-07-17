@@ -173,6 +173,90 @@ func (w *failoverResponseWriter) FlushError() {
 	w.commitHeaders(status)
 }
 
+// markProviderUnavailable records that a live upstream request found
+// providerID unavailable, so /__state can surface a "unavailable"/"异常"
+// badge plus a countdown until the background recovery loop
+// (StartProviderFailoverRecovery) re-probes it. Safe for concurrent use.
+func (s *Server) markProviderUnavailable(providerID string) {
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		return
+	}
+	s.providerAvailabilityMu.Lock()
+	if s.providerAvailability == nil {
+		s.providerAvailability = make(map[string]time.Time)
+	}
+	s.providerAvailability[providerID] = time.Now().Add(providerFailoverRecoveryInterval)
+	s.providerAvailabilityMu.Unlock()
+}
+
+// markProviderAvailable clears any tracked "unavailable" cooldown for
+// providerID, e.g. once a live request or background probe succeeds again.
+func (s *Server) markProviderAvailable(providerID string) {
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		return
+	}
+	s.providerAvailabilityMu.Lock()
+	if s.providerAvailability != nil {
+		delete(s.providerAvailability, providerID)
+	}
+	s.providerAvailabilityMu.Unlock()
+}
+
+// providerNextRetry reports the next scheduled recovery-probe time for
+// providerID and whether it is currently tracked as unavailable.
+func (s *Server) providerNextRetry(providerID string) (time.Time, bool) {
+	s.providerAvailabilityMu.Lock()
+	defer s.providerAvailabilityMu.Unlock()
+	t, ok := s.providerAvailability[providerID]
+	return t, ok
+}
+
+// providerUnavailableIDs snapshots the currently-tracked unavailable provider
+// IDs, for the background recovery loop to re-probe each cycle.
+func (s *Server) providerUnavailableIDs() []string {
+	s.providerAvailabilityMu.Lock()
+	defer s.providerAvailabilityMu.Unlock()
+	ids := make([]string, 0, len(s.providerAvailability))
+	for id := range s.providerAvailability {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// applyProviderAvailability overlays the live-request availability tracker
+// onto a provider destined for the client: a provider that just failed a real
+// API call shows healthStatus "unavailable" (rendered "异常" in the console)
+// with nextRetryAt, even if its persisted HealthStatus still reflects an
+// earlier manual "获取模型" check.
+func (s *Server) applyProviderAvailability(provider *domain.Provider) {
+	nextRetry, unavailable := s.providerNextRetry(provider.ID)
+	if !unavailable {
+		return
+	}
+	provider.HealthStatus = "unavailable"
+	provider.NextRetryAt = nextRetry.Format(time.RFC3339)
+}
+
+// recordProviderRequestOutcome updates the runtime availability tracker for
+// providerID based on one completed upstream attempt (mirrors the same
+// quota/auth/5xx/transport-error classification failover already uses via
+// shouldFailoverProvider), independent of whether a fallback chain exists.
+func (s *Server) recordProviderRequestOutcome(providerID string, status int, body []byte, err error) {
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		return
+	}
+	if shouldFailoverProvider(status, body, err) {
+		s.markProviderUnavailable(providerID)
+		return
+	}
+	if err == nil {
+		s.markProviderAvailable(providerID)
+	}
+}
+
 func (s *Server) persistAPIKeyActiveProvider(keyID, providerID string) {
 	updated, err := s.router.SetAPIKeyActiveProvider(keyID, providerID)
 	if err != nil {
@@ -199,12 +283,14 @@ func (s *Server) executeProtocolFlowWithFailover(
 ) (int, TokenUsage, []byte, domain.RouteDecision, string, error) {
 	if !gatewayKeyMatched {
 		status, usage, body, err := s.executeProtocolFlow(w, r, route, decision, model, req, clientProtocol, skipIncomingAuth)
+		s.recordProviderRequestOutcome(decision.ProviderID, status, body, err)
 		return status, usage, body, decision, model, err
 	}
 
 	chain := apiKeyProviderChain(route.ProviderID, matchedKey.FallbackProviderIDs)
 	if len(chain) == 0 {
 		status, usage, body, err := s.executeProtocolFlow(w, r, route, decision, model, req, clientProtocol, skipIncomingAuth)
+		s.recordProviderRequestOutcome(decision.ProviderID, status, body, err)
 		return status, usage, body, decision, model, err
 	}
 	start := apiKeyEffectiveProviderIndex(matchedKey.ActiveProviderID, chain)
@@ -253,7 +339,11 @@ func (s *Server) executeProtocolFlowWithFailover(
 		status, usage, body, execErr := s.executeProtocolFlow(writer, r, route, attemptDecision, attemptModel, attemptReq, clientProtocol, skipIncomingAuth)
 		if execErr != nil {
 			lastStatus, lastUsage, lastBody, lastErr, lastModel = status, usage, nil, execErr, attemptModel
-			if canDefer && shouldFailoverProvider(0, nil, execErr) {
+			transportFailoverWorthy := shouldFailoverProvider(0, nil, execErr)
+			if transportFailoverWorthy {
+				s.markProviderUnavailable(providerID)
+			}
+			if canDefer && transportFailoverWorthy {
 				writer.Discard()
 				markTimingFlag(r.Context(), timingFlagFailoverRetry)
 				if t := requestTimingFrom(r.Context()); t != nil {
@@ -277,7 +367,13 @@ func (s *Server) executeProtocolFlowWithFailover(
 		}
 		lastStatus, lastUsage, lastBody, lastErr, lastModel = status, usage, respBody, nil, attemptModel
 
-		if canDefer && shouldFailoverProvider(status, respBody, nil) {
+		attemptFailoverWorthy := shouldFailoverProvider(status, respBody, nil)
+		if attemptFailoverWorthy {
+			s.markProviderUnavailable(providerID)
+		} else {
+			s.markProviderAvailable(providerID)
+		}
+		if canDefer && attemptFailoverWorthy {
 			writer.Discard()
 			markTimingFlag(r.Context(), timingFlagFailoverRetry)
 			if t := requestTimingFrom(r.Context()); t != nil {
@@ -340,6 +436,7 @@ func (s *Server) StartProviderFailoverRecovery(ctx context.Context) {
 				return
 			case <-timer.C:
 				s.recoverAPIKeyPreferredProviders(context.Background())
+				s.reprobeUnavailableProviders(context.Background())
 				timer.Reset(providerFailoverRecoveryInterval)
 			}
 		}
@@ -391,6 +488,30 @@ func (s *Server) recoverAPIKeyPreferredProviders(ctx context.Context) {
 			slog.Info("api key recovered higher-priority provider", "key", key.ID, "provider", providerID)
 			break
 		}
+	}
+}
+
+// reprobeUnavailableProviders re-checks every provider currently marked
+// unavailable by a live request failure (recordProviderRequestOutcome) and
+// clears the mark once a probe succeeds. Providers still down get their
+// retry countdown pushed to the next cycle, matching the console's
+// "N秒后重试" hint. Runs on the same cadence as recoverAPIKeyPreferredProviders.
+func (s *Server) reprobeUnavailableProviders(ctx context.Context) {
+	for _, id := range s.providerUnavailableIDs() {
+		provider, err := s.router.ProviderByID(id)
+		if err != nil {
+			// Provider no longer exists: stop tracking it.
+			s.markProviderAvailable(id)
+			continue
+		}
+		if s.probeProviderAvailable(ctx, provider) {
+			s.markProviderAvailable(id)
+			s.logs.AddApp("info", "provider recovered", fmt.Sprintf("provider=%s", id))
+			slog.Info("provider recovered", "provider", id)
+			continue
+		}
+		// Still unavailable: refresh the countdown for the next cycle.
+		s.markProviderUnavailable(id)
 	}
 }
 
