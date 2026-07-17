@@ -19,20 +19,47 @@ func (s *Server) requestIdentity(r *http.Request) sessionIdentity {
 	return adminIdentity()
 }
 
-// allowedProviderIDsForUser loads the admin-assigned provider whitelist.
+// allowedProviderIDsForUser returns the providers a normal user may access:
+// the admin-assigned whitelist plus every provider the user created
+// themselves (ownership implies access).
 func (s *Server) allowedProviderIDsForUser(userID string) map[string]bool {
 	out := map[string]bool{}
-	if s.userStore == nil {
+	if strings.TrimSpace(userID) == "" {
 		return out
 	}
-	user, err := s.userStore.UserByID(userID)
-	if err != nil {
-		return out
+	if s.userStore != nil {
+		if user, err := s.userStore.UserByID(userID); err == nil {
+			for _, id := range user.AllowedProviderIDs {
+				out[id] = true
+			}
+		}
 	}
-	for _, id := range user.AllowedProviderIDs {
-		out[id] = true
+	for _, provider := range s.router.State().Providers {
+		if strings.TrimSpace(provider.OwnerUserID) == userID {
+			out[provider.ID] = true
+		}
 	}
 	return out
+}
+
+// requireProviderOwnerForUser rejects normal users acting on providers they
+// did not create (edit/clone/delete/test are owner-only for role=user).
+// Admins always pass. Returns false after writing the error response.
+func (s *Server) requireProviderOwnerForUser(w http.ResponseWriter, r *http.Request, providerID string) bool {
+	identity := s.requestIdentity(r)
+	if identity.isAdmin() {
+		return true
+	}
+	provider, err := s.router.ProviderByID(providerID)
+	if err != nil {
+		writeOpenAIError(w, http.StatusNotFound, err.Error())
+		return false
+	}
+	if strings.TrimSpace(provider.OwnerUserID) != identity.UserID {
+		writeOpenAIError(w, http.StatusForbidden, "permission denied: only the provider owner or an admin can do this")
+		return false
+	}
+	return true
 }
 
 // requireProviderAccessForUser rejects normal users who were not granted the

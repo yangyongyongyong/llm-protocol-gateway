@@ -178,6 +178,8 @@ func (s *Store) migrate() error {
 		{"oauth_expires_at", "TEXT NOT NULL DEFAULT ''"},
 		{"oauth_scope", "TEXT NOT NULL DEFAULT ''"},
 		{"oauth_account_label", "TEXT NOT NULL DEFAULT ''"},
+		// owner_user_id: console user that created the provider ("" = admin).
+		{"owner_user_id", "TEXT NOT NULL DEFAULT ''"},
 	}
 	for _, column := range oauthColumns {
 		if err := addColumnIfMissing(tx, "providers", column.name, column.definition); err != nil {
@@ -425,12 +427,12 @@ func (s *Store) Save(state domain.GatewayState) error {
 		}
 		if _, err := tx.Exec(`INSERT INTO providers
 			(id, name, protocol, base_url, api_key_source, default_model, default_thinking_depth, health_status, auth_header, extra_endpoint, position,
-			 auth_type, oauth_access_token, oauth_refresh_token, oauth_expires_at, oauth_scope, oauth_account_label)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 auth_type, oauth_access_token, oauth_refresh_token, oauth_expires_at, oauth_scope, oauth_account_label, owner_user_id)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			provider.ID, provider.Name, string(provider.Protocol), provider.BaseURL, provider.APIKeySource,
 			provider.DefaultModel, provider.DefaultThinkingDepth, provider.HealthStatus, provider.AuthHeader,
 			provider.ExtraEndpoint, pIndex,
-			provider.AuthType, accessToken, refreshToken, expiresAt, scope, accountLabel); err != nil {
+			provider.AuthType, accessToken, refreshToken, expiresAt, scope, accountLabel, provider.OwnerUserID); err != nil {
 			return err
 		}
 		for mIndex, model := range provider.Models {
@@ -519,7 +521,7 @@ func (s *Store) Save(state domain.GatewayState) error {
 
 func (s *Store) loadProviders() ([]domain.Provider, error) {
 	rows, err := s.reader().Query(`SELECT id, name, protocol, base_url, api_key_source, default_model, default_thinking_depth, health_status, auth_header, extra_endpoint,
-		auth_type, oauth_access_token, oauth_refresh_token, oauth_expires_at, oauth_scope, oauth_account_label
+		auth_type, oauth_access_token, oauth_refresh_token, oauth_expires_at, oauth_scope, oauth_account_label, owner_user_id
 		FROM providers ORDER BY position, id`)
 	if err != nil {
 		return nil, err
@@ -530,7 +532,7 @@ func (s *Store) loadProviders() ([]domain.Provider, error) {
 		var protocol string
 		var accessToken, refreshToken, expiresAt, scope, accountLabel string
 		if err := rows.Scan(&p.ID, &p.Name, &protocol, &p.BaseURL, &p.APIKeySource, &p.DefaultModel, &p.DefaultThinkingDepth, &p.HealthStatus, &p.AuthHeader, &p.ExtraEndpoint,
-			&p.AuthType, &accessToken, &refreshToken, &expiresAt, &scope, &accountLabel); err != nil {
+			&p.AuthType, &accessToken, &refreshToken, &expiresAt, &scope, &accountLabel, &p.OwnerUserID); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}

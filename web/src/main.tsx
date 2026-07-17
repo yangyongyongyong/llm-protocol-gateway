@@ -282,6 +282,9 @@ type Provider = {
   // 'unavailable' — a live upstream request just failed against this
   // provider, and the background recovery loop will re-probe it at this time.
   nextRetryAt?: string;
+  // 创建该 Provider 的控制台用户；空 = 管理员创建。普通用户对自己创建的
+  // Provider 拥有编辑/克隆/删除/对话测试/获取模型权限。
+  ownerUserId?: string;
   authType?: 'api_key' | 'claude_oauth' | 'cursor_oauth' | 'chatgpt_oauth';
   claudeOAuth?: ClaudeOAuthInfo;
   cursorOAuth?: CursorOAuthInfo;
@@ -5867,10 +5870,15 @@ function App() {
                   <h2 className="panel-title">输入 Provider</h2>
                   <p className="panel-desc">
                     {isNormalUser
-                      ? '仅展示管理员授权给你的上游 Provider（只读）。可查看订阅额度等信息，不可增删改或获取模型。'
+                      ? '展示管理员授权给你的 Provider（只读）以及你自己创建的 Provider（可编辑/克隆/删除/对话测试/获取模型）。删除前会检查是否被 API 密钥引用。'
                       : '用户自定义添加的上游 Provider。删除前会检查是否被 API 密钥引用。列表按近 3 日请求量排序。支持勾选后导出/导入配置（含 apiKeySource 与已持久化的 OAuth 元数据）。'}
                   </p>
                 </div>
+                {isNormalUser ? (
+                  <div className="panel-header-actions">
+                    <button className="btn primary" disabled={saving} onClick={openProviderModal}>添加输入 Provider</button>
+                  </div>
+                ) : null}
                 {!isNormalUser ? (
                   <div className="panel-header-actions">
                     <button className="btn" disabled={saving || selectedExportProviderIDs.length === 0} onClick={() => void exportProviders(selectedExportProviderIDs)}>导出选中{selectedExportProviderIDs.length > 0 ? ` (${selectedExportProviderIDs.length})` : ''}</button>
@@ -5911,7 +5919,7 @@ function App() {
               ) : null}
               {sortedProviders.length === 0 ? (
                 <div className="empty-state">
-                  {isNormalUser ? '暂无授权的 Provider。请联系管理员为你分配可用输入 Provider。' : '暂无 Provider。点击「添加输入 Provider」创建。'}
+                  {isNormalUser ? '暂无可用 Provider。可点击「添加输入 Provider」创建自己的 Provider，或联系管理员为你分配。' : '暂无 Provider。点击「添加输入 Provider」创建。'}
                 </div>
               ) : (
                 <div className="provider-card-grid">
@@ -5933,7 +5941,8 @@ function App() {
                         healthStatus={provider.healthStatus || 'unchecked'}
                         nextRetryAt={provider.nextRetryAt}
                         testing={testingProviderID === provider.id}
-                        readOnly={isNormalUser}
+                        readOnly={isNormalUser && provider.ownerUserId !== authStatus?.userId}
+                        selectable={!isNormalUser}
                         isClaudeOAuth={provider.authType === 'claude_oauth'}
                         claudeOAuthConnected={provider.claudeOAuth?.connected}
                         isCursorOAuth={provider.authType === 'cursor_oauth'}
@@ -8100,7 +8109,7 @@ function ChatGPTOAuthUsagePanel({ providerId, connected, compact }: { providerId
   );
 }
 
-function ProviderCard({ active, selected, name, providerId, protocol, tone, url, usedCount, healthStatus, nextRetryAt, testing, readOnly, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, cursorBridge, authorizedUserCount, onShowUsers, onToggleSelect, onClick, onTest, onChatTest, onEdit, onClone, onDelete }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; usedCount: number; healthStatus: string; nextRetryAt?: string; testing: boolean; readOnly?: boolean; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; cursorBridge?: CursorBridgeRuntime; authorizedUserCount?: number; onShowUsers?: () => void; onToggleSelect: () => void; onClick: () => void; onTest: () => void; onChatTest: () => void; onEdit: () => void; onClone: () => void; onDelete: () => void }) {
+function ProviderCard({ active, selected, name, providerId, protocol, tone, url, usedCount, healthStatus, nextRetryAt, testing, readOnly, selectable, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, cursorBridge, authorizedUserCount, onShowUsers, onToggleSelect, onClick, onTest, onChatTest, onEdit, onClone, onDelete }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; usedCount: number; healthStatus: string; nextRetryAt?: string; testing: boolean; readOnly?: boolean; selectable?: boolean; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; cursorBridge?: CursorBridgeRuntime; authorizedUserCount?: number; onShowUsers?: () => void; onToggleSelect: () => void; onClick: () => void; onTest: () => void; onChatTest: () => void; onEdit: () => void; onClone: () => void; onDelete: () => void }) {
   const oauthConnected = isClaudeOAuth ? claudeOAuthConnected : isCursorOAuth ? cursorOAuthConnected : isChatGPTOAuth ? chatgptOAuthConnected : false;
   const showOAuthBadge = isClaudeOAuth || isCursorOAuth || isChatGPTOAuth;
   const isUnavailable = healthStatus === 'unavailable';
@@ -8113,13 +8122,13 @@ function ProviderCard({ active, selected, name, providerId, protocol, tone, url,
     <div className={`provider-card clickable ${active ? 'active' : ''} ${selected ? 'selected' : ''}`} onClick={onClick} role="button" tabIndex={0} onKeyDown={(event) => { if (event.key === 'Enter') onClick(); }}>
       <div className="provider-head">
         <div className="provider-title-block">
-          {readOnly ? (
-            <div className="provider-name">{name}</div>
-          ) : (
+          {selectable ? (
             <label className="provider-select checkbox-field" onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
               <input type="checkbox" checked={!!selected} onChange={onToggleSelect} aria-label={`选择 ${name}`} />
               <span className="provider-name">{name}</span>
             </label>
+          ) : (
+            <div className="provider-name">{name}</div>
           )}
           <div className="provider-subtitle">{providerId} · {protocol}</div>
         </div>

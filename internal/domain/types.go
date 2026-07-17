@@ -100,6 +100,10 @@ type Provider struct {
 	// (see gateway.StartProviderFailoverRecovery) will re-probe it at this
 	// time. Computed at response time in handleState; never persisted.
 	NextRetryAt          string   `json:"nextRetryAt,omitempty"`
+	// OwnerUserID is the console user that created this provider. Empty means
+	// admin-created. A normal user owns the providers they create and may
+	// edit/clone/delete/test them; admins have full access to every provider.
+	OwnerUserID          string   `json:"ownerUserId,omitempty"`
 	AuthHeader           string   `json:"authHeader"`
 	ExtraEndpoint        string   `json:"extraEndpoint,omitempty"`
 	// AuthType selects the provider's authentication mode. "" and "api_key"

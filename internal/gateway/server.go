@@ -1370,6 +1370,11 @@ func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid provider json: "+err.Error())
 		return
 	}
+	if identity := s.requestIdentity(r); !identity.isAdmin() {
+		// Normal users own the providers they create (including clones);
+		// OAuth connect/disconnect on owned providers is allowed too.
+		provider.OwnerUserID = identity.UserID
+	}
 	created, err := s.router.AddProvider(provider)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error())
@@ -1438,6 +1443,9 @@ func (s *Server) handleImportProviders(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
+	if !s.requireProviderOwnerForUser(w, r, r.PathValue("id")) {
+		return
+	}
 	var provider domain.Provider
 	if err := json.NewDecoder(r.Body).Decode(&provider); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid provider json: "+err.Error())
@@ -1459,6 +1467,9 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleTestProvider(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	providerID := r.PathValue("id")
+	if !s.requireProviderOwnerForUser(w, r, providerID) {
+		return
+	}
 	provider, err := s.router.ProviderByID(providerID)
 	if err != nil {
 		writeOpenAIError(w, http.StatusNotFound, err.Error())
@@ -1498,6 +1509,9 @@ func (s *Server) handleTestProvider(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleProviderAuthPreview(w http.ResponseWriter, r *http.Request) {
+	if !s.requireProviderOwnerForUser(w, r, r.PathValue("id")) {
+		return
+	}
 	provider, err := s.router.ProviderByID(r.PathValue("id"))
 	if err != nil {
 		writeOpenAIError(w, http.StatusNotFound, err.Error())
@@ -1519,6 +1533,9 @@ func (s *Server) handleProviderAuthPreview(w http.ResponseWriter, r *http.Reques
 // Pass {"mode":"manual"} to fall back to the platform.claude.com copy/paste flow.
 func (s *Server) handleClaudeOAuthStart(w http.ResponseWriter, r *http.Request) {
 	providerID := r.PathValue("id")
+	if !s.requireProviderOwnerForUser(w, r, providerID) {
+		return
+	}
 	if _, err := s.router.ProviderByID(providerID); err != nil {
 		writeOpenAIError(w, http.StatusNotFound, err.Error())
 		return
@@ -1565,6 +1582,9 @@ func (s *Server) handleClaudeOAuthStart(w http.ResponseWriter, r *http.Request) 
 
 // handleClaudeOAuthStatus reports the progress of a localhost OAuth flow.
 func (s *Server) handleClaudeOAuthStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.requireProviderOwnerForUser(w, r, r.PathValue("id")) {
+		return
+	}
 	flowID := strings.TrimSpace(r.URL.Query().Get("flowId"))
 	if flowID == "" {
 		writeOpenAIError(w, http.StatusBadRequest, "flowId is required")
@@ -1622,6 +1642,9 @@ func (s *Server) handleClaudeOAuthCallback(w http.ResponseWriter, r *http.Reques
 // onto the provider, and returns the redacted provider.
 func (s *Server) handleClaudeOAuthComplete(w http.ResponseWriter, r *http.Request) {
 	providerID := r.PathValue("id")
+	if !s.requireProviderOwnerForUser(w, r, providerID) {
+		return
+	}
 	if _, err := s.router.ProviderByID(providerID); err != nil {
 		writeOpenAIError(w, http.StatusNotFound, err.Error())
 		return
@@ -1679,6 +1702,9 @@ func (s *Server) handleClaudeOAuthComplete(w http.ResponseWriter, r *http.Reques
 // credential (logout), keeping the provider itself intact.
 func (s *Server) handleClaudeOAuthDisconnect(w http.ResponseWriter, r *http.Request) {
 	providerID := r.PathValue("id")
+	if !s.requireProviderOwnerForUser(w, r, providerID) {
+		return
+	}
 	updated, err := s.router.ClearProviderClaudeOAuth(providerID)
 	if err != nil {
 		writeOpenAIError(w, http.StatusNotFound, err.Error())
@@ -1897,6 +1923,9 @@ func (s *Server) unlockOAuthUsageFetch(key string) {
 func (s *Server) handleProviderChatTest(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	providerID := r.PathValue("id")
+	if !s.requireProviderOwnerForUser(w, r, providerID) {
+		return
+	}
 	var payload providerChatTestRequest
 	_ = json.NewDecoder(r.Body).Decode(&payload)
 	result, status := s.testProviderChat(r, providerID, payload, started)
@@ -1906,6 +1935,9 @@ func (s *Server) handleProviderChatTest(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleProviderCacheTest(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	providerID := r.PathValue("id")
+	if !s.requireProviderOwnerForUser(w, r, providerID) {
+		return
+	}
 	var payload providerChatTestRequest
 	_ = json.NewDecoder(r.Body).Decode(&payload)
 	result, status := s.testProviderCacheChat(r, providerID, payload, started)
@@ -1915,6 +1947,9 @@ func (s *Server) handleProviderCacheTest(w http.ResponseWriter, r *http.Request)
 func (s *Server) handleProviderThinkingTest(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	providerID := r.PathValue("id")
+	if !s.requireProviderOwnerForUser(w, r, providerID) {
+		return
+	}
 	var payload providerChatTestRequest
 	_ = json.NewDecoder(r.Body).Decode(&payload)
 	result, status := s.testProviderThinkingChat(r, providerID, payload, started)
@@ -2174,6 +2209,9 @@ func (s *Server) testClaudeOAuthProviderChat(r *http.Request, provider domain.Pr
 
 func (s *Server) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
 	providerID := r.PathValue("id")
+	if !s.requireProviderOwnerForUser(w, r, providerID) {
+		return
+	}
 	if err := s.router.DeleteProvider(providerID); err != nil {
 		s.logs.AddApp("warn", "provider delete blocked", err.Error())
 		writeOpenAIError(w, http.StatusConflict, err.Error())
@@ -2191,6 +2229,11 @@ func (s *Server) handleCreateRoute(w http.ResponseWriter, r *http.Request) {
 	var route domain.Route
 	if err := json.NewDecoder(r.Body).Decode(&route); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid route json: "+err.Error())
+		return
+	}
+	// Normal users may only create routes for providers assigned to them or
+	// created by them (needed when binding their API keys to own providers).
+	if !s.requireProviderAccessForUser(w, r, strings.TrimSpace(route.ProviderID)) {
 		return
 	}
 	created, err := s.router.AddRoute(route)

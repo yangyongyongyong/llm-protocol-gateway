@@ -12,6 +12,9 @@ import (
 
 func (s *Server) handleChatGPTOAuthStart(w http.ResponseWriter, r *http.Request) {
 	providerID := r.PathValue("id")
+	if !s.requireProviderOwnerForUser(w, r, providerID) {
+		return
+	}
 	if _, err := s.router.ProviderByID(providerID); err != nil {
 		writeOpenAIError(w, http.StatusNotFound, err.Error())
 		return
@@ -54,6 +57,9 @@ func (s *Server) handleChatGPTOAuthStart(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) handleChatGPTOAuthStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.requireProviderOwnerForUser(w, r, r.PathValue("id")) {
+		return
+	}
 	flowID := strings.TrimSpace(r.URL.Query().Get("flowId"))
 	if flowID == "" {
 		writeOpenAIError(w, http.StatusBadRequest, "flowId is required")
@@ -106,6 +112,9 @@ func (s *Server) handleChatGPTOAuthCallback(w http.ResponseWriter, r *http.Reque
 
 func (s *Server) handleChatGPTOAuthComplete(w http.ResponseWriter, r *http.Request) {
 	providerID := r.PathValue("id")
+	if !s.requireProviderOwnerForUser(w, r, providerID) {
+		return
+	}
 	if _, err := s.router.ProviderByID(providerID); err != nil {
 		writeOpenAIError(w, http.StatusNotFound, err.Error())
 		return
@@ -152,6 +161,9 @@ func (s *Server) handleChatGPTOAuthComplete(w http.ResponseWriter, r *http.Reque
 
 func (s *Server) handleChatGPTOAuthDisconnect(w http.ResponseWriter, r *http.Request) {
 	providerID := r.PathValue("id")
+	if !s.requireProviderOwnerForUser(w, r, providerID) {
+		return
+	}
 	updated, err := s.router.ClearProviderChatGPTOAuth(providerID)
 	if err != nil {
 		writeOpenAIError(w, http.StatusNotFound, err.Error())

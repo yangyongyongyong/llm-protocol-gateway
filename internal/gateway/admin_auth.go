@@ -127,6 +127,16 @@ func isUserAllowedPath(method, path string) bool {
 	if strings.HasPrefix(path, "/__apikeys/") {
 		return true
 	}
+	// Users may create providers (they become the owner) and create routes for
+	// binding their keys; per-provider route/provider checks live in handlers.
+	if method == http.MethodPost && (path == "/__providers" || path == "/__routes") {
+		return true
+	}
+	// Owner-only provider management (enforced via requireProviderOwnerForUser
+	// inside each handler): edit / delete / fetch-models / chat-test / preview.
+	if isUserProviderManagementPath(method, path) {
+		return true
+	}
 	// Read-only OAuth quota panels on the Providers page (no CRUD / test).
 	if method == http.MethodGet && isUserProviderUsagePath(path) {
 		return true
@@ -138,7 +148,53 @@ func isUserAllowedPath(method, path string) bool {
 	return false
 }
 
-// isUserProviderUsagePath matches GET /__providers/{id}/(claude|cursor)-oauth/usage.
+// isUserProviderManagementPath matches the provider endpoints a normal user
+// may call on providers they own: PATCH/DELETE /__providers/{id}, plus
+// POST {id}/test (获取模型), POST {id}/chat-test (对话测试),
+// GET {id}/auth-preview (edit-modal helper) and the OAuth connect flows
+// ({id}/(claude|cursor|chatgpt)-oauth/start|status|complete|disconnect) so
+// users can log their own accounts into providers they created. Ownership
+// itself is checked in the handlers via requireProviderOwnerForUser.
+func isUserProviderManagementPath(method, path string) bool {
+	if !strings.HasPrefix(path, "/__providers/") {
+		return false
+	}
+	parts := strings.Split(strings.TrimPrefix(path, "/__providers/"), "/")
+	if strings.TrimSpace(parts[0]) == "" {
+		return false
+	}
+	if len(parts) == 1 {
+		return method == http.MethodPatch || method == http.MethodDelete
+	}
+	if len(parts) == 2 {
+		switch parts[1] {
+		case "test", "chat-test", "cache-test", "thinking-test":
+			return method == http.MethodPost
+		case "auth-preview":
+			return method == http.MethodGet
+		default:
+			return false
+		}
+	}
+	if len(parts) == 3 {
+		switch parts[1] {
+		case "claude-oauth", "cursor-oauth", "chatgpt-oauth":
+		default:
+			return false
+		}
+		switch parts[2] {
+		case "start", "complete", "disconnect":
+			return method == http.MethodPost
+		case "status":
+			return method == http.MethodGet
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+// isUserProviderUsagePath matches GET /__providers/{id}/(claude|cursor|chatgpt)-oauth/usage.
 func isUserProviderUsagePath(path string) bool {
 	if !strings.HasPrefix(path, "/__providers/") {
 		return false
@@ -148,7 +204,7 @@ func isUserProviderUsagePath(path string) bool {
 		return false
 	}
 	switch parts[1] {
-	case "claude-oauth", "cursor-oauth":
+	case "claude-oauth", "cursor-oauth", "chatgpt-oauth":
 		return parts[2] == "usage"
 	default:
 		return false

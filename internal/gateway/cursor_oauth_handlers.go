@@ -8,6 +8,9 @@ import (
 
 func (s *Server) handleCursorOAuthStart(w http.ResponseWriter, r *http.Request) {
 	providerID := r.PathValue("id")
+	if !s.requireProviderOwnerForUser(w, r, providerID) {
+		return
+	}
 	if _, err := s.router.ProviderByID(providerID); err != nil {
 		writeOpenAIError(w, http.StatusNotFound, err.Error())
 		return
@@ -48,6 +51,9 @@ func (s *Server) handleCursorOAuthStart(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleCursorOAuthStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.requireProviderOwnerForUser(w, r, r.PathValue("id")) {
+		return
+	}
 	flowID := strings.TrimSpace(r.URL.Query().Get("flowId"))
 	if flowID == "" {
 		writeOpenAIError(w, http.StatusBadRequest, "flowId is required")
@@ -63,6 +69,9 @@ func (s *Server) handleCursorOAuthStatus(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) handleCursorOAuthDisconnect(w http.ResponseWriter, r *http.Request) {
 	providerID := r.PathValue("id")
+	if !s.requireProviderOwnerForUser(w, r, providerID) {
+		return
+	}
 	updated, err := s.router.ClearProviderCursorOAuth(providerID)
 	if err != nil {
 		writeOpenAIError(w, http.StatusNotFound, err.Error())
