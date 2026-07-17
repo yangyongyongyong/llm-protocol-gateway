@@ -186,8 +186,13 @@ html[data-theme="dark"] .slate { color: #cbd5e1; }
 .usage-range-left { display: flex; flex-direction: column; }
 .usage-range-summary { color: var(--muted); font-size: 12px; font-weight: 780; padding-top: 8px; }
 /* 流量日志：日历右侧的筛选字段 */
-.traffic-filter-fields { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start; flex: 1 1 280px; min-width: 240px; }
+.traffic-filter-fields { display: flex; flex-wrap: wrap; align-content: flex-start; gap: 12px; align-items: flex-start; flex: 1 1 280px; min-width: 240px; }
 .traffic-filter-fields .field { min-width: 150px; }
+/* “应用筛选”本质是“翻页后回到第 1 页刷新”（各筛选项本身修改即时生效），
+   不需要长得像主操作按钮；靠右悬空 + 用跟分页按钮一致的 mini-btn 柔和配色，
+   跟其它筛选下拉框区分开，同时不抢视觉重点。 */
+.traffic-filter-apply { align-self: flex-end; margin-left: auto; }
+.traffic-filter-apply .mini-btn { height: 42px; padding: 0 16px; }
 /* 日历右侧：最近 30 天组合图（柱=Token 左轴，线=请求次数 右轴） */
 .usage-month-bars { flex: 1 1 320px; min-width: 280px; border: 1px solid var(--border); border-radius: 16px; background: var(--surface); padding: 12px 14px; display: flex; flex-direction: column; }
 .usage-month-bars-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }

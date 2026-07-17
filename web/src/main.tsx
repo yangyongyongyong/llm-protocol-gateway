@@ -6534,8 +6534,15 @@ function App() {
                       </select>
                     </label>
                   ) : null}
-                  <div className="field" style={{ display: 'flex', alignItems: 'flex-end', gap: 8 }}>
-                    <button className="btn" type="button" onClick={() => { setLogsPage(1); void refreshLogs(1); }}>应用筛选</button>
+                  <div className="traffic-filter-apply">
+                    <button
+                      className="mini-btn"
+                      type="button"
+                      title="回到第 1 页并按当前筛选条件刷新（各筛选项修改后已即时生效，此按钮主要用于翻页后重新回到第 1 页）"
+                      onClick={() => { setLogsPage(1); void refreshLogs(1); }}
+                    >
+                      应用筛选
+                    </button>
                   </div>
                 </div>
               </div>
