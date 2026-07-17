@@ -30,6 +30,9 @@ func (s *Server) StartOAuthUsageBackgroundRefresh(ctx context.Context) {
 
 func (s *Server) refreshAllOAuthUsage(ctx context.Context) {
 	for _, provider := range s.router.State().Providers {
+		if provider.Deleted {
+			continue
+		}
 		switch provider.AuthType {
 		case domain.AuthTypeClaudeOAuth:
 			if provider.ClaudeOAuth != nil && strings.TrimSpace(provider.ClaudeOAuth.RefreshToken) != "" {

@@ -47,6 +47,21 @@ func TestShouldRectifyThinkingSignature(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "gemini thought signature not valid",
+			body: "Unable to submit request because Thought signature is not valid.. Learn more: https://example.com",
+			want: true,
+		},
+		{
+			name: "signature extra inputs not permitted",
+			body: "messages.1.content.0.signature: Extra inputs are not permitted",
+			want: true,
+		},
+		{
+			name: "latest assistant thinking blocks cannot be modified",
+			body: "messages.3.content.16: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response.",
+			want: true,
+		},
+		{
 			name: "unrelated timeout",
 			body: `{"error":{"message":"request timeout"}}`,
 			want: false,

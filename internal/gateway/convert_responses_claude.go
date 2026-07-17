@@ -461,6 +461,16 @@ func claudeToResponsesResponseDirect(claudeBody []byte, model string, clientTool
 	status, incompleteReason := mapAnthropicStopReasonToStatus(stringValue(payload["stop_reason"]))
 	usage := ParseClaudeUsage(claudeBody)
 
+	if len(output) <= 1 {
+		dumpNearEmptyConvertedResponse("non_stream", model, claudeBody, map[string]any{
+			"status":        status,
+			"stop_reason":   stringValue(payload["stop_reason"]),
+			"output_len":    len(output),
+			"output_types":  outputItemTypes(output),
+			"output_tokens": usage.OutputTokens,
+		})
+	}
+
 	if isThinkingOnlyEmptyOutput(status, output) {
 		return nil, usage, fmt.Errorf("claude response completed with no visible output (stop_reason=%q): %w",
 			stringValue(payload["stop_reason"]), errThinkingOnlyEmptyResponse)

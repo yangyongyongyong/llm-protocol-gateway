@@ -103,6 +103,38 @@ cd web && npm install && npm run build
 
 否则公网 UI 域名会返回 404。
 
+## 已知问题 / 踩坑记录
+
+### 1. Claude 上游 thinking 尾块导致连环静默（已修复）
+
+**现象**：长会话下，Codex 某一轮"想了一下"但完全不回复、`task_complete` 里 `last_agent_message` 为 `null`，之后每一轮都重复该现象，会话事实上卡死；严格一点的上游会直接 400（`messages.N: The final block in an assistant message cannot be 'thinking'.`），宽松的第三方中转则不报错但静默复读同样的空转。
+
+**根因**：某一轮模型在 thinking 后被打断（无 text/tool_use），历史里就留了一条以裸 `thinking` 块结尾的 assistant 消息。下一轮网关把 Responses `reasoning` item 还原成 Claude `thinking` 块时，如果后面紧跟的是 user 消息（没有真实输出垫在中间），转换出来的请求就是"assistant 消息以 thinking 收尾"——这本身是非法请求，且模型看到裸 thinking 结尾的历史后，倾向于继续只输出 thinking，形成连环静默。
+
+**修复**：
+- `internal/gateway/convert_responses_claude.go` 的 `dropTrailingAssistantThinking`：转换后清理掉 assistant 消息末尾的裸 thinking/redacted_thinking 块；纯 thinking 的 assistant 轮整条丢弃并合并相邻同角色消息。尾部 thinking 模型不会回读，零上下文损失。
+- `internal/gateway/thinking_rectifier.go`：签名整流重试的错误匹配增加了这个错误文案，命中同类 400 时也会走剥离重试。
+- 增加了"上游 200 但输出仅有 thinking、无 text/tool_use"的检测（`isThinkingOnlyEmptyOutput`）：流式和非流式转换都会在判定为该情况时自动同 Provider 重试一次（`timing_flags` 里能看到 `thinking_only_retry`），重试仍失败才把原样结果透传给客户端。
+
+### 2. Codex `remote_compaction_v2` 在自定义/第三方 Provider 下无法保证成功（未修复，非本项目缺陷）
+
+**现象**：长会话触发 Codex 的远程上下文压缩时，客户端报 `Error running remote compact task: Fatal error: remote compaction v2 expected exactly one compaction output item, got 0 from N output items`。网关侧这次请求往往是正常的 200，`timing_flags` 也没有异常标记——即响应本身不是空的，只是形状不满足 Codex 的要求。
+
+**根因**：Codex 的 remote compaction 校验器要求响应里**恰好 1 个**它认可的输出项；但带 thinking 的模型天然会把回答拆成 `reasoning` + `message` 两个 output item，天然凑不齐"恰好 1 个"。这是 Codex 客户端侧未公开的强校验，属于所有自定义/第三方 Provider 的通用缺陷，不是本网关的转换 bug——参考 [`farion1231/cc-switch`](https://github.com/farion1231/cc-switch) 的 [#4030](https://github.com/farion1231/cc-switch/issues/4030)、[#4725](https://github.com/farion1231/cc-switch/issues/4725) 等多个 issue，MiniMax / DeepSeek 等原生支持 `/v1/responses` 的官方 Provider 也同样复现，社区折腾数月未能在代理层可靠绕过。
+
+**应对方式**：关掉 Codex 的 `remote_compaction_v2` 特性，让 Codex 走本地（客户端侧）压缩，绕开这条对输出形状有强要求的远程链路：
+
+```bash
+codex features disable remote_compaction_v2
+```
+
+本项目在生成 Codex 配置时已经默认带上这一步（见 `web/src/main.tsx` 的 `buildApiKeyCodexConfigPatchScript`）：
+- **"复制修改脚本"**：写完 provider 配置后会自动尝试执行上述命令（找不到 `codex` 命令或执行失败只打印提示，不影响 provider 配置本身写入）。
+- **"仅复制配置内容"**：因为是纯文本、无法执行命令，只在文件头部加了一行注释提醒手动执行。
+- **"还原为官方 provider"**：对称地会执行 `codex features enable remote_compaction_v2` 恢复默认值（官方 Provider 下一般没有这个兼容性问题）。
+
+若手动配置 Codex（未走本项目生成的脚本），需要自己执行一次上述命令；改动后需重启 Codex 桌面 App 才会生效。
+
 ## 验证接口
 
 ```bash

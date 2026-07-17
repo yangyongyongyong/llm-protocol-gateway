@@ -602,6 +602,7 @@ html[data-theme="dark"] .api-key-client-config-actions .client-config-btn {
 .runtime-meta, .hint-line { margin-top: 8px; color: var(--muted); font-size: 12px; font-family: var(--mono); }
 .hint-line.error { color: #dc2626; }
 .claude-oauth-panel { margin-top: 14px; padding: 14px; border-radius: 16px; border: 1px solid rgba(147, 51, 234, 0.18); background: rgba(147, 51, 234, 0.05); display: grid; gap: 10px; }
+.self-register-panel { margin-top: 14px; padding: 14px; border-radius: 16px; border: 1px solid rgba(37, 99, 235, 0.18); background: rgba(37, 99, 235, 0.05); display: grid; gap: 10px; }
 .claude-usage-panel { margin-top: 10px; padding: 12px; border-radius: 14px; border: 1px solid rgba(147, 51, 234, 0.16); background: rgba(147, 51, 234, 0.04); display: grid; gap: 10px; }
 .claude-usage-panel.compact { margin-top: 8px; padding: 10px 12px; }
 .claude-usage-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 12px; font-weight: 780; color: #5b21b6; }

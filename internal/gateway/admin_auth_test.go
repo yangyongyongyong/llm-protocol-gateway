@@ -222,6 +222,17 @@ func TestIsUserAllowedPathProviderUsage(t *testing.T) {
 		{http.MethodPost, "/__providers/p1/cursor-oauth/disconnect", true},
 		{http.MethodDelete, "/__providers/p1/claude-oauth/start", false},
 		{http.MethodGet, "/__providers/p1/chatgpt-oauth/usage", true},
+		// 自助注册令牌管理走普通会话（owner/admin 校验在 handler 内）；
+		// 真正的机器人端点 PATCH .../self-register 完全绕过本中间件，见
+		// TestIsSelfRegisterPath。
+		{http.MethodPost, "/__providers/p1/self-register-token", true},
+		{http.MethodPost, "/__providers/p1/self-register-token/revoke", true},
+		{http.MethodGet, "/__providers/p1/self-register-token", false},
+		{http.MethodPatch, "/__providers/p1/self-register", false},
+		// self-check（health/chat）跟 self-register 一样完全绕过本中间件走
+		// Bearer 令牌鉴权，见 TestIsSelfCheckPath。
+		{http.MethodPost, "/__providers/p1/self-check/health", false},
+		{http.MethodPost, "/__providers/p1/self-check/chat", false},
 		{http.MethodPost, "/__providers/export", false},
 		{http.MethodPost, "/__providers/import", false},
 		// PATCH /__providers/export 命中 PATCH /__providers/{id}（id="export"），

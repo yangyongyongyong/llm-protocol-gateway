@@ -517,6 +517,9 @@ func (s *Server) finishClaudeOAuthExchange(providerID, flowID string, pending cl
 func (s *Server) BackfillClaudeOAuthAccountLabels() {
 	go func() {
 		for _, provider := range s.router.State().Providers {
+			if provider.Deleted {
+				continue
+			}
 			if provider.AuthType != domain.AuthTypeClaudeOAuth || provider.ClaudeOAuth == nil {
 				continue
 			}

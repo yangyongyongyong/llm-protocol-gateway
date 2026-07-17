@@ -383,6 +383,9 @@ func (s *Server) SyncConnectedCursorProviderModels() {
 func (s *Server) syncConnectedCursorProviders(forceRefresh bool) {
 	state := s.router.State()
 	for _, provider := range state.Providers {
+		if provider.Deleted {
+			continue
+		}
 		if provider.AuthType != domain.AuthTypeCursorOAuth {
 			continue
 		}

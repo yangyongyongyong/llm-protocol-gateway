@@ -155,6 +155,32 @@ func buildProviderClaudeChatPayload(model string, req providerChatTestRequest) m
 	return payload
 }
 
+// buildProviderResponsesChatPayload builds a minimal OpenAI Responses API
+// request body for a plain api_key (non-ChatGPT-OAuth) provider. Mirrors
+// buildProviderClaudeChatPayload's shape/defaults for the OpenAI Chat sibling.
+func buildProviderResponsesChatPayload(model string, req providerChatTestRequest) map[string]any {
+	userPrompt := strings.TrimSpace(req.UserPrompt)
+	if userPrompt == "" {
+		userPrompt = strings.TrimSpace(req.Message)
+	}
+	if userPrompt == "" {
+		userPrompt = "1+1等于几"
+	}
+	resolvedModel := resolveProviderTestModel(model)
+	if resolvedModel == "" {
+		resolvedModel = "request-model-not-set"
+	}
+	input := []map[string]any{{"role": "user", "content": userPrompt}}
+	if systemPrompt := strings.TrimSpace(req.SystemPrompt); systemPrompt != "" {
+		input = append([]map[string]any{{"role": "system", "content": systemPrompt}}, input...)
+	}
+	return map[string]any{
+		"model":  resolvedModel,
+		"stream": false,
+		"input":  input,
+	}
+}
+
 func applyProviderThinkingPayload(payload map[string]any, provider domain.Provider, field, value string) {
 	field = strings.TrimSpace(field)
 	value = strings.TrimSpace(value)
@@ -313,15 +339,6 @@ func (s *Server) testProviderChat(r *http.Request, providerID string, req provid
 	if provider.AuthType == domain.AuthTypeChatGPTOAuth {
 		return s.testChatGPTOAuthProviderChat(r, provider, req, started)
 	}
-	if provider.Protocol != domain.ProtocolOpenAIChat {
-		return map[string]any{
-			"success":    false,
-			"providerId": provider.ID,
-			"status":     http.StatusNotImplemented,
-			"latencyMs":  time.Since(started).Milliseconds(),
-			"preview":    "Provider chat test currently supports OpenAI Chat providers only.",
-		}, http.StatusOK
-	}
 
 	model := strings.TrimSpace(req.Model)
 	if model == "" {
@@ -331,8 +348,21 @@ func (s *Server) testProviderChat(r *http.Request, providerID string, req provid
 		model = "request-model-not-set"
 	}
 
-	messages := buildProviderChatMessages(req)
-	payload := buildProviderChatPayload(model, messages)
+	// Payload shape follows the provider's own protocol (api_key providers of
+	// any of the three supported protocols, not just OpenAI Chat): the
+	// transport layer below (executeProviderChatHTTP) is already fully
+	// protocol-generic via resolveProviderChatURLWithAdapter/AuthHeader, so
+	// only the request-body shape needs to branch here.
+	var payload map[string]any
+	switch provider.Protocol {
+	case domain.ProtocolClaude:
+		payload = buildProviderClaudeChatPayload(model, req)
+	case domain.ProtocolOpenAIResponses:
+		payload = buildProviderResponsesChatPayload(model, req)
+	default:
+		messages := buildProviderChatMessages(req)
+		payload = buildProviderChatPayload(model, messages)
+	}
 	round := s.executeProviderChatHTTP(r, provider, model, payload, started)
 	if round.Error != "" {
 		s.logs.AddApp("error", "provider chat test failed", round.Error)

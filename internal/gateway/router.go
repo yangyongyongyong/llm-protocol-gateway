@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -400,7 +401,7 @@ func (r *Router) AddRoute(route domain.Route) (domain.Route, error) {
 	if route.Name == "" {
 		return domain.Route{}, fmt.Errorf("route name is required")
 	}
-	if _, ok := r.providerLocked(route.ProviderID); !ok {
+	if provider, ok := r.providerLocked(route.ProviderID); !ok || provider.Deleted {
 		return domain.Route{}, fmt.Errorf("provider %q not found", route.ProviderID)
 	}
 	endpoint, ok := r.endpointByProtocolLocked(route.OutputProtocol)
@@ -442,7 +443,7 @@ func (r *Router) UpdateRoute(routeID string, patch domain.Route) (domain.Route, 
 			updated.Name = strings.TrimSpace(patch.Name)
 		}
 		if strings.TrimSpace(patch.ProviderID) != "" {
-			if _, ok := r.providerLocked(patch.ProviderID); !ok {
+			if provider, ok := r.providerLocked(patch.ProviderID); !ok || provider.Deleted {
 				return domain.Route{}, fmt.Errorf("provider %q not found", patch.ProviderID)
 			}
 			updated.ProviderID = strings.TrimSpace(patch.ProviderID)
@@ -1017,6 +1018,15 @@ func (r *Router) routeLocked(routeID string) (domain.Route, bool) {
 	return domain.Route{}, false
 }
 
+// DeleteProvider soft-deletes a provider: it marks the row Deleted/DeletedAt
+// instead of removing it, so an accidental delete can be undone with
+// RestoreProvider (config, models, and OAuth credentials are preserved
+// on disk). The provider still can't be deleted while a route or API key
+// references it — that guard is unrelated to soft-vs-hard delete and stays
+// in place so in-use providers are never silently orphaned. Deleting an
+// already-deleted provider is reported as not found (it is effectively gone
+// from every normal code path already). Use PurgeProvider to actually free
+// the row once you're sure the delete wasn't a mistake.
 func (r *Router) DeleteProvider(providerID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1040,11 +1050,76 @@ func (r *Router) DeleteProvider(providerID string) error {
 		}
 	}
 	for index := range r.state.Providers {
-		if r.state.Providers[index].ID == providerID {
-			r.state.Providers = append(r.state.Providers[:index], r.state.Providers[index+1:]...)
-			r.rebuildModelsLocked()
-			return nil
+		if r.state.Providers[index].ID != providerID {
+			continue
 		}
+		if r.state.Providers[index].Deleted {
+			return fmt.Errorf("provider %q not found", providerID)
+		}
+		r.state.Providers[index].Deleted = true
+		r.state.Providers[index].DeletedAt = nowRFC3339()
+		r.rebuildModelsLocked()
+		return nil
+	}
+	return fmt.Errorf("provider %q not found", providerID)
+}
+
+// DeletedProviders returns soft-deleted providers (the admin "trash" view),
+// most recently deleted first. Callers are responsible for redacting secrets
+// (see redactProvidersForClient) and for any ownership filtering.
+func (r *Router) DeletedProviders() []domain.Provider {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	out := make([]domain.Provider, 0)
+	for _, provider := range r.state.Providers {
+		if provider.Deleted {
+			out = append(out, provider)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].DeletedAt > out[j].DeletedAt })
+	return out
+}
+
+// RestoreProvider undoes a soft delete (see DeleteProvider), making the
+// provider visible/usable again exactly as it was configured before deletion.
+func (r *Router) RestoreProvider(providerID string) (domain.Provider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID != providerID {
+			continue
+		}
+		if !r.state.Providers[index].Deleted {
+			return domain.Provider{}, fmt.Errorf("provider %q is not deleted", providerID)
+		}
+		r.state.Providers[index].Deleted = false
+		r.state.Providers[index].DeletedAt = ""
+		r.rebuildModelsLocked()
+		return r.state.Providers[index], nil
+	}
+	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+}
+
+// PurgeProvider permanently removes a previously soft-deleted provider. This
+// is the only way a provider row actually goes away; providers must already
+// be soft-deleted (via DeleteProvider) before they can be purged, which keeps
+// permanent removal a deliberate two-step action.
+func (r *Router) PurgeProvider(providerID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID != providerID {
+			continue
+		}
+		if !r.state.Providers[index].Deleted {
+			return fmt.Errorf("provider %q is not deleted; delete it first", providerID)
+		}
+		r.state.Providers = append(r.state.Providers[:index], r.state.Providers[index+1:]...)
+		r.rebuildModelsLocked()
+		return nil
 	}
 	return fmt.Errorf("provider %q not found", providerID)
 }
@@ -1172,7 +1247,26 @@ func (r *Router) ClearProviderChatGPTOAuth(providerID string) (domain.Provider, 
 	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
 }
 
+// ProviderByID returns a provider by ID, treating soft-deleted providers as
+// not found: this is the single choke point that makes a deleted provider
+// invisible to every admin action (edit/test/OAuth/self-register/failover
+// probes) without needing a Deleted check at each call site. Use
+// ProviderByIDIncludingDeleted for the restore/purge/trash-list paths that
+// must still be able to see deleted providers.
 func (r *Router) ProviderByID(providerID string) (domain.Provider, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	provider, ok := r.providerLocked(providerID)
+	if !ok || provider.Deleted {
+		return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+	}
+	return provider, nil
+}
+
+// ProviderByIDIncludingDeleted is like ProviderByID but also returns
+// soft-deleted providers, for the restore/purge/trash-list admin paths.
+func (r *Router) ProviderByIDIncludingDeleted(providerID string) (domain.Provider, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -1195,6 +1289,93 @@ func (r *Router) TouchAPIKeyLastUsed(keyID, ts string) {
 			return
 		}
 	}
+}
+
+// SetProviderSelfRegistrationToken stores a freshly generated self-register
+// token's hash/preview for providerID, replacing any previous token (old
+// tokens stop working immediately — there is only ever one live token).
+func (r *Router) SetProviderSelfRegistrationToken(providerID string, reg domain.ProviderSelfRegistration) (domain.Provider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID != providerID {
+			continue
+		}
+		regCopy := reg
+		r.state.Providers[index].SelfRegistration = &regCopy
+		return r.state.Providers[index], nil
+	}
+	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+}
+
+// RevokeProviderSelfRegistration clears self-registration for providerID;
+// any previously issued token stops working immediately.
+func (r *Router) RevokeProviderSelfRegistration(providerID string) (domain.Provider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID != providerID {
+			continue
+		}
+		r.state.Providers[index].SelfRegistration = nil
+		return r.state.Providers[index], nil
+	}
+	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+}
+
+// ProviderSelfRegistrationTokenHash returns the stored token hash for
+// providerID ("" if self-registration is not set up), for bearer-token
+// verification without exposing the full provider record.
+func (r *Router) ProviderSelfRegistrationTokenHash(providerID string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, provider := range r.state.Providers {
+		if provider.ID == providerID {
+			if provider.SelfRegistration == nil {
+				return ""
+			}
+			return provider.SelfRegistration.TokenHash
+		}
+	}
+	return ""
+}
+
+// SelfRegisterProvider applies a partial connection-info update from the
+// provider's own self-register script: each field is updated only when the
+// caller explicitly supplied it (nil pointer = leave unchanged), unlike the
+// generic UpdateProvider patch. BaseURL/APIKeySource/Protocol/AuthHeader and
+// the self-registration LastSeenAt heartbeat are the only fields touched —
+// deliberately the smallest mutation surface for a bearer-token authenticated,
+// non-console caller. Protocol lets the self-hosted service declare what API
+// shape it actually implements (openai_chat/openai_responses/claude), fixing
+// mismatches without requiring a console edit; the handler validates the
+// value and derives a sensible AuthHeader default before calling this.
+func (r *Router) SelfRegisterProvider(providerID string, baseURL, apiKeySource, protocol, authHeader *string, seenAt string) (domain.Provider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID != providerID {
+			continue
+		}
+		if baseURL != nil {
+			r.state.Providers[index].BaseURL = strings.TrimSpace(*baseURL)
+		}
+		if apiKeySource != nil {
+			r.state.Providers[index].APIKeySource = strings.TrimSpace(*apiKeySource)
+		}
+		if protocol != nil {
+			r.state.Providers[index].Protocol = domain.Protocol(strings.TrimSpace(*protocol))
+		}
+		if authHeader != nil {
+			r.state.Providers[index].AuthHeader = strings.TrimSpace(*authHeader)
+		}
+		if r.state.Providers[index].SelfRegistration != nil {
+			r.state.Providers[index].SelfRegistration.LastSeenAt = seenAt
+		}
+		normalizeProvider(&r.state.Providers[index])
+		return r.state.Providers[index], nil
+	}
+	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
 }
 
 // SetProviderDisabled flips the admin-only enable/disable switch for a
@@ -1413,6 +1594,12 @@ func (r *Router) rebuildModelsLocked() {
 func rebuildModels(state *domain.GatewayState) {
 	models := make([]domain.Model, 0)
 	for pIndex := range state.Providers {
+		// Soft-deleted providers keep their Models slice on disk (so a
+		// restore brings everything back), but their models must not appear
+		// in the routable/selectable model list while deleted.
+		if state.Providers[pIndex].Deleted {
+			continue
+		}
 		for mIndex := range state.Providers[pIndex].Models {
 			fillModelTokenBudgets(&state.Providers[pIndex].Models[mIndex])
 			models = append(models, state.Providers[pIndex].Models[mIndex])

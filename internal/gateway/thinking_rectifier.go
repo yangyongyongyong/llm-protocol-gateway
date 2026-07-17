@@ -75,6 +75,27 @@ func shouldRectifyThinkingSignature(body []byte) bool {
 		strings.Contains(lower, "thinking") {
 		return true
 	}
+	// 场景1b：Gemini/第三方渠道返回 "Thought signature is not valid"（对齐 cc-switch）
+	if strings.Contains(lower, "thought signature") &&
+		(strings.Contains(lower, "not valid") || strings.Contains(lower, "invalid")) {
+		return true
+	}
+	// 场景5b：signature 字段不被下游接受（第三方渠道，对齐 cc-switch）
+	// 例："xxx.signature: Extra inputs are not permitted"
+	if strings.Contains(lower, "signature") &&
+		strings.Contains(lower, "extra inputs are not permitted") {
+		return true
+	}
+	// 场景6：客户端回放的 thinking/redacted_thinking 块内容与原始签发时不一致
+	// （常见于把 Responses `reasoning.encrypted_content` 重建回 Claude 块时，
+	// 顺序/内容与原始响应出现偏差）。
+	// 例："messages.3.content.16: `thinking` or `redacted_thinking` blocks in
+	// the latest assistant message cannot be modified. These blocks must
+	// remain as they were in the original response."
+	if strings.Contains(lower, "cannot be modified") &&
+		(strings.Contains(lower, "thinking") || strings.Contains(lower, "redacted_thinking")) {
+		return true
+	}
 	return false
 }
 

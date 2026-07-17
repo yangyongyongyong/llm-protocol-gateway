@@ -38,7 +38,7 @@ func (s *Server) allowedProviderIDsForUser(userID string) map[string]bool {
 		}
 	}
 	for _, provider := range s.router.State().Providers {
-		if provider.Disabled {
+		if provider.Disabled || provider.Deleted {
 			continue
 		}
 		if granted[provider.ID] || strings.TrimSpace(provider.OwnerUserID) == userID {

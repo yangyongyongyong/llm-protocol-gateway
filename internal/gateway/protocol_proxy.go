@@ -166,10 +166,10 @@ type pipeResponseWriter struct {
 	w io.Writer
 }
 
-func (p *pipeResponseWriter) Header() http.Header       { return http.Header{} }
-func (p *pipeResponseWriter) WriteHeader(int)           {}
+func (p *pipeResponseWriter) Header() http.Header         { return http.Header{} }
+func (p *pipeResponseWriter) WriteHeader(int)             {}
 func (p *pipeResponseWriter) Write(b []byte) (int, error) { return p.w.Write(b) }
-func (p *pipeResponseWriter) Flush()                    {}
+func (p *pipeResponseWriter) Flush()                      {}
 
 // streamTwoHop pipes a two-hop streaming protocol conversion so the second hop
 // consumes the first hop's SSE output incrementally instead of waiting for the
@@ -295,7 +295,20 @@ func (s *Server) proxyConvertedThroughClaude(w http.ResponseWriter, r *http.Requ
 		accept = "text/event-stream"
 	}
 	send := func() (*http.Response, error) {
-		return s.doClaudeProviderRequest(r.Context(), r, provider, upstreamBody, accept)
+		response, err := s.doClaudeProviderRequest(r.Context(), r, provider, upstreamBody, accept)
+		if err != nil || response == nil || response.StatusCode != http.StatusBadRequest {
+			return response, err
+		}
+		// Thinking 签名整流：Responses<->Claude 转换路径同样可能因回传的历史 /
+		// 最新 thinking 块与原始签名不一致而收到该类 400（例如 "blocks in the
+		// latest assistant message cannot be modified"）。命中则剥离 thinking 块
+		// 后按相同 Accept 对同一 Provider 重试一次，对客户端透明。
+		if rectified, ok := s.maybeRectifyClaudeThinkingResend(r, provider, upstreamBody, response, func(b []byte) (*http.Response, error) {
+			return s.doClaudeProviderRequest(r.Context(), r, provider, b, accept)
+		}); ok {
+			return rectified, nil
+		}
+		return response, nil
 	}
 	return s.finishConvertedProxyWithEmptyStreamRetry(w, r, model, stream, send, convert, streamConvert)
 }

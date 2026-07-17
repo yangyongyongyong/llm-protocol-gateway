@@ -109,6 +109,15 @@ type Provider struct {
 	// While disabled, normal users cannot see, bind, or send traffic through
 	// this provider; admins keep full access.
 	Disabled             bool     `json:"disabled,omitempty"`
+	// Deleted marks a provider as soft-deleted (see Router.DeleteProvider).
+	// Soft-deleted providers are hidden from normal listings/routing and can't
+	// be bound to new routes or API keys, but their configuration/secrets are
+	// preserved on disk so an accidental delete can be undone (RestoreProvider)
+	// instead of losing OAuth credentials, request adapters, etc. Only a
+	// separate, explicit purge (Router.PurgeProvider) removes the row for real.
+	Deleted              bool     `json:"deleted,omitempty"`
+	// DeletedAt is the RFC3339 timestamp of the soft delete; empty when not deleted.
+	DeletedAt            string   `json:"deletedAt,omitempty"`
 	AuthHeader           string   `json:"authHeader"`
 	ExtraEndpoint        string   `json:"extraEndpoint,omitempty"`
 	// AuthType selects the provider's authentication mode. "" and "api_key"
@@ -128,6 +137,28 @@ type Provider struct {
 	// RequestAdapter is an optional provider-level request rewrite template
 	// (URL/headers/body/model mapping). Nil means use built-in protocol logic.
 	RequestAdapter *RequestAdapter `json:"requestAdapter,omitempty"`
+	// SelfRegistration lets the provider owner's own automation script keep
+	// BaseURL/APIKeySource in sync (e.g. a self-hosted backend behind a
+	// rotating reverse-tunnel URL) by calling
+	// PATCH /__providers/{id}/self-register with a provider-scoped bearer
+	// token, instead of a console session login. Nil means self-registration
+	// has not been set up for this provider.
+	SelfRegistration *ProviderSelfRegistration `json:"selfRegistration,omitempty"`
+}
+
+// ProviderSelfRegistration is the server-side state backing the self-register
+// bearer-token flow. TokenHash is never sent to the client (json:"-"); the
+// raw token is shown to the console user exactly once, at generation time.
+type ProviderSelfRegistration struct {
+	TokenHash string `json:"-"`
+	// TokenPreview is a short, non-secret suffix (last 4 chars of the raw
+	// token) so the console can show "which token" without re-exposing it.
+	TokenPreview string `json:"tokenPreview,omitempty"`
+	CreatedAt    string `json:"createdAt,omitempty"`
+	// LastSeenAt is informational only (last successful self-register call);
+	// availability/异常 status is driven purely by real proxied-request
+	// failures (see gateway.shouldFailoverProvider), not by heartbeat gaps.
+	LastSeenAt string `json:"lastSeenAt,omitempty"`
 }
 
 // RequestAdapter customizes how gateway requests are sent to an upstream

@@ -182,6 +182,17 @@ func (s *Store) migrate() error {
 		{"owner_user_id", "TEXT NOT NULL DEFAULT ''"},
 		// disabled: admin kill switch; 0 = enabled (default for legacy rows).
 		{"disabled", "INTEGER NOT NULL DEFAULT 0"},
+		// self_reg_*: provider-scoped bearer-token self-registration state
+		// (see domain.ProviderSelfRegistration). Empty token hash = not set up.
+		{"self_reg_token_hash", "TEXT NOT NULL DEFAULT ''"},
+		{"self_reg_token_preview", "TEXT NOT NULL DEFAULT ''"},
+		{"self_reg_created_at", "TEXT NOT NULL DEFAULT ''"},
+		{"self_reg_last_seen_at", "TEXT NOT NULL DEFAULT ''"},
+		// deleted / deleted_at: soft-delete state (see domain.Provider.Deleted).
+		// 0/'' = not deleted (default for legacy rows). Deletion never removes
+		// the row; only an explicit purge does.
+		{"deleted", "INTEGER NOT NULL DEFAULT 0"},
+		{"deleted_at", "TEXT NOT NULL DEFAULT ''"},
 	}
 	for _, column := range oauthColumns {
 		if err := addColumnIfMissing(tx, "providers", column.name, column.definition); err != nil {
@@ -436,14 +447,27 @@ func (s *Store) Save(state domain.GatewayState) error {
 		if provider.Disabled {
 			disabled = 1
 		}
+		selfRegTokenHash, selfRegTokenPreview, selfRegCreatedAt, selfRegLastSeenAt := "", "", "", ""
+		if provider.SelfRegistration != nil {
+			selfRegTokenHash = provider.SelfRegistration.TokenHash
+			selfRegTokenPreview = provider.SelfRegistration.TokenPreview
+			selfRegCreatedAt = provider.SelfRegistration.CreatedAt
+			selfRegLastSeenAt = provider.SelfRegistration.LastSeenAt
+		}
+		deleted := 0
+		if provider.Deleted {
+			deleted = 1
+		}
 		if _, err := tx.Exec(`INSERT INTO providers
 			(id, name, protocol, base_url, api_key_source, default_model, default_thinking_depth, health_status, auth_header, extra_endpoint, position,
-			 auth_type, oauth_access_token, oauth_refresh_token, oauth_expires_at, oauth_scope, oauth_account_label, owner_user_id, disabled)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 auth_type, oauth_access_token, oauth_refresh_token, oauth_expires_at, oauth_scope, oauth_account_label, owner_user_id, disabled,
+			 self_reg_token_hash, self_reg_token_preview, self_reg_created_at, self_reg_last_seen_at, deleted, deleted_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			provider.ID, provider.Name, string(provider.Protocol), provider.BaseURL, provider.APIKeySource,
 			provider.DefaultModel, provider.DefaultThinkingDepth, provider.HealthStatus, provider.AuthHeader,
 			provider.ExtraEndpoint, pIndex,
-			provider.AuthType, accessToken, refreshToken, expiresAt, scope, accountLabel, provider.OwnerUserID, disabled); err != nil {
+			provider.AuthType, accessToken, refreshToken, expiresAt, scope, accountLabel, provider.OwnerUserID, disabled,
+			selfRegTokenHash, selfRegTokenPreview, selfRegCreatedAt, selfRegLastSeenAt, deleted, provider.DeletedAt); err != nil {
 			return err
 		}
 		for mIndex, model := range provider.Models {
@@ -532,7 +556,8 @@ func (s *Store) Save(state domain.GatewayState) error {
 
 func (s *Store) loadProviders() ([]domain.Provider, error) {
 	rows, err := s.reader().Query(`SELECT id, name, protocol, base_url, api_key_source, default_model, default_thinking_depth, health_status, auth_header, extra_endpoint,
-		auth_type, oauth_access_token, oauth_refresh_token, oauth_expires_at, oauth_scope, oauth_account_label, owner_user_id, disabled
+		auth_type, oauth_access_token, oauth_refresh_token, oauth_expires_at, oauth_scope, oauth_account_label, owner_user_id, disabled,
+		self_reg_token_hash, self_reg_token_preview, self_reg_created_at, self_reg_last_seen_at, deleted, deleted_at
 		FROM providers ORDER BY position, id`)
 	if err != nil {
 		return nil, err
@@ -543,13 +568,27 @@ func (s *Store) loadProviders() ([]domain.Provider, error) {
 		var protocol string
 		var accessToken, refreshToken, expiresAt, scope, accountLabel string
 		var disabled int
+		var selfRegTokenHash, selfRegTokenPreview, selfRegCreatedAt, selfRegLastSeenAt string
+		var deleted int
+		var deletedAt string
 		if err := rows.Scan(&p.ID, &p.Name, &protocol, &p.BaseURL, &p.APIKeySource, &p.DefaultModel, &p.DefaultThinkingDepth, &p.HealthStatus, &p.AuthHeader, &p.ExtraEndpoint,
-			&p.AuthType, &accessToken, &refreshToken, &expiresAt, &scope, &accountLabel, &p.OwnerUserID, &disabled); err != nil {
+			&p.AuthType, &accessToken, &refreshToken, &expiresAt, &scope, &accountLabel, &p.OwnerUserID, &disabled,
+			&selfRegTokenHash, &selfRegTokenPreview, &selfRegCreatedAt, &selfRegLastSeenAt, &deleted, &deletedAt); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}
 		p.Protocol = domain.Protocol(protocol)
 		p.Disabled = disabled != 0
+		p.Deleted = deleted != 0
+		p.DeletedAt = deletedAt
+		if selfRegTokenHash != "" {
+			p.SelfRegistration = &domain.ProviderSelfRegistration{
+				TokenHash:    selfRegTokenHash,
+				TokenPreview: selfRegTokenPreview,
+				CreatedAt:    selfRegCreatedAt,
+				LastSeenAt:   selfRegLastSeenAt,
+			}
+		}
 		switch p.AuthType {
 		case domain.AuthTypeClaudeOAuth:
 			if accessToken != "" || refreshToken != "" {

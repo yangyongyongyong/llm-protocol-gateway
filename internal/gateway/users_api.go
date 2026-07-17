@@ -249,6 +249,9 @@ func (s *Server) sanitizeProviderIDs(ids []string) []string {
 	}
 	known := map[string]bool{}
 	for _, provider := range s.router.State().Providers {
+		if provider.Deleted {
+			continue
+		}
 		known[provider.ID] = true
 	}
 	out := make([]string, 0, len(ids))

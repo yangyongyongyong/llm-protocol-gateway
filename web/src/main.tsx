@@ -277,6 +277,9 @@ type Provider = {
   protocol: Protocol;
   baseUrl: string;
   apiKeySource: string;
+  // 实际发送凭证时使用的请求头名（Claude 默认 x-api-key，其余默认
+  // Authorization）；自助注册脚本可以在协议不匹配时一并声明修正。
+  authHeader?: string;
   defaultModel: string;
   defaultThinkingDepth?: string;
   models?: Model[];
@@ -291,6 +294,15 @@ type Provider = {
   // 管理员禁用开关：禁用后普通用户不可见、不可绑定、请求会被拒绝；
   // 新建 Provider 默认启用（字段缺省 = 启用）。
   disabled?: boolean;
+  // 自助注册（内网穿透场景）：owner/admin 生成一个 Provider 专属令牌后，
+  // 用户自己的脚本可用该令牌调用 PATCH /__providers/{id}/self-register
+  // 更新 baseUrl/apiKeySource，无需登录控制台。原始令牌只在生成那一刻返回，
+  // 这里只有非敏感的展示信息。
+  selfRegistration?: {
+    tokenPreview?: string;
+    createdAt?: string;
+    lastSeenAt?: string;
+  };
   authType?: 'api_key' | 'claude_oauth' | 'cursor_oauth' | 'chatgpt_oauth';
   claudeOAuth?: ClaudeOAuthInfo;
   cursorOAuth?: CursorOAuthInfo;
@@ -1142,6 +1154,123 @@ function maskApiKeySource(source?: string): string {
   return `${raw.slice(0, 4)}••••${raw.slice(-4)}`;
 }
 
+// selfRegistrationEndpointSpec 描述每种协议下，用户自建服务需要实现的接口
+// 形状：路径、上游协议名称，以及一句话的关键格式提示（供生成 Prompt 使用）。
+// 「连接方式」下拉框里代表自助注册模式的选项文案；三种协议共用同一个选项
+// （不像 OAuth 选项那样绑定单一协议）。
+const SELF_REGISTER_CONNECT_LABEL = '内网穿透自助注册（Bearer 令牌）';
+
+// selfRegisterPlaceholderBaseURL 是创建时的占位 baseUrl：真实地址由用户自己的
+// 脚本在生成令牌后通过 self-register 接口写入，这里只是先满足"创建 Provider
+// 必须填 baseUrl"的校验，明显带有 pending 字样，不会被当成真实可用的上游。
+function selfRegisterPlaceholderBaseURL(protocol: Protocol): string {
+  return `https://pending-self-registration.example${selfRegistrationEndpointSpec(protocol).path}`;
+}
+
+function selfRegistrationEndpointSpec(protocol: Protocol): { path: string; label: string; hint: string } {
+  switch (protocol) {
+    case 'openai_chat':
+      return {
+        path: '/v1/chat/completions',
+        label: 'OpenAI Chat Completions',
+        hint: '请求体含 model/messages（role+content 数组）；stream=true 时按 SSE 逐行返回 `data: {...}\n\n`，每个 chunk 是 delta 增量，以 `data: [DONE]` 结束；非流式返回 choices[0].message。',
+      };
+    case 'openai_responses':
+      return {
+        path: '/v1/responses',
+        label: 'OpenAI Responses',
+        hint: '请求体含 model/input（items 数组，每项有 role+content 或 type=function_call 等）；stream=true 时按 SSE 发送 response.created / response.output_text.delta / response.completed 等事件；非流式返回 { output: [...], status: "completed" }。',
+      };
+    case 'claude':
+      return {
+        path: '/v1/messages',
+        label: 'Anthropic Messages',
+        hint: '请求体含 model/system/messages（content 为 block 数组，如 {type:"text",text:"..."}）、max_tokens 必填；stream=true 时按 SSE 发送 message_start/content_block_delta/message_stop 等事件；非流式返回 { content: [...], stop_reason: "end_turn" }。',
+      };
+  }
+}
+
+// buildSelfRegistrationPrompt 生成一段可直接丢给本地编码大模型（Claude Code /
+// Codex / Cursor 等）的说明文本：描述要实现的协议接口形状、鉴权方式、如何用
+// 内网穿透暴露成公网地址，以及每次地址变化后如何调用我们的自助注册接口。
+// rawToken 只在生成令牌那一刻才有值；没有则用占位符提示先生成。
+function buildSelfRegistrationPrompt(provider: Provider, rawToken: string, originBase: string): string {
+  const registerUrl = `${originBase}/__providers/${provider.id}/self-register`;
+  const tokenLine = rawToken || '<在控制台点击"生成注册令牌"后粘贴到这里>';
+  // 三种协议逐条列出，供本地已有代码对号入座，不预设/不强制其中任何一种。
+  const protocolMenu = (['openai_chat', 'openai_responses', 'claude'] as Protocol[])
+    .map((protocol) => {
+      const spec = selfRegistrationEndpointSpec(protocol);
+      const header = protocol === 'claude' ? 'x-api-key: <SHARED_SECRET>' : 'Authorization: Bearer <SHARED_SECRET>';
+      return `  \u00b7 protocol="${protocol}"：POST ${spec.path}（${spec.label} 协议格式），鉴权头默认 ${header}\n    ${spec.hint}`;
+    })
+    .join('\n');
+  return `帮我实现一个本地服务 + 内网穿透 + 自动注册的完整方案，要求如下：
+
+【1. 本地服务 —— 三选一，选你已有代码 / 更顺手的那种，不强制】
+网关支持下面三种协议格式，你的本地服务只需要实现其中任意一种（哪怕你手头已经有
+现成的某种格式的代码，直接拿来用即可，不用为了迁就我而改写）：
+${protocolMenu}
+
+- 无论选哪种，鉴权都要求请求带上面对应的头（SHARED_SECRET 由我自己设定，作为
+  "上游密钥"，和下面第 3 步注册接口用的令牌是两回事，不要混淆；如果你想用非标准
+  头名，第 3 步注册时可以用 authHeader 字段显式覆盖，不必强行匹配上面的默认值）
+- 内部对接我自己现有的模型/服务即可，只要出参符合你选定的那个协议格式
+
+【2. 内网穿透】
+- 用 cloudflared 快速隧道（免费、无需域名、无需登录）：
+  cloudflared tunnel --url http://localhost:8787
+- 该命令会在标准输出打印一个形如 https://xxxx.trycloudflare.com 的公网地址；
+  注意：这个地址每次重启隧道都会变，脚本要能捕获它
+
+【3. 自动注册到网关平台 —— 必须声明你选的协议】
+- 每次拿到新的公网地址后（包括隧道意外重启），立刻调用（**protocol 字段必填，
+  取值必须跟你在第 1 步实际实现的协议一致**：openai_chat / openai_responses / claude
+  三选一；网关这边不会预先假定协议，完全以这次调用声明的为准）：
+  curl -X PATCH "${registerUrl}" \\
+    -H "Authorization: Bearer ${tokenLine}" \\
+    -H "Content-Type: application/json" \\
+    -d '{"baseUrl": "https://xxxx.trycloudflare.com/<你第1步实现的路径，比如 /v1/chat/completions>", "apiKeySource": "literal:<第1步里设定的 SHARED_SECRET>", "protocol": "<openai_chat|openai_responses|claude 三选一>"}'
+  （把 xxxx.trycloudflare.com 换成实际隧道打印出来的地址；这里 Bearer 后面跟的是
+  第 3 步专用的"注册令牌"，跟第 1 步本地服务自己的 SHARED_SECRET 是两个不同的东西）
+- 这个注册接口只鉴权 Bearer 令牌本身，和登录账号无关；只允许改这一个 Provider 的
+  baseUrl / apiKeySource / protocol / authHeader 这几个字段，改不了别的东西；网关控制台
+  这边也不提供协议选择/修改的入口——协议只能通过这个接口声明，这是唯一的协议来源
+- 不传 authHeader 时，网关按第 1 步表格里的惯例自动推导鉴权头（claude -> x-api-key，
+  其余 -> Authorization）；本地服务用了非标准头名时可以显式传 authHeader 覆盖
+- baseUrl 不能是内网地址（127.0.0.1 / 192.168.x.x / 10.x.x.x 等会被拒绝），必须是
+  隧道给的公网地址
+- 以后如果想换成另一种协议实现，不用回控制台改，下次注册时把 protocol 换成新值即可
+
+【4. 自检（注册成功后立刻做，方便我确认配置对不对）】
+网关另外提供两个自检接口，都用第 3 步同一个注册令牌鉴权（Authorization: Bearer），
+和登录账号无关：
+
+(a) 健康检查——验证网关能不能连通并鉴权成功访问到我的服务：
+    curl -X POST "${originBase}/__providers/${provider.id}/self-check/health" \\
+      -H "Authorization: Bearer ${tokenLine}"
+    返回 {"success": true/false, "status": ..., "latencyMs": ...}。
+    **必须连续调用 3 次、3 次都是 success=true 才算通过**；只要有一次失败就要停下来排查
+    （常见原因：baseUrl 没跟上、SHARED_SECRET 不对、protocol 和 authHeader 没匹配上），
+    不要略过这一步直接进入下一步。
+
+(b) 对话测试——验证完整的请求/响应链路是通的：
+    curl -X POST "${originBase}/__providers/${provider.id}/self-check/chat" \\
+      -H "Authorization: Bearer ${tokenLine}"
+    不需要也不能自定义测试内容，网关固定发送"2+2等于几"这句话，只要拿到一次
+    success=true 就算通过，不用重复调用。
+    返回里的 preview 字段是模型的真实回复，可以打印出来供我人工确认回答是否正常。
+
+请把这两个自检步骤也写进脚本里：每次注册成功后自动跑一遍（a）和（b），
+在日志里打印清晰的"自检通过/自检失败"结果，方便我不用打开浏览器就知道配置对不对。
+
+【5. 整合成一个常驻脚本】
+- 启动本地服务 -> 启动 cloudflared 隧道 -> 解析出公网 URL -> 调用注册接口（带上 protocol）
+  -> 注册成功后跑一遍上面的自检（a）（b） -> 持续监控隧道进程，一旦断线/重启就重新走一遍
+  解析+注册+自检
+- 可以用 Python/Bash 都行，帮我把这五步串成一个可以后台常驻运行的脚本`;
+}
+
 function healthStatusLabel(status: string) {
   switch (status) {
     case 'healthy': return '正常';
@@ -1535,6 +1664,10 @@ function buildApiKeyCodexConfig(key: APIKey, route: Route | undefined, endpoints
   return `# ~/.codex/config.toml （用户级；项目内 .codex/config.toml 不会生效 provider）
 # Codex 使用 Responses：base_url 指向网关 /openai/v1，wire_api = "responses"
 # model_catalog_json 提供覆盖模型/别名的本地元数据，避免 “Model metadata not found”
+# 提醒：第三方/自定义 provider 下 Codex 的 remote compaction（长会话自动压缩）
+# 常报 "expected exactly one compaction output item"（社区已知通用缺陷，非本
+# 工具问题），建议额外执行一次： codex features disable remote_compaction_v2
+# （下方的“复制修改脚本”会自动帮你执行这一步；这里是纯文本，需要手动跑）
 ${warning}${keepOfficialComment}model_provider = "${providerID}"
 model = "${model}"
 model_reasoning_effort = "${effort}"
@@ -1670,6 +1803,24 @@ function buildApiKeyCodexConfigPatchScript(
       `echo "已写入: ${file.display}"`,
     );
   });
+  // 第三方/自定义 provider 下 Codex 的 remote compaction（长会话自动压缩）
+  // 常报 "expected exactly one compaction output item"——社区已确认这是所有
+  // 非官方 provider 的通用缺陷（cc-switch #4030/#4725 等），网关这边无法保证
+  // 模型每次都吐出 Codex 期望的那种单一输出项形状，唯一可靠的绕过方式是关掉
+  // 该特性、让 Codex 走本地压缩。用官方 codex CLI 完成（不手写 TOML，避免和
+  // 用户已有的 [features] 表冲突）；找不到 codex 命令或执行失败都只是提示，
+  // 不影响本脚本其余部分（provider 配置已经写完）。
+  lines.push(
+    'if command -v codex >/dev/null 2>&1; then',
+    '  if codex features disable remote_compaction_v2 >/dev/null 2>&1; then',
+    '    echo "已关闭 Codex remote compaction（第三方 provider 下长会话自动压缩常报 compaction 相关错误，改走本地压缩）"',
+    '  else',
+    '    echo "提示：codex features disable remote_compaction_v2 执行失败，可手动运行一次"',
+    '  fi',
+    'else',
+    '  echo "提示：未找到 codex 命令，建议手动执行一次: codex features disable remote_compaction_v2 （第三方 provider 下长会话自动压缩可能报错）"',
+    'fi',
+  );
   lines.push('echo "完成。如客户端已在运行，请重启后再试。"', '');
   return lines.join('\n');
 }
@@ -1696,6 +1847,18 @@ function buildApiKeyCodexRestoreOfficialScript() {
     `${CODEX_PROVIDER_BLOCK_STRIP_AWK} "$FILE" > "$TMP"`,
     'mv "$TMP" "$FILE"',
     'echo "已移除本工具管理的 provider 配置，Codex 将回退到官方 provider（其他设置保持不变）: $FILE"',
+    // 官方 provider 走官方链路，remote compaction 通常没问题；对称地把我们
+    // 关掉的这个特性开回去，不残留我们的footprint。同样通过官方 CLI 完成，
+    // 找不到命令或执行失败都只是提示，不影响还原本身（provider 配置已经移除）。
+    'if command -v codex >/dev/null 2>&1; then',
+    '  if codex features enable remote_compaction_v2 >/dev/null 2>&1; then',
+    '    echo "已恢复 Codex remote compaction（官方 provider 下通常没有兼容性问题）"',
+    '  else',
+    '    echo "提示：codex features enable remote_compaction_v2 执行失败，可忽略或手动运行"',
+    '  fi',
+    'else',
+    '  echo "提示：未找到 codex 命令，如需恢复 remote compaction 可手动执行: codex features enable remote_compaction_v2"',
+    'fi',
   ];
   return lines.join('\n');
 }
@@ -2691,12 +2854,16 @@ function App() {
     apiKeySource: '',
     defaultModel: '',
     defaultThinkingDepth: '',
-    authType: 'api_key' as 'api_key' | 'claude_oauth' | 'cursor_oauth' | 'chatgpt_oauth',
+    authType: 'api_key' as 'api_key' | 'claude_oauth' | 'cursor_oauth' | 'chatgpt_oauth' | 'self_register',
     requestAdapterJSON: '',
   });
   const [claudeOAuthState, setClaudeOAuthState] = useState('');
   const [claudeOAuthCode, setClaudeOAuthCode] = useState('');
   const [claudeOAuthBusy, setClaudeOAuthBusy] = useState(false);
+  // 自助注册（内网穿透）：原始令牌只在生成那一刻拿到，仅保存在内存里，
+  // 弹窗关闭/刷新后不再可见。
+  const [selfRegToken, setSelfRegToken] = useState('');
+  const [selfRegBusy, setSelfRegBusy] = useState(false);
   const [claudeOAuthError, setClaudeOAuthError] = useState('');
   const [claudeOAuthFlowId, setClaudeOAuthFlowId] = useState('');
   const [claudeOAuthPolling, setClaudeOAuthPolling] = useState(false);
@@ -4260,6 +4427,13 @@ function App() {
     setClaudeOAuthPolling(false);
   }
 
+  // 原始令牌只在生成瞬间返回一次；换 Provider / 关闭弹窗都要清掉内存里的值，
+  // 避免残留在别的 Provider 编辑视图里被误用。
+  function resetSelfRegistrationState() {
+    setSelfRegToken('');
+    setSelfRegBusy(false);
+  }
+
   function openProviderModal() {
     setEditingProviderID('');
     setProviderDraft({
@@ -4275,6 +4449,7 @@ function App() {
     resetClaudeOAuthFlowState();
     resetCursorOAuthFlowState();
     resetChatGPTOAuthFlowState();
+    resetSelfRegistrationState();
     setProviderModalOpen(true);
   }
 
@@ -4305,6 +4480,7 @@ function App() {
     resetClaudeOAuthFlowState();
     resetCursorOAuthFlowState();
     resetChatGPTOAuthFlowState();
+    resetSelfRegistrationState();
     setProviderModalOpen(true);
   }
 
@@ -4330,6 +4506,7 @@ function App() {
     resetClaudeOAuthFlowState();
     resetCursorOAuthFlowState();
     resetChatGPTOAuthFlowState();
+    resetSelfRegistrationState();
     setProviderModalOpen(true);
   }
 
@@ -4419,6 +4596,7 @@ function App() {
       const isClaudeOAuth = providerDraft.protocol === 'claude' && providerDraft.authType === 'claude_oauth';
       const isCursorOAuth = providerDraft.protocol === 'openai_chat' && providerDraft.authType === 'cursor_oauth';
       const isChatGPTOAuth = providerDraft.protocol === 'openai_responses' && providerDraft.authType === 'chatgpt_oauth';
+      const isSelfRegister = providerDraft.authType === 'self_register';
       let requestAdapter: RequestAdapter | null = null;
       const adapterRaw = providerDraft.requestAdapterJSON.trim();
       if (adapterRaw) {
@@ -4447,23 +4625,36 @@ function App() {
       if (!response.ok) throw new Error(await response.text());
       const saved = await response.json() as Provider;
       const wasCreate = !editingProviderID;
-      setProviderModalOpen(false);
-      setEditingProviderID('');
       resetClaudeOAuthFlowState();
       resetCursorOAuthFlowState();
       resetChatGPTOAuthFlowState();
-      if (wasCreate && isClaudeOAuth) {
-        showToast(`已添加输入 Provider：${saved.name}。在列表中点击编辑可连接 Claude 账号。`);
-      } else if (wasCreate && isCursorOAuth) {
-        showToast(`已添加输入 Provider：${saved.name}。在列表中点击编辑可连接 Cursor 账号。`);
-      } else if (wasCreate && isChatGPTOAuth) {
-        showToast(`已添加输入 Provider：${saved.name}。在列表中点击编辑可连接 ChatGPT 账号。`);
+      // OAuth 三种连接方式 / 自助注册模式：创建后不关弹窗，直接停留在编辑态，
+      // 用户立刻就能点连接按钮 / 拿到注册令牌，不用再多点一次「编辑」重新进来。
+      if (wasCreate && (isSelfRegister || isClaudeOAuth || isCursorOAuth || isChatGPTOAuth)) {
+        // 不关弹窗、留在编辑态，并且直接把"创建"和"发起授权/生成令牌"这两步
+        // 接在同一次点击触发的调用链里完成，用户不用再多点一次。
+        setEditingProviderID(saved.id);
+        await refreshState(false);
+        if (isSelfRegister) {
+          await generateProviderSelfRegToken(saved.id);
+        } else if (isClaudeOAuth) {
+          showToast(`已添加输入 Provider：${saved.name}，正在跳转 Claude 授权…`);
+          await startClaudeOAuthConnect(saved.id);
+        } else if (isCursorOAuth) {
+          showToast(`已添加输入 Provider：${saved.name}，正在跳转 Cursor 授权…`);
+          await startCursorOAuthConnect(saved.id);
+        } else if (isChatGPTOAuth) {
+          showToast(`已添加输入 Provider：${saved.name}，正在跳转 ChatGPT 授权…`);
+          await startChatGPTOAuthConnect(saved.id);
+        }
       } else {
+        setProviderModalOpen(false);
+        setEditingProviderID('');
         showToast(wasCreate ? `已添加输入 Provider：${saved.name}` : `已更新输入 Provider：${saved.name}`);
+        await refreshState(false);
+        await refreshAppLogs();
+        setSelectedProviderID(saved.id);
       }
-      await refreshState(false);
-      await refreshAppLogs();
-      setSelectedProviderID(saved.id);
     } catch (error) {
       showToast(`${editingProviderID ? '更新' : '添加'} Provider 失败：${String(error)}`);
     } finally {
@@ -4471,12 +4662,12 @@ function App() {
     }
   }
 
-  async function pollClaudeOAuthStatus(flowId: string) {
+  async function pollClaudeOAuthStatus(flowId: string, providerId: string = editingProviderID) {
     const deadline = Date.now() + 15 * 60 * 1000;
     setClaudeOAuthPolling(true);
     try {
       while (Date.now() < deadline) {
-        const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(editingProviderID!)}/claude-oauth/status?flowId=${encodeURIComponent(flowId)}`);
+        const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(providerId)}/claude-oauth/status?flowId=${encodeURIComponent(flowId)}`);
         if (!response.ok) {
           const text = await response.text();
           throw new Error(text || 'oauth status check failed');
@@ -4499,12 +4690,12 @@ function App() {
     }
   }
 
-  async function startClaudeOAuthConnect() {
-    if (!editingProviderID) return;
+  async function startClaudeOAuthConnect(providerId: string = editingProviderID) {
+    if (!providerId) return;
     setClaudeOAuthBusy(true);
     setClaudeOAuthError('');
     try {
-      const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(editingProviderID)}/claude-oauth/start`, {
+      const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(providerId)}/claude-oauth/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode: 'localhost' }),
@@ -4513,19 +4704,19 @@ function App() {
       const data = await response.json() as { authUrl: string; state: string; flowId?: string; mode?: string };
       setClaudeOAuthState(data.state);
       if (data.flowId) setClaudeOAuthFlowId(data.flowId);
-      const opened = window.open(data.authUrl, '_blank', 'noopener,noreferrer');
-      if (!opened) {
-        setClaudeOAuthError('浏览器拦截了弹窗，请复制下方授权链接手动打开。');
-      }
+      // window.open 传 noopener/noreferrer 时规范规定返回值恒为 null（无论是否
+      // 真的打开成功），没法用它判断"是否被拦截"；这里不再据此误报，统一给中性
+      // 提示，并始终把链接复制到剪贴板兜底（下方"手动粘贴 code"入口始终可用）。
+      window.open(data.authUrl, '_blank', 'noopener,noreferrer');
       try {
         await navigator.clipboard.writeText(data.authUrl);
-        if (opened) showToast('已打开授权页面，授权完成后将自动连接');
+        showToast('已尝试打开 Claude 授权页面；如未自动跳转，可粘贴剪贴板中的链接手动打开');
       } catch {
-        if (opened) showToast('已打开 Claude 授权页面');
+        showToast('已尝试打开 Claude 授权页面');
       }
       if (data.flowId) {
         setClaudeOAuthBusy(false);
-        await pollClaudeOAuthStatus(data.flowId);
+        await pollClaudeOAuthStatus(data.flowId, providerId);
       }
     } catch (error) {
       setClaudeOAuthError(String(error));
@@ -4608,23 +4799,22 @@ function App() {
     }
   }
 
-  async function pollCursorOAuthStatus(flowId: string) {
+  async function pollCursorOAuthStatus(flowId: string, providerId: string = editingProviderID) {
     const deadline = Date.now() + 15 * 60 * 1000;
     setCursorOAuthPolling(true);
     try {
       while (Date.now() < deadline) {
-        const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(editingProviderID!)}/cursor-oauth/status?flowId=${encodeURIComponent(flowId)}`);
+        const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(providerId)}/cursor-oauth/status?flowId=${encodeURIComponent(flowId)}`);
         if (!response.ok) {
           const text = await response.text();
           throw new Error(text || 'oauth status check failed');
         }
         const data = await response.json() as { status: string; message?: string };
         if (data.status === 'connected') {
-          const providerID = editingProviderID!;
           resetCursorOAuthFlowState();
           // OAuth finish syncs models server-side before status=connected;
           // force one more models refresh so the models menu updates immediately.
-          await fetchProviderModels(providerID, 'cursor pro', false);
+          await fetchProviderModels(providerId, 'cursor pro', false);
           await refreshState(false);
           showToast('Cursor 账号已连接，模型列表已同步');
           return;
@@ -4640,28 +4830,26 @@ function App() {
     }
   }
 
-  async function startCursorOAuthConnect() {
-    if (!editingProviderID) return;
+  async function startCursorOAuthConnect(providerId: string = editingProviderID) {
+    if (!providerId) return;
     setCursorOAuthBusy(true);
     setCursorOAuthError('');
     try {
-      const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(editingProviderID)}/cursor-oauth/start`, { method: 'POST' });
+      const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(providerId)}/cursor-oauth/start`, { method: 'POST' });
       if (!response.ok) throw new Error(await response.text());
       const data = await response.json() as { authUrl: string; flowId?: string };
       if (data.flowId) setCursorOAuthFlowId(data.flowId);
-      const opened = window.open(data.authUrl, '_blank', 'noopener,noreferrer');
-      if (!opened) {
-        setCursorOAuthError('浏览器拦截了弹窗，请复制授权链接手动打开。');
-      }
+      // 同上：noopener 场景下返回值恒为 null，不再据此误报"被拦截"。
+      window.open(data.authUrl, '_blank', 'noopener,noreferrer');
       try {
         await navigator.clipboard.writeText(data.authUrl);
-        if (opened) showToast('已打开 Cursor 授权页面，完成后将自动连接');
+        showToast('已尝试打开 Cursor 授权页面；如未自动跳转，可粘贴剪贴板中的链接手动打开');
       } catch {
-        if (opened) showToast('已打开 Cursor 授权页面');
+        showToast('已尝试打开 Cursor 授权页面');
       }
       if (data.flowId) {
         setCursorOAuthBusy(false);
-        await pollCursorOAuthStatus(data.flowId);
+        await pollCursorOAuthStatus(data.flowId, providerId);
       }
     } catch (error) {
       setCursorOAuthError(String(error));
@@ -4687,21 +4875,20 @@ function App() {
     }
   }
 
-  async function pollChatGPTOAuthStatus(flowId: string) {
+  async function pollChatGPTOAuthStatus(flowId: string, providerId: string = editingProviderID) {
     const deadline = Date.now() + 15 * 60 * 1000;
     setChatgptOAuthPolling(true);
     try {
       while (Date.now() < deadline) {
-        const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(editingProviderID!)}/chatgpt-oauth/status?flowId=${encodeURIComponent(flowId)}`);
+        const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(providerId)}/chatgpt-oauth/status?flowId=${encodeURIComponent(flowId)}`);
         if (!response.ok) {
           const text = await response.text();
           throw new Error(text || 'oauth status check failed');
         }
         const data = await response.json() as { status: string; message?: string };
         if (data.status === 'connected') {
-          const providerID = editingProviderID!;
           resetChatGPTOAuthFlowState();
-          await fetchProviderModels(providerID, 'chatgpt', false);
+          await fetchProviderModels(providerId, 'chatgpt', false);
           await refreshState(false);
           showToast('ChatGPT 账号已连接，模型列表已同步');
           return;
@@ -4717,28 +4904,26 @@ function App() {
     }
   }
 
-  async function startChatGPTOAuthConnect() {
-    if (!editingProviderID) return;
+  async function startChatGPTOAuthConnect(providerId: string = editingProviderID) {
+    if (!providerId) return;
     setChatgptOAuthBusy(true);
     setChatgptOAuthError('');
     try {
-      const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(editingProviderID)}/chatgpt-oauth/start`, { method: 'POST' });
+      const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(providerId)}/chatgpt-oauth/start`, { method: 'POST' });
       if (!response.ok) throw new Error(await response.text());
       const data = await response.json() as { authUrl: string; flowId?: string };
       if (data.flowId) setChatgptOAuthFlowId(data.flowId);
-      const opened = window.open(data.authUrl, '_blank', 'noopener,noreferrer');
-      if (!opened) {
-        setChatgptOAuthError('浏览器拦截了弹窗，请复制授权链接手动打开。');
-      }
+      // 同上：noopener 场景下返回值恒为 null，不再据此误报"被拦截"。
+      window.open(data.authUrl, '_blank', 'noopener,noreferrer');
       try {
         await navigator.clipboard.writeText(data.authUrl);
-        if (opened) showToast('已打开 ChatGPT 授权页面，完成后将自动连接');
+        showToast('已尝试打开 ChatGPT 授权页面；如未自动跳转，可粘贴剪贴板中的链接手动打开');
       } catch {
-        if (opened) showToast('已打开 ChatGPT 授权页面');
+        showToast('已尝试打开 ChatGPT 授权页面');
       }
       if (data.flowId) {
         setChatgptOAuthBusy(false);
-        await pollChatGPTOAuthStatus(data.flowId);
+        await pollChatGPTOAuthStatus(data.flowId, providerId);
       }
     } catch (error) {
       setChatgptOAuthError(String(error));
@@ -4818,6 +5003,46 @@ function App() {
       showToast(`切换 Provider 状态失败：${String(error)}`);
     } finally {
       setSaving(false);
+    }
+  }
+
+  // 生成/重置该 Provider 的自助注册令牌；原始令牌只在这次响应里出现一次，
+  // 之后只能看到掩码预览（tokenPreview）。
+  async function generateProviderSelfRegToken(providerID: string) {
+    setSelfRegBusy(true);
+    try {
+      const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(providerID)}/self-register-token`, {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const data = await response.json() as { token: string };
+      setSelfRegToken(data.token);
+      await refreshState(false);
+      showToast('已生成注册令牌，请立即复制（离开或刷新页面后不再显示）');
+    } catch (error) {
+      showToast(`生成令牌失败：${String(error)}`);
+    } finally {
+      setSelfRegBusy(false);
+    }
+  }
+
+  async function revokeProviderSelfRegistration(providerID: string) {
+    if (!window.confirm('确定撤销自助注册？之前签发的令牌会立即失效，对方脚本将无法再更新地址。')) return;
+    setSelfRegBusy(true);
+    try {
+      const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(providerID)}/self-register-token/revoke`, {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
+      if (!response.ok) throw new Error(await response.text());
+      setSelfRegToken('');
+      await refreshState(false);
+      showToast('已撤销自助注册');
+    } catch (error) {
+      showToast(`撤销失败：${String(error)}`);
+    } finally {
+      setSelfRegBusy(false);
     }
   }
 
@@ -7361,28 +7586,75 @@ function App() {
       )}
 
       {providerModalOpen && (
-        <Modal title={editingProviderID ? '编辑输入 Provider' : '创建输入 Provider'} description="API Key Source 可留空：留空时透传客户端 Authorization；也可直接填 sk-xxx，或填 env:VAR_NAME / literal:sk-xxx。Fallback Model 只在模型接口不可用时兜底。" onClose={() => { setProviderModalOpen(false); setEditingProviderID(''); resetClaudeOAuthFlowState(); resetCursorOAuthFlowState(); resetChatGPTOAuthFlowState(); }}>
+        <Modal title={editingProviderID ? '编辑输入 Provider' : '创建输入 Provider'} description="API Key Source 可留空：留空时透传客户端 Authorization；也可直接填 sk-xxx，或填 env:VAR_NAME / literal:sk-xxx。Fallback Model 只在模型接口不可用时兜底。" onClose={() => { setProviderModalOpen(false); setEditingProviderID(''); resetClaudeOAuthFlowState(); resetCursorOAuthFlowState(); resetChatGPTOAuthFlowState(); resetSelfRegistrationState(); }}>
           <div className="form-grid modal-form">
-            <Field label="Provider 名称" value={providerDraft.name} onChange={(value) => setProviderDraft((current) => ({ ...current, name: value }))} />
-            <SelectField
-              label="协议"
-              values={
-                providerDraft.authType === 'cursor_oauth'
-                  ? ['OpenAI Chat']
-                  : providerDraft.authType === 'claude_oauth'
-                    ? ['Claude']
-                    : providerDraft.authType === 'chatgpt_oauth'
-                      ? ['OpenAI Responses']
-                    : fixedOutputLabels
-              }
-              value={protocolLabel(providerDraft.protocol)}
-              onChange={(value) => setProviderDraft((current) => ({
-                ...current,
-                protocol: protocolFromLabel(value),
-                // Switching protocol drops OAuth modes that are protocol-bound.
-                authType: 'api_key',
-              }))}
-            />
+            <Field fullWidth label="Provider 名称" value={providerDraft.name} onChange={(value) => setProviderDraft((current) => ({ ...current, name: value }))} />
+            {(() => {
+              const connectLocked = providerDraft.authType === 'claude_oauth' || providerDraft.authType === 'cursor_oauth' || providerDraft.authType === 'chatgpt_oauth';
+              const connectValue = providerDraft.authType === 'claude_oauth' ? '登录 Claude 账号 (OAuth)'
+                : providerDraft.authType === 'cursor_oauth' ? '登录 Cursor 账号 (OAuth)'
+                : providerDraft.authType === 'chatgpt_oauth' ? '登录 ChatGPT 账号 (OAuth)'
+                : providerDraft.authType === 'self_register' ? SELF_REGISTER_CONNECT_LABEL
+                : 'API Key';
+              // 自助注册类 Provider：协议只能由脚本通过 self-register 接口的
+              // protocol 字段声明，控制台不提供选择/修改入口——不管这次是刚选中
+              // 「内网穿透自助注册」（尚未注册），还是重新打开一个已经注册过的
+              // 旧 Provider（此时 authType 会话态早就回退成 api_key 了，得看
+              // 后端真实持久化的 selfRegistration 字段才知道它是这一类）。
+              const editingProviderRecord = editingProviderID ? state.providers.find((item) => item.id === editingProviderID) : undefined;
+              const protocolManagedByAPI = providerDraft.authType === 'self_register' || !!editingProviderRecord?.selfRegistration;
+              return (
+                <>
+                  {/* 先选连接方式，协议由连接方式决定：OAuth 三选一时协议自动锁定，
+                      自助注册协议交给脚本自己声明，只有 API Key 能自由选协议。 */}
+                  <SelectField
+                    fullWidth
+                    label="连接方式"
+                    values={['API Key', '登录 Claude 账号 (OAuth)', '登录 Cursor 账号 (OAuth)', '登录 ChatGPT 账号 (OAuth)', SELF_REGISTER_CONNECT_LABEL]}
+                    value={connectValue}
+                    onChange={(value) => setProviderDraft((current) => {
+                      const authType = value === '登录 Claude 账号 (OAuth)' ? 'claude_oauth'
+                        : value === '登录 Cursor 账号 (OAuth)' ? 'cursor_oauth'
+                        : value === '登录 ChatGPT 账号 (OAuth)' ? 'chatgpt_oauth'
+                        : value === SELF_REGISTER_CONNECT_LABEL ? 'self_register'
+                        : 'api_key';
+                      const protocol = authType === 'claude_oauth' ? 'claude'
+                        : authType === 'cursor_oauth' ? 'openai_chat'
+                        : authType === 'chatgpt_oauth' ? 'openai_responses'
+                        // 自助注册：协议不在控制台选，这里只是内部占位默认值
+                        // （真实协议以脚本注册时声明的为准），固定用 openai_chat。
+                        : authType === 'self_register' ? 'openai_chat'
+                        : current.protocol;
+                      return {
+                        ...current,
+                        authType,
+                        protocol,
+                        baseUrl: authType === 'self_register' ? selfRegisterPlaceholderBaseURL(protocol) : current.baseUrl,
+                      };
+                    })}
+                  />
+                  {protocolManagedByAPI ? (
+                    <div className="field field-full">
+                      <label>协议</label>
+                      <div className="hint-line" style={{ margin: 0 }}>
+                        当前：{protocolLabel(editingProviderRecord?.protocol ?? providerDraft.protocol)}
+                        （由脚本通过自助注册接口的 protocol 字段声明，控制台不提供协议选择/修改，
+                        避免和脚本实际实现的协议对不上；要换协议请让脚本下次注册时改传新的 protocol）
+                      </div>
+                    </div>
+                  ) : (
+                    <SelectField
+                      fullWidth
+                      label="协议"
+                      disabled={connectLocked}
+                      values={connectLocked ? [protocolLabel(providerDraft.protocol)] : fixedOutputLabels}
+                      value={protocolLabel(providerDraft.protocol)}
+                      onChange={(value) => setProviderDraft((current) => ({ ...current, protocol: protocolFromLabel(value) }))}
+                    />
+                  )}
+                </>
+              );
+            })()}
             {providerDraft.authType === 'cursor_oauth' && (
               <div className="hint-line">Cursor OAuth 上游固定为 OpenAI Chat（本地 bridge `/v1/chat/completions`）；客户端若要 Responses/Claude，请在路由输出协议里转换。</div>
             )}
@@ -7392,43 +7664,14 @@ function App() {
             {providerDraft.authType === 'chatgpt_oauth' && (
               <div className="hint-line">ChatGPT OAuth 上游固定为 OpenAI Responses（chatgpt.com/backend-api/codex/responses）。</div>
             )}
-            {providerDraft.protocol === 'claude' && (
-              <SelectField
-                label="连接方式"
-                values={['API Key', '登录 Claude 账号 (OAuth)']}
-                value={providerDraft.authType === 'claude_oauth' ? '登录 Claude 账号 (OAuth)' : 'API Key'}
-                onChange={(value) => setProviderDraft((current) => ({
-                  ...current,
-                  authType: value === '登录 Claude 账号 (OAuth)' ? 'claude_oauth' : 'api_key',
-                  protocol: value === '登录 Claude 账号 (OAuth)' ? 'claude' : current.protocol,
-                }))}
-              />
+            {providerDraft.authType === 'self_register' && (
+              <div className="hint-line">
+                适合"用户自己内网穿透暴露服务"的场景：无需现在填写 Base URL / API Key Source / 协议，
+                保存后会自动生成一个专属令牌 + 一段配置 Prompt，交给对方脚本使用——协议不限（chat/response/
+                claude 任选，脚本已有哪种代码就用哪种），脚本调用接口时把实际用的 baseUrl / 协议一并声明即可。
+              </div>
             )}
-            {providerDraft.protocol === 'openai_chat' && (
-              <SelectField
-                label="连接方式"
-                values={['API Key', '登录 Cursor 账号 (OAuth)']}
-                value={providerDraft.authType === 'cursor_oauth' ? '登录 Cursor 账号 (OAuth)' : 'API Key'}
-                onChange={(value) => setProviderDraft((current) => ({
-                  ...current,
-                  authType: value === '登录 Cursor 账号 (OAuth)' ? 'cursor_oauth' : 'api_key',
-                  protocol: value === '登录 Cursor 账号 (OAuth)' ? 'openai_chat' : current.protocol,
-                }))}
-              />
-            )}
-            {providerDraft.protocol === 'openai_responses' && (
-              <SelectField
-                label="连接方式"
-                values={['API Key', '登录 ChatGPT 账号 (OAuth)']}
-                value={providerDraft.authType === 'chatgpt_oauth' ? '登录 ChatGPT 账号 (OAuth)' : 'API Key'}
-                onChange={(value) => setProviderDraft((current) => ({
-                  ...current,
-                  authType: value === '登录 ChatGPT 账号 (OAuth)' ? 'chatgpt_oauth' : 'api_key',
-                  protocol: value === '登录 ChatGPT 账号 (OAuth)' ? 'openai_responses' : current.protocol,
-                }))}
-              />
-            )}
-            {!(providerDraft.protocol === 'claude' && providerDraft.authType === 'claude_oauth') && !(providerDraft.protocol === 'openai_chat' && providerDraft.authType === 'cursor_oauth') && !(providerDraft.protocol === 'openai_responses' && providerDraft.authType === 'chatgpt_oauth') && (
+            {providerDraft.authType === 'api_key' && (
               <>
                 <Field fullWidth label="Base URL" value={providerDraft.baseUrl} onChange={(value) => setProviderDraft((current) => ({ ...current, baseUrl: value }))} />
                 <Field fullWidth label="API Key Source（可选）" value={providerDraft.apiKeySource} onChange={(value) => setProviderDraft((current) => ({ ...current, apiKeySource: value }))} />
@@ -7442,7 +7685,7 @@ function App() {
           {providerDraft.protocol === 'claude' && providerDraft.authType === 'claude_oauth' && (
             <div className="claude-oauth-panel">
               {!editingProviderID ? (
-                <div className="hint-line">保存后即可连接 Claude 账号（OAuth 连接需要先创建 Provider 获得 ID）。</div>
+                <div className="hint-line">点击下方按钮保存后会自动跳转 Claude 授权页面。</div>
               ) : (() => {
                 const editingProvider = state.providers.find((item) => item.id === editingProviderID);
                 const connected = editingProvider?.claudeOAuth?.connected;
@@ -7476,7 +7719,7 @@ function App() {
           {providerDraft.protocol === 'openai_chat' && providerDraft.authType === 'cursor_oauth' && (
             <div className="claude-oauth-panel">
               {!editingProviderID ? (
-                <div className="hint-line">保存后即可连接 Cursor 账号（OAuth 连接需要先创建 Provider 获得 ID）。需要本机安装 bun。</div>
+                <div className="hint-line">点击下方按钮保存后会自动跳转 Cursor 授权页面。需要本机安装 bun。</div>
               ) : (() => {
                 const editingProvider = state.providers.find((item) => item.id === editingProviderID);
                 const connected = editingProvider?.cursorOAuth?.connected;
@@ -7505,7 +7748,7 @@ function App() {
           {providerDraft.protocol === 'openai_responses' && providerDraft.authType === 'chatgpt_oauth' && (
             <div className="claude-oauth-panel">
               {!editingProviderID ? (
-                <div className="hint-line">保存后即可连接 ChatGPT 账号（OAuth 连接需要先创建 Provider 获得 ID）。</div>
+                <div className="hint-line">点击下方按钮保存后会自动跳转 ChatGPT 授权页面。</div>
               ) : (() => {
                 const editingProvider = state.providers.find((item) => item.id === editingProviderID);
                 const connected = editingProvider?.chatgptOAuth?.connected;
@@ -7538,7 +7781,57 @@ function App() {
               })()}
             </div>
           )}
-          <details className="adapter-editor" open={!!providerDraft.requestAdapterJSON.trim() || providerDraft.baseUrl.includes('{model}') || providerDraft.baseUrl.includes('deployments/')}>
+          {editingProviderID && (providerDraft.authType === 'api_key' || providerDraft.authType === 'self_register') && (() => {
+            const editingProvider = state.providers.find((item) => item.id === editingProviderID);
+            if (!editingProvider) return null;
+            const selfReg = editingProvider.selfRegistration;
+            const promptText = buildSelfRegistrationPrompt(editingProvider, selfRegToken, window.location.origin);
+            return (
+              <div className="self-register-panel">
+                <div className="hint-line">
+                  适合"用户自己内网穿透暴露服务"的场景：生成专属令牌后，对方脚本可直接调用接口更新
+                  baseUrl / apiKeySource，协议（chat/response/claude 三选一）也由脚本在这次调用里
+                  声明——这是唯一的协议来源，控制台不提供协议选择/修改入口；还能顺带声明自定义
+                  authHeader，无需登录控制台账号。同一个令牌还能触发两个自检接口（健康检查需连续
+                  3 次成功、对话测试固定问"2+2等于几"成功 1 次即可），方便对方脚本自己确认配置对不对。
+                  令牌只能操作这一个 Provider，改不了别的。是否异常仍按真实请求失败判定，这里不做
+                  心跳超时告警。
+                </div>
+                {selfReg ? (
+                  <div className="hint-line">
+                    已启用 · 令牌尾号 ****{selfReg.tokenPreview || '----'}
+                    {selfReg.createdAt ? ` · 生成于 ${selfReg.createdAt}` : ''}
+                    {selfReg.lastSeenAt ? ` · 上次自助注册 ${new Date(selfReg.lastSeenAt).toLocaleString()}` : ' · 尚未收到过注册请求'}
+                  </div>
+                ) : (
+                  <div className="hint-line">尚未启用自助注册。</div>
+                )}
+                {selfRegToken ? (
+                  <div className="field field-full">
+                    <label>新令牌（只显示这一次，请立即复制保存）</label>
+                    <div className="field-inline">
+                      <input readOnly value={selfRegToken} onFocus={(event) => event.currentTarget.select()} />
+                      <CopyButton value={selfRegToken} label="复制令牌" />
+                    </div>
+                  </div>
+                ) : null}
+                <div className="actions" style={{ gap: 8, flexWrap: 'wrap' }}>
+                  <button
+                    className={selfReg ? 'btn' : 'btn primary'}
+                    disabled={selfRegBusy}
+                    onClick={() => void generateProviderSelfRegToken(editingProviderID)}
+                  >
+                    {selfRegBusy ? '处理中…' : selfReg ? '重置令牌' : '生成注册令牌'}
+                  </button>
+                  <CopyButton value={promptText} label="复制配置 Prompt" toastContent="已复制配置 Prompt，可粘贴给本地编码大模型使用" />
+                  {selfReg ? (
+                    <button className="btn danger" disabled={selfRegBusy} onClick={() => void revokeProviderSelfRegistration(editingProviderID)}>撤销自助注册</button>
+                  ) : null}
+                </div>
+              </div>
+            );
+          })()}
+                    <details className="adapter-editor" open={!!providerDraft.requestAdapterJSON.trim() || providerDraft.baseUrl.includes('{model}') || providerDraft.baseUrl.includes('deployments/')}>
             <summary>自定义适配（非标准上游）</summary>
             <div className="hint-line">
               用于 tuyadev / Azure deployment 等非标准上游。字段：urlTemplate、headers、bodyTemplate、modelMapping。
@@ -7598,7 +7891,7 @@ function App() {
               );
             })()}
           </details>
-          <div className="actions modal-actions"><button className="btn" onClick={() => { setProviderModalOpen(false); setEditingProviderID(''); resetClaudeOAuthFlowState(); resetCursorOAuthFlowState(); }}>取消</button><button className="btn primary" disabled={saving} onClick={() => void createProvider()}>{saving ? '保存中…' : editingProviderID ? '保存修改' : '创建 Provider'}</button></div>
+          <div className="actions modal-actions"><button className="btn" onClick={() => { setProviderModalOpen(false); setEditingProviderID(''); resetClaudeOAuthFlowState(); resetCursorOAuthFlowState(); resetSelfRegistrationState(); }}>取消</button><button className="btn primary" disabled={saving} onClick={() => void createProvider()}>{saving ? '保存中…' : editingProviderID ? '保存修改' : providerDraft.authType === 'claude_oauth' ? '创建并连接 Claude 账号' : providerDraft.authType === 'cursor_oauth' ? '创建并连接 Cursor 账号' : providerDraft.authType === 'chatgpt_oauth' ? '创建并连接 ChatGPT 账号' : providerDraft.authType === 'self_register' ? '创建并生成注册令牌' : '创建 Provider'}</button></div>
         </Modal>
       )}
 
@@ -9894,8 +10187,8 @@ function CheckboxField({ label, checked, onChange }: { label: string; checked: b
   return <label className="field checkbox-field"><input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} /><span>{label}</span></label>;
 }
 
-function SelectField({ label, values, value, onChange }: { label: string; values: string[]; value?: string; onChange: (value: string) => void }) {
-  return <div className="field"><label>{label}</label><select value={value || values[0] || ''} onChange={(event) => onChange(event.target.value)}>{values.map((item) => <option key={item}>{item}</option>)}</select></div>;
+function SelectField({ label, values, value, onChange, disabled, fullWidth }: { label: string; values: string[]; value?: string; onChange: (value: string) => void; disabled?: boolean; fullWidth?: boolean }) {
+  return <div className={`field${fullWidth ? ' field-full' : ''}`}><label>{label}</label><select value={value || values[0] || ''} disabled={disabled} onChange={(event) => onChange(event.target.value)}>{values.map((item) => <option key={item}>{item}</option>)}</select></div>;
 }
 
 function URLRow({ label, value, onCopy }: { label: string; value: string; onCopy?: () => void }) {

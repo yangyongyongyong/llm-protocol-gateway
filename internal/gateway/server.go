@@ -217,6 +217,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /__providers/import", s.handleImportProviders)
 	mux.HandleFunc("POST /__providers/{id}/test", s.handleTestProvider)
 	mux.HandleFunc("POST /__providers/{id}/enabled", s.handleSetProviderEnabled)
+	mux.HandleFunc("POST /__providers/{id}/self-register-token", s.handleGenerateProviderSelfRegistrationToken)
+	mux.HandleFunc("POST /__providers/{id}/self-register-token/revoke", s.handleRevokeProviderSelfRegistration)
+	mux.HandleFunc("PATCH /__providers/{id}/self-register", s.handleProviderSelfRegister)
+	mux.HandleFunc("POST /__providers/{id}/self-check/health", s.handleProviderSelfCheckHealth)
+	mux.HandleFunc("POST /__providers/{id}/self-check/chat", s.handleProviderSelfCheckChat)
 	mux.HandleFunc("GET /__providers/{id}/auth-preview", s.handleProviderAuthPreview)
 	mux.HandleFunc("POST /__providers/{id}/chat-test", s.handleProviderChatTest)
 	mux.HandleFunc("POST /__providers/{id}/cache-test", s.handleProviderCacheTest)
@@ -240,6 +245,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /__providers/{id}/chatgpt-oauth/disconnect", s.handleChatGPTOAuthDisconnect)
 	mux.HandleFunc("GET /__providers/{id}/chatgpt-oauth/usage", s.handleChatGPTOAuthUsage)
 	mux.HandleFunc("DELETE /__providers/{id}", s.handleDeleteProvider)
+	mux.HandleFunc("GET /__providers/deleted", s.handleListDeletedProviders)
+	mux.HandleFunc("POST /__providers/{id}/restore", s.handleRestoreProvider)
+	mux.HandleFunc("DELETE /__providers/{id}/purge", s.handlePurgeProvider)
 	mux.HandleFunc("POST /__routes", s.handleCreateRoute)
 	mux.HandleFunc("PATCH /__routes/{id}", s.handleUpdateRoute)
 	mux.HandleFunc("DELETE /__routes/{id}", s.handleDeleteRoute)
@@ -307,6 +315,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	identity := s.requestIdentity(r)
 	state := s.router.State()
+	// Soft-deleted providers live on in storage (see Router.DeleteProvider)
+	// but never appear in the normal console listing; admins use the
+	// dedicated GET /__providers/deleted trash view to find and restore them.
+	state.Providers = activeProviders(state.Providers)
 	state.Providers = redactProvidersForClient(state.Providers)
 	for index := range state.Providers {
 		enrichProviderAdapterCurl(&state.Providers[index])
@@ -330,6 +342,20 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSettingsPaths(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, ResolveDataPaths())
+}
+
+// activeProviders filters out soft-deleted providers (see
+// Router.DeleteProvider) for normal listings; deleted providers are only
+// exposed via the dedicated trash endpoints.
+func activeProviders(providers []domain.Provider) []domain.Provider {
+	out := make([]domain.Provider, 0, len(providers))
+	for _, provider := range providers {
+		if provider.Deleted {
+			continue
+		}
+		out = append(out, provider)
+	}
+	return out
 }
 
 // redactProvidersForClient deep-copies providers and scrubs secret fields
@@ -643,6 +669,7 @@ const memoryLogCap = 50000
 //   - 2xx 正常请求：只留精简体，够定位模型/参数即可，避免正常流量把库撑大。
 //   - 非 2xx 错误请求：放大上限，尽量保留完整请求/响应体，方便事后排查
 //     （如 thinking 签名 400、上游报错等需要看到完整上下文）。
+//
 // SQLite TEXT 列本身无硬长度限制，这里的上限用于防止单条日志异常超长
 // （如超大 base64 图片/附件）拖垮内存缓存与 DB 写入。
 const (
@@ -2246,6 +2273,9 @@ func (s *Server) testClaudeOAuthProviderChat(r *http.Request, provider domain.Pr
 	}, http.StatusOK
 }
 
+// handleDeleteProvider soft-deletes a provider (see Router.DeleteProvider):
+// it is hidden from listings/routing but recoverable via
+// POST /__providers/{id}/restore until an admin explicitly purges it.
 func (s *Server) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
 	providerID := r.PathValue("id")
 	if !s.requireProviderOwnerForUser(w, r, providerID) {
@@ -2260,8 +2290,57 @@ func (s *Server) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
 		return
 	}
-	s.logs.AddApp("info", "provider deleted", providerID)
+	s.logs.AddApp("info", "provider soft-deleted (recoverable)", providerID)
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
+}
+
+// handleListDeletedProviders returns the admin "trash" view of soft-deleted
+// providers so an accidental delete can be found and undone. Admin-only
+// (not registered in isUserAllowedPath, same tier as the Disabled kill switch).
+func (s *Server) handleListDeletedProviders(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	deleted := redactProvidersForClient(s.router.DeletedProviders())
+	writeJSON(w, http.StatusOK, map[string]any{"providers": deleted})
+}
+
+// handleRestoreProvider undoes a soft delete, admin-only.
+func (s *Server) handleRestoreProvider(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	providerID := r.PathValue("id")
+	updated, err := s.router.RestoreProvider(providerID)
+	if err != nil {
+		writeOpenAIError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if err := s.saveState(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+		return
+	}
+	s.logs.AddApp("info", "provider restored", providerID)
+	writeJSON(w, http.StatusOK, redactProviderForClient(updated))
+}
+
+// handlePurgeProvider permanently removes a previously soft-deleted provider.
+// Admin-only and irreversible; the provider must already be soft-deleted.
+func (s *Server) handlePurgeProvider(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	providerID := r.PathValue("id")
+	if err := s.router.PurgeProvider(providerID); err != nil {
+		writeOpenAIError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if err := s.saveState(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+		return
+	}
+	s.logs.AddApp("warn", "provider purged permanently", providerID)
+	writeJSON(w, http.StatusOK, map[string]any{"purged": true})
 }
 
 func (s *Server) handleCreateRoute(w http.ResponseWriter, r *http.Request) {
@@ -3977,6 +4056,17 @@ func (s *Server) sendClaudeMessagesUpstream(r *http.Request, provider domain.Pro
 // retry response (and true) when a retry was actually issued; otherwise it
 // rebuilds the original 400 response body so the caller can forward it intact.
 func (s *Server) maybeRectifyClaudeThinking(r *http.Request, provider domain.Provider, body []byte, response *http.Response) (*http.Response, bool) {
+	return s.maybeRectifyClaudeThinkingResend(r, provider, body, response, func(rectified []byte) (*http.Response, error) {
+		return s.sendClaudeMessagesUpstream(r, provider, rectified)
+	})
+}
+
+// maybeRectifyClaudeThinkingResend is the resend-agnostic core of
+// maybeRectifyClaudeThinking. The passthrough path resends via
+// sendClaudeMessagesUpstream; converted paths (e.g. Responses<->Claude) must
+// resend via doClaudeProviderRequest with their own Accept header, so they
+// inject a matching resend closure here instead.
+func (s *Server) maybeRectifyClaudeThinkingResend(r *http.Request, provider domain.Provider, body []byte, response *http.Response, resend func([]byte) (*http.Response, error)) (*http.Response, bool) {
 	errBody, readErr := io.ReadAll(response.Body)
 	response.Body.Close()
 	// Always restore a readable body on the original response for the no-retry paths.
@@ -3997,7 +4087,7 @@ func (s *Server) maybeRectifyClaudeThinking(r *http.Request, provider domain.Pro
 		provider.ID, result.removedThinkingBlocks, result.removedRedactedThinkingBlocks,
 		result.removedSignatureFields, result.removedTopLevelThinking))
 	markTimingFlag(r.Context(), timingFlagThinkingRectify)
-	retryResp, retryErr := s.sendClaudeMessagesUpstream(r, provider, rectifiedBody)
+	retryResp, retryErr := resend(rectifiedBody)
 	if retryErr != nil {
 		s.logs.AddApp("warn", "thinking rectifier retry transport error", retryErr.Error())
 		dumpThinkingRectify(provider.ID, body, rectifiedBody, errBody, nil, retryErr, result)

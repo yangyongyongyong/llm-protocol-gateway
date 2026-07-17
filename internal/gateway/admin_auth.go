@@ -90,6 +90,21 @@ func (s *Server) withAdminAuth(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		// Provider self-register: authenticated purely via its own
+		// provider-scoped bearer token (see handleProviderSelfRegister), never
+		// via console session/cookie. Bypasses this whole session/role
+		// middleware entirely — no session/CSRF surface applies to it.
+		if isSelfRegisterPath(r.Method, r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// Provider self-check (health/chat): same bearer-token-only trust
+		// model as self-register, also bypasses console session/cookie auth
+		// entirely — see authenticateSelfRegistrationRequest.
+		if isSelfCheckPath(r.Method, r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
 
 		localBypass := isLocalAdminBypass(r)
 		if localBypass {
@@ -171,7 +186,7 @@ func isUserProviderManagementPath(method, path string) bool {
 	}
 	if len(parts) == 2 {
 		switch parts[1] {
-		case "test", "chat-test", "cache-test", "thinking-test":
+		case "test", "chat-test", "cache-test", "thinking-test", "self-register-token":
 			return method == http.MethodPost
 		case "auth-preview":
 			return method == http.MethodGet
@@ -182,17 +197,21 @@ func isUserProviderManagementPath(method, path string) bool {
 	if len(parts) == 3 {
 		switch parts[1] {
 		case "claude-oauth", "cursor-oauth", "chatgpt-oauth":
-		default:
+			switch parts[2] {
+			case "start", "complete", "disconnect":
+				return method == http.MethodPost
+			case "status":
+				return method == http.MethodGet
+			}
 			return false
+		case "self-register-token":
+			// self-register-token/revoke: console-session-authenticated
+			// owner/admin action (unlike PATCH .../self-register, which is
+			// the separate bearer-token machine endpoint handled above the
+			// session middleware entirely).
+			return parts[2] == "revoke" && method == http.MethodPost
 		}
-		switch parts[2] {
-		case "start", "complete", "disconnect":
-			return method == http.MethodPost
-		case "status":
-			return method == http.MethodGet
-		default:
-			return false
-		}
+		return false
 	}
 	return false
 }

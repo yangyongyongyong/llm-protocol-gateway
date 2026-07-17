@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -23,18 +24,18 @@ const (
 )
 
 type claudeDirectBlockState struct {
-	kind               claudeDirectBlockKind
-	outputIndex        int
-	itemID             string
-	callID             string
-	name               string
-	accum              strings.Builder
-	startInput         string
-	sourceBlock        map[string]any
-	hasVisibleSummary  bool
-	done               bool
-	writtenArgs        int
-	messageOpened      bool
+	kind              claudeDirectBlockKind
+	outputIndex       int
+	itemID            string
+	callID            string
+	name              string
+	accum             strings.Builder
+	startInput        string
+	sourceBlock       map[string]any
+	hasVisibleSummary bool
+	done              bool
+	writtenArgs       int
+	messageOpened     bool
 }
 
 // visibilityGatedSSEWriter buffers written SSE bytes until markVisible is
@@ -105,12 +106,12 @@ type claudeToResponsesDirectStreamState struct {
 	responseID      string
 	clientToolNames map[string]struct{}
 
-	seq            int
-	outputIndex    int
+	seq             int
+	outputIndex     int
 	responseCreated bool
-	completed      bool
-	stopReason     string
-	usage          TokenUsage
+	completed       bool
+	stopReason      string
+	usage           TokenUsage
 
 	blocks      map[int]*claudeDirectBlockState
 	outputItems []map[string]any
@@ -588,6 +589,15 @@ func (s *claudeToResponsesDirectStreamState) finalize() error {
 // OpenAI Responses SSE directly (no Chat intermediate).
 func streamClaudeToResponsesEventsDirect(w http.ResponseWriter, reader io.Reader, model string, clientToolNames map[string]struct{}) (TokenUsage, error) {
 	state := newClaudeToResponsesDirectStreamState(w, model, clientToolNames)
+
+	// Only tee (buffer) the raw upstream SSE bytes when the near-empty debug
+	// dump is enabled, so this has zero overhead in normal operation.
+	var debugTee *bytes.Buffer
+	if strings.TrimSpace(os.Getenv("LPG_DEBUG_NEAR_EMPTY_DUMP")) != "" {
+		debugTee = &bytes.Buffer{}
+		reader = io.TeeReader(reader, debugTee)
+	}
+
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
@@ -660,6 +670,17 @@ func streamClaudeToResponsesEventsDirect(w http.ResponseWriter, reader io.Reader
 	// is safe to treat as retryable — see errThinkingOnlyEmptyResponse.
 	if err := state.closeRemainingBlocks(); err != nil {
 		return state.usage, err
+	}
+	if len(state.outputItems) <= 1 && debugTee != nil {
+		status, _ := mapAnthropicStopReasonToStatus(state.stopReason)
+		dumpNearEmptyConvertedResponse("stream", model, debugTee.Bytes(), map[string]any{
+			"status":        status,
+			"stop_reason":   state.stopReason,
+			"output_len":    len(state.outputItems),
+			"output_types":  outputItemTypes(state.outputItems),
+			"ever_visible":  state.visGate.everVisible(),
+			"output_tokens": state.usage.OutputTokens,
+		})
 	}
 	if !state.visGate.everVisible() {
 		status, _ := mapAnthropicStopReasonToStatus(state.stopReason)
