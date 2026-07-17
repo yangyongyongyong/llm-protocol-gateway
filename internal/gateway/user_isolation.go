@@ -60,6 +60,34 @@ func (s *Server) ownedKeyIDs(userID string) []string {
 	return ids
 }
 
+// logOwnerFilterAdmin is the sentinel value the admin-only request-log "所属用户"
+// filter uses to mean "keys with no owner (legacy admin-owned keys)", matching
+// the frontend's LOG_OWNER_FILTER_ADMIN constant. It is distinct from the empty
+// string, which instead means "no owner filter applied" (show every user).
+const logOwnerFilterAdmin = "_admin"
+
+// ownedKeyIDsForOwnerFilter resolves the request-log "所属用户" filter value to
+// the matching set of API key ids. Unlike ownedKeyIDs (used for per-request
+// identity restriction, where an empty OwnerUserID never matches a real user
+// id), this treats logOwnerFilterAdmin as matching legacy admin-owned keys
+// (empty OwnerUserID), so admins can filter logs down to "管理员" specifically.
+func (s *Server) ownedKeyIDsForOwnerFilter(ownerUserID string) []string {
+	ids := []string{}
+	for _, key := range s.router.State().APIKeys {
+		owner := strings.TrimSpace(key.OwnerUserID)
+		if ownerUserID == logOwnerFilterAdmin {
+			if owner == "" {
+				ids = append(ids, key.ID)
+			}
+			continue
+		}
+		if owner == ownerUserID {
+			ids = append(ids, key.ID)
+		}
+	}
+	return ids
+}
+
 // ownerUserIDForStats normalizes a key's OwnerUserID for usage bucketing. Legacy
 // keys with an empty owner belong to the administrator, so they collapse onto
 // the stable admin id rather than the "_anonymous" bucket.

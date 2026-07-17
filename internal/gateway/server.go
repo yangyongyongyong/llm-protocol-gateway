@@ -364,6 +364,7 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	query := monitor.RequestLogQuery{
 		Status:        strings.TrimSpace(r.URL.Query().Get("status")),
 		APIKeyName:    strings.TrimSpace(r.URL.Query().Get("apiKeyName")),
+		ProviderID:    strings.TrimSpace(r.URL.Query().Get("providerId")),
 		Page:          atoiDefault(r.URL.Query().Get("page"), 1),
 		PageSize:      atoiDefault(r.URL.Query().Get("pageSize"), 100),
 		IncludeBodies: parseBoolQuery(r.URL.Query().Get("includeBodies")),
@@ -371,6 +372,9 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	if !identity.isAdmin() {
 		// Normal users only see logs of their own keys (empty set matches nothing).
 		query.APIKeyIDs = s.ownedKeyIDs(identity.UserID)
+	} else if ownerUserID := strings.TrimSpace(r.URL.Query().Get("ownerUserId")); ownerUserID != "" {
+		// Admin-only "所属用户" log filter; empty param means no filter (see all users).
+		query.APIKeyIDs = s.ownedKeyIDsForOwnerFilter(ownerUserID)
 	}
 	if from := strings.TrimSpace(r.URL.Query().Get("from")); from != "" {
 		if parsed, err := time.Parse(time.RFC3339, from); err == nil {

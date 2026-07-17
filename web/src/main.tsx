@@ -804,6 +804,8 @@ function normalizeGatewayState(data: Partial<GatewayState> | null | undefined, c
 const UI_CACHE_PREFIX = 'llm-gateway-ui-cache:v1:';
 const UI_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const LOGS_PAGE_SIZE = 10;
+// 与后端 internal/gateway/user_isolation.go 里的 logOwnerFilterAdmin 保持一致。
+const LOG_OWNER_FILTER_ADMIN = '_admin';
 
 function uiCacheScope(auth?: Pick<AdminAuthStatus, 'userId' | 'role' | 'username'> | null) {
   return auth?.userId || auth?.username || auth?.role || 'anon';
@@ -2486,6 +2488,10 @@ function App() {
   const [logsFetchedOnce, setLogsFetchedOnce] = useState(false);
   const [logsStatusFilter, setLogsStatusFilter] = useState<'all' | '2xx' | '4xx' | '5xx'>('all');
   const [logsApiKeyName, setLogsApiKeyName] = useState('');
+  const [logsProviderFilter, setLogsProviderFilter] = useState('');
+  // 空字符串 = 全部；LOG_OWNER_FILTER_ADMIN = 管理员（无所属用户的旧密钥）；
+  // 其余为具体用户 id。仅管理员可见/可用，与后端 ownedKeyIDsForOwnerFilter 对应。
+  const [logsOwnerFilter, setLogsOwnerFilter] = useState('');
   const [logsFrom, setLogsFrom] = useState('');
   const [logsTo, setLogsTo] = useState('');
   const [requestLogRetentionDays, setRequestLogRetentionDays] = useState(7);
@@ -3003,7 +3009,7 @@ function App() {
     // 抖动乱跳”。锁定在第 1 页之外的页时只做一次性拉取（导航到该页/翻页/应用筛选
     // 时触发），不再自动轮询；第 1 页保持原来的实时自动刷新。
     const scope = uiCacheScope(authStatusRef.current);
-    const kind = `logs:p${logsPage}:s${logsStatusFilter}:f${logsFrom}:t${logsTo}:k${logsApiKeyName.trim()}`;
+    const kind = `logs:p${logsPage}:s${logsStatusFilter}:f${logsFrom}:t${logsTo}:k${logsApiKeyName.trim()}:pv${logsProviderFilter}:u${logsOwnerFilter}`;
     const cached = readUICache<{ items: LogEntry[]; total: number; page: number; fetchedAt?: string }>(scope, kind);
     if (cached?.items) {
       setLogs(cached.items);
@@ -3022,7 +3028,15 @@ function App() {
       void refreshLogs(logsPage, undefined, undefined, { silent: true });
     }, 5000);
     return () => window.clearInterval(timer);
-  }, [activeNav, logsPage, logsStatusFilter, logsFrom, logsTo, logsApiKeyName]);
+  }, [activeNav, logsPage, logsStatusFilter, logsFrom, logsTo, logsApiKeyName, logsProviderFilter, logsOwnerFilter]);
+
+  // 管理员打开 API 日志页时加载用户列表，用于「用户」筛选下拉；普通用户看不到这个
+  // 筛选项（后端也只对 admin 生效），不需要拉取。
+  useEffect(() => {
+    if (activeNav !== 'traffic-tokens') return;
+    if (authStatus?.role === 'user') return;
+    void refreshConsoleUsers();
+  }, [activeNav, authStatus?.role]);
 
   useEffect(() => {
     if (activeNav !== 'self-check') return;
@@ -3417,6 +3431,8 @@ function App() {
     if (to) params.set('to', to);
     const keyName = apiKeyNameOverride !== undefined ? apiKeyNameOverride.trim() : logsApiKeyName.trim();
     if (keyName) params.set('apiKeyName', keyName);
+    if (logsProviderFilter) params.set('providerId', logsProviderFilter);
+    if (logsOwnerFilter) params.set('ownerUserId', logsOwnerFilter);
     return params;
   }
 
@@ -3454,7 +3470,7 @@ function App() {
       const from = fromOverride !== undefined ? fromOverride : logsFrom;
       const to = toOverride !== undefined ? toOverride : logsTo;
       const keyForCache = (opts?.apiKeyName !== undefined ? opts.apiKeyName : logsApiKeyName).trim();
-      writeUICache(uiCacheScope(authStatusRef.current), `logs:p${nextPage}:s${logsStatusFilter}:f${from}:t${to}:k${keyForCache}`, {
+      writeUICache(uiCacheScope(authStatusRef.current), `logs:p${nextPage}:s${logsStatusFilter}:f${from}:t${to}:k${keyForCache}:pv${logsProviderFilter}:u${logsOwnerFilter}`, {
         items,
         total,
         page: nextPage,
@@ -6491,6 +6507,33 @@ function App() {
                       ))}
                     </select>
                   </label>
+                  <label className="field">
+                    <span>输入 Provider</span>
+                    <select
+                      value={logsProviderFilter}
+                      onChange={(e) => setLogsProviderFilter(e.target.value)}
+                    >
+                      <option value="">全部</option>
+                      {(state.providers || []).map((provider) => (
+                        <option key={provider.id} value={provider.id}>{providerOptionLabel(provider)}</option>
+                      ))}
+                    </select>
+                  </label>
+                  {!isNormalUser ? (
+                    <label className="field">
+                      <span>用户</span>
+                      <select
+                        value={logsOwnerFilter}
+                        onChange={(e) => setLogsOwnerFilter(e.target.value)}
+                      >
+                        <option value="">全部</option>
+                        <option value={LOG_OWNER_FILTER_ADMIN}>管理员</option>
+                        {consoleUsers.map((user) => (
+                          <option key={user.id} value={user.id}>{user.username}</option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : null}
                   <div className="field" style={{ display: 'flex', alignItems: 'flex-end', gap: 8 }}>
                     <button className="btn" type="button" onClick={() => { setLogsPage(1); void refreshLogs(1); }}>应用筛选</button>
                   </div>

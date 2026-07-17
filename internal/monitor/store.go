@@ -54,8 +54,11 @@ type RequestLogQuery struct {
 	To            time.Time
 	Status        string // all | 2xx | 4xx | 5xx
 	APIKeyName    string // substring match against api_key_name (case-insensitive)
+	// ProviderID filters to the exact input provider id (empty means no filter).
+	ProviderID    string
 	// APIKeyIDs restricts results to logs whose api_key_id is in this set.
-	// Used for per-user data isolation; nil means no restriction.
+	// Used for per-user data isolation, and for the admin-only "owner user"
+	// log filter; nil means no restriction.
 	APIKeyIDs     []string
 	Page          int
 	PageSize      int
@@ -294,6 +297,9 @@ func (s *Store) Query(query RequestLogQuery) RequestLogPage {
 			continue
 		}
 		if keyNameFilter != "" && !strings.Contains(strings.ToLower(item.APIKeyName), keyNameFilter) {
+			continue
+		}
+		if providerID := strings.TrimSpace(query.ProviderID); providerID != "" && item.ProviderID != providerID {
 			continue
 		}
 		if keyIDSet != nil {

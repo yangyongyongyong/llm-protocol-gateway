@@ -176,6 +176,10 @@ func (s *Store) QueryRequestLogs(query monitor.RequestLogQuery) (monitor.Request
 		where = append(where, "LOWER(api_key_name) LIKE ?")
 		args = append(args, "%"+strings.ToLower(keyName)+"%")
 	}
+	if providerID := strings.TrimSpace(query.ProviderID); providerID != "" {
+		where = append(where, "provider_id = ?")
+		args = append(args, providerID)
+	}
 	if query.APIKeyIDs != nil {
 		// Per-user isolation: an empty (non-nil) set must match nothing.
 		if len(query.APIKeyIDs) == 0 {
