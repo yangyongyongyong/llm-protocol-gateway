@@ -104,6 +104,11 @@ type Provider struct {
 	// admin-created. A normal user owns the providers they create and may
 	// edit/clone/delete/test them; admins have full access to every provider.
 	OwnerUserID          string   `json:"ownerUserId,omitempty"`
+	// Disabled is the admin-only kill switch. Zero value (false) means enabled,
+	// so newly created providers and legacy rows/exports default to enabled.
+	// While disabled, normal users cannot see, bind, or send traffic through
+	// this provider; admins keep full access.
+	Disabled             bool     `json:"disabled,omitempty"`
 	AuthHeader           string   `json:"authHeader"`
 	ExtraEndpoint        string   `json:"extraEndpoint,omitempty"`
 	// AuthType selects the provider's authentication mode. "" and "api_key"

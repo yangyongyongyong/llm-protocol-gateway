@@ -21,21 +21,27 @@ func (s *Server) requestIdentity(r *http.Request) sessionIdentity {
 
 // allowedProviderIDsForUser returns the providers a normal user may access:
 // the admin-assigned whitelist plus every provider the user created
-// themselves (ownership implies access).
+// themselves (ownership implies access). Providers disabled by the admin are
+// excluded entirely — normal users cannot see, bind, or use them until
+// re-enabled.
 func (s *Server) allowedProviderIDsForUser(userID string) map[string]bool {
 	out := map[string]bool{}
 	if strings.TrimSpace(userID) == "" {
 		return out
 	}
+	granted := map[string]bool{}
 	if s.userStore != nil {
 		if user, err := s.userStore.UserByID(userID); err == nil {
 			for _, id := range user.AllowedProviderIDs {
-				out[id] = true
+				granted[id] = true
 			}
 		}
 	}
 	for _, provider := range s.router.State().Providers {
-		if strings.TrimSpace(provider.OwnerUserID) == userID {
+		if provider.Disabled {
+			continue
+		}
+		if granted[provider.ID] || strings.TrimSpace(provider.OwnerUserID) == userID {
 			out[provider.ID] = true
 		}
 	}

@@ -285,6 +285,9 @@ type Provider = {
   // 创建该 Provider 的控制台用户；空 = 管理员创建。普通用户对自己创建的
   // Provider 拥有编辑/克隆/删除/对话测试/获取模型权限。
   ownerUserId?: string;
+  // 管理员禁用开关：禁用后普通用户不可见、不可绑定、请求会被拒绝；
+  // 新建 Provider 默认启用（字段缺省 = 启用）。
+  disabled?: boolean;
   authType?: 'api_key' | 'claude_oauth' | 'cursor_oauth' | 'chatgpt_oauth';
   claudeOAuth?: ClaudeOAuthInfo;
   cursorOAuth?: CursorOAuthInfo;
@@ -2634,7 +2637,7 @@ function App() {
   const [apiKeyProviderFilter, setApiKeyProviderFilter] = useState<string[]>([]);
   const [apiKeyProtocolFilter, setApiKeyProtocolFilter] = useState<string[]>([]);
   const [apiKeyPage, setApiKeyPage] = useState(1);
-  const [apiKeySortBy, setApiKeySortBy] = useState<'name' | 'createdAt'>('createdAt');
+  const [apiKeySortBy, setApiKeySortBy] = useState<'name' | 'createdAt' | 'owner'>('createdAt');
   const [apiKeySortDir, setApiKeySortDir] = useState<'asc' | 'desc'>('desc');
   const [selfcheckProviderIDs, setSelfcheckProviderIDs] = useState<string[]>(() => {
     const prefs = readSelfcheckPrefs(uiCacheScope(bootSession.auth));
@@ -2854,6 +2857,13 @@ function App() {
     return counts;
   }, [state.models]);
 
+  // 解析密钥所属用户显示名：空 = 管理员（旧密钥/管理员自建）。
+  const apiKeyOwnerName = React.useCallback((key: APIKey) => {
+    const ownerID = (key.ownerUserId || '').trim();
+    if (!ownerID) return '管理员';
+    return consoleUsers.find((user) => user.id === ownerID)?.username || ownerID;
+  }, [consoleUsers]);
+
   const filteredApiKeys = useMemo(() => {
     let keys = state.apiKeys || [];
     const keyword = apiKeyKeyword.trim().toLowerCase();
@@ -2882,6 +2892,11 @@ function App() {
       if (apiKeySortBy === 'name') {
         const byName = a.name.localeCompare(b.name, 'zh-CN');
         if (byName !== 0) return byName * dir;
+      } else if (apiKeySortBy === 'owner') {
+        const byOwner = apiKeyOwnerName(a).localeCompare(apiKeyOwnerName(b), 'zh-CN');
+        if (byOwner !== 0) return byOwner * dir;
+        const byName = a.name.localeCompare(b.name, 'zh-CN');
+        if (byName !== 0) return byName * dir;
       } else {
         const ta = Date.parse(a.createdAt || '') || 0;
         const tb = Date.parse(b.createdAt || '') || 0;
@@ -2892,7 +2907,7 @@ function App() {
       return a.id.localeCompare(b.id) * dir;
     });
     return sorted;
-  }, [state.apiKeys, state.routes, apiKeyKeyword, apiKeyOwnerFilter, apiKeyProviderFilter, apiKeyProtocolFilter, apiKeySortBy, apiKeySortDir]);
+  }, [state.apiKeys, state.routes, apiKeyKeyword, apiKeyOwnerFilter, apiKeyProviderFilter, apiKeyProtocolFilter, apiKeySortBy, apiKeySortDir, apiKeyOwnerName]);
 
   // 分页展示：每页最多 API_KEYS_PAGE_SIZE 个；页码越界时自动收敛到最后一页。
   const apiKeyTotalPages = Math.max(1, Math.ceil(filteredApiKeys.length / API_KEYS_PAGE_SIZE));
@@ -2905,13 +2920,13 @@ function App() {
     setApiKeyPage(1);
   }, [apiKeyKeyword, apiKeyOwnerFilter, apiKeyProviderFilter, apiKeyProtocolFilter, apiKeySortBy, apiKeySortDir]);
 
-  function toggleApiKeySort(field: 'name' | 'createdAt') {
+  function toggleApiKeySort(field: 'name' | 'createdAt' | 'owner') {
     if (apiKeySortBy === field) {
       setApiKeySortDir((current) => (current === 'asc' ? 'desc' : 'asc'));
       return;
     }
     setApiKeySortBy(field);
-    setApiKeySortDir(field === 'name' ? 'asc' : 'desc');
+    setApiKeySortDir(field === 'createdAt' ? 'desc' : 'asc');
   }
 
   const selectedApiKey = useMemo(() => {
@@ -4755,6 +4770,27 @@ function App() {
     await fetchProviderModels(provider.id, provider.name);
   }
 
+  // 管理员启用/禁用 Provider；禁用后普通用户不可见、不可绑定、请求被拒绝。
+  async function toggleProviderEnabled(provider: Provider) {
+    const enabling = !!provider.disabled;
+    setSaving(true);
+    try {
+      const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(provider.id)}/enabled`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: enabling }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      showToast(enabling ? `已启用 Provider：${provider.name}` : `已禁用 Provider：${provider.name}（普通用户将不可用）`);
+      await refreshState(false);
+    } catch (error) {
+      showToast(`切换 Provider 状态失败：${String(error)}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
   async function deleteProvider(providerID: string, providerName: string) {
     const usedByKeys = (state.apiKeys || []).filter((key) => apiKeyReferencesProvider(key, state.routes, providerID));
     if (usedByKeys.length > 0) {
@@ -5793,7 +5829,7 @@ function App() {
                 <div className="api-keys-layout">
                   <div className="api-keys-table-wrap">
                     <div className="api-keys-table">
-                      <div className="api-keys-table-head">
+                      <div className={`api-keys-table-head${!isNormalUser ? ' with-owner' : ''}`}>
                         <label className="api-keys-check" title="全选当前列表" onClick={(event) => event.stopPropagation()}>
                           <input
                             type="checkbox"
@@ -5814,6 +5850,16 @@ function App() {
                         >
                           名称{apiKeySortBy === 'name' ? (apiKeySortDir === 'asc' ? ' ↑' : ' ↓') : ''}
                         </button>
+                        {!isNormalUser ? (
+                          <button
+                            type="button"
+                            className={`api-keys-sort-btn${apiKeySortBy === 'owner' ? ' active' : ''}`}
+                            onClick={() => toggleApiKeySort('owner')}
+                            title="按所属用户排序"
+                          >
+                            用户{apiKeySortBy === 'owner' ? (apiKeySortDir === 'asc' ? ' ↑' : ' ↓') : ''}
+                          </button>
+                        ) : null}
                         <button
                           type="button"
                           className={`api-keys-sort-btn${apiKeySortBy === 'createdAt' ? ' active' : ''}`}
@@ -5843,7 +5889,7 @@ function App() {
                           <button
                             type="button"
                             key={key.id}
-                            className={`api-keys-row${selectedApiKey?.id === key.id ? ' active' : ''}${checked ? ' checked' : ''}`}
+                            className={`api-keys-row${!isNormalUser ? ' with-owner' : ''}${selectedApiKey?.id === key.id ? ' active' : ''}${checked ? ' checked' : ''}`}
                             onClick={(event) => {
                               if (event.shiftKey) {
                                 event.preventDefault();
@@ -5870,6 +5916,9 @@ function App() {
                               />
                             </label>
                             <span className="api-keys-cell name" title={key.name}>{key.name}</span>
+                            {!isNormalUser ? (
+                              <span className="api-keys-cell owner" title={apiKeyOwnerName(key)}>{apiKeyOwnerName(key)}</span>
+                            ) : null}
                             <span className="api-keys-cell created" title={createdLabel}>{createdLabel}</span>
                           </button>
                         );
@@ -6003,6 +6052,8 @@ function App() {
                         testing={testingProviderID === provider.id}
                         readOnly={isNormalUser && provider.ownerUserId !== authStatus?.userId}
                         selectable={!isNormalUser}
+                        providerDisabled={!!provider.disabled}
+                        onToggleEnabled={!isNormalUser ? () => void toggleProviderEnabled(provider) : undefined}
                         isClaudeOAuth={provider.authType === 'claude_oauth'}
                         claudeOAuthConnected={provider.claudeOAuth?.connected}
                         isCursorOAuth={provider.authType === 'cursor_oauth'}
@@ -6776,11 +6827,11 @@ function App() {
                         <div className="log-row-main" style={{ gridTemplateColumns: 'minmax(0,0.8fr) 70px minmax(0,1.4fr) minmax(0,0.9fr) minmax(0,0.9fr) auto' }}>
                           <span style={{ fontWeight: 700 }}>{user.username}</span>
                           <span className={user.enabled ? 'ok' : 'err'}>{user.enabled ? '启用' : '禁用'}</span>
-                          <span className="slate" title={providerNames.join('、')}>
+                          <span className="muted-text" title={providerNames.join('、')}>
                             {providerNames.length > 0 ? `Provider：${providerNames.join('、')}` : '未分配 Provider'}
                           </span>
-                          <span className="slate">{ownedKeys.length > 0 ? `Key：${ownedKeys.map((key) => key.name).join('、')}` : '暂无 Key'}</span>
-                          <span className="slate">{user.lastLoginAt ? `最近登录 ${new Date(user.lastLoginAt).toLocaleString()}` : '从未登录'}</span>
+                          <span className="muted-text">{ownedKeys.length > 0 ? `Key：${ownedKeys.map((key) => key.name).join('、')}` : '暂无 Key'}</span>
+                          <span className="muted-text">{user.lastLoginAt ? `最近登录 ${new Date(user.lastLoginAt).toLocaleString()}` : '从未登录'}</span>
                           <span style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
                             <button className="mini-btn" type="button" onClick={() => openUserModal(user)}>编辑</button>
                             <button className="mini-btn" type="button" onClick={() => void resetConsoleUserPassword(user)}>重置密码</button>
@@ -7804,24 +7855,40 @@ function App() {
               </div>
             ) : null}
             <div className="field field-full">
-              <label>可用输入 Provider（未勾选的不可用）</label>
-              {state.providers.length === 0 ? <div className="hint-line">暂无输入 Provider。</div> : null}
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                {state.providers.map((provider) => (
-                  <label key={provider.id} className="hint-line" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <input
-                      type="checkbox"
-                      checked={userFormProviders.includes(provider.id)}
-                      onChange={(event) => {
-                        setUserFormProviders((current) => event.target.checked
-                          ? [...current, provider.id]
-                          : current.filter((id) => id !== provider.id));
-                      }}
-                    />
-                    {providerOptionLabel(provider)}
-                  </label>
-                ))}
-              </div>
+              <label>可用输入 Provider（未选中的不可用）</label>
+              {state.providers.length === 0 ? <div className="hint-line">暂无输入 Provider。</div> : (
+                <>
+                  <MultiSelectFilter
+                    options={state.providers.map((provider) => ({ id: provider.id, label: providerOptionLabel(provider) }))}
+                    selected={userFormProviders}
+                    onChange={setUserFormProviders}
+                    allLabel="点击选择可用 Provider…"
+                    fieldClassName="modal-multi-select"
+                  />
+                  {userFormProviders.length > 0 ? (
+                    <div className="provider-chips">
+                      {userFormProviders.map((id) => {
+                        const provider = state.providers.find((item) => item.id === id);
+                        return (
+                          <span key={id} className="provider-chip">
+                            {provider ? providerOptionLabel(provider) : id}
+                            <button
+                              type="button"
+                              className="provider-chip-remove"
+                              aria-label={`移除 ${provider?.name || id}`}
+                              onClick={() => setUserFormProviders((current) => current.filter((item) => item !== id))}
+                            >
+                              ×
+                            </button>
+                          </span>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div className="hint-line">尚未选择任何 Provider，该用户将没有可用的输入 Provider。</div>
+                  )}
+                </>
+              )}
             </div>
           </div>
           <div className="actions modal-actions">
@@ -8169,7 +8236,7 @@ function ChatGPTOAuthUsagePanel({ providerId, connected, compact }: { providerId
   );
 }
 
-function ProviderCard({ active, selected, name, providerId, protocol, tone, url, usedCount, healthStatus, nextRetryAt, testing, readOnly, selectable, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, cursorBridge, authorizedUserCount, onShowUsers, onToggleSelect, onClick, onTest, onChatTest, onEdit, onClone, onDelete }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; usedCount: number; healthStatus: string; nextRetryAt?: string; testing: boolean; readOnly?: boolean; selectable?: boolean; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; cursorBridge?: CursorBridgeRuntime; authorizedUserCount?: number; onShowUsers?: () => void; onToggleSelect: () => void; onClick: () => void; onTest: () => void; onChatTest: () => void; onEdit: () => void; onClone: () => void; onDelete: () => void }) {
+function ProviderCard({ active, selected, name, providerId, protocol, tone, url, usedCount, healthStatus, nextRetryAt, testing, readOnly, selectable, providerDisabled, onToggleEnabled, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, cursorBridge, authorizedUserCount, onShowUsers, onToggleSelect, onClick, onTest, onChatTest, onEdit, onClone, onDelete }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; usedCount: number; healthStatus: string; nextRetryAt?: string; testing: boolean; readOnly?: boolean; selectable?: boolean; providerDisabled?: boolean; onToggleEnabled?: () => void; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; cursorBridge?: CursorBridgeRuntime; authorizedUserCount?: number; onShowUsers?: () => void; onToggleSelect: () => void; onClick: () => void; onTest: () => void; onChatTest: () => void; onEdit: () => void; onClone: () => void; onDelete: () => void }) {
   const oauthConnected = isClaudeOAuth ? claudeOAuthConnected : isCursorOAuth ? cursorOAuthConnected : isChatGPTOAuth ? chatgptOAuthConnected : false;
   const showOAuthBadge = isClaudeOAuth || isCursorOAuth || isChatGPTOAuth;
   const isUnavailable = healthStatus === 'unavailable';
@@ -8179,7 +8246,7 @@ function ProviderCard({ active, selected, name, providerId, protocol, tone, url,
     ? ` · :${cursorBridge.port}${cursorBridge.message ? ` · ${cursorBridge.message}` : ''}`
     : (cursorBridge?.message ? ` · ${cursorBridge.message}` : '');
   return (
-    <div className={`provider-card clickable ${active ? 'active' : ''} ${selected ? 'selected' : ''}`} onClick={onClick} role="button" tabIndex={0} onKeyDown={(event) => { if (event.key === 'Enter') onClick(); }}>
+    <div className={`provider-card clickable ${active ? 'active' : ''} ${selected ? 'selected' : ''} ${providerDisabled ? 'provider-disabled' : ''}`} onClick={onClick} role="button" tabIndex={0} onKeyDown={(event) => { if (event.key === 'Enter') onClick(); }}>
       <div className="provider-head">
         <div className="provider-title-block">
           {selectable ? (
@@ -8193,6 +8260,7 @@ function ProviderCard({ active, selected, name, providerId, protocol, tone, url,
           <div className="provider-subtitle">{providerId} · {protocol}</div>
         </div>
         <div className="provider-badges">
+          {providerDisabled ? <Badge tone="red">已禁用</Badge> : null}
           <Badge tone={tone}>{protocol}</Badge>
           {showOAuthBadge ? (
             <Badge tone={oauthConnected ? 'green' : 'amber'}>{oauthConnected ? 'OAuth 已连接' : 'OAuth 未连接'}</Badge>
@@ -8233,6 +8301,15 @@ function ProviderCard({ active, selected, name, providerId, protocol, tone, url,
           <button className="icon-btn" onClick={(event) => { event.stopPropagation(); onEdit(); }} title="编辑 Provider">编辑</button>
           <button className="icon-btn" onClick={(event) => { event.stopPropagation(); onClone(); }} title="克隆为新 Provider">克隆</button>
           <button className="icon-btn danger" disabled={usedCount > 0} onClick={(event) => { event.stopPropagation(); onDelete(); }} title={usedCount > 0 ? '该 Provider 正被 API Key 引用' : '删除 Provider'}>删除</button>
+          {onToggleEnabled ? (
+            <button
+              className={`icon-btn${providerDisabled ? '' : ' danger'}`}
+              onClick={(event) => { event.stopPropagation(); onToggleEnabled(); }}
+              title={providerDisabled ? '启用后普通用户恢复可用' : '禁用后普通用户不可见、不可绑定、请求被拒绝（管理员不受影响）'}
+            >
+              {providerDisabled ? '启用' : '禁用'}
+            </button>
+          ) : null}
         </div>
       ) : null}
     </div>
@@ -9293,12 +9370,14 @@ type MultiFilterOption = { id: string; label: string };
 // MultiSelectFilter：下拉多选 + 文本快捷过滤合一的筛选框（复用
 // searchable-select 样式，参考 SearchableModelSelect 的交互）。收起时输入框
 // 展示已选摘要，展开时变成关键字过滤；点击选项切换勾选且菜单保持展开。
-function MultiSelectFilter({ label, options, selected, onChange, allLabel }: {
-  label: string;
+function MultiSelectFilter({ label, options, selected, onChange, allLabel, fieldClassName }: {
+  label?: string;
   options: MultiFilterOption[];
   selected: string[];
   onChange: (next: string[]) => void;
   allLabel?: string;
+  // 外层 field 样式：筛选栏默认窄宽度，弹窗内可传 '' 占满整行。
+  fieldClassName?: string;
 }) {
   const rootRef = React.useRef<HTMLDivElement | null>(null);
   const inputRef = React.useRef<HTMLInputElement | null>(null);
@@ -9376,8 +9455,8 @@ function MultiSelectFilter({ label, options, selected, onChange, allLabel }: {
   };
 
   return (
-    <div className="field api-keys-filter-field">
-      <label>{label}</label>
+    <div className={`field ${fieldClassName ?? 'api-keys-filter-field'}`.trim()}>
+      {label ? <label>{label}</label> : null}
       <div className={`searchable-select${open ? ' open' : ''}`} ref={rootRef}>
         <input
           ref={inputRef}

@@ -307,12 +307,25 @@ html[data-theme="dark"] .usage-calendar-day.edge { background: #3b82f6; color: #
 .api-keys-filter-field .searchable-select-input { min-height: 42px; }
 .multi-check { display: inline-block; width: 16px; margin-right: 6px; font-weight: 900; color: var(--accent, #2563eb); }
 .searchable-select-option.multi-clear { color: var(--muted); font-weight: 700; border-bottom: 1px solid var(--border, rgba(127,127,127,0.25)); }
+/* 弹窗内的多选下拉占满整行；已选项以标签芯片展示，可单个移除。 */
+.modal-multi-select { margin: 0; width: 100%; }
+.modal-multi-select .searchable-select-input { min-height: 42px; }
+/* 表格长文本用纯灰色文字，不带徽标底色（.slate 只用于短徽标）。 */
+.muted-text { color: var(--muted); font-size: 12px; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.provider-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.provider-chip { display: inline-flex; align-items: center; gap: 4px; padding: 4px 10px; border-radius: 999px; background: var(--blue-soft); color: #1e40af; font-size: 12px; font-weight: 700; }
+html[data-theme="dark"] .provider-chip { color: #93c5fd; }
+.provider-chip-remove { border: 0; background: transparent; cursor: pointer; color: inherit; font-size: 14px; font-weight: 900; padding: 0 2px; line-height: 1; opacity: 0.7; }
+.provider-chip-remove:hover { opacity: 1; }
 .api-keys-toolbar-meta { margin-left: auto; color: var(--muted); font-size: 12px; font-weight: 700; padding-bottom: 10px; }
 .api-keys-bulk-actions { display: flex; align-items: center; gap: 8px; padding-bottom: 6px; }
 .api-keys-layout { display: grid; grid-template-columns: minmax(220px, 280px) minmax(0, 1fr); gap: 12px; align-items: start; }
 .api-keys-table-wrap { min-width: 0; border: 1px solid var(--border); border-radius: 18px; background: var(--surface); overflow: hidden; }
 .api-keys-table { display: grid; }
 .api-keys-table-head, .api-keys-row { display: grid; grid-template-columns: 18px minmax(0, 1fr) 88px; gap: 8px; align-items: center; padding: 8px 10px; text-align: left; }
+/* 管理员视图多一列「用户」（所属用户名）。 */
+.api-keys-table-head.with-owner, .api-keys-row.with-owner { grid-template-columns: 18px minmax(0, 1fr) minmax(0, 84px) 88px; }
+.api-keys-cell.owner { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--muted); font-weight: 700; }
 .api-keys-table-head { color: var(--muted); font-size: 11px; font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase; border-bottom: 1px solid var(--border); background: var(--surface-strong); }
 .api-keys-sort-btn { border: 0; background: transparent; color: inherit; font: inherit; font-size: 11px; font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase; padding: 0; cursor: pointer; text-align: left; }
 .api-keys-sort-btn:hover, .api-keys-sort-btn.active { color: var(--text); }
@@ -423,6 +436,8 @@ html[data-theme="dark"] .api-key-client-config-actions .client-config-btn {
 .provider-badges { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; flex-shrink: 0; }
 .provider-retry-hint { color: #991b1b; font-size: 11px; font-weight: 700; white-space: nowrap; }
 .provider-users-badge { cursor: pointer; display: inline-flex; }
+.provider-card.provider-disabled { opacity: 0.62; }
+.provider-card.provider-disabled:hover { opacity: 0.85; }
 .provider-users-badge:hover .badge { filter: brightness(0.94); }
 .provider-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
 .protocol-pair { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
@@ -639,6 +654,9 @@ html[data-theme="dark"] .claude-usage-head {
 html[data-theme="dark"] .status-pill { color: #86efac; }
 html[data-theme="dark"] .status-pill.off { color: #fca5a5; }
 html[data-theme="dark"] .status-pill-btn.reconnecting { color: #fcd34d; background: var(--amber-soft); }
+/* 深色主题下危险按钮/重试提示改用浅红文字，避免红底红字看不清。 */
+html[data-theme="dark"] .icon-btn.danger { color: #fca5a5; }
+html[data-theme="dark"] .provider-retry-hint { color: #fca5a5; }
 html[data-theme="dark"] .mini-btn { color: #93c5fd; }
 .modal-card.wide { width: min(860px, calc(100vw - 36px)); }
 .modal-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 18px; }

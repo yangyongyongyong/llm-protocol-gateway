@@ -210,6 +210,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /__providers/export", s.handleExportProviders)
 	mux.HandleFunc("POST /__providers/import", s.handleImportProviders)
 	mux.HandleFunc("POST /__providers/{id}/test", s.handleTestProvider)
+	mux.HandleFunc("POST /__providers/{id}/enabled", s.handleSetProviderEnabled)
 	mux.HandleFunc("GET /__providers/{id}/auth-preview", s.handleProviderAuthPreview)
 	mux.HandleFunc("POST /__providers/{id}/chat-test", s.handleProviderChatTest)
 	mux.HandleFunc("POST /__providers/{id}/cache-test", s.handleProviderCacheTest)
@@ -1461,6 +1462,38 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.logs.AddApp("info", "provider updated", updated.ID)
+	writeJSON(w, http.StatusOK, redactProviderForClient(updated))
+}
+
+// handleSetProviderEnabled is the admin-only provider enable/disable switch.
+// Newly created providers default to enabled (Disabled zero value); while
+// disabled, normal users cannot see, bind, or send traffic through the
+// provider.
+func (s *Server) handleSetProviderEnabled(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	var payload struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.Enabled == nil {
+		writeOpenAIError(w, http.StatusBadRequest, "body must be {\"enabled\": true|false}")
+		return
+	}
+	updated, err := s.router.SetProviderDisabled(r.PathValue("id"), !*payload.Enabled)
+	if err != nil {
+		writeOpenAIError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err := s.saveState(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+		return
+	}
+	if *payload.Enabled {
+		s.logs.AddApp("info", "provider enabled", updated.ID)
+	} else {
+		s.logs.AddApp("info", "provider disabled", updated.ID)
+	}
 	writeJSON(w, http.StatusOK, redactProviderForClient(updated))
 }
 

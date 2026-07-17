@@ -305,9 +305,19 @@ func (s *Server) executeProtocolFlowWithFailover(
 	var lastDecision domain.RouteDecision = decision
 	lastModel := model
 	requestModel, _ := req["model"].(string)
+	// 普通用户的 Key（有归属用户）不能使用被管理员禁用的 Provider；
+	// 管理员自己的 Key（无归属）不受限制。
+	ownerRestricted := strings.TrimSpace(matchedKey.OwnerUserID) != ""
 
 	for i := start; i < len(chain); i++ {
 		providerID := chain[i]
+		if ownerRestricted {
+			if provider, err := s.router.ProviderByID(providerID); err == nil && provider.Disabled {
+				lastErr = fmt.Errorf("provider %q is disabled by administrator", providerID)
+				s.logs.AddApp("warn", "provider disabled, skipped for user key", fmt.Sprintf("key=%s provider=%s", matchedKey.ID, providerID))
+				continue
+			}
+		}
 		attemptDecision, err := s.router.DecideForProvider(route.ID, providerID)
 		if err != nil {
 			lastErr = err

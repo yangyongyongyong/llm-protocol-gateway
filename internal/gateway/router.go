@@ -1183,6 +1183,22 @@ func (r *Router) ProviderByID(providerID string) (domain.Provider, error) {
 	return provider, nil
 }
 
+// SetProviderDisabled flips the admin-only enable/disable switch for a
+// provider. Disabled providers stay fully manageable by admins but become
+// invisible and unusable for normal users.
+func (r *Router) SetProviderDisabled(providerID string, disabled bool) (domain.Provider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID != providerID {
+			continue
+		}
+		r.state.Providers[index].Disabled = disabled
+		return r.state.Providers[index], nil
+	}
+	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+}
+
 func (r *Router) UpdateProviderModels(providerID string, models []domain.Model, healthStatus string) (domain.Provider, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
