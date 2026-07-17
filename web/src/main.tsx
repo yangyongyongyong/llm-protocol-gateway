@@ -2658,8 +2658,8 @@ function App() {
   const [apiKeyProviderFilter, setApiKeyProviderFilter] = useState<string[]>([]);
   const [apiKeyProtocolFilter, setApiKeyProtocolFilter] = useState<string[]>([]);
   const [apiKeyPage, setApiKeyPage] = useState(1);
-  const [apiKeySortBy, setApiKeySortBy] = useState<'name' | 'createdAt' | 'owner'>('createdAt');
-  const [apiKeySortDir, setApiKeySortDir] = useState<'asc' | 'desc'>('desc');
+  const [apiKeySortBy, setApiKeySortBy] = useState<'name' | 'createdAt' | 'owner'>('owner');
+  const [apiKeySortDir, setApiKeySortDir] = useState<'asc' | 'desc'>('asc');
   const [selfcheckProviderIDs, setSelfcheckProviderIDs] = useState<string[]>(() => {
     const prefs = readSelfcheckPrefs(uiCacheScope(bootSession.auth));
     return Array.isArray(prefs?.providerIds) ? prefs!.providerIds!.filter(Boolean) : [];
@@ -5733,7 +5733,6 @@ function App() {
             <div className="brand-logo">PG</div>
             <div>
               <div className="brand-title">协议网关</div>
-              <div className="brand-subtitle">协议入 · 协议出</div>
             </div>
             <a
               className="brand-github"
@@ -5907,14 +5906,6 @@ function App() {
                             用户{apiKeySortBy === 'owner' ? (apiKeySortDir === 'asc' ? ' ↑' : ' ↓') : ''}
                           </button>
                         ) : null}
-                        <button
-                          type="button"
-                          className={`api-keys-sort-btn${apiKeySortBy === 'createdAt' ? ' active' : ''}`}
-                          onClick={() => toggleApiKeySort('createdAt')}
-                          title="按创建时间排序"
-                        >
-                          创建时间{apiKeySortBy === 'createdAt' ? (apiKeySortDir === 'asc' ? ' ↑' : ' ↓') : ''}
-                        </button>
                       </div>
                       {filteredApiKeys.length === 0 ? (
                         <div className="empty-state compact">当前筛选条件下没有匹配的密钥。</div>
@@ -5922,16 +5913,6 @@ function App() {
                         // index 基于 filteredApiKeys 全局序号，保证 Shift 连选跨页也正确。
                         const index = apiKeyPageStart + pageIndex;
                         const checked = checkedApiKeyIDs.includes(key.id);
-                        const createdLabel = key.createdAt
-                          ? (() => {
-                              const d = new Date(key.createdAt);
-                              if (Number.isNaN(d.getTime())) return key.createdAt.slice(0, 10) || '—';
-                              const y = d.getFullYear();
-                              const m = String(d.getMonth() + 1).padStart(2, '0');
-                              const day = String(d.getDate()).padStart(2, '0');
-                              return `${y}-${m}-${day}`;
-                            })()
-                          : '—';
                         return (
                           <button
                             type="button"
@@ -5966,7 +5947,6 @@ function App() {
                             {!isNormalUser ? (
                               <span className="api-keys-cell owner" title={apiKeyOwnerName(key)}>{apiKeyOwnerName(key)}</span>
                             ) : null}
-                            <span className="api-keys-cell created" title={createdLabel}>{createdLabel}</span>
                           </button>
                         );
                       })}

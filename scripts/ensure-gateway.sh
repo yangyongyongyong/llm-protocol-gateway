@@ -14,6 +14,12 @@ LOCK_DIR="$CACHE_DIR/gateway.lock.d"
 
 mkdir -p "$CACHE_DIR"
 
+# --restart / -r：即使旧进程健康也强制重启（先构建后切换，最小化停机窗口）。
+RESTART=0
+if [[ "${1:-}" == "--restart" || "${1:-}" == "-r" ]]; then
+  RESTART=1
+fi
+
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   echo "waiting for gateway lock..."
   for _ in $(seq 1 30); do
@@ -43,36 +49,38 @@ is_our_gateway_pid() {
   [[ "$cmd" == *"gateway-dev"* || "$cmd" == *"llm-protocol-gateway"* ]]
 }
 
+# stop_stale [force]：force=1 时无论旧进程是否健康都停掉（--restart 用）。
+# 端口释放用 50ms 轮询代替固定 sleep，缩短切换窗口。
 stop_stale() {
+  local force="${1:-0}"
   if [[ -f "$PID_FILE" ]]; then
     local old_pid
     old_pid="$(cat "$PID_FILE")"
     if is_our_gateway_pid "$old_pid"; then
-      if health; then
+      if [[ "$force" -eq 0 ]] && health; then
         return 0
       fi
-      echo "stopping unhealthy gateway pid=${old_pid}"
+      echo "stopping gateway pid=${old_pid}"
       kill "$old_pid" 2>/dev/null || true
-      sleep 0.3
     fi
     rm -f "$PID_FILE"
   fi
   if lsof -ti "tcp:${PORT}" >/dev/null 2>&1; then
-    echo "freeing port ${PORT}"
     lsof -ti "tcp:${PORT}" | xargs kill 2>/dev/null || true
-    sleep 0.3
   fi
+  for _ in $(seq 1 20); do
+    lsof -ti "tcp:${PORT}" >/dev/null 2>&1 || return 0
+    sleep 0.05
+  done
 }
 
-if health; then
+if [[ "$RESTART" -eq 0 ]] && health; then
   if [[ -f "$PID_FILE" ]] && is_our_gateway_pid "$(cat "$PID_FILE")"; then
     echo "gateway already healthy at http://${HEALTH_ADDR} (bind ${ADDR})"
     exit 0
   fi
   echo "port ${PORT} is healthy but pid file is stale; restarting gateway"
 fi
-
-stop_stale
 
 # Cloudflare / LAN UI is served by the gateway itself from web/dist.
 # Vite (5173) only covers local HMR; without a built dist, public hostnames
@@ -103,10 +111,18 @@ ensure_web_dist() {
   echo "building web UI -> $web_dist"
   (cd "$ROOT/web" && npm run build)
 }
+# ===== 所有构建都在停旧进程之前完成，构建耗时不再计入停机窗口 =====
 ensure_web_dist
 
-echo "building gateway -> $BIN"
-(cd "$ROOT" && go build -o "$BIN" ./cmd/gateway)
+# 编译到独立文件再原子替换：不能直接覆盖运行中的 $BIN —— macOS 上就地改写
+# 运行中的二进制会使其代码签名失效，旧进程可能被系统直接 SIGKILL。
+BIN_NEW="$BIN.new"
+echo "building gateway -> $BIN_NEW"
+(cd "$ROOT" && go build -o "$BIN_NEW" ./cmd/gateway)
+
+# ===== 现在才停旧进程：停机窗口 = 杀进程 + mv + 新进程启动 =====
+stop_stale "$RESTART"
+mv -f "$BIN_NEW" "$BIN"
 
 echo "starting gateway at ${ADDR}"
 # Start in a new session so quitting Cursor/terminal process groups cannot kill it.
