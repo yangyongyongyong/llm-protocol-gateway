@@ -561,7 +561,7 @@ html[data-theme="dark"] .api-key-client-config-actions .client-config-btn {
 .log-time, .log-model, .log-latency, .log-token { font-family: var(--mono); color: var(--muted); }
 .log-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); }
 .empty-state { padding: 18px; border-radius: 16px; color: var(--muted); background: rgba(15, 23, 42, 0.04); text-align: center; }
-.toast { position: fixed; left: 50%; bottom: 30px; transform: translateX(-50%) translateY(20px); padding: 12px 16px; border-radius: 16px; background: var(--toast-bg); color: var(--toast-fg); font-weight: 760; opacity: 0; pointer-events: none; transition: 0.22s ease; box-shadow: var(--shadow-soft); z-index: 10; }
+.toast { position: fixed; left: 50%; bottom: 30px; transform: translateX(-50%) translateY(20px); padding: 12px 16px; border-radius: 16px; background: var(--toast-bg); color: var(--toast-fg); font-weight: 760; opacity: 0; pointer-events: none; transition: 0.22s ease; box-shadow: var(--shadow-soft); z-index: 10; max-width: min(90vw, 560px); word-break: break-all; text-align: center; }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 .runtime-card { padding: 14px; border-radius: 16px; border: 1px solid rgba(37, 99, 235, 0.14); background: linear-gradient(145deg, rgba(37, 99, 235, 0.08), rgba(255, 255, 255, 0.7)); }
 .runtime-title { font-weight: 880; letter-spacing: -0.02em; }

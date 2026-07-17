@@ -1520,12 +1520,136 @@ function clientConfigTitle(client: 'opencode' | 'codex' | 'claude') {
   return 'Claude Code 配置';
 }
 
-/** 生成可粘贴到终端执行的覆盖脚本：备份旧文件后写入完整配置（Codex 另写 model catalog）。 */
+// Codex config.toml 里，本工具管理的 provider 段的分界线（一对，多个 # 号）。
+// 只有落在这两行之间的内容会被本工具增量替换；文件里其余任何区块
+// （[features]、[memories]、sandbox_mode、approval_policy、personality 等用户
+// 自定义配置）永远原样保留、不会被这份脚本触碰或挪动位置。
+const CODEX_PROVIDER_BLOCK_BEGIN = '################ LPG-CODEX-PROVIDER-BEGIN ################';
+const CODEX_PROVIDER_BLOCK_END = '################ LPG-CODEX-PROVIDER-END ################';
+
+// 复制脚本对应的动作名：Codex 走增量合并（"修改脚本"），其余客户端配置文件由本
+// 工具独占，仍是整份覆盖（"覆盖脚本"），语义上没有“误删用户其他配置”的问题。
+function clientConfigScriptNoun(client: 'opencode' | 'codex' | 'claude') {
+  return client === 'codex' ? '修改脚本' : '覆盖脚本';
+}
+
+// awk 片段：删除 BEGIN_MARK..END_MARK（含首尾）之间的内容，并顺带吃掉紧跟在
+// END_MARK 后面的空行，避免每次重复执行都多攒一行空行。找不到分界线时原样透传。
+const CODEX_PROVIDER_BLOCK_STRIP_AWK = [
+  "awk -v begin=\"$BEGIN_MARK\" -v end=\"$END_MARK\" '",
+  '  $0 == begin { skip=1; next }',
+  '  skip == 1 { if ($0 == end) skip=2; next }',
+  '  skip == 2 { if ($0 == "") next; skip=0 }',
+  '  { print }',
+  "'",
+].join('\n');
+
+/**
+ * 生成 Codex 专用的“修改脚本”：增量合并进 ~/.codex/config.toml。
+ * - 没有配置文件：直接新建，只包含我们这段。
+ * - 已有配置文件：先摘掉此前由本工具写入的分界线区块（如果存在），再把新的一段
+ *   插到文件最顶部，最后拼回文件原本剩余的全部内容——[features]/[memories]/
+ *   sandbox_mode/approval_policy/personality 等用户自己的配置一个字符都不会被
+ *   改动，也不会被换位置。
+ * model catalog 附加文件仍是本工具独占的一个文件，按原方式整份覆盖，不受影响。
+ */
+function buildApiKeyCodexConfigPatchScript(
+  configText: string,
+  extraFiles: Array<{ rel: string; display: string; content: string }> = [],
+) {
+  const stamp = Date.now().toString(36);
+  const blockMarker = `LPG_CFG_CODEX_BLOCK_${stamp}`;
+  const body = configText.endsWith('\n') ? configText : `${configText}\n`;
+  const lines = [
+    '# 修改脚本（增量合并进 config.toml；只替换本工具管理的一段，不动你其他配置；粘贴到终端执行即可）',
+    'set -euo pipefail',
+    'FILE="$HOME/.codex/config.toml"',
+    'mkdir -p "$(dirname "$FILE")"',
+    `BEGIN_MARK='${CODEX_PROVIDER_BLOCK_BEGIN}'`,
+    `END_MARK='${CODEX_PROVIDER_BLOCK_END}'`,
+    'if [ -f "$FILE" ]; then',
+    '  BAK="${FILE}.bak.$(date +%Y%m%d%H%M%S)"',
+    '  cp "$FILE" "$BAK"',
+    '  echo "已备份: $BAK"',
+    'fi',
+    'REST="$(mktemp)"',
+    'if [ -f "$FILE" ]; then',
+    `  ${CODEX_PROVIDER_BLOCK_STRIP_AWK} "$FILE" > "$REST"`,
+    'else',
+    '  : > "$REST"',
+    'fi',
+    'NEWFILE="$(mktemp)"',
+    '{',
+    '  echo "$BEGIN_MARK"',
+    `  cat <<'${blockMarker}'`,
+    body.replace(/\n$/, ''),
+    blockMarker,
+    '  echo "$END_MARK"',
+    '  echo ""',
+    '  cat "$REST"',
+    '} > "$NEWFILE"',
+    'mv "$NEWFILE" "$FILE"',
+    'rm -f "$REST"',
+    'echo "已合并写入（仅替换本工具管理的 provider 段，其余配置保持不变）: ~/.codex/config.toml"',
+  ];
+  extraFiles.forEach((file, index) => {
+    const fileMarker = `LPG_EXTRA_CODEX_${index}_${stamp}`;
+    const fileBody = file.content.endsWith('\n') ? file.content : `${file.content}\n`;
+    lines.push(
+      `EXTRA="$HOME/${file.rel}"`,
+      'mkdir -p "$(dirname "$EXTRA")"',
+      'if [ -f "$EXTRA" ]; then',
+      '  BAK="${EXTRA}.bak.$(date +%Y%m%d%H%M%S)"',
+      '  cp "$EXTRA" "$BAK"',
+      '  echo "已备份: $BAK"',
+      'fi',
+      `cat > "$EXTRA" <<'${fileMarker}'`,
+      fileBody.replace(/\n$/, ''),
+      fileMarker,
+      `echo "已写入: ${file.display}"`,
+    );
+  });
+  lines.push('echo "完成。如客户端已在运行，请重启后再试。"', '');
+  return lines.join('\n');
+}
+
+/**
+ * 生成“还原为官方 provider”脚本：只删除本工具此前写入的那一段分界线区块，其余
+ * 任何配置都不会被触碰；没有该区块时是无害的空操作（不会报错、不会误删）。
+ */
+function buildApiKeyCodexRestoreOfficialScript() {
+  const lines = [
+    '# 还原为官方 provider（只移除本工具管理的那一段，不动你其他配置；粘贴到终端执行即可）',
+    'set -euo pipefail',
+    'FILE="$HOME/.codex/config.toml"',
+    `BEGIN_MARK='${CODEX_PROVIDER_BLOCK_BEGIN}'`,
+    `END_MARK='${CODEX_PROVIDER_BLOCK_END}'`,
+    'if [ ! -f "$FILE" ]; then',
+    '  echo "未发现 $FILE，无需还原"',
+    '  exit 0',
+    'fi',
+    'BAK="${FILE}.bak.$(date +%Y%m%d%H%M%S)"',
+    'cp "$FILE" "$BAK"',
+    'echo "已备份: $BAK"',
+    'TMP="$(mktemp)"',
+    `${CODEX_PROVIDER_BLOCK_STRIP_AWK} "$FILE" > "$TMP"`,
+    'mv "$TMP" "$FILE"',
+    'echo "已移除本工具管理的 provider 配置，Codex 将回退到官方 provider（其他设置保持不变）: $FILE"',
+  ];
+  return lines.join('\n');
+}
+
+/** 生成可粘贴到终端执行的覆盖脚本：备份旧文件后写入完整配置（Codex 另写 model catalog）。
+ *  Codex 会走上面的增量“修改脚本”；这里只服务 opencode / claude —— 它们的配置文件
+ *  由本工具独占管理，整份覆盖不存在“误删用户其他配置”的问题。 */
 function buildApiKeyClientConfigInstallScript(
   client: 'opencode' | 'codex' | 'claude',
   configText: string,
   extraFiles: Array<{ rel: string; display: string; content: string }> = [],
 ) {
+  if (client === 'codex') {
+    return buildApiKeyCodexConfigPatchScript(configText, extraFiles);
+  }
   const rel = clientConfigHomeRelativePath(client);
   const display = clientConfigFilePath(client);
   // 避免配置正文里偶发出现相同结束标记
@@ -7961,8 +8085,8 @@ function ApiKeyDetailPanel({
           <Badge tone={keyItem.enabled ? 'green' : 'slate'}>{keyItem.enabled ? '启用' : '禁用'}</Badge>
           <Badge tone={bindingAction === '透传' ? 'green' : 'cyan'}>{bindingAction}</Badge>
           {usingFallback ? <Badge tone="amber">已切备选</Badge> : null}
-          {route ? <CopyButton value={apiKeyClientURL} label="复制 URL" /> : null}
-          <CopyButton value={keyItem.key} label="复制 Key" />
+          {route ? <CopyButton value={apiKeyClientURL} label="复制 URL" toastContent={`已复制 URL：${apiKeyClientURL}`} /> : null}
+          <CopyButton value={keyItem.key} label="复制 Key" toastContent={`已复制 Key：${keyItem.key}`} />
           <button className="icon-btn" onClick={() => onClone(keyItem)} title="克隆为新 API 密钥">克隆</button>
           <button className="icon-btn danger" onClick={() => void onDelete(keyItem)} title="删除">删除</button>
         </div>
@@ -8444,6 +8568,8 @@ function ApiKeyClientConfigModal({
     () => buildApiKeyClientConfigInstallScript(client, configText, configExtras),
     [client, configText, configExtras],
   );
+  // 静态脚本（不依赖当前 key/provider），只用来把本工具此前写入的那一段摘掉。
+  const codexRestoreScript = React.useMemo(() => buildApiKeyCodexRestoreOfficialScript(), []);
   const filePath = clientConfigFilePath(client);
   const gatewayRoot = apiKeyGatewayRoot(endpoints, effectivePublicBase);
   const protocolHint = clientConfigProtocolHint(client, route);
@@ -8456,7 +8582,7 @@ function ApiKeyClientConfigModal({
 
   React.useEffect(() => {
     const modeLabel = networkMode === 'public' ? '公网域名' : '内网';
-    copyConfig(installScript, `已复制覆盖脚本（${clientConfigTitle(client)} · ${modeLabel}），粘贴到终端执行即可`);
+    copyConfig(installScript, `已复制${clientConfigScriptNoun(client)}（${clientConfigTitle(client)} · ${modeLabel}），粘贴到终端执行即可`);
     // 仅打开弹窗时自动复制一次；切换网络时由按钮自行复制
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -8470,7 +8596,11 @@ function ApiKeyClientConfigModal({
   return (
     <Modal
       title={clientConfigTitle(client)}
-      description="已复制覆盖脚本到剪贴板。在终端粘贴执行即可写入配置（会先备份旧文件）。"
+      description={
+        client === 'codex'
+          ? '已复制修改脚本到剪贴板。在终端粘贴执行即可增量合并进 config.toml（只替换本工具管理的一段，不动你其他配置；会先备份旧文件）。'
+          : '已复制覆盖脚本到剪贴板。在终端粘贴执行即可写入配置（会先备份旧文件）。'
+      }
       onClose={onClose}
       size="wide"
     >
@@ -8498,7 +8628,7 @@ function ApiKeyClientConfigModal({
                 setNetworkMode('lan');
                 const nextConfig = buildApiKeyClientConfig(client, keyItem, route, endpoints, '', provider, keepOfficialLogin);
                 const nextScript = buildApiKeyClientConfigInstallScript(client, nextConfig, buildApiKeyClientConfigExtras(client, keyItem, provider));
-                copyConfig(nextScript, `已复制覆盖脚本（${clientConfigTitle(client)} · 内网）`);
+                copyConfig(nextScript, `已复制${clientConfigScriptNoun(client)}（${clientConfigTitle(client)} · 内网）`);
               }}
             >
               内网
@@ -8513,7 +8643,7 @@ function ApiKeyClientConfigModal({
                 setNetworkMode('public');
                 const nextConfig = buildApiKeyClientConfig(client, keyItem, route, endpoints, publicBase, provider, keepOfficialLogin);
                 const nextScript = buildApiKeyClientConfigInstallScript(client, nextConfig, buildApiKeyClientConfigExtras(client, keyItem, provider));
-                copyConfig(nextScript, `已复制覆盖脚本（${clientConfigTitle(client)} · 公网域名）`);
+                copyConfig(nextScript, `已复制${clientConfigScriptNoun(client)}（${clientConfigTitle(client)} · 公网域名）`);
               }}
             >
               公网域名
@@ -8537,7 +8667,7 @@ function ApiKeyClientConfigModal({
                   setKeepOfficialLogin(next);
                   const nextConfig = buildApiKeyClientConfig(client, keyItem, route, endpoints, effectivePublicBase, provider, next);
                   const nextScript = buildApiKeyClientConfigInstallScript(client, nextConfig, buildApiKeyClientConfigExtras(client, keyItem, provider));
-                  copyConfig(nextScript, `已复制覆盖脚本（${clientConfigTitle(client)} · ${next ? '保持账号登录' : '不保留'}）`);
+                  copyConfig(nextScript, `已复制${clientConfigScriptNoun(client)}（${clientConfigTitle(client)} · ${next ? '保持账号登录' : '不保留'}）`);
                   // 持久化到该 key，下次打开弹窗（甚至换设备/刷新页面）自动恢复这次的选择。
                   void onUpdateField?.(keyItem, 'codexKeepOfficialLogin', next);
                 }}
@@ -8552,11 +8682,24 @@ function ApiKeyClientConfigModal({
         {protocolHint ? <div className="hint-line error">{protocolHint}</div> : null}
 
         <div className="field">
-          <label>配置覆盖脚本</label>
+          <label>{client === 'codex' ? '配置修改脚本' : '配置覆盖脚本'}</label>
           <div className="hint-line">
-            终端执行后会覆盖 {filePath}
-            {configExtras.length > 0 ? ` 与 ${configExtras.map((item) => item.display).join('、')}` : ''}
-            ；若文件已存在，会先备份为同目录 `.bak.时间戳`。
+            {client === 'codex' ? (
+              <>
+                终端执行后会增量合并进 {filePath}：只替换本工具用一对多个 # 号分界线包起来的那一段
+                （provider 相关配置），文件里其他任何区块（比如 [features]/[memories]、
+                sandbox_mode、approval_policy、personality 等你自己的配置）原样保留、不会被改动或
+                挪动位置——对 Codex App 做最小改动。
+                {configExtras.length > 0 ? ` 同时整份覆盖 ${configExtras.map((item) => item.display).join('、')}（本工具独占的模型元数据文件，不影响其他配置）。` : ''}
+                {' '}执行前会先备份为同目录 <code>.bak.时间戳</code>。
+              </>
+            ) : (
+              <>
+                终端执行后会覆盖 {filePath}
+                {configExtras.length > 0 ? ` 与 ${configExtras.map((item) => item.display).join('、')}` : ''}
+                ；若文件已存在，会先备份为同目录 <code>.bak.时间戳</code>。
+              </>
+            )}
           </div>
           <pre className="curl-preview api-key-client-config-preview">{installScript}</pre>
         </div>
@@ -8570,12 +8713,22 @@ function ApiKeyClientConfigModal({
         >
           仅复制配置内容
         </button>
+        {client === 'codex' ? (
+          <button
+            className="btn"
+            type="button"
+            title="只移除本工具此前写入的那一段，其余配置不受影响；没有该区块时是无害的空操作"
+            onClick={() => copyConfig(codexRestoreScript, '已复制"还原为官方 provider"脚本，粘贴到终端执行即可')}
+          >
+            还原为官方 provider
+          </button>
+        ) : null}
         <button
           className="btn primary"
           type="button"
-          onClick={() => copyConfig(installScript, `已复制覆盖脚本（${clientConfigTitle(client)}）`)}
+          onClick={() => copyConfig(installScript, `已复制${clientConfigScriptNoun(client)}（${clientConfigTitle(client)}）`)}
         >
-          复制覆盖脚本
+          复制{clientConfigScriptNoun(client)}
         </button>
       </div>
     </Modal>
@@ -9126,7 +9279,7 @@ function ApiKeyNameField({ name, disabled, onSave }: { name: string; disabled?: 
   );
 }
 
-function CopyButton({ value, label = '复制' }: { value: string; label?: string }) {
+function CopyButton({ value, label = '复制', toastContent }: { value: string; label?: string; toastContent?: string }) {
   const [copied, setCopied] = React.useState(false);
   return (
     <button
@@ -9136,6 +9289,17 @@ function CopyButton({ value, label = '复制' }: { value: string; label?: string
         void navigator.clipboard.writeText(value).then(() => {
           setCopied(true);
           window.setTimeout(() => setCopied(false), 2000);
+          // 仅当调用方显式传入 toastContent 时，才在底部全局 toast 里展示复制的具体内容
+          // （持续 3s）；不传时保持原有行为（只有按钮自身文案变化），避免大段文本
+          // （比如“复制全部”/“复制 curl”）把底部 toast 撑爆。
+          if (toastContent !== undefined) {
+            const toast = document.getElementById('toast');
+            if (toast) {
+              toast.textContent = toastContent;
+              toast.classList.add('show');
+              window.setTimeout(() => toast.classList.remove('show'), 3000);
+            }
+          }
         });
       }}
     >
