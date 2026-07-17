@@ -310,6 +310,8 @@ html[data-theme="dark"] .usage-calendar-day.edge { background: #3b82f6; color: #
 /* 弹窗内的多选下拉占满整行；已选项以标签芯片展示，可单个移除。 */
 .modal-multi-select { margin: 0; width: 100%; }
 .modal-multi-select .searchable-select-input { min-height: 42px; }
+/* 用户管理表头：与数据行同一 grid 模板，弱化文字样式。 */
+.users-table-head { display: grid; gap: 10px; align-items: center; padding: 8px 12px; color: var(--muted); font-size: 11px; font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase; border-bottom: 1px solid var(--border); background: var(--surface-strong); min-width: 0; }
 /* 表格长文本用纯灰色文字，不带徽标底色（.slate 只用于短徽标）。 */
 .muted-text { color: var(--muted); font-size: 12px; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .provider-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }

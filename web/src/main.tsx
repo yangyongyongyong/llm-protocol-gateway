@@ -56,6 +56,9 @@ type ConsoleUser = {
   enabled: boolean;
   createdAt: string;
   lastLoginAt?: string;
+  // 最近活跃：用户浏览器最近一次控制台接口请求时间（内存精确值，
+  // 后端最多 5 分钟落库一次）。
+  lastActiveAt?: string;
 };
 
 type TunnelRuntime = {
@@ -816,6 +819,8 @@ const UI_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const LOGS_PAGE_SIZE = 10;
 // API 密钥列表每页最多显示 30 个，密钥多时翻页浏览。
 const API_KEYS_PAGE_SIZE = 30;
+// 用户管理表格列宽（表头与数据行共用，保证对齐）。
+const USERS_TABLE_GRID = 'minmax(0,0.7fr) 48px minmax(0,1.2fr) minmax(0,0.8fr) minmax(0,0.9fr) minmax(0,0.9fr) 236px';
 // 与后端 internal/gateway/user_isolation.go 里的 logOwnerFilterAdmin 保持一致。
 const LOG_OWNER_FILTER_ADMIN = '_admin';
 
@@ -2596,6 +2601,9 @@ function App() {
   const [userFormPassword, setUserFormPassword] = useState('');
   const [userFormProviders, setUserFormProviders] = useState<string[]>([]);
   const [userFormBusy, setUserFormBusy] = useState(false);
+  // 用户管理表格排序：null = 默认创建顺序；userActive/keyActive 可点击列名切换。
+  const [usersSortBy, setUsersSortBy] = useState<'userActive' | 'keyActive' | null>(null);
+  const [usersSortDir, setUsersSortDir] = useState<'asc' | 'desc'>('desc');
   // Provider 用户权限弹窗（仅管理员）：查看/新增/移除哪些普通用户可用某个输入 Provider。
   const [providerUsersModalID, setProviderUsersModalID] = useState<string | null>(null);
   const [providerUsersBusyID, setProviderUsersBusyID] = useState('');
@@ -3347,6 +3355,15 @@ function App() {
     } finally {
       setUsersLoading(false);
     }
+  }
+
+  function toggleUsersSort(field: 'userActive' | 'keyActive') {
+    if (usersSortBy === field) {
+      setUsersSortDir((current) => (current === 'asc' ? 'desc' : 'asc'));
+      return;
+    }
+    setUsersSortBy(field);
+    setUsersSortDir('desc'); // 默认最近的在前
   }
 
   // 授予/移除某个普通用户对指定输入 Provider 的使用权限（管理员专用，
@@ -6818,20 +6835,62 @@ function App() {
               {!usersLoading && consoleUsers.length === 0 ? <div className="empty-state">暂无用户。点击「新建用户」创建第一个普通用户账号。</div> : null}
               {consoleUsers.length > 0 ? (
                 <div className="log-table">
+                  <div className="users-table-head" style={{ gridTemplateColumns: USERS_TABLE_GRID }}>
+                    <span>用户名</span>
+                    <span>状态</span>
+                    <span>Provider</span>
+                    <span>Key</span>
+                    <button
+                      type="button"
+                      className={`api-keys-sort-btn${usersSortBy === 'userActive' ? ' active' : ''}`}
+                      onClick={() => toggleUsersSort('userActive')}
+                      title="用户浏览器最近一次访问控制台的时间（点击排序）"
+                    >
+                      user 活跃{usersSortBy === 'userActive' ? (usersSortDir === 'asc' ? ' ↑' : ' ↓') : ''}
+                    </button>
+                    <button
+                      type="button"
+                      className={`api-keys-sort-btn${usersSortBy === 'keyActive' ? ' active' : ''}`}
+                      onClick={() => toggleUsersSort('keyActive')}
+                      title="该用户的 API Key 最近一次被调用的时间（点击排序）"
+                    >
+                      key 活跃{usersSortBy === 'keyActive' ? (usersSortDir === 'asc' ? ' ↑' : ' ↓') : ''}
+                    </button>
+                    <span />
+                  </div>
                   {consoleUsers.map((user) => {
                     const ownedKeys = (state.apiKeys || []).filter((key) => key.ownerUserId === user.id);
+                    // 最近活跃：优先后端内存精确值，老账号回退到登录时间。
+                    const lastActive = user.lastActiveAt || user.lastLoginAt;
+                    // Key 最近使用：取该用户所有 Key 里最新的 lastUsedAt（内存精确值）。
+                    const lastUsedMs = ownedKeys.reduce((acc, key) => {
+                      const ts = Date.parse(key.lastUsedAt || '');
+                      return Number.isNaN(ts) ? acc : Math.max(acc, ts);
+                    }, 0);
+                    return { user, ownedKeys, lastActive, lastUsedMs };
+                  }).sort((a, b) => {
+                    if (!usersSortBy) return 0; // 默认保持创建顺序
+                    const dir = usersSortDir === 'asc' ? 1 : -1;
+                    const va = usersSortBy === 'userActive' ? (Date.parse(a.lastActive || '') || 0) : a.lastUsedMs;
+                    const vb = usersSortBy === 'userActive' ? (Date.parse(b.lastActive || '') || 0) : b.lastUsedMs;
+                    if (va !== vb) return (va - vb) * dir;
+                    return a.user.username.localeCompare(b.user.username, 'zh-CN');
+                  }).map(({ user, ownedKeys, lastActive, lastUsedMs }) => {
                     const providerNames = (user.allowedProviderIds || [])
                       .map((id) => state.providers.find((provider) => provider.id === id)?.name || id);
                     return (
                       <div className="log-row" key={user.id}>
-                        <div className="log-row-main" style={{ gridTemplateColumns: 'minmax(0,0.8fr) 70px minmax(0,1.4fr) minmax(0,0.9fr) minmax(0,0.9fr) auto' }}>
+                        <div className="log-row-main" style={{ gridTemplateColumns: USERS_TABLE_GRID }}>
                           <span style={{ fontWeight: 700 }}>{user.username}</span>
                           <span className={user.enabled ? 'ok' : 'err'}>{user.enabled ? '启用' : '禁用'}</span>
                           <span className="muted-text" title={providerNames.join('、')}>
-                            {providerNames.length > 0 ? `Provider：${providerNames.join('、')}` : '未分配 Provider'}
+                            {providerNames.length > 0 ? providerNames.join('、') : '未分配'}
                           </span>
-                          <span className="muted-text">{ownedKeys.length > 0 ? `Key：${ownedKeys.map((key) => key.name).join('、')}` : '暂无 Key'}</span>
-                          <span className="muted-text">{user.lastLoginAt ? `最近登录 ${new Date(user.lastLoginAt).toLocaleString()}` : '从未登录'}</span>
+                          <span className="muted-text" title={ownedKeys.map((key) => key.name).join('、')}>
+                            {ownedKeys.length > 0 ? ownedKeys.map((key) => key.name).join('、') : '暂无'}
+                          </span>
+                          <span className="muted-text" title="用户浏览器最近一次访问控制台的时间">{lastActive ? new Date(lastActive).toLocaleString() : '从未活跃'}</span>
+                          <span className="muted-text" title="该用户的 API Key 最近一次被调用的时间">{lastUsedMs > 0 ? new Date(lastUsedMs).toLocaleString() : '未使用'}</span>
                           <span style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
                             <button className="mini-btn" type="button" onClick={() => openUserModal(user)}>编辑</button>
                             <button className="mini-btn" type="button" onClick={() => void resetConsoleUserPassword(user)}>重置密码</button>

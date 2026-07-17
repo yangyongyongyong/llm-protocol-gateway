@@ -304,6 +304,11 @@ type User struct {
 	Enabled            bool     `json:"enabled"`
 	CreatedAt          string   `json:"createdAt"`
 	LastLoginAt        string   `json:"lastLoginAt,omitempty"`
+	// LastActiveAt is the latest console API request time from this user's
+	// browser session. The in-memory tracker is always accurate; the DB copy
+	// is flushed asynchronously and at most once per 5 minutes per user to
+	// avoid hot-path write churn.
+	LastActiveAt       string   `json:"lastActiveAt,omitempty"`
 }
 
 type RouteDecision struct {

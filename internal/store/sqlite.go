@@ -240,6 +240,11 @@ func (s *Store) migrate() error {
 	)`); err != nil {
 		return fmt.Errorf("migrate users: %w", err)
 	}
+	// last_active_at: latest console API request time (flushed at most every
+	// 5 minutes; the accurate value lives in gateway memory).
+	if err := addColumnIfMissing(tx, "users", "last_active_at", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("migrate users: %w", err)
+	}
 	if _, err := tx.Exec(`INSERT INTO settings (key, value) VALUES ('version', ?)
 		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, fmt.Sprintf("%d", schemaVersion)); err != nil {
 		return err

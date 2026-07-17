@@ -95,6 +95,12 @@ type Server struct {
 	// persisted; cleared as soon as a live request or probe succeeds again.
 	providerAvailabilityMu sync.Mutex
 	providerAvailability   map[string]time.Time
+
+	// userActivity tracks each console user's latest API request time.
+	// In-memory values are exact; StartUserActivityFlush persists them at most
+	// once per userActivityPersistMinGap per user (see user_activity.go).
+	userActivityMu sync.Mutex
+	userActivity   map[string]*userActivityEntry
 }
 
 func NewServer(router *Router, logs *monitor.Store, stateSaver ...StateSaver) *Server {
@@ -116,7 +122,7 @@ func NewServer(router *Router, logs *monitor.Store, stateSaver ...StateSaver) *S
 		if store, ok := stateSaver[0].(APIKeyStore); ok {
 			server.apiKeyStore = store
 			// Coalesce last_used_at writes off the request hot path.
-			server.apiKeyToucher = newAPIKeyToucher(store, 2*time.Second)
+			server.apiKeyToucher = newAPIKeyToucher(store, router, 2*time.Second)
 		}
 		if pos, ok := stateSaver[0].(ProviderOAuthSaver); ok {
 			server.providerOAuthSaver = pos

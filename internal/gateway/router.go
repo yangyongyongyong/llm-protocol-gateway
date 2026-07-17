@@ -1183,6 +1183,20 @@ func (r *Router) ProviderByID(providerID string) (domain.Provider, error) {
 	return provider, nil
 }
 
+// TouchAPIKeyLastUsed updates the in-memory LastUsedAt for an API key so the
+// console sees exact usage times; SQLite persistence is throttled separately
+// by apiKeyToucher. No state save is triggered here.
+func (r *Router) TouchAPIKeyLastUsed(keyID, ts string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for index := range r.state.APIKeys {
+		if r.state.APIKeys[index].ID == keyID {
+			r.state.APIKeys[index].LastUsedAt = ts
+			return
+		}
+	}
+}
+
 // SetProviderDisabled flips the admin-only enable/disable switch for a
 // provider. Disabled providers stay fully manageable by admins but become
 // invisible and unusable for normal users.

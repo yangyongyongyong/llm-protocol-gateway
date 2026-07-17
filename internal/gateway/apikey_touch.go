@@ -12,12 +12,20 @@ import (
 // saveState / request-log writes that synchronous UPDATE added ~1s+ to the
 // request prep phase. last_used_at is not latency-sensitive, so we buffer the
 // latest timestamp per key and flush from one background goroutine.
+// apiKeyTouchPersistMinGap throttles last_used_at DB writes: the in-memory
+// router state always holds the exact timestamp (shown by the console), while
+// the SQLite row is refreshed at most once per gap per key. Close() force-
+// flushes everything so shutdown loses nothing.
+const apiKeyTouchPersistMinGap = 5 * time.Minute
+
 type apiKeyToucher struct {
 	store         APIKeyStore
+	router        *Router
 	flushInterval time.Duration
 
-	mu      sync.Mutex
-	pending map[string]string // apiKeyID -> latest RFC3339 timestamp
+	mu        sync.Mutex
+	pending   map[string]string    // apiKeyID -> latest RFC3339 timestamp (not yet persisted)
+	persisted map[string]time.Time // apiKeyID -> last DB write time of that key
 
 	wake    chan struct{}
 	stop    chan struct{}
@@ -26,7 +34,7 @@ type apiKeyToucher struct {
 }
 
 // newAPIKeyToucher starts a background flusher. flushInterval<=0 defaults to 2s.
-func newAPIKeyToucher(store APIKeyStore, flushInterval time.Duration) *apiKeyToucher {
+func newAPIKeyToucher(store APIKeyStore, router *Router, flushInterval time.Duration) *apiKeyToucher {
 	if store == nil {
 		return nil
 	}
@@ -35,8 +43,10 @@ func newAPIKeyToucher(store APIKeyStore, flushInterval time.Duration) *apiKeyTou
 	}
 	t := &apiKeyToucher{
 		store:         store,
+		router:        router,
 		flushInterval: flushInterval,
 		pending:       make(map[string]string),
+		persisted:     make(map[string]time.Time),
 		wake:          make(chan struct{}, 1),
 		stop:          make(chan struct{}),
 		stopped:       make(chan struct{}),
@@ -54,6 +64,11 @@ func (t *apiKeyToucher) Touch(id string) {
 		return
 	}
 	ts := t.nowFn().Format(time.RFC3339)
+	// 内存中的 router 状态立即更新（/__state 与控制台始终看到精确时间）；
+	// 数据库写入由后台按 >=5min/key 节流。
+	if t.router != nil {
+		t.router.TouchAPIKeyLastUsed(id, ts)
+	}
 	t.mu.Lock()
 	t.pending[id] = ts
 	t.mu.Unlock()
@@ -71,32 +86,44 @@ func (t *apiKeyToucher) loop() {
 	for {
 		select {
 		case <-t.stop:
-			t.flush()
+			t.flush(true)
 			return
 		case <-ticker.C:
-			t.flush()
+			t.flush(false)
 		case <-t.wake:
 			// Coalesce a burst: wait one interval before flushing so many
 			// near-simultaneous touches become a single batch.
 			select {
 			case <-t.stop:
-				t.flush()
+				t.flush(true)
 				return
 			case <-time.After(t.flushInterval):
-				t.flush()
+				t.flush(false)
 			}
 		}
 	}
 }
 
-func (t *apiKeyToucher) flush() {
+// flush persists pending touches. Without force, a key is written only when
+// it has never been persisted by this process or its previous DB write is at
+// least apiKeyTouchPersistMinGap old; skipped keys stay pending so shutdown
+// (force=true) still lands their exact timestamps.
+func (t *apiKeyToucher) flush(force bool) {
+	now := t.nowFn()
 	t.mu.Lock()
 	if len(t.pending) == 0 {
 		t.mu.Unlock()
 		return
 	}
-	batch := t.pending
-	t.pending = make(map[string]string, len(batch))
+	batch := make(map[string]string, len(t.pending))
+	for id, ts := range t.pending {
+		last, seen := t.persisted[id]
+		if force || !seen || now.Sub(last) >= apiKeyTouchPersistMinGap {
+			batch[id] = ts
+			t.persisted[id] = now
+			delete(t.pending, id)
+		}
+	}
 	t.mu.Unlock()
 
 	for id, ts := range batch {

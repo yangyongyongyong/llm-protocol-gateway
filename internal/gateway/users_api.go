@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/luca/llm-protocol-gateway/internal/domain"
 	"golang.org/x/crypto/bcrypt"
@@ -36,6 +37,12 @@ func (s *Server) handleListUsers(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	// 覆盖为内存中的精确活跃时间：落库最多 5 分钟一次，直接读库会偏旧。
+	for index := range users {
+		if at := s.userLastActive(users[index].ID); !at.IsZero() {
+			users[index].LastActiveAt = at.Format(time.RFC3339)
+		}
 	}
 	writeJSON(w, http.StatusOK, users)
 }

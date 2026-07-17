@@ -42,6 +42,7 @@ type UserStore interface {
 	UpdateUser(domain.User) error
 	DeleteUser(id string) error
 	TouchUserLogin(id string, lastLoginAt string) error
+	TouchUserActive(id string, lastActiveAt string) error
 }
 
 type adminAuthStatus struct {
@@ -113,6 +114,8 @@ func (s *Server) withAdminAuth(next http.Handler) http.Handler {
 			writeOpenAIError(w, http.StatusForbidden, "permission denied")
 			return
 		}
+		// 记录该用户浏览器最近一次控制台请求时间（内存精确，周期性节流落库）。
+		s.noteUserActivity(identity.UserID)
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), authContextKey{}, identity)))
 	})
 }

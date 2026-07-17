@@ -14,7 +14,7 @@ func scanUser(rows *sql.Rows) (domain.User, error) {
 	var role string
 	var allowedProviderIDs string
 	var enabled int
-	if err := rows.Scan(&user.ID, &user.Username, &user.PasswordHash, &role, &allowedProviderIDs, &enabled, &user.CreatedAt, &user.LastLoginAt); err != nil {
+	if err := rows.Scan(&user.ID, &user.Username, &user.PasswordHash, &role, &allowedProviderIDs, &enabled, &user.CreatedAt, &user.LastLoginAt, &user.LastActiveAt); err != nil {
 		return domain.User{}, err
 	}
 	user.Role = domain.UserRole(strings.TrimSpace(role))
@@ -26,7 +26,7 @@ func scanUser(rows *sql.Rows) (domain.User, error) {
 	return user, nil
 }
 
-const userSelectColumns = `id, username, password_hash, role, allowed_provider_ids, enabled, created_at, last_login_at`
+const userSelectColumns = `id, username, password_hash, role, allowed_provider_ids, enabled, created_at, last_login_at, last_active_at`
 
 // ListUsers returns all console users ordered by creation time.
 func (s *Store) ListUsers() ([]domain.User, error) {
@@ -77,9 +77,9 @@ func (s *Store) CreateUser(user domain.User) error {
 		enabled = 1
 	}
 	_, err := s.db.Exec(`INSERT INTO users
-		(id, username, password_hash, role, allowed_provider_ids, enabled, created_at, last_login_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		user.ID, strings.TrimSpace(user.Username), user.PasswordHash, string(user.Role), encodeProviderIDList(user.AllowedProviderIDs), enabled, user.CreatedAt, user.LastLoginAt)
+		(id, username, password_hash, role, allowed_provider_ids, enabled, created_at, last_login_at, last_active_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		user.ID, strings.TrimSpace(user.Username), user.PasswordHash, string(user.Role), encodeProviderIDList(user.AllowedProviderIDs), enabled, user.CreatedAt, user.LastLoginAt, user.LastActiveAt)
 	return err
 }
 
@@ -89,9 +89,9 @@ func (s *Store) UpdateUser(user domain.User) error {
 		enabled = 1
 	}
 	_, err := s.db.Exec(`UPDATE users
-		SET username = ?, password_hash = ?, role = ?, allowed_provider_ids = ?, enabled = ?, last_login_at = ?
+		SET username = ?, password_hash = ?, role = ?, allowed_provider_ids = ?, enabled = ?, last_login_at = ?, last_active_at = ?
 		WHERE id = ?`,
-		strings.TrimSpace(user.Username), user.PasswordHash, string(user.Role), encodeProviderIDList(user.AllowedProviderIDs), enabled, user.LastLoginAt, user.ID)
+		strings.TrimSpace(user.Username), user.PasswordHash, string(user.Role), encodeProviderIDList(user.AllowedProviderIDs), enabled, user.LastLoginAt, user.LastActiveAt, user.ID)
 	return err
 }
 
@@ -103,5 +103,13 @@ func (s *Store) DeleteUser(id string) error {
 // TouchUserLogin records the latest successful login time.
 func (s *Store) TouchUserLogin(id string, lastLoginAt string) error {
 	_, err := s.db.Exec(`UPDATE users SET last_login_at = ? WHERE id = ?`, lastLoginAt, id)
+	return err
+}
+
+// TouchUserActive records the latest console API activity time. Callers
+// throttle this (>=5min between writes per user); the accurate value lives in
+// the gateway's in-memory tracker.
+func (s *Store) TouchUserActive(id string, lastActiveAt string) error {
+	_, err := s.db.Exec(`UPDATE users SET last_active_at = ? WHERE id = ?`, lastActiveAt, id)
 	return err
 }
