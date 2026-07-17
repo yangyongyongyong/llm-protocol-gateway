@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -36,8 +37,70 @@ type claudeDirectBlockState struct {
 	messageOpened      bool
 }
 
+// visibilityGatedSSEWriter buffers written SSE bytes until markVisible is
+// called, then flushes the buffer and passes all further writes straight
+// through. It lets streamClaudeToResponsesEventsDirect hold back
+// response.created / reasoning events until it knows the turn will actually
+// produce visible output (text or tool_use): if the turn instead ends up
+// thinking-only (see isThinkingOnlyEmptyOutput), nothing was ever sent to the
+// real client, so the caller can safely retry against the same provider — the
+// same "retryable" contract finishConvertedProxy already uses for empty
+// upstream streams (dw.WroteBody() == false).
+type visibilityGatedSSEWriter struct {
+	base    http.ResponseWriter
+	buf     bytes.Buffer
+	visible bool
+}
+
+func newVisibilityGatedSSEWriter(base http.ResponseWriter) *visibilityGatedSSEWriter {
+	return &visibilityGatedSSEWriter{base: base}
+}
+
+func (v *visibilityGatedSSEWriter) Header() http.Header { return v.base.Header() }
+
+// WriteHeader is a no-op: the caller (finishConvertedProxy) already committed
+// status on the outer deferred writer before streaming began.
+func (v *visibilityGatedSSEWriter) WriteHeader(int) {}
+
+func (v *visibilityGatedSSEWriter) Write(p []byte) (int, error) {
+	if v.visible {
+		return v.base.Write(p)
+	}
+	return v.buf.Write(p)
+}
+
+func (v *visibilityGatedSSEWriter) Flush() {
+	if !v.visible {
+		return
+	}
+	if f, ok := v.base.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// markVisible flushes any buffered bytes through to base and switches to
+// direct passthrough for all subsequent writes. Idempotent.
+func (v *visibilityGatedSSEWriter) markVisible() {
+	if v.visible {
+		return
+	}
+	v.visible = true
+	if v.buf.Len() > 0 {
+		_, _ = v.base.Write(v.buf.Bytes())
+		v.buf.Reset()
+	}
+	if f, ok := v.base.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// everVisible reports whether any visible (non-thinking) output block was
+// ever seen, i.e. whether anything was actually flushed to the real client.
+func (v *visibilityGatedSSEWriter) everVisible() bool { return v.visible }
+
 type claudeToResponsesDirectStreamState struct {
 	w               http.ResponseWriter
+	visGate         *visibilityGatedSSEWriter
 	model           string
 	responseID      string
 	clientToolNames map[string]struct{}
@@ -54,8 +117,10 @@ type claudeToResponsesDirectStreamState struct {
 }
 
 func newClaudeToResponsesDirectStreamState(w http.ResponseWriter, model string, clientToolNames map[string]struct{}) *claudeToResponsesDirectStreamState {
+	gate := newVisibilityGatedSSEWriter(w)
 	return &claudeToResponsesDirectStreamState{
-		w:               w,
+		w:               gate,
+		visGate:         gate,
 		model:           model,
 		responseID:      fmt.Sprintf("resp_%d", time.Now().UnixNano()),
 		clientToolNames: clientToolNames,
@@ -129,6 +194,7 @@ func (s *claudeToResponsesDirectStreamState) handleContentBlockStart(event map[s
 
 	switch blockType {
 	case "text":
+		s.visGate.markVisible()
 		outputIndex := s.nextOutputIndex()
 		itemID := fmt.Sprintf("%s_msg_%d", s.responseID, outputIndex)
 		if err := writeResponsesSSEEvent(s.w, "response.output_item.added", map[string]any{
@@ -172,6 +238,7 @@ func (s *claudeToResponsesDirectStreamState) handleContentBlockStart(event map[s
 		s.blocks[index] = state
 
 	case "tool_use":
+		s.visGate.markVisible()
 		outputIndex := s.nextOutputIndex()
 		callID := sanitizeResponsesCallID(stringValue(block["id"]))
 		name := sanitizeResponsesToolName(stringValue(block["name"]), s.clientToolNames)
@@ -468,10 +535,11 @@ func (s *claudeToResponsesDirectStreamState) handleMessageDelta(event map[string
 	}
 }
 
-func (s *claudeToResponsesDirectStreamState) finalize() error {
-	if s.completed {
-		return nil
-	}
+// closeRemainingBlocks closes any content blocks that never received an
+// explicit content_block_stop (defensive; well-formed Anthropic streams always
+// close every block before message_stop). Idempotent: closeBlock is a no-op
+// for already-done blocks, so calling this more than once is safe.
+func (s *claudeToResponsesDirectStreamState) closeRemainingBlocks() error {
 	if err := s.ensureResponseCreated(); err != nil {
 		return err
 	}
@@ -481,6 +549,16 @@ func (s *claudeToResponsesDirectStreamState) finalize() error {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+func (s *claudeToResponsesDirectStreamState) finalize() error {
+	if s.completed {
+		return nil
+	}
+	if err := s.closeRemainingBlocks(); err != nil {
+		return err
 	}
 	status, incompleteReason := mapAnthropicStopReasonToStatus(s.stopReason)
 	response := map[string]any{
@@ -529,7 +607,12 @@ func streamClaudeToResponsesEventsDirect(w http.ResponseWriter, reader io.Reader
 		if errorValue, ok := event["error"]; ok {
 			msg, _ := errorMessageFromValue(errorValue, "upstream stream error")
 			_ = state.ensureResponseCreated()
-			_ = writeResponsesSSEEvent(w, "response.failed", map[string]any{
+			// Surface upstream errors immediately: flush anything buffered so
+			// far and stop gating further writes. This intentionally makes
+			// dw.WroteBody() true, so the thinking-only-empty retry path
+			// below never fires for a genuine upstream error.
+			state.visGate.markVisible()
+			_ = writeResponsesSSEEvent(state.w, "response.failed", map[string]any{
 				"type":            "response.failed",
 				"sequence_number": state.nextSeq(),
 				"response": map[string]any{
@@ -569,6 +652,23 @@ func streamClaudeToResponsesEventsDirect(w http.ResponseWriter, reader io.Reader
 	if err := scanner.Err(); err != nil {
 		return state.usage, err
 	}
+
+	// Detect the thinking-only-empty upstream bug before committing anything:
+	// close any still-open blocks, then check whether the turn ended up with
+	// zero visible output. Nothing has reached the real client yet as long as
+	// no text/tool_use block ever started (visGate stayed buffered), so this
+	// is safe to treat as retryable — see errThinkingOnlyEmptyResponse.
+	if err := state.closeRemainingBlocks(); err != nil {
+		return state.usage, err
+	}
+	if !state.visGate.everVisible() {
+		status, _ := mapAnthropicStopReasonToStatus(state.stopReason)
+		if isThinkingOnlyEmptyOutput(status, state.outputItems) {
+			return state.usage, fmt.Errorf("claude stream completed with no visible output (stop_reason=%q): %w",
+				state.stopReason, errThinkingOnlyEmptyResponse)
+		}
+	}
+
 	if err := state.finalize(); err != nil {
 		return state.usage, err
 	}

@@ -21,6 +21,7 @@ const (
 	timingFlagEmptyStreamRetry   timingFlag = "empty_stream_retry"
 	timingFlagTouchDB            timingFlag = "touch_db"
 	timingFlagThinkingRectify    timingFlag = "thinking_rectify"
+	timingFlagThinkingOnlyRetry  timingFlag = "thinking_only_retry"
 )
 
 type timingContextKey struct{}

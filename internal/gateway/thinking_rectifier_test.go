@@ -42,6 +42,11 @@ func TestShouldRectifyThinkingSignature(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "final block cannot be thinking",
+			body: `{"type":"error","error":{"type":"invalid_request_error","message":"messages.717: The final block in an assistant message cannot be ` + "`thinking`" + `."}}`,
+			want: true,
+		},
+		{
 			name: "unrelated timeout",
 			body: `{"error":{"message":"request timeout"}}`,
 			want: false,

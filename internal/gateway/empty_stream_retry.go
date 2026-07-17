@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 )
@@ -16,6 +17,24 @@ func isEmptyUpstreamStreamError(err error) bool {
 	return strings.Contains(msg, "stream ended without any chunks") ||
 		strings.Contains(msg, "stream ended without any events") ||
 		strings.Contains(msg, "stream ended without any text deltas")
+}
+
+// errThinkingOnlyEmptyResponse marks an upstream turn that Anthropic/the
+// provider reported as fully completed (not truncated by max_tokens/refusal)
+// but which produced zero visible output: no text, no tool_use, only
+// thinking/redacted_thinking blocks (or nothing at all). Seen in practice on a
+// long session where the request history carried a stray trailing thinking
+// block (see dropTrailingAssistantThinking in convert_responses_claude.go):
+// some upstreams silently echo another "thinking-only, no answer" turn
+// instead of erroring, which otherwise reads to the client as the assistant
+// going silent. Call sites wrap this with fmt.Errorf("...: %w", ...) so
+// errors.Is still matches through the wrapping.
+var errThinkingOnlyEmptyResponse = errors.New("claude turn completed with no visible output (thinking-only)")
+
+// isThinkingOnlyEmptyStreamError reports whether err (or anything it wraps)
+// is errThinkingOnlyEmptyResponse.
+func isThinkingOnlyEmptyStreamError(err error) bool {
+	return errors.Is(err, errThinkingOnlyEmptyResponse)
 }
 
 // deferredSSEWriter 推迟 WriteHeader，直到首次 Write（或显式 Commit）。

@@ -92,6 +92,25 @@ func mapAnthropicStopReasonToStatus(stopReason string) (string, string) {
 
 func _directResponsesClaudeMarker() { _ = fmt.Sprint }
 
+// isThinkingOnlyEmptyOutput reports the "silent thinking-only" upstream bug:
+// the turn is reported as fully completed (not truncated by max_tokens or a
+// refusal) yet produced no visible output at all — every output item is a
+// reasoning (thinking/redacted_thinking) block, or there are none. A completed
+// turn with zero visible text/tool_use is never a legitimate answer, so this
+// is treated as retry-worthy rather than delivered to the client as a silent
+// non-response. See errThinkingOnlyEmptyResponse for the retry wiring.
+func isThinkingOnlyEmptyOutput(status string, output []map[string]any) bool {
+	if status != "completed" {
+		return false
+	}
+	for _, item := range output {
+		if stringValue(item["type"]) != "reasoning" {
+			return false
+		}
+	}
+	return true
+}
+
 func isMeaningfulText(text string) bool {
 	return strings.TrimSpace(text) != ""
 }
@@ -230,6 +249,50 @@ func responsesInputToClaudeMessages(input any) []map[string]any {
 	return messages
 }
 
+// dropTrailingAssistantThinking removes thinking / redacted_thinking blocks
+// that would otherwise terminate an assistant message. Anthropic rejects such
+// requests ("The final block in an assistant message cannot be `thinking`"),
+// which happens when a turn was interrupted after reasoning but before any
+// text/tool_use output (the client then replays reasoning followed directly by
+// a user message). Trailing thinking is never re-read by the model, so
+// dropping it is lossless; assistant messages left empty are removed and any
+// resulting same-role adjacency is merged back into one message.
+func dropTrailingAssistantThinking(messages []map[string]any) []map[string]any {
+	out := make([]map[string]any, 0, len(messages))
+	for _, msg := range messages {
+		if stringValue(msg["role"]) == "assistant" {
+			if blocks, ok := msg["content"].([]any); ok {
+				trimmed := len(blocks)
+				for trimmed > 0 {
+					block, ok := blocks[trimmed-1].(map[string]any)
+					if !ok {
+						break
+					}
+					blockType := stringValue(block["type"])
+					if blockType != "thinking" && blockType != "redacted_thinking" {
+						break
+					}
+					trimmed--
+				}
+				if trimmed == 0 {
+					continue // thinking-only assistant turn (interrupted): drop entirely
+				}
+				msg["content"] = blocks[:trimmed]
+			}
+		}
+		if n := len(out); n > 0 && stringValue(out[n-1]["role"]) == stringValue(msg["role"]) {
+			prevBlocks, prevOK := out[n-1]["content"].([]any)
+			curBlocks, curOK := msg["content"].([]any)
+			if prevOK && curOK {
+				out[n-1]["content"] = append(prevBlocks, curBlocks...)
+				continue
+			}
+		}
+		out = append(out, msg)
+	}
+	return out
+}
+
 // ensureLeadingClaudeUser guarantees the first message is from the user, as
 // required by Anthropic /v1/messages. Compacted/resumed sessions may start with
 // an assistant/tool_use turn.
@@ -258,6 +321,7 @@ func responsesToClaudeRequestDirect(responsesReq map[string]any, model string, m
 	}
 
 	messages := responsesInputToClaudeMessages(responsesReq["input"])
+	messages = dropTrailingAssistantThinking(messages)
 	messages = ensureLeadingClaudeUser(messages)
 	if len(messages) == 0 {
 		return nil, fmt.Errorf("responses request has no usable input items")
@@ -396,6 +460,11 @@ func claudeToResponsesResponseDirect(claudeBody []byte, model string, clientTool
 
 	status, incompleteReason := mapAnthropicStopReasonToStatus(stringValue(payload["stop_reason"]))
 	usage := ParseClaudeUsage(claudeBody)
+
+	if isThinkingOnlyEmptyOutput(status, output) {
+		return nil, usage, fmt.Errorf("claude response completed with no visible output (stop_reason=%q): %w",
+			stringValue(payload["stop_reason"]), errThinkingOnlyEmptyResponse)
+	}
 
 	response := map[string]any{
 		"id":         responseID,

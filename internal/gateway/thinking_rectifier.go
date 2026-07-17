@@ -68,6 +68,13 @@ func shouldRectifyThinkingSignature(body []byte) bool {
 	if strings.Contains(lower, "signature") && strings.Contains(lower, "field required") {
 		return true
 	}
+	// 场景5：assistant 消息以 thinking 块结尾（如客户端回放被中断的 reasoning 轮次）
+	// 例："messages.717: The final block in an assistant message cannot be `thinking`."
+	if strings.Contains(lower, "final block") &&
+		strings.Contains(lower, "cannot be") &&
+		strings.Contains(lower, "thinking") {
+		return true
+	}
 	return false
 }
 

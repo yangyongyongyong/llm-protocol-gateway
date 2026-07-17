@@ -76,10 +76,17 @@ func TestClaudeToResponsesDirectThinkingRoundTrip(t *testing.T) {
 	if !ok || block["signature"] != "sig-abc" {
 		t.Fatalf("encrypted_content round-trip failed: %#v", block)
 	}
-	// Feed the reasoning item back into a request and confirm the signed block replays.
+	// Feed the reasoning item back into a request and confirm the signed block
+	// replays. The reasoning item must be followed by assistant output (here a
+	// function_call) in the same turn — a bare trailing thinking block would be
+	// rejected by Anthropic and is dropped by dropTrailingAssistantThinking.
 	replayReq := map[string]any{
 		"model": "claude-sonnet-5",
-		"input": []any{reasoning, map[string]any{"type": "message", "role": "user", "content": "next"}},
+		"input": []any{
+			reasoning,
+			map[string]any{"type": "function_call", "call_id": "tu_1", "name": "exec_command", "arguments": `{"cmd":"ls"}`},
+			map[string]any{"type": "function_call_output", "call_id": "tu_1", "output": "ok"},
+		},
 	}
 	claudeReq, err := responsesToClaudeRequestDirect(replayReq, "claude-sonnet-5", 0)
 	if err != nil {
@@ -207,5 +214,56 @@ func TestResponsesToClaudeResponseDirectRoundTrip(t *testing.T) {
 	}
 	if !foundThinking || !foundText {
 		t.Fatalf("round-trip content wrong: %s", back)
+	}
+}
+
+func TestResponsesToClaudeDropsTrailingThinking(t *testing.T) {
+	encOnly, _ := encodeAnthropicThinkingBlock(map[string]any{"type": "thinking", "thinking": "", "signature": "sig-1"})
+	encTail, _ := encodeAnthropicThinkingBlock(map[string]any{"type": "thinking", "thinking": "draft", "signature": "sig-2"})
+
+	// Replays an interrupted turn: reasoning with no follow-up output, then the
+	// user speaks again. Upstream Anthropic rejects assistant messages ending in
+	// thinking ("The final block in an assistant message cannot be `thinking`").
+	responsesReq := map[string]any{
+		"model": "claude-sonnet-5",
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": "hi"},
+			map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "partial answer"}}},
+			map[string]any{"type": "reasoning", "encrypted_content": encTail},
+			map[string]any{"type": "message", "role": "user", "content": "continue"},
+			map[string]any{"type": "reasoning", "encrypted_content": encOnly},
+			map[string]any{"type": "message", "role": "user", "content": "again"},
+		},
+	}
+	claudeReq, err := responsesToClaudeRequestDirect(responsesReq, "claude-sonnet-5", 0)
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	msgs := claudeReq["messages"].([]any)
+	for i, m := range msgs {
+		msg := m.(map[string]any)
+		blocks, ok := msg["content"].([]any)
+		if !ok || len(blocks) == 0 {
+			t.Fatalf("message %d has no content blocks: %s", i, mustJSON(claudeReq))
+		}
+		if msg["role"] != "assistant" {
+			continue
+		}
+		last := blocks[len(blocks)-1].(map[string]any)
+		if lt := stringValue(last["type"]); lt == "thinking" || lt == "redacted_thinking" {
+			t.Fatalf("assistant message %d still ends with %s: %s", i, lt, mustJSON(claudeReq))
+		}
+	}
+	// The thinking-only assistant turn is dropped and the surrounding user
+	// messages merge, so roles must still alternate starting from user.
+	for i, m := range msgs {
+		msg := m.(map[string]any)
+		want := "user"
+		if i%2 == 1 {
+			want = "assistant"
+		}
+		if msg["role"] != want {
+			t.Fatalf("message %d role = %v, want %s: %s", i, msg["role"], want, mustJSON(claudeReq))
+		}
 	}
 }

@@ -322,12 +322,18 @@ func (s *Server) finishConvertedProxyWithEmptyStreamRetry(w http.ResponseWriter,
 		if finishErr == nil || !retryable || attempt >= attempts {
 			return status, usage, body, finishErr
 		}
-		markTimingFlag(r.Context(), timingFlagEmptyStreamRetry)
+		flag := timingFlagEmptyStreamRetry
+		label := "upstream empty stream retry"
+		if isThinkingOnlyEmptyStreamError(finishErr) {
+			flag = timingFlagThinkingOnlyRetry
+			label = "upstream thinking-only empty response retry"
+		}
+		markTimingFlag(r.Context(), flag)
 		if t := requestTimingFrom(r.Context()); t != nil {
 			t.resetUpstreamMarks()
 		}
 		if s.logs != nil {
-			s.logs.AddApp("warn", "upstream empty stream retry", fmt.Sprintf("attempt=%d/%d model=%s err=%s", attempt, attempts, model, finishErr.Error()))
+			s.logs.AddApp("warn", label, fmt.Sprintf("attempt=%d/%d model=%s err=%s", attempt, attempts, model, finishErr.Error()))
 		}
 	}
 	return lastStatus, lastUsage, lastBody, lastErr
@@ -354,7 +360,7 @@ func (s *Server) finishConvertedProxy(w http.ResponseWriter, response *http.Resp
 			return response.StatusCode, TokenUsage{}, converted, writeErr, false
 		}
 		usage, streamErr := streamConvert(dw, response.Body, model)
-		if streamErr != nil && isEmptyUpstreamStreamError(streamErr) && !dw.WroteBody() {
+		if streamErr != nil && (isEmptyUpstreamStreamError(streamErr) || isThinkingOnlyEmptyStreamError(streamErr)) && !dw.WroteBody() {
 			// 尚未向客户端写出任何 SSE 字节，可安全同 Provider 重试。
 			return response.StatusCode, usage, nil, streamErr, true
 		}
@@ -383,6 +389,11 @@ func (s *Server) finishConvertedProxy(w http.ResponseWriter, response *http.Resp
 	}
 	converted, usage, err := convert(responseBody, model)
 	if err != nil {
+		if isThinkingOnlyEmptyStreamError(err) {
+			// 上游 200 但转换后判定为"仅 thinking 无可见输出"，尚未写出任何字节，
+			// 可安全同 Provider 重试。
+			return response.StatusCode, usage, nil, err, true
+		}
 		return 0, TokenUsage{}, nil, err, false
 	}
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(converted)))
