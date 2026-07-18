@@ -53,23 +53,54 @@ Provider 不止支持 API Key，还支持 **OAuth 账号**直连：
 
 ## 🖼️ 界面预览
 
-> 以下截图均已脱敏（账号邮箱 / 私有域名 / Tunnel Token / 局域网 IP 等已替换为示例值）。
+> 以下截图均已脱敏（账号邮箱 / 私有域名 / Tunnel Token / 局域网 IP / 真实用户名 / 密钥值等已替换为示例值）。
 
-**三协议接入地址**（同一网关对外提供 OpenAI Chat / OpenAI Responses / Claude 三种端点）
+### API 密钥：同一个 Key，多方案一键切换
+
+一个 Key（token 不变）可保存多套完整转发配置（方案），点选即时切换；每套方案可配置首选
+Provider、备选 Provider、模型映射、思考深度等，页面底部可一键复制对应 Agent 客户端配置。
+
+![API 密钥 - 多方案与客户端配置](docs/images/api-keys.png)
+
+**备选 Provider 配置**（按优先级排序，首选额度耗尽后自动切换）
+
+![备选 Provider 配置](docs/images/api-keys-fallback.png)
+
+### 三协议接入地址
+
+同一网关对外提供 OpenAI Chat / OpenAI Responses / Claude 三种端点（局域网 + 公网）。
 
 ![三协议接入地址](docs/images/overview.png)
 
-**Provider 管理**（支持 Claude / OpenAI / Cursor 账号与 API Key，展示订阅额度、协议、绑定用户）
+### Provider 管理
+
+支持 Claude / OpenAI / Cursor 账号与 API Key，展示订阅额度、协议、绑定用户。
 
 ![Provider 管理](docs/images/providers.png)
 
-**公网访问**（Cloudflare 一键穿透，管理页与模型 API 域名可分别开启）
+### 公网访问（Cloudflare）
+
+一键穿透，管理页与模型 API 域名可分别开启。
 
 ![公网访问](docs/images/public-url.png)
 
-**用量统计**（按日期区间汇总请求 / Token，含缓存命中率、按 Key/Provider/模型 维度）
+### 用量统计
+
+按日期区间汇总请求 / Token，含缓存命中率，按 Key / Provider / 模型 维度。
 
 ![用量统计](docs/images/usage.png)
+
+### 用户管理
+
+创建普通用户并分配可用 Provider；普通用户仅能管理自己的 Key 与查看自己的日志/用量。
+
+![用户管理](docs/images/users.png)
+
+### 自检
+
+对勾选的 Provider 并行用 OpenCode / Codex / Claude CLI 走网关探测，校验回答是否正确。
+
+![自检](docs/images/self-check.png)
 
 ---
 
