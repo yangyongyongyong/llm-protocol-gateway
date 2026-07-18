@@ -1,0 +1,13 @@
+.git
+.gitignore
+.cache
+**/node_modules
+web/dist
+desktop/build
+desktop/frontend/dist
+docs/images
+*.md
+!README.md
+tmp
+*.log
+.DS_Store

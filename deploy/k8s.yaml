@@ -1,0 +1,77 @@
+# 最小可用 K8s 部署：Deployment + Service + PVC
+# 使用：kubectl apply -f deploy/k8s.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: llm-gateway
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gateway-data
+  namespace: llm-gateway
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-protocol-gateway
+  namespace: llm-gateway
+spec:
+  replicas: 1                 # 单副本：SQLite 为本地文件，勿多副本共享同一 PVC
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: llm-protocol-gateway }
+  template:
+    metadata:
+      labels: { app: llm-protocol-gateway }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: gateway
+          image: ghcr.io/yangyongyongyong/llm-protocol-gateway:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 18093
+          env:
+            - name: GATEWAY_ADDR
+              value: "0.0.0.0:18093"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet: { path: /__health, port: 18093 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /__health, port: 18093 }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { cpu: "1",    memory: "512Mi" }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: gateway-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-protocol-gateway
+  namespace: llm-gateway
+spec:
+  selector: { app: llm-protocol-gateway }
+  ports:
+    - name: http
+      port: 80
+      targetPort: 18093
+  type: ClusterIP

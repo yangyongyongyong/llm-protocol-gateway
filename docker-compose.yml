@@ -1,0 +1,23 @@
+services:
+  gateway:
+    # 本地构建；或改成已发布镜像：image: ghcr.io/yangyongyongyong/llm-protocol-gateway:latest
+    build: .
+    image: ghcr.io/yangyongyongyong/llm-protocol-gateway:latest
+    container_name: llm-protocol-gateway
+    restart: unless-stopped
+    ports:
+      - "18093:18093"
+    volumes:
+      - gateway-data:/data          # SQLite 配置/日志持久化
+    environment:
+      GATEWAY_ADDR: "0.0.0.0:18093"
+      # GATEWAY_DB / GATEWAY_WEB_DIST 已在镜像内设好默认值，一般无需改
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:18093/__health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  gateway-data:

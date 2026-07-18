@@ -144,6 +144,7 @@ GATEWAY_ADDR=127.0.0.1:18090 go run ./cmd/gateway
 
 - [Bearer 令牌 Provider 说明](docs/bearer-provider.md) —— 配置、鉴权、健康探测、故障转移、自注册
 - [macOS App](docs/macos-app.md)
+- [容器部署（Docker / Compose / K8s）](docs/deploy.md) —— 一键部署与发布镜像到 GHCR
 - [已知问题 / 踩坑记录](docs/known-issues.md)
 
 ---
