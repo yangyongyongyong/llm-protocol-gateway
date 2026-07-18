@@ -128,6 +128,33 @@ GATEWAY_ADDR=127.0.0.1:18090 go run ./cmd/gateway
 
 ---
 
+## 🐳 容器部署（Docker）
+
+镜像已发布到 Docker Hub（多架构 `linux/amd64` + `linux/arm64`，约 57MB）：
+
+**`yangyongyong/llm-protocol-gateway`** — https://hub.docker.com/r/yangyongyong/llm-protocol-gateway
+
+标签：`latest`、`X.Y.Z`（与 GitHub tag `vX.Y.Z` 一一对应）、`X.Y`
+
+```bash
+# 一键运行
+docker run -d --name llm-protocol-gateway \
+  -p 18093:18093 \
+  -v llm-gateway-data:/data \
+  --restart unless-stopped \
+  yangyongyong/llm-protocol-gateway:latest
+
+curl -s http://127.0.0.1:18093/__health   # {"status":"ok",...}
+```
+
+或用仓库根目录的 `docker-compose.yml`：`docker compose up -d`；K8s 用 `deploy/k8s.yaml`。
+
+- 打开 `http://<服务器IP>:18093/`，非本机访问首次需**设置管理员密码**。
+- 数据持久化在 `/data` 卷（Provider / API Key / 日志），务必挂载。
+- 完整说明（环境变量、K8s、发布流程、OAuth/持久化注意事项）见 **[容器部署文档](docs/deploy.md)**。
+
+---
+
 ## ☁️ Cloudflare 公网访问
 
 默认关闭；在 UI 开启后可选：
