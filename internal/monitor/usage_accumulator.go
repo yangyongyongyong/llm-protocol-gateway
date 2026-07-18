@@ -15,33 +15,35 @@ const usageEventBuffer = 4096
 // Hit rate = CacheTokens / InputTokens. Legacy rows may store exclusive prompt
 // counts; applyUsageEvent repairs those via normalizeUsageTokens.
 type UsageEvent struct {
-	Time         time.Time
-	APIKeyID     string
-	APIKeyName   string
-	UserID       string
-	ProviderID   string
-	Model        string
-	Status       int
-	InputTokens  int64
-	OutputTokens int64
-	CacheTokens  int64
-	LatencyMs    int64
-	TTFTMs       int64
+	Time           time.Time
+	APIKeyID       string
+	APIKeyName     string
+	UserID         string
+	ProviderID     string
+	Model          string
+	OutputProtocol string
+	Status         int
+	InputTokens    int64
+	OutputTokens   int64
+	CacheTokens    int64
+	LatencyMs      int64
+	TTFTMs         int64
 }
 
 type usageDayStats struct {
-	total        APIKeyDayStats
-	byAPIKey     map[string]*APIKeyDayStats
-	byProvider   map[string]*ProviderDayStats
-	byModel      map[string]*ModelDayStats
-	byUser       map[string]*UserDayStats
-	status2xx    int64
-	status4xx    int64
-	status5xx    int64
-	statusOther  int64
-	latencySum   int64
-	ttftSum      int64
-	ttftCount    int64
+	total       APIKeyDayStats
+	byAPIKey    map[string]*APIKeyDayStats
+	byProvider  map[string]*ProviderDayStats
+	byModel     map[string]*ModelDayStats
+	byUser      map[string]*UserDayStats
+	byProtocol  map[string]*ProtocolDayStats
+	status2xx   int64
+	status4xx   int64
+	status5xx   int64
+	statusOther int64
+	latencySum  int64
+	ttftSum     int64
+	ttftCount   int64
 }
 
 func newUsageDayStats() *usageDayStats {
@@ -51,6 +53,7 @@ func newUsageDayStats() *usageDayStats {
 		byProvider: make(map[string]*ProviderDayStats),
 		byModel:    make(map[string]*ModelDayStats),
 		byUser:     make(map[string]*UserDayStats),
+		byProtocol: make(map[string]*ProtocolDayStats),
 	}
 }
 
@@ -148,6 +151,19 @@ func (s *Store) applyUsageEventLocked(event UsageEvent) UsagePersistDelta {
 		modelStats.CacheTokens += cacheTokens
 	}
 
+	outputProtocol := strings.TrimSpace(event.OutputProtocol)
+	if outputProtocol != "" {
+		protoStats, ok := day.byProtocol[outputProtocol]
+		if !ok {
+			protoStats = &ProtocolDayStats{Protocol: outputProtocol}
+			day.byProtocol[outputProtocol] = protoStats
+		}
+		protoStats.RequestCount++
+		protoStats.InputTokens += inputTokens
+		protoStats.OutputTokens += event.OutputTokens
+		protoStats.CacheTokens += cacheTokens
+	}
+
 	switch statusBucket(event.Status) {
 	case "2xx":
 		day.status2xx++
@@ -190,19 +206,20 @@ func (s *Store) applyUsageEventLocked(event UsageEvent) UsagePersistDelta {
 		lastCopy = &copied
 	}
 	return UsagePersistDelta{
-		Day:          dayKey,
-		KeyID:        keyID,
-		KeyName:      keyName,
-		UserID:       userID,
-		ProviderID:   providerID,
-		Model:        modelForBucket,
-		StatusClass:  statusBucket(event.Status),
-		InputTokens:  inputTokens,
-		OutputTokens: event.OutputTokens,
-		CacheTokens:  cacheTokens,
-		LatencyMs:    event.LatencyMs,
-		TTFTMs:       event.TTFTMs,
-		LastRequest:  lastCopy,
+		Day:            dayKey,
+		KeyID:          keyID,
+		KeyName:        keyName,
+		UserID:         userID,
+		ProviderID:     providerID,
+		Model:          modelForBucket,
+		OutputProtocol: outputProtocol,
+		StatusClass:    statusBucket(event.Status),
+		InputTokens:    inputTokens,
+		OutputTokens:   event.OutputTokens,
+		CacheTokens:    cacheTokens,
+		LatencyMs:      event.LatencyMs,
+		TTFTMs:         event.TTFTMs,
+		LastRequest:    lastCopy,
 	}
 }
 
@@ -297,6 +314,7 @@ func (s *Store) periodStatsSinceLocked(since time.Time, periodLabel string) Peri
 		ByProvider: sortProviderStats(byProvider),
 		ByModel:    sortModelDayStats(byModel),
 		ByUser:     sortUserStats(byUser),
+		ByProtocol: sortProtocolStats(mergeProtocolDays(s.usageByDay, since, time.Time{})),
 	}
 }
 
@@ -315,6 +333,7 @@ func (s *Store) periodStatsInRangeLocked(from, to time.Time, periodLabel string)
 		ByProvider: sortProviderStats(byProvider),
 		ByModel:    sortModelDayStats(byModel),
 		ByUser:     sortUserStats(byUser),
+		ByProtocol: sortProtocolStats(mergeProtocolDays(s.usageByDay, from, to)),
 	}
 }
 
@@ -341,6 +360,7 @@ func (s *Store) todayStatsFromCountersLocked(dayStart time.Time) TodayStatsSnaps
 		ByProvider:  sortProviderStats(byProvider),
 		ByModel:     sortModelDayStats(byModel),
 		ByUser:      sortUserStats(byUser),
+		ByProtocol:  sortProtocolStats(mergeProtocolDays(s.usageByDay, dayStart, time.Time{})),
 	}
 }
 
@@ -423,6 +443,35 @@ func (s *Store) statusStatsInRangeLocked(from, to time.Time) []StatusBucketStats
 		out = append(out, StatusBucketStats{Class: class, RequestCount: buckets[class]})
 	}
 	return out
+}
+
+func mergeProtocolDays(byDay map[string]*usageDayStats, from, to time.Time) map[string]*ProtocolDayStats {
+	loc := from.Location()
+	if to.IsZero() {
+		to = time.Date(9999, 1, 1, 0, 0, 0, 0, loc)
+	}
+	fromDay := time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, loc)
+	toDay := time.Date(to.Year(), to.Month(), to.Day(), 0, 0, 0, 0, loc)
+	byProtocol := make(map[string]*ProtocolDayStats)
+	for dayKey, dayStats := range byDay {
+		day, err := time.ParseInLocation("2006-01-02", dayKey, loc)
+		if err != nil || day.Before(fromDay) || !day.Before(toDay) {
+			continue
+		}
+		for id, stats := range dayStats.byProtocol {
+			out, ok := byProtocol[id]
+			if !ok {
+				copied := *stats
+				byProtocol[id] = &copied
+				continue
+			}
+			out.RequestCount += stats.RequestCount
+			out.InputTokens += stats.InputTokens
+			out.OutputTokens += stats.OutputTokens
+			out.CacheTokens += stats.CacheTokens
+		}
+	}
+	return byProtocol
 }
 
 func mergeUsageDays(byDay map[string]*usageDayStats, from, to time.Time) (APIKeyDayStats, map[string]*APIKeyDayStats, map[string]*ProviderDayStats, map[string]*ModelDayStats, map[string]*UserDayStats) {

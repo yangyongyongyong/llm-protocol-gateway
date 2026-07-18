@@ -572,17 +572,32 @@ func (s *Server) loadRequestLogsForStats(from, to time.Time, limit int) []monito
 	return out
 }
 
+// usageBucketSchema* gate a one-time backfill when the daily-bucket dimensions
+// change (e.g. adding the output_protocol bucket). Existing deployments' buckets
+// lack new dimensions; bumping the version forces exactly one rebuild-from-logs
+// after upgrade, then the fast bucket-load path resumes on later startups.
+const (
+	usageBucketSchemaSettingKey = "usageDailyBucketSchema"
+	usageBucketSchemaVersion    = "2" // v2 adds the output_protocol dimension
+)
+
 // RebuildUsageStats loads persisted daily aggregates, or replays request logs once
-// to backfill when the usage_daily tables are empty.
+// to backfill when the usage_daily tables are empty or the bucket schema changed.
 func (s *Server) RebuildUsageStats() {
 	retention := s.RequestLogRetentionDays()
 	since := time.Now().AddDate(0, 0, -retention)
+
+	settings, _ := s.usageDailyStore.(interface {
+		Setting(string) string
+		SetSetting(string, string) error
+	})
+	needsBackfill := settings != nil && settings.Setting(usageBucketSchemaSettingKey) != usageBucketSchemaVersion
 
 	if s.usageDailyStore != nil {
 		days, last, err := s.usageDailyStore.LoadUsageSince(since)
 		if err != nil {
 			s.logs.AddApp("warn", "load usage daily aggregates failed", err.Error())
-		} else if len(days) > 0 && s.usageDailyAggregatesMatchLogs(days) {
+		} else if !needsBackfill && len(days) > 0 && s.usageDailyAggregatesMatchLogs(days) {
 			s.logs.ResetUsageStats()
 			s.logs.BootstrapUsageDays(days, last)
 			return
@@ -593,6 +608,11 @@ func (s *Server) RebuildUsageStats() {
 	}
 
 	s.rebuildUsageStatsFromLogs(since)
+	if settings != nil {
+		if err := settings.SetSetting(usageBucketSchemaSettingKey, usageBucketSchemaVersion); err != nil {
+			s.logs.AddApp("warn", "persist usage bucket schema version failed", err.Error())
+		}
+	}
 }
 
 func (s *Server) usageDailyAggregatesMatchLogs(days map[string]monitor.UsageDayBuckets) bool {
@@ -647,18 +667,19 @@ func (s *Server) rebuildUsageStatsFromLogs(since time.Time) {
 			usageUserID = ownerUserIDForStats(key.OwnerUserID)
 		}
 		s.logs.ApplyUsageEventSync(monitor.UsageEvent{
-			Time:         log.Time,
-			APIKeyID:     log.APIKeyID,
-			APIKeyName:   log.APIKeyName,
-			UserID:       usageUserID,
-			ProviderID:   log.ProviderID,
-			Model:        resolved,
-			Status:       log.Status,
-			InputTokens:  log.InputTokens,
-			OutputTokens: log.OutputTokens,
-			CacheTokens:  log.CacheTokens,
-			LatencyMs:    log.LatencyMillis,
-			TTFTMs:       log.TTFTMillis,
+			Time:           log.Time,
+			APIKeyID:       log.APIKeyID,
+			APIKeyName:     log.APIKeyName,
+			UserID:         usageUserID,
+			ProviderID:     log.ProviderID,
+			Model:          resolved,
+			OutputProtocol: monitor.OutputProtocolFromFlow(log.ProtocolFlow),
+			Status:         log.Status,
+			InputTokens:    log.InputTokens,
+			OutputTokens:   log.OutputTokens,
+			CacheTokens:    log.CacheTokens,
+			LatencyMs:      log.LatencyMillis,
+			TTFTMs:         log.TTFTMillis,
 		})
 	}
 }
@@ -759,18 +780,19 @@ func (s *Server) recordRequestLogEx(started time.Time, matchedKey domain.APIKey,
 		usageUserID = ownerUserIDForStats(matchedKey.OwnerUserID)
 	}
 	s.logs.EnqueueUsage(monitor.UsageEvent{
-		Time:         started,
-		APIKeyID:     entry.APIKeyID,
-		APIKeyName:   entry.APIKeyName,
-		UserID:       usageUserID,
-		ProviderID:   providerID,
-		Model:        model,
-		Status:       status,
-		InputTokens:  usage.InputTokens,
-		OutputTokens: usage.OutputTokens,
-		CacheTokens:  usage.CacheTokens,
-		LatencyMs:    latency,
-		TTFTMs:       ttftMs,
+		Time:           started,
+		APIKeyID:       entry.APIKeyID,
+		APIKeyName:     entry.APIKeyName,
+		UserID:         usageUserID,
+		ProviderID:     providerID,
+		Model:          model,
+		OutputProtocol: monitor.OutputProtocolFromFlow(protocolFlow),
+		Status:         status,
+		InputTokens:    usage.InputTokens,
+		OutputTokens:   usage.OutputTokens,
+		CacheTokens:    usage.CacheTokens,
+		LatencyMs:      latency,
+		TTFTMs:         ttftMs,
 	})
 	if s.requestLogStore != nil {
 		if err := s.requestLogStore.AppendRequestLogWithRetention(entry, s.RequestLogRetentionDays()); err != nil {

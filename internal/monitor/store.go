@@ -8,24 +8,24 @@ import (
 )
 
 type RequestLog struct {
-	Time             time.Time `json:"time"`
-	APIKeyID         string    `json:"apiKeyId,omitempty"`
-	APIKeyName       string    `json:"apiKeyName,omitempty"`
+	Time       time.Time `json:"time"`
+	APIKeyID   string    `json:"apiKeyId,omitempty"`
+	APIKeyName string    `json:"apiKeyName,omitempty"`
 	// UserName is a transient display field resolved at query time from the
 	// owning API key's user id (not persisted). Renames reflect immediately.
-	UserName         string    `json:"userName,omitempty"`
-	RouteID          string    `json:"routeId"`
-	ProviderID       string    `json:"providerId"`
-	Model            string    `json:"model"`
-	Action           string    `json:"action"`
-	ProtocolFlow     string    `json:"protocolFlow"`
-	Path             string    `json:"path"`
-	Status           int       `json:"status"`
-	InputTokens      int64     `json:"inputTokens"`  // prompt total (inclusive of cache)
-	OutputTokens     int64     `json:"outputTokens"`
-	CacheTokens      int64     `json:"cacheTokens"`  // cache-read/hit portion only
-	LatencyMillis    int64     `json:"latencyMs"`
-	TTFTMillis       int64     `json:"ttftMs,omitempty"`
+	UserName      string `json:"userName,omitempty"`
+	RouteID       string `json:"routeId"`
+	ProviderID    string `json:"providerId"`
+	Model         string `json:"model"`
+	Action        string `json:"action"`
+	ProtocolFlow  string `json:"protocolFlow"`
+	Path          string `json:"path"`
+	Status        int    `json:"status"`
+	InputTokens   int64  `json:"inputTokens"` // prompt total (inclusive of cache)
+	OutputTokens  int64  `json:"outputTokens"`
+	CacheTokens   int64  `json:"cacheTokens"` // cache-read/hit portion only
+	LatencyMillis int64  `json:"latencyMs"`
+	TTFTMillis    int64  `json:"ttftMs,omitempty"`
 	// Observational latency breakdown (ms). Zero means unset / unavailable.
 	PrepMillis            int64  `json:"prepMs,omitempty"`
 	PreUpstreamMillis     int64  `json:"preUpstreamMs,omitempty"`
@@ -50,12 +50,12 @@ const (
 
 // RequestLogQuery filters and pages request logs.
 type RequestLogQuery struct {
-	From          time.Time
-	To            time.Time
-	Status        string // all | 2xx | 4xx | 5xx
-	APIKeyName    string // substring match against api_key_name (case-insensitive)
+	From       time.Time
+	To         time.Time
+	Status     string // all | 2xx | 4xx | 5xx
+	APIKeyName string // substring match against api_key_name (case-insensitive)
 	// ProviderID filters to the exact input provider id (empty means no filter).
-	ProviderID    string
+	ProviderID string
 	// APIKeyIDs restricts results to logs whose api_key_id is in this set.
 	// Used for per-user data isolation, and for the admin-only "owner user"
 	// log filter; nil means no restriction.
@@ -111,6 +111,16 @@ type ModelDayStats struct {
 	CacheTokens  int64  `json:"cacheTokens"`
 }
 
+// ProtocolDayStats aggregates request/token usage for one output protocol
+// (OpenAI Chat / OpenAI Responses / Claude — the protocol the client called).
+type ProtocolDayStats struct {
+	Protocol     string `json:"protocol"`
+	RequestCount int64  `json:"requestCount"`
+	InputTokens  int64  `json:"inputTokens"`
+	OutputTokens int64  `json:"outputTokens"`
+	CacheTokens  int64  `json:"cacheTokens"`
+}
+
 type TodayStatsSnapshot struct {
 	Date        string             `json:"date"`
 	Total       APIKeyDayStats     `json:"total"`
@@ -119,6 +129,7 @@ type TodayStatsSnapshot struct {
 	ByProvider  []ProviderDayStats `json:"byProvider"`
 	ByModel     []ModelDayStats    `json:"byModel"`
 	ByUser      []UserDayStats     `json:"byUser,omitempty"`
+	ByProtocol  []ProtocolDayStats `json:"byProtocol,omitempty"`
 }
 
 type PeriodStatsSnapshot struct {
@@ -128,6 +139,7 @@ type PeriodStatsSnapshot struct {
 	ByProvider []ProviderDayStats `json:"byProvider"`
 	ByModel    []ModelDayStats    `json:"byModel"`
 	ByUser     []UserDayStats     `json:"byUser,omitempty"`
+	ByProtocol []ProtocolDayStats `json:"byProtocol,omitempty"`
 }
 
 type DailyRequestPoint struct {
@@ -146,13 +158,13 @@ type StatusBucketStats struct {
 }
 
 type UsageStatsSnapshot struct {
-	Today   TodayStatsSnapshot  `json:"today"`
-	Month   PeriodStatsSnapshot `json:"month"`
-	Range   *PeriodStatsSnapshot `json:"range,omitempty"`
-	From    string              `json:"from,omitempty"`
-	To      string              `json:"to,omitempty"`
-	Daily   []DailyRequestPoint `json:"daily,omitempty"`
-	Status  []StatusBucketStats `json:"status,omitempty"`
+	Today  TodayStatsSnapshot   `json:"today"`
+	Month  PeriodStatsSnapshot  `json:"month"`
+	Range  *PeriodStatsSnapshot `json:"range,omitempty"`
+	From   string               `json:"from,omitempty"`
+	To     string               `json:"to,omitempty"`
+	Daily  []DailyRequestPoint  `json:"daily,omitempty"`
+	Status []StatusBucketStats  `json:"status,omitempty"`
 }
 
 type AppLog struct {
@@ -220,6 +232,10 @@ func (s *Store) BootstrapUsageDays(days map[string]UsageDayBuckets, last *Reques
 		for id, stats := range buckets.ByUser {
 			copied := stats
 			day.byUser[id] = &copied
+		}
+		for id, stats := range buckets.ByProtocol {
+			copied := stats
+			day.byProtocol[id] = &copied
 		}
 		s.usageByDay[dayKey] = day
 	}
@@ -410,6 +426,69 @@ func sortModelDayStats(byModel map[string]*ModelDayStats) []ModelDayStats {
 	return out
 }
 
+// OutputProtocolFromFlow extracts the client-facing (output) protocol from a
+// request log's protocol_flow, which is stored as "<provider> -> <output>"
+// (e.g. "Claude -> OpenAI Responses"). Returns "" for rejected/unknown flows.
+func OutputProtocolFromFlow(flow string) string {
+	flow = strings.TrimSpace(flow)
+	idx := strings.LastIndex(flow, "->")
+	if idx < 0 {
+		return ""
+	}
+	switch out := strings.TrimSpace(flow[idx+2:]); out {
+	case "OpenAI Chat", "OpenAI Responses", "Claude":
+		return out
+	default:
+		return ""
+	}
+}
+
+func protocolUsageTotalTokens(s ProtocolDayStats) int64 { return s.InputTokens + s.OutputTokens }
+
+func sortProtocolStats(byProtocol map[string]*ProtocolDayStats) []ProtocolDayStats {
+	out := make([]ProtocolDayStats, 0, len(byProtocol))
+	for _, stats := range byProtocol {
+		out = append(out, *stats)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		ti, tj := protocolUsageTotalTokens(out[i]), protocolUsageTotalTokens(out[j])
+		if ti == tj {
+			if out[i].RequestCount == out[j].RequestCount {
+				return out[i].Protocol < out[j].Protocol
+			}
+			return out[i].RequestCount > out[j].RequestCount
+		}
+		return ti > tj
+	})
+	return out
+}
+
+// aggregateByProtocol builds per-output-protocol stats from in-memory request
+// logs (used by the per-user path, which lacks per-key day buckets).
+func aggregateByProtocol(logs []RequestLog, since time.Time) []ProtocolDayStats {
+	byProto := map[string]*ProtocolDayStats{}
+	for index := range logs {
+		log := logs[index]
+		if log.Time.Before(since) {
+			continue
+		}
+		proto := OutputProtocolFromFlow(log.ProtocolFlow)
+		if proto == "" {
+			continue
+		}
+		stats, ok := byProto[proto]
+		if !ok {
+			stats = &ProtocolDayStats{Protocol: proto}
+			byProto[proto] = stats
+		}
+		stats.RequestCount++
+		stats.InputTokens += log.InputTokens
+		stats.OutputTokens += log.OutputTokens
+		stats.CacheTokens += log.CacheTokens
+	}
+	return sortProtocolStats(byProto)
+}
+
 // CanonicalModelForUsage returns the upstream/real model id for ranking.
 // Historical logs may store "alias -> real-model"; prefer the real side.
 func CanonicalModelForUsage(raw string) string {
@@ -586,11 +665,14 @@ func (s *Store) UsageStatsRangeForKeys(now time.Time, from, to time.Time, keyIDs
 		ByProvider:  aggregateByProvider(filterLogsInRange(logs, dayStart, dayStart.Add(24*time.Hour)), time.Time{}),
 		ByModel:     aggregateByModel(filterLogsInRange(logs, dayStart, dayStart.Add(24*time.Hour)), time.Time{}),
 		ByUser:      todayPeriod.ByUser,
+		ByProtocol:  aggregateByProtocol(filterLogsInRange(logs, dayStart, dayStart.Add(24*time.Hour)), time.Time{}),
 	}
 	month.ByProvider = aggregateByProvider(filterLogsInRange(logs, monthStart, time.Time{}), time.Time{})
 	month.ByModel = aggregateByModel(filterLogsInRange(logs, monthStart, time.Time{}), time.Time{})
+	month.ByProtocol = aggregateByProtocol(filterLogsInRange(logs, monthStart, time.Time{}), time.Time{})
 	rangeStats.ByProvider = aggregateByProvider(filterLogsInRange(logs, from, to), time.Time{})
 	rangeStats.ByModel = aggregateByModel(filterLogsInRange(logs, from, to), time.Time{})
+	rangeStats.ByProtocol = aggregateByProtocol(filterLogsInRange(logs, from, to), time.Time{})
 
 	return UsageStatsSnapshot{
 		Today:  today,

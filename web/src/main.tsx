@@ -521,6 +521,14 @@ type ModelDayStats = {
   cacheTokens: number;
 };
 
+type ProtocolDayStats = {
+  protocol: string;
+  requestCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheTokens: number;
+};
+
 type UserDayStats = {
   userId: string;
   userName: string;
@@ -554,6 +562,7 @@ type RequestStatsSnapshot = {
     byProvider?: ProviderDayStats[];
     byModel?: ModelDayStats[];
     byUser?: UserDayStats[];
+    byProtocol?: ProtocolDayStats[];
   };
   month: {
     period: string;
@@ -562,6 +571,7 @@ type RequestStatsSnapshot = {
     byProvider?: ProviderDayStats[];
     byModel?: ModelDayStats[];
     byUser?: UserDayStats[];
+    byProtocol?: ProtocolDayStats[];
   };
   range?: {
     period: string;
@@ -570,6 +580,7 @@ type RequestStatsSnapshot = {
     byProvider?: ProviderDayStats[];
     byModel?: ModelDayStats[];
     byUser?: UserDayStats[];
+    byProtocol?: ProtocolDayStats[];
   };
   from?: string;
   to?: string;
@@ -6427,6 +6438,13 @@ function App() {
                     value: item.requestCount,
                   }))}
                 />
+                <UsageBarChart
+                  title="按输出协议请求"
+                  items={(requestStats?.range?.byProtocol || usageToday?.byProtocol || []).slice(0, 8).map((item) => ({
+                    label: item.protocol,
+                    value: item.requestCount,
+                  }))}
+                />
                 {!isNormalUser && (
                   <UsageBarChart
                     title="按用户请求"
@@ -6519,6 +6537,37 @@ function App() {
                       return (
                         <div className="usage-row" key={row.providerId}>
                           <span className="usage-key-name">{providerUsageLabel(row.providerId, state.providers || [])}</span>
+                          <span>{row.requestCount}</span>
+                          <span>{formatTokenSummary(row)}</span>
+                          <span>{month?.requestCount ?? 0}</span>
+                          <span>{month ? formatTokenSummary(month) : '—'}</span>
+                        </div>
+                      );
+                    });
+                  })()}
+                </div>
+              </div>
+
+              <div className="usage-table-wrap">
+                <div className="usage-section-title">按输出协议（区间）</div>
+                <div className="usage-table">
+                  <div className="usage-header">
+                    <span>输出协议</span>
+                    <span>区间请求</span>
+                    <span>区间 Token</span>
+                    <span>本月请求</span>
+                    <span>本月 Token</span>
+                  </div>
+                  {(() => {
+                    const rows = [...(requestStats?.range?.byProtocol || usageToday?.byProtocol || [])];
+                    if (rows.length === 0) {
+                      return <div className="empty-state">暂无输出协议请求记录。</div>;
+                    }
+                    return rows.map((row) => {
+                      const month = usageMonth?.byProtocol?.find((item) => item.protocol === row.protocol);
+                      return (
+                        <div className="usage-row" key={row.protocol}>
+                          <span className="usage-key-name">{row.protocol}</span>
                           <span>{row.requestCount}</span>
                           <span>{formatTokenSummary(row)}</span>
                           <span>{month?.requestCount ?? 0}</span>

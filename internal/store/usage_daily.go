@@ -61,6 +61,11 @@ func (s *Store) ApplyUsageDelta(delta monitor.UsagePersistDelta) error {
 			return err
 		}
 	}
+	if delta.OutputProtocol != "" {
+		if err := upsertUsageBucket(tx, delta.Day, "output_protocol", delta.OutputProtocol, "", delta, false); err != nil {
+			return err
+		}
+	}
 
 	if delta.LastRequest != nil {
 		payload, err := json.Marshal(delta.LastRequest)
@@ -138,9 +143,9 @@ func (s *Store) LoadUsageSince(since time.Time) (map[string]monitor.UsageDayBuck
 	for rows.Next() {
 		var (
 			day, bucketType, bucketID, bucketName string
-			reqCount, inTok, outTok, cacheTok      int64
-			s2xx, s4xx, s5xx, sOther               int64
-			latSum, ttftSum, ttftCount             int64
+			reqCount, inTok, outTok, cacheTok     int64
+			s2xx, s4xx, s5xx, sOther              int64
+			latSum, ttftSum, ttftCount            int64
 		)
 		if err := rows.Scan(&day, &bucketType, &bucketID, &bucketName, &reqCount, &inTok, &outTok, &cacheTok,
 			&s2xx, &s4xx, &s5xx, &sOther, &latSum, &ttftSum, &ttftCount); err != nil {
@@ -153,6 +158,7 @@ func (s *Store) LoadUsageSince(since time.Time) (map[string]monitor.UsageDayBuck
 				ByProvider: make(map[string]monitor.ProviderDayStats),
 				ByModel:    make(map[string]monitor.ModelDayStats),
 				ByUser:     make(map[string]monitor.UserDayStats),
+				ByProtocol: make(map[string]monitor.ProtocolDayStats),
 			}
 		}
 		stats := monitor.APIKeyDayStats{
@@ -194,6 +200,14 @@ func (s *Store) LoadUsageSince(since time.Time) (map[string]monitor.UsageDayBuck
 		case "user":
 			dayBuckets.ByUser[bucketID] = monitor.UserDayStats{
 				UserID:       bucketID,
+				RequestCount: reqCount,
+				InputTokens:  inTok,
+				OutputTokens: outTok,
+				CacheTokens:  cacheTok,
+			}
+		case "output_protocol":
+			dayBuckets.ByProtocol[bucketID] = monitor.ProtocolDayStats{
+				Protocol:     bucketID,
 				RequestCount: reqCount,
 				InputTokens:  inTok,
 				OutputTokens: outTok,
