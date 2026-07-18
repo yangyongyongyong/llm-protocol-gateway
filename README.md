@@ -62,10 +62,6 @@ Provider、备选 Provider、模型映射、思考深度等，页面底部可一
 
 ![API 密钥 - 多方案与客户端配置](docs/images/api-keys.png)
 
-**备选 Provider 配置**（按优先级排序，首选额度耗尽后自动切换）
-
-![备选 Provider 配置](docs/images/api-keys-fallback.png)
-
 ### 三协议接入地址
 
 同一网关对外提供 OpenAI Chat / OpenAI Responses / Claude 三种端点（局域网 + 公网）。
