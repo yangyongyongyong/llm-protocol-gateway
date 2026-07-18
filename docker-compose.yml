@@ -1,8 +1,8 @@
 services:
   gateway:
-    # 本地构建；或改成已发布镜像：image: ghcr.io/yangyongyongyong/llm-protocol-gateway:latest
+    # 本地构建；或改成已发布镜像：image: docker.io/yangyongyong/llm-protocol-gateway:latest
     build: .
-    image: ghcr.io/yangyongyongyong/llm-protocol-gateway:latest
+    image: docker.io/yangyongyong/llm-protocol-gateway:latest
     container_name: llm-protocol-gateway
     restart: unless-stopped
     ports:

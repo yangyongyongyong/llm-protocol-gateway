@@ -7,6 +7,16 @@
 > 桌面版的「Cloudflare 公网访问」依赖本机 `cloudflared`，容器里**不需要**它：用 K8s Ingress /
 > 反向代理 / 云负载均衡对外暴露即可。
 
+## 镜像地址
+
+- **Docker Hub**：[`yangyongyong/llm-protocol-gateway`](https://hub.docker.com/r/yangyongyong/llm-protocol-gateway)
+- 支持标签：`latest`、`X.Y.Z`（对应 GitHub tag `vX.Y.Z`）、`X.Y`
+- 架构：`linux/amd64`、`linux/arm64`
+
+```bash
+docker pull yangyongyong/llm-protocol-gateway:latest
+```
+
 ## 关键环境变量
 
 | 变量 | 默认（镜像内） | 说明 |
@@ -18,25 +28,24 @@
 ## 一、Docker 一键运行
 
 ```bash
-# 用已发布镜像（见下方 CI 发布），或先本地 docker build -t llm-protocol-gateway .
 docker run -d --name llm-protocol-gateway \
   -p 18093:18093 \
   -v llm-gateway-data:/data \
   --restart unless-stopped \
-  ghcr.io/yangyongyongyong/llm-protocol-gateway:latest
+  yangyongyong/llm-protocol-gateway:latest
 
 curl -s http://127.0.0.1:18093/__health   # {"status":"ok",...}
 ```
 
 打开 `http://<服务器IP>:18093/`：非本机访问会跳转 `/login`，**首次需设置管理员密码**
-（本机 `127.0.0.1` 访问才自动免密）。之后在控制台添加 Provider / API Key。
+（本机 `127.0.0.1` 直连才自动免密）。之后在控制台添加 Provider / API Key。
 
 ## 二、Docker Compose
 
-仓库根目录已提供 `docker-compose.yml`：
+仓库根目录已提供 `docker-compose.yml`（默认拉取 Docker Hub 镜像；如需本地构建取消 `build: .` 注释）：
 
 ```bash
-docker compose up -d          # 本地构建并启动
+docker compose up -d
 docker compose logs -f
 ```
 
@@ -52,21 +61,31 @@ kubectl -n llm-gateway port-forward svc/llm-protocol-gateway 18093:80
 ```
 
 > **单副本**：SQLite 是本地文件，请勿多副本共享同一 PVC（`strategy: Recreate` 已设）。
-> 需要高可用时，另议外置存储方案。
 
-## 四、发布镜像给别人用（GitHub Actions → GHCR）
+## 四、发布镜像（GitHub Actions → Docker Hub）
 
-已提供 `.github/workflows/docker-publish.yml`：**打 tag（如 `v0.2.1`）即自动构建
-`linux/amd64,linux/arm64` 多架构镜像并推送到 GHCR**，用内置 `GITHUB_TOKEN`，无需额外密钥。
+`.github/workflows/docker-publish.yml`：**打 tag（如 `v0.2.1`）即自动构建 `linux/amd64,linux/arm64`
+多架构镜像并推送到 Docker Hub**。镜像与 GitHub 版本一一对应（tag `v0.2.1` → 镜像 `0.2.1`/`0.2`/`latest`）。
+
+需在 GitHub 仓库 **Settings → Secrets and variables → Actions** 添加两个 secret：
+
+| Secret | 值 |
+| --- | --- |
+| `DOCKERHUB_USERNAME` | `yangyongyong` |
+| `DOCKERHUB_TOKEN`    | Docker Hub Access Token（Account Settings → Security → New Access Token，权限 Read/Write） |
 
 ```bash
-git tag v0.2.1 && git push origin v0.2.1
-# 产物：ghcr.io/yangyongyongyong/llm-protocol-gateway:{0.2.1, 0.2, latest}
+git tag v0.2.1 && git push origin v0.2.1     # 触发自动构建发布
 ```
 
-首次发布后到 GitHub 仓库 → Packages，把该 package 设为 Public，别人即可直接
-`docker pull` 使用。若要发到 Docker Hub，把 workflow 的登录与镜像名换成 Docker Hub 账号
-并加 `DOCKERHUB_TOKEN` secret 即可。
+本地手动多架构发布（需已 `docker login`）：
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t yangyongyong/llm-protocol-gateway:0.2.1 \
+  -t yangyongyong/llm-protocol-gateway:latest \
+  --push .
+```
 
 ## 注意事项
 

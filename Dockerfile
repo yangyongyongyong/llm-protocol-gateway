@@ -9,13 +9,16 @@ COPY web/ ./
 RUN npm run build
 
 ########## 2) 构建 Go 网关（纯 Go SQLite，CGO 关闭，静态二进制） ##########
-# buildx 多架构构建时，本阶段会按目标平台运行，go build 直接产出对应架构静态二进制。
-FROM golang:1.26-alpine AS build
+# 在构建机原生架构上运行，交叉编译到目标架构（多架构构建更快，避免 QEMU 跑 go build）。
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/gateway ./cmd/gateway
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags "-s -w" -o /out/gateway ./cmd/gateway
 
 ########## 3) 运行时镜像 ##########
 FROM alpine:3.20

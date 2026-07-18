@@ -37,7 +37,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: gateway
-          image: ghcr.io/yangyongyongyong/llm-protocol-gateway:latest
+          image: docker.io/yangyongyong/llm-protocol-gateway:latest
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 18093
