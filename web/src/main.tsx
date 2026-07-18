@@ -1732,10 +1732,11 @@ function clientConfigTitle(client: 'opencode' | 'codex' | 'claude') {
 const CODEX_PROVIDER_BLOCK_BEGIN = '################ LPG-CODEX-PROVIDER-BEGIN ################';
 const CODEX_PROVIDER_BLOCK_END = '################ LPG-CODEX-PROVIDER-END ################';
 
-// 复制脚本对应的动作名：Codex 走增量合并（"修改脚本"），其余客户端配置文件由本
-// 工具独占，仍是整份覆盖（"覆盖脚本"），语义上没有“误删用户其他配置”的问题。
-function clientConfigScriptNoun(client: 'opencode' | 'codex' | 'claude') {
-  return client === 'codex' ? '修改脚本' : '覆盖脚本';
+// 复制脚本对应的动作名：三种客户端现在都走增量合并（"修改脚本"）——只更新本工具
+// 管理的键/段，保留用户在同一配置文件里的其它设置（OpenCode 的其它 provider/主题/
+// keybinds/mcp，Claude 的 permissions/hooks/model/statusLine 等）。
+function clientConfigScriptNoun(_client: 'opencode' | 'codex' | 'claude') {
+  return '修改脚本';
 }
 
 // awk 片段：删除 BEGIN_MARK..END_MARK（含首尾）之间的内容，并顺带吃掉紧跟在
@@ -1885,27 +1886,62 @@ function buildApiKeyClientConfigInstallScript(
   if (client === 'codex') {
     return buildApiKeyCodexConfigPatchScript(configText, extraFiles);
   }
+  // OpenCode / Claude 的配置文件是 JSON，且并非本工具独占（用户自己的 provider/
+  // 主题/keybinds/mcp、permissions/hooks/model/statusLine 等都在同一文件里）。因此
+  // 改为“增量合并”：用 python3 做键级深合并，只更新本工具管理的键（Claude 的
+  // env.ANTHROPIC_*，OpenCode 的 provider.<key> 与顶层 model），其余用户配置一律保留。
   const rel = clientConfigHomeRelativePath(client);
   const display = clientConfigFilePath(client);
-  // 避免配置正文里偶发出现相同结束标记
   const stamp = Date.now().toString(36);
-  const marker = `LPG_CFG_${client.toUpperCase()}_${stamp}`;
+  const jsonMarker = `LPG_CFG_JSON_${client.toUpperCase()}_${stamp}`;
+  const pyMarker = `LPG_CFG_PY_${client.toUpperCase()}_${stamp}`;
   const body = configText.endsWith('\n') ? configText : `${configText}\n`;
   const lines = [
-    '# 覆盖客户端配置（粘贴到终端执行即可；勿带 shebang，避免 zsh 把 ! 当历史展开）',
+    '# 修改脚本（增量合并进 JSON 配置；只更新本工具管理的键，保留你其它配置；粘贴到终端执行即可）',
     'set -euo pipefail',
     `FILE="$HOME/${rel}"`,
     'mkdir -p "$(dirname "$FILE")"',
+    'if ! command -v python3 >/dev/null 2>&1; then',
+    '  echo "未找到 python3，无法安全增量合并 JSON。请改用弹窗里的「仅复制配置内容」手动合并。" >&2',
+    '  exit 1',
+    'fi',
     'if [ -f "$FILE" ]; then',
     '  BAK="${FILE}.bak.$(date +%Y%m%d%H%M%S)"',
     '  cp "$FILE" "$BAK"',
     '  echo "已备份: $BAK"',
     'fi',
-    `cat > "$FILE" <<'${marker}'`,
+    `LPG_NEW=$(cat <<'${jsonMarker}'`,
     body.replace(/\n$/, ''),
-    marker,
-    `echo "已写入: ${display}"`,
+    jsonMarker,
+    ')',
+    `LPG_NEW="$LPG_NEW" python3 - "$FILE" <<'${pyMarker}'`,
+    'import json, os, sys',
+    'path = sys.argv[1]',
+    'new = json.loads(os.environ["LPG_NEW"])',
+    'data = {}',
+    'if os.path.exists(path):',
+    '    try:',
+    '        with open(path, "r", encoding="utf-8") as f:',
+    '            data = json.load(f) or {}',
+    '    except Exception:',
+    '        data = {}',
+    'if not isinstance(data, dict):',
+    '    data = {}',
+    'def merge(dst, src):',
+    '    for k, v in src.items():',
+    '        if isinstance(v, dict) and isinstance(dst.get(k), dict):',
+    '            merge(dst[k], v)',
+    '        else:',
+    '            dst[k] = v',
+    '    return dst',
+    'merge(data, new)',
+    'with open(path, "w", encoding="utf-8") as f:',
+    '    json.dump(data, f, ensure_ascii=False, indent=2)',
+    '    f.write("\\n")',
+    pyMarker,
+    `echo "已合并写入（仅更新本工具管理的键，保留你其它配置）: ${display}"`,
   ];
+  // opencode / claude 目前没有附加文件；保留循环以兼容将来扩展（附加文件仍整份写入）。
   extraFiles.forEach((file, index) => {
     const fileMarker = `LPG_EXTRA_${client.toUpperCase()}_${index}_${stamp}`;
     const fileBody = file.content.endsWith('\n') ? file.content : `${file.content}\n`;
@@ -9375,7 +9411,7 @@ function ApiKeyClientConfigModal({
       description={
         client === 'codex'
           ? '已复制修改脚本到剪贴板。在终端粘贴执行即可增量合并进 config.toml（只替换本工具管理的一段，不动你其他配置；会先备份旧文件）。'
-          : '已复制覆盖脚本到剪贴板。在终端粘贴执行即可写入配置（会先备份旧文件）。'
+          : '已复制修改脚本到剪贴板。在终端粘贴执行即可增量合并进 JSON 配置（只更新本工具管理的键，保留你其它配置；会先备份旧文件；依赖 python3）。'
       }
       onClose={onClose}
       size="wide"
