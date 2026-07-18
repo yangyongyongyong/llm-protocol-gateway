@@ -53,14 +53,23 @@ Provider 不止支持 API Key，还支持 **OAuth 账号**直连：
 
 ## 🖼️ 界面预览
 
-> 截图请放到 `docs/images/`（见该目录说明），并确认已脱敏（不含密钥 / Tunnel Token /
-> 账号邮箱 / 私有域名）。放好后取消下面对应行的注释即可显示。
+> 以下截图均已脱敏（账号邮箱 / 私有域名 / Tunnel Token / 局域网 IP 等已替换为示例值）。
 
-<!-- ![总览 / 协议互转](docs/images/overview.png) -->
-<!-- ![Provider 管理](docs/images/providers.png) -->
-<!-- ![同 Key 多 Provider 切换](docs/images/api-keys.png) -->
-<!-- ![公网访问（Cloudflare）](docs/images/public-url.png) -->
-<!-- ![用量 / 日志](docs/images/usage.png) -->
+**三协议接入地址**（同一网关对外提供 OpenAI Chat / OpenAI Responses / Claude 三种端点）
+
+![三协议接入地址](docs/images/overview.png)
+
+**Provider 管理**（支持 Claude / OpenAI / Cursor 账号与 API Key，展示订阅额度、协议、绑定用户）
+
+![Provider 管理](docs/images/providers.png)
+
+**公网访问**（Cloudflare 一键穿透，管理页与模型 API 域名可分别开启）
+
+![公网访问](docs/images/public-url.png)
+
+**用量统计**（按日期区间汇总请求 / Token，含缓存命中率、按 Key/Provider/模型 维度）
+
+![用量统计](docs/images/usage.png)
 
 ---
 
@@ -108,6 +117,7 @@ GATEWAY_ADDR=127.0.0.1:18090 go run ./cmd/gateway
 
 - [Bearer 令牌 Provider 说明](docs/bearer-provider.md) —— 配置、鉴权、健康探测、故障转移、自注册
 - [macOS App](docs/macos-app.md)
+- [已知问题 / 踩坑记录](docs/known-issues.md)
 
 ---
 
@@ -122,23 +132,3 @@ curl -s http://127.0.0.1:18093/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"gpt-5.5","messages":[{"role":"user","content":"hi"}]}'
 ```
-
----
-
-## 🧩 已知问题 / 踩坑记录
-
-### 1. Claude thinking 尾块导致连环静默（已修复）
-某轮模型在 thinking 后被打断，历史里留下以裸 `thinking` 结尾的 assistant 消息，下一轮转换出的请求
-非法（`assistant` 消息不能以 thinking 收尾），且模型倾向继续只输出 thinking，造成会话卡死。已通过
-`dropTrailingAssistantThinking` 清理尾部 thinking、`thinking_rectifier` 匹配该类 400 剥离重试、以及
-"仅 thinking 空响应"自动重试解决。
-
-### 2. thinking 块 "cannot be modified" 报错（已修复）
-Codex（Responses→Claude）回放历史/最新 thinking 块时与 Anthropic 原始签名不一致会触发
-`blocks ... cannot be modified` 类 400。网关的 thinking 签名整流器现已覆盖**转换路径**（此前只覆盖
-原生透传），命中即剥离 thinking 块并同 Provider 透明重试一次（对齐 `farion1231/cc-switch` 思路）。
-
-### 3. Codex `remote_compaction_v2` 在自定义/第三方 Provider 下无法保证成功（非本项目缺陷）
-Codex 远程压缩要求响应"恰好 1 个输出项"，而带 thinking 的模型天然拆成 `reasoning` + `message` 两项，
-无法满足。这是 Codex 客户端侧的强校验，MiniMax / DeepSeek 等官方 `/v1/responses` 也复现。**应对**：
-`codex features disable remote_compaction_v2`（本项目生成 Codex 配置时已默认带上）。
