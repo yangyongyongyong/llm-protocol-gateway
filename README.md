@@ -1,10 +1,14 @@
 # LLM Protocol Gateway
 
-**一个 macOS 桌面网关：在 OpenAI Chat / OpenAI Responses / Claude 三种协议之间自由互转与透传，
+**一个 LLM 协议网关：在 OpenAI Chat / OpenAI Responses / Claude 三种协议之间自由互转与透传，
 把本地/第三方/官方账号统一收敛成一个可对外访问的 OpenAI 或 Claude 端点。**
 
 面向 Cursor、Codex 等自定义模型客户端，解决"协议对不上、无法跨网络访问、无法控制模型名与
 思考深度、单一上游不稳定"等一系列实际痛点。
+
+> 🖥️ **同时支持两种部署形态，一套核心**：
+> - **macOS 桌面 App**：菜单栏常驻 + Cloudflare 一键公网，开箱即用（见 [macOS App](docs/macos-app.md)）
+> - **Web / 容器部署**：Docker / Compose / Kubernetes，部署到服务器供跨网络访问（见 [容器部署](docs/deploy.md)）
 
 ---
 
