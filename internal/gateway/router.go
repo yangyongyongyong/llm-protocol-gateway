@@ -340,6 +340,11 @@ func (r *Router) UpdateProvider(providerID string, patch domain.Provider) (domai
 		}
 		// Explicitly allow clearing requestAdapter by sending null/empty object.
 		updated.RequestAdapter = patch.RequestAdapter
+		// Zhipu coding-plan quota-query config (non-secret). Sent verbatim from
+		// the editor; trim so blank inputs clear the fields.
+		updated.CodingPlanProvider = strings.TrimSpace(patch.CodingPlanProvider)
+		updated.TeamOrganizationID = strings.TrimSpace(patch.TeamOrganizationID)
+		updated.TeamProjectID = strings.TrimSpace(patch.TeamProjectID)
 		normalizeProvider(&updated)
 		r.state.Providers[index] = updated
 		r.rebuildModelsLocked()

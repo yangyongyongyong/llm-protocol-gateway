@@ -37,9 +37,9 @@ const (
 )
 
 type PublicAccessSettings struct {
-	Enabled      bool             `json:"enabled"`
-	Provider     string           `json:"provider"`
-	Mode         PublicAccessMode `json:"mode"`
+	Enabled  bool             `json:"enabled"`
+	Provider string           `json:"provider"`
+	Mode     PublicAccessMode `json:"mode"`
 	// ExposeAPI controls whether the model-API custom hostname is published
 	// on the Cloudflare tunnel. Independent from ExposeUI.
 	ExposeAPI bool `json:"exposeApi"`
@@ -51,17 +51,17 @@ type PublicAccessSettings struct {
 	CustomDomain string `json:"customDomain,omitempty"`
 	// UIDomain is the public hostname for the management UI only
 	// (e.g. console.example.com). Must differ from CustomDomain when both are set.
-	UIDomain string           `json:"uiDomain,omitempty"`
-	Expose   string           `json:"expose"`
-	RuntimeURL   string           `json:"runtimeUrl,omitempty"`
+	UIDomain   string `json:"uiDomain,omitempty"`
+	Expose     string `json:"expose"`
+	RuntimeURL string `json:"runtimeUrl,omitempty"`
 	// Named-tunnel fields for custom-domain mode (cloudflared). These are
 	// persisted so the setup can be reused, but full named-tunnel automation is
 	// stubbed in this build (see internal/tunnel).
-	TunnelName        string `json:"tunnelName,omitempty"`
-	TunnelToken       string `json:"tunnelToken,omitempty"`
-	CredentialsFile   string `json:"credentialsFile,omitempty"`
-	TunnelConfigFile  string `json:"tunnelConfigFile,omitempty"`
-	PublicBaseURL   string `json:"publicBaseUrl,omitempty"`
+	TunnelName       string `json:"tunnelName,omitempty"`
+	TunnelToken      string `json:"tunnelToken,omitempty"`
+	CredentialsFile  string `json:"credentialsFile,omitempty"`
+	TunnelConfigFile string `json:"tunnelConfigFile,omitempty"`
+	PublicBaseURL    string `json:"publicBaseUrl,omitempty"`
 	// UIPublicBaseURL is the browser management URL for custom-domain mode.
 	UIPublicBaseURL string `json:"uiPublicBaseUrl,omitempty"`
 	Status          string `json:"status"`
@@ -99,27 +99,27 @@ type Provider struct {
 	// against this provider, and the background recovery loop
 	// (see gateway.StartProviderFailoverRecovery) will re-probe it at this
 	// time. Computed at response time in handleState; never persisted.
-	NextRetryAt          string   `json:"nextRetryAt,omitempty"`
+	NextRetryAt string `json:"nextRetryAt,omitempty"`
 	// OwnerUserID is the console user that created this provider. Empty means
 	// admin-created. A normal user owns the providers they create and may
 	// edit/clone/delete/test them; admins have full access to every provider.
-	OwnerUserID          string   `json:"ownerUserId,omitempty"`
+	OwnerUserID string `json:"ownerUserId,omitempty"`
 	// Disabled is the admin-only kill switch. Zero value (false) means enabled,
 	// so newly created providers and legacy rows/exports default to enabled.
 	// While disabled, normal users cannot see, bind, or send traffic through
 	// this provider; admins keep full access.
-	Disabled             bool     `json:"disabled,omitempty"`
+	Disabled bool `json:"disabled,omitempty"`
 	// Deleted marks a provider as soft-deleted (see Router.DeleteProvider).
 	// Soft-deleted providers are hidden from normal listings/routing and can't
 	// be bound to new routes or API keys, but their configuration/secrets are
 	// preserved on disk so an accidental delete can be undone (RestoreProvider)
 	// instead of losing OAuth credentials, request adapters, etc. Only a
 	// separate, explicit purge (Router.PurgeProvider) removes the row for real.
-	Deleted              bool     `json:"deleted,omitempty"`
+	Deleted bool `json:"deleted,omitempty"`
 	// DeletedAt is the RFC3339 timestamp of the soft delete; empty when not deleted.
-	DeletedAt            string   `json:"deletedAt,omitempty"`
-	AuthHeader           string   `json:"authHeader"`
-	ExtraEndpoint        string   `json:"extraEndpoint,omitempty"`
+	DeletedAt     string `json:"deletedAt,omitempty"`
+	AuthHeader    string `json:"authHeader"`
+	ExtraEndpoint string `json:"extraEndpoint,omitempty"`
 	// AuthType selects the provider's authentication mode. "" and "api_key"
 	// both mean today's default APIKeySource-driven auth; "claude_oauth" means
 	// the provider authenticates via a Claude.ai OAuth token pair instead.
@@ -137,6 +137,16 @@ type Provider struct {
 	// RequestAdapter is an optional provider-level request rewrite template
 	// (URL/headers/body/model mapping). Nil means use built-in protocol logic.
 	RequestAdapter *RequestAdapter `json:"requestAdapter,omitempty"`
+	// CodingPlanProvider explicitly tags providers whose coding-plan quota API
+	// can't be disambiguated by BaseURL alone. Currently only "zhipu_team":
+	// its quota endpoint shares open.bigmodel.cn with personal Zhipu and is
+	// distinguished by the ?type=2 query + org/project headers.
+	CodingPlanProvider string `json:"codingPlanProvider,omitempty"`
+	// TeamOrganizationID / TeamProjectID are the Zhipu team-plan (bigmodel)
+	// quota-query headers (bigmodel-organization / bigmodel-project). These are
+	// account identifiers, not secrets, so they may be sent to the frontend.
+	TeamOrganizationID string `json:"teamOrganizationId,omitempty"`
+	TeamProjectID      string `json:"teamProjectId,omitempty"`
 	// SelfRegistration lets the provider owner's own automation script keep
 	// BaseURL/APIKeySource in sync (e.g. a self-hosted backend behind a
 	// rotating reverse-tunnel URL) by calling
@@ -202,7 +212,7 @@ type CursorOAuthCredential struct {
 type ChatGPTOAuthCredential struct {
 	AccessToken      string `json:"accessToken,omitempty"`
 	RefreshToken     string `json:"refreshToken,omitempty"`
-	ExpiresAt        string `json:"expiresAt,omitempty"` // RFC3339
+	ExpiresAt        string `json:"expiresAt,omitempty"`    // RFC3339
 	AccountLabel     string `json:"accountLabel,omitempty"` // email / plan
 	ChatGPTAccountID string `json:"chatgptAccountId,omitempty"`
 	Connected        bool   `json:"connected,omitempty"`
@@ -339,7 +349,7 @@ type User struct {
 	// browser session. The in-memory tracker is always accurate; the DB copy
 	// is flushed asynchronously and at most once per 5 minutes per user to
 	// avoid hot-path write churn.
-	LastActiveAt       string   `json:"lastActiveAt,omitempty"`
+	LastActiveAt string `json:"lastActiveAt,omitempty"`
 }
 
 type RouteDecision struct {

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -24,10 +25,10 @@ import (
 // Claude Code CLI uses to turn a Claude.ai Pro/Max subscription into an API
 // backend (see sub2api / claude-oauth-proxy for prior art).
 const (
-	claudeOAuthClientID     = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+	claudeOAuthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 	// Browser OAuth scope must include org:create_api_key (sub2api ScopeOAuth).
-	claudeOAuthScope        = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
-	claudeOAuthAuthorizeURL = "https://claude.ai/oauth/authorize"
+	claudeOAuthScope           = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+	claudeOAuthAuthorizeURL    = "https://claude.ai/oauth/authorize"
 	claudeOAuthCAIAuthorizeURL = "https://claude.com/cai/oauth/authorize"
 	// claudeOAuthTokenURL is the current token endpoint. console.anthropic.com/v1/oauth/token
 	// is a legacy alternative that reportedly still works, but platform.claude.com is
@@ -42,9 +43,9 @@ const (
 	claudeOAuthBetaHeader = "oauth-2025-04-20"
 	// claudeMessagesURL is the upstream Anthropic Messages API used for both
 	// the real pass-through path and the Claude-native chat test path.
-	claudeMessagesURL = "https://api.anthropic.com/v1/messages"
+	claudeMessagesURL    = "https://api.anthropic.com/v1/messages"
 	claudeCountTokensURL = "https://api.anthropic.com/v1/messages/count_tokens"
-	claudeModelsURL     = "https://api.anthropic.com/v1/models"
+	claudeModelsURL      = "https://api.anthropic.com/v1/models"
 	// claudeBillingHeaderMarker is injected into the system prompt for
 	// claude_oauth providers; required for OAuth-authenticated Sonnet/Opus
 	// billing to work correctly against the subscription.
@@ -448,16 +449,33 @@ func (s *Server) ensureFreshClaudeToken(provider domain.Provider) (domain.Provid
 		return provider, nil
 	}
 
-	refreshed, err := refreshClaudeOAuthToken(provider.ClaudeOAuth.RefreshToken)
+	// Serialize refresh per provider. Concurrent refresh with the same refresh
+	// token can yield invalid_grant (Anthropic may rotate/invalidate R1 after
+	// the first success); UI usage polls + live traffic used to race here.
+	unlock := s.lockOAuthUsageFetch("claude-token:" + provider.ID)
+	defer unlock()
+
+	current, err := s.router.ProviderByID(provider.ID)
 	if err != nil {
-		return provider, fmt.Errorf("failed to refresh claude oauth token: %w", err)
+		return provider, err
+	}
+	if current.ClaudeOAuth == nil || strings.TrimSpace(current.ClaudeOAuth.RefreshToken) == "" {
+		return current, fmt.Errorf("provider %q has no Claude OAuth connection; connect it first", provider.ID)
+	}
+	if !claudeTokenNeedsRefresh(current.ClaudeOAuth) {
+		return current, nil
+	}
+
+	refreshed, err := refreshClaudeOAuthToken(current.ClaudeOAuth.RefreshToken)
+	if err != nil {
+		return current, fmt.Errorf("failed to refresh claude oauth token: %w", err)
 	}
 	// The refresh endpoint may omit refresh_token when it doesn't rotate it;
 	// keep the previous one in that case.
 	if strings.TrimSpace(refreshed.RefreshToken) == "" {
-		refreshed.RefreshToken = provider.ClaudeOAuth.RefreshToken
+		refreshed.RefreshToken = current.ClaudeOAuth.RefreshToken
 	}
-	refreshed.AccountLabel = provider.ClaudeOAuth.AccountLabel
+	refreshed.AccountLabel = current.ClaudeOAuth.AccountLabel
 	if strings.TrimSpace(refreshed.AccountLabel) == "" {
 		// 老连接没存过账号信息：借 token 刷新的时机补齐。
 		if label, labelErr := fetchClaudeOAuthProfileLabel(refreshed.AccessToken); labelErr == nil {
@@ -465,15 +483,18 @@ func (s *Server) ensureFreshClaudeToken(provider domain.Provider) (domain.Provid
 		}
 	}
 	if strings.TrimSpace(refreshed.Scope) == "" {
-		refreshed.Scope = provider.ClaudeOAuth.Scope
+		refreshed.Scope = current.ClaudeOAuth.Scope
 	}
 
-	updated, err := s.router.SetProviderClaudeOAuth(provider.ID, refreshed)
+	updated, err := s.router.SetProviderClaudeOAuth(current.ID, refreshed)
 	if err != nil {
-		return provider, err
+		return current, err
 	}
 	if err := s.persistProviderOAuth(updated.ID, updated.ClaudeOAuth, nil, nil); err != nil {
-		s.logs.AddApp("warn", "failed to persist refreshed claude oauth token", err.Error())
+		// Memory has the new token; DB does not. A restart would then load the
+		// old refresh token and hit invalid_grant — surface loudly.
+		s.logs.AddApp("error", "failed to persist refreshed claude oauth token", err.Error())
+		slog.Error("failed to persist refreshed claude oauth token", "provider", updated.ID, "error", err)
 	}
 	return updated, nil
 }

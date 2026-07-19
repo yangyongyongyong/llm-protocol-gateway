@@ -216,7 +216,8 @@ func isUserProviderManagementPath(method, path string) bool {
 	return false
 }
 
-// isUserProviderUsagePath matches GET /__providers/{id}/(claude|cursor|chatgpt)-oauth/usage.
+// isUserProviderUsagePath matches GET /__providers/{id}/(claude|cursor|chatgpt)-oauth/usage
+// and GET /__providers/{id}/zhipu/usage.
 func isUserProviderUsagePath(path string) bool {
 	if !strings.HasPrefix(path, "/__providers/") {
 		return false
@@ -226,7 +227,7 @@ func isUserProviderUsagePath(path string) bool {
 		return false
 	}
 	switch parts[1] {
-	case "claude-oauth", "cursor-oauth", "chatgpt-oauth":
+	case "claude-oauth", "cursor-oauth", "chatgpt-oauth", "zhipu":
 		return parts[2] == "usage"
 	default:
 		return false

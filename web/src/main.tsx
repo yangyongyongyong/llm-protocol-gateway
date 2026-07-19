@@ -135,6 +135,21 @@ type ClaudeOAuthUsageReport = {
   extra_usage?: Record<string, unknown>;
 };
 
+type ZhipuUsageBucket = {
+  utilization: number;
+  resets_at?: string;
+};
+
+type ZhipuUsageReport = {
+  available: boolean;
+  unsupported?: boolean;
+  error?: string;
+  fetchedAt?: string;
+  level?: string;
+  five_hour?: ZhipuUsageBucket;
+  weekly?: ZhipuUsageBucket;
+};
+
 type CursorOAuthUsageBucket = {
   label: string;
   utilization: number;
@@ -304,6 +319,12 @@ type Provider = {
     lastSeenAt?: string;
   };
   authType?: 'api_key' | 'claude_oauth' | 'cursor_oauth' | 'chatgpt_oauth';
+  // 智谱（bigmodel / z.ai）编程套餐额度查询配置：团队版需要组织 + 项目 ID，
+  // 两者都填时走团队版端点（?type=2 + bigmodel-organization/-project 请求头），
+  // 否则走个人版端点。均为非敏感账号标识。
+  codingPlanProvider?: string;
+  teamOrganizationId?: string;
+  teamProjectId?: string;
   claudeOAuth?: ClaudeOAuthInfo;
   cursorOAuth?: CursorOAuthInfo;
   chatgptOAuth?: ChatGPTOAuthInfo;
@@ -2903,6 +2924,8 @@ function App() {
     defaultThinkingDepth: '',
     authType: 'api_key' as 'api_key' | 'claude_oauth' | 'cursor_oauth' | 'chatgpt_oauth' | 'self_register',
     requestAdapterJSON: '',
+    teamOrganizationId: '',
+    teamProjectId: '',
   });
   const [claudeOAuthState, setClaudeOAuthState] = useState('');
   const [claudeOAuthCode, setClaudeOAuthCode] = useState('');
@@ -4492,6 +4515,8 @@ function App() {
       defaultThinkingDepth: '',
       authType: 'api_key',
       requestAdapterJSON: '',
+      teamOrganizationId: '',
+      teamProjectId: '',
     });
     resetClaudeOAuthFlowState();
     resetCursorOAuthFlowState();
@@ -4523,6 +4548,8 @@ function App() {
         bodyTemplate: provider.requestAdapter.bodyTemplate || '',
         modelMapping: provider.requestAdapter.modelMapping || {},
       }, null, 2) : '',
+      teamOrganizationId: provider.teamOrganizationId || '',
+      teamProjectId: provider.teamProjectId || '',
     });
     resetClaudeOAuthFlowState();
     resetCursorOAuthFlowState();
@@ -4549,6 +4576,8 @@ function App() {
         bodyTemplate: provider.requestAdapter.bodyTemplate || '',
         modelMapping: provider.requestAdapter.modelMapping || {},
       }, null, 2) : '',
+      teamOrganizationId: provider.teamOrganizationId || '',
+      teamProjectId: provider.teamProjectId || '',
     });
     resetClaudeOAuthFlowState();
     resetCursorOAuthFlowState();
@@ -4663,6 +4692,10 @@ function App() {
         authHeader: providerDraft.protocol === 'claude' ? 'x-api-key' : 'Authorization',
         authType: isClaudeOAuth ? 'claude_oauth' : isCursorOAuth ? 'cursor_oauth' : isChatGPTOAuth ? 'chatgpt_oauth' : 'api_key',
         requestAdapter,
+        // 智谱团队版：两者都填才发送并触发团队端点；否则清空（走个人版）。
+        teamOrganizationId: providerDraft.teamOrganizationId.trim(),
+        teamProjectId: providerDraft.teamProjectId.trim(),
+        codingPlanProvider: providerDraft.teamOrganizationId.trim() && providerDraft.teamProjectId.trim() ? 'zhipu_team' : '',
       };
       const response = await fetch(editingProviderID ? `${API_BASE}/__providers/${encodeURIComponent(editingProviderID)}` : `${API_BASE}/__providers`, {
         method: editingProviderID ? 'PATCH' : 'POST',
@@ -7760,6 +7793,12 @@ function App() {
               <>
                 <Field fullWidth label="Base URL" value={providerDraft.baseUrl} onChange={(value) => setProviderDraft((current) => ({ ...current, baseUrl: value }))} />
                 <Field fullWidth label="API Key Source（可选）" value={providerDraft.apiKeySource} onChange={(value) => setProviderDraft((current) => ({ ...current, apiKeySource: value }))} />
+                {/(?:bigmodel\.cn|z\.ai)/i.test(providerDraft.baseUrl) && (
+                  <>
+                    <Field label="智谱组织 ID（团队版填，个人版留空）" value={providerDraft.teamOrganizationId} onChange={(value) => setProviderDraft((current) => ({ ...current, teamOrganizationId: value }))} />
+                    <Field label="智谱项目 ID（团队版填，个人版留空）" value={providerDraft.teamProjectId} onChange={(value) => setProviderDraft((current) => ({ ...current, teamProjectId: value }))} />
+                  </>
+                )}
               </>
             )}
             <Field label="兜底模型（可选）" value={providerDraft.defaultModel} onChange={(value) => setProviderDraft((current) => ({ ...current, defaultModel: value }))} />
@@ -7767,6 +7806,12 @@ function App() {
               {thinkingDepthSelectOptions({ value: '', label: '（不指定）' })}
             </select></div>
           </div>
+          {editingProviderID && providerDraft.authType === 'api_key' && /(?:bigmodel\.cn|z\.ai)/i.test(providerDraft.baseUrl) && (
+            <div className="claude-oauth-panel">
+              <div className="hint-line">智谱编程套餐额度{providerDraft.teamOrganizationId.trim() && providerDraft.teamProjectId.trim() ? '（团队版 · 需先保存组织/项目 ID）' : '（个人版）'}</div>
+              <ZhipuUsagePanel providerId={editingProviderID} />
+            </div>
+          )}
           {providerDraft.protocol === 'claude' && providerDraft.authType === 'claude_oauth' && (
             <div className="claude-oauth-panel">
               {!editingProviderID ? (
@@ -8567,6 +8612,76 @@ function ClaudeOAuthUsagePanel({ providerId, connected, compact }: { providerId:
   );
 }
 
+function ZhipuUsagePanel({ providerId, compact }: { providerId: string; compact?: boolean }) {
+  const { report, loading, refresh } = useOAuthUsageReport<ZhipuUsageReport>(
+    true,
+    `/__providers/${encodeURIComponent(providerId)}/zhipu/usage`,
+  );
+
+  // 卡片上：非编程套餐 / 拉取失败都不渲染，避免把「额度 UI」误当成 Provider/转发故障。
+  if (compact) {
+    if (!report?.available) return null;
+  } else if (report?.unsupported) {
+    return (
+      <div className="claude-usage-panel" onClick={(event) => event.stopPropagation()}>
+        <div className="hint-line">该密钥非智谱编程套餐，无额度面板（按量转发不受影响）。</div>
+      </div>
+    );
+  }
+
+  const buckets: Array<{ key: string; label: string; bucket?: ZhipuUsageBucket }> = [
+    { key: 'five_hour', label: '5 小时额度', bucket: report?.five_hour },
+    { key: 'weekly', label: '每周额度', bucket: report?.weekly },
+  ].filter((item) => item.bucket);
+
+  return (
+    <div className={`claude-usage-panel${compact ? ' compact' : ''}`} onClick={(event) => event.stopPropagation()}>
+      <div className="claude-usage-title">
+        <span>智谱编程套餐额度{report?.level ? ` · ${report.level}` : ''}</span>
+        <span className="claude-usage-actions">
+          {loading ? <span className="claude-usage-status">刷新中…</span> : report?.fetchedAt ? <span className="claude-usage-status">更新于 {formatClaudeUsageResetAt(report.fetchedAt)}</span> : null}
+          <button
+            type="button"
+            className="btn btn-tiny"
+            disabled={loading}
+            onClick={(event) => {
+              event.stopPropagation();
+              void refresh();
+            }}
+          >
+            刷新
+          </button>
+        </span>
+      </div>
+      {!report ? (
+        <div className="claude-usage-empty">{loading ? '正在拉取额度…' : '暂无额度数据'}</div>
+      ) : !report.available ? (
+        <div className="claude-usage-empty">{report.error || '额度不可用'}</div>
+      ) : buckets.length === 0 ? (
+        <div className="claude-usage-empty">未返回额度桶数据（老套餐可能只有 5 小时窗口）</div>
+      ) : (
+        <div className="claude-usage-grid">
+          {buckets.map(({ key, label, bucket }) => {
+            const percent = Math.min(100, Math.max(0, bucket?.utilization ?? 0));
+            return (
+              <div className="claude-usage-row" key={key}>
+                <div className="claude-usage-head">
+                  <span>{label}</span>
+                  <span>{percent.toFixed(0)}%</span>
+                </div>
+                <div className="claude-usage-track">
+                  <div className={`claude-usage-fill ${claudeUsageFillTone(percent)}`} style={{ width: `${percent}%` }} />
+                </div>
+                <div className="claude-usage-reset">重置：{formatClaudeUsageResetAt(bucket?.resets_at)}</div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function CursorOAuthUsagePanel({ providerId, connected, compact }: { providerId: string; connected?: boolean; compact?: boolean }) {
   const { report, loading, refresh } = useOAuthUsageReport<CursorOAuthUsageReport>(
     Boolean(connected),
@@ -8744,6 +8859,7 @@ function ProviderCard({ active, selected, name, providerId, protocol, tone, url,
       {isClaudeOAuth && claudeOAuthConnected ? <ClaudeOAuthUsagePanel providerId={providerId} connected={claudeOAuthConnected} compact /> : null}
       {isCursorOAuth && cursorOAuthConnected ? <CursorOAuthUsagePanel providerId={providerId} connected={cursorOAuthConnected} compact /> : null}
       {isChatGPTOAuth && chatgptOAuthConnected ? <ChatGPTOAuthUsagePanel providerId={providerId} connected={chatgptOAuthConnected} compact /> : null}
+      {!isClaudeOAuth && !isCursorOAuth && !isChatGPTOAuth && /(?:bigmodel\.cn|z\.ai)/i.test(url) ? <ZhipuUsagePanel providerId={providerId} compact /> : null}
       {!readOnly ? (
         <div className="provider-actions">
           <button className="icon-btn" disabled={testing} onClick={(event) => { event.stopPropagation(); onTest(); }} title="从 Provider 接口获取可用模型">{testing ? '获取中' : '获取模型'}</button>

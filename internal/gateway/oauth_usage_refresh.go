@@ -46,7 +46,58 @@ func (s *Server) refreshAllOAuthUsage(ctx context.Context) {
 			if provider.ChatGPTOAuth != nil && strings.TrimSpace(provider.ChatGPTOAuth.RefreshToken) != "" {
 				s.refreshChatGPTOAuthUsage(provider.ID)
 			}
+		default:
+			// api_key Zhipu (bigmodel / z.ai) providers expose a coding-plan
+			// quota endpoint; keep it warm like the OAuth reports.
+			if isZhipuBaseURL(provider.BaseURL) && strings.TrimSpace(resolveProviderAuth(provider)) != "" {
+				s.refreshZhipuUsage(provider.ID)
+			}
 		}
+	}
+}
+
+func (s *Server) refreshZhipuUsage(providerID string) {
+	cacheKey := "zhipu:" + providerID
+	unlock := s.lockOAuthUsageFetch(cacheKey)
+	defer unlock()
+	s.refreshZhipuUsageHoldingLock(providerID)
+}
+
+func (s *Server) maybeRefreshZhipuUsageAsync(providerID string) {
+	cacheKey := "zhipu:" + providerID
+	if !s.oauthUsageCache.needsRefresh(cacheKey) {
+		return
+	}
+	if !s.tryLockOAuthUsageFetch(cacheKey) {
+		return
+	}
+	go func() {
+		defer s.unlockOAuthUsageFetch(cacheKey)
+		s.refreshZhipuUsageHoldingLock(providerID)
+	}()
+}
+
+func (s *Server) refreshZhipuUsageHoldingLock(providerID string) {
+	provider, err := s.router.ProviderByID(providerID)
+	if err != nil {
+		return
+	}
+	if !isZhipuBaseURL(provider.BaseURL) {
+		return
+	}
+	apiKey := resolveProviderAuth(provider)
+	if strings.TrimSpace(apiKey) == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	report, err := fetchZhipuUsageForProvider(ctx, provider, apiKey)
+	if err != nil {
+		return
+	}
+	// Cache both success and "unsupported" so we don't keep hammering 按量 keys.
+	if report.Available || report.Unsupported {
+		s.oauthUsageCache.set("zhipu:"+providerID, report)
 	}
 }
 

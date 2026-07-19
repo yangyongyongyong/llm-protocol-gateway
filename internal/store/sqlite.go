@@ -193,6 +193,11 @@ func (s *Store) migrate() error {
 		// the row; only an explicit purge does.
 		{"deleted", "INTEGER NOT NULL DEFAULT 0"},
 		{"deleted_at", "TEXT NOT NULL DEFAULT ''"},
+		// coding_plan_provider / team_*: Zhipu coding-plan quota-query config
+		// (see domain.Provider). Empty for every non-Zhipu provider.
+		{"coding_plan_provider", "TEXT NOT NULL DEFAULT ''"},
+		{"team_organization_id", "TEXT NOT NULL DEFAULT ''"},
+		{"team_project_id", "TEXT NOT NULL DEFAULT ''"},
 	}
 	for _, column := range oauthColumns {
 		if err := addColumnIfMissing(tx, "providers", column.name, column.definition); err != nil {
@@ -461,13 +466,15 @@ func (s *Store) Save(state domain.GatewayState) error {
 		if _, err := tx.Exec(`INSERT INTO providers
 			(id, name, protocol, base_url, api_key_source, default_model, default_thinking_depth, health_status, auth_header, extra_endpoint, position,
 			 auth_type, oauth_access_token, oauth_refresh_token, oauth_expires_at, oauth_scope, oauth_account_label, owner_user_id, disabled,
-			 self_reg_token_hash, self_reg_token_preview, self_reg_created_at, self_reg_last_seen_at, deleted, deleted_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 self_reg_token_hash, self_reg_token_preview, self_reg_created_at, self_reg_last_seen_at, deleted, deleted_at,
+			 coding_plan_provider, team_organization_id, team_project_id)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			provider.ID, provider.Name, string(provider.Protocol), provider.BaseURL, provider.APIKeySource,
 			provider.DefaultModel, provider.DefaultThinkingDepth, provider.HealthStatus, provider.AuthHeader,
 			provider.ExtraEndpoint, pIndex,
 			provider.AuthType, accessToken, refreshToken, expiresAt, scope, accountLabel, provider.OwnerUserID, disabled,
-			selfRegTokenHash, selfRegTokenPreview, selfRegCreatedAt, selfRegLastSeenAt, deleted, provider.DeletedAt); err != nil {
+			selfRegTokenHash, selfRegTokenPreview, selfRegCreatedAt, selfRegLastSeenAt, deleted, provider.DeletedAt,
+			provider.CodingPlanProvider, provider.TeamOrganizationID, provider.TeamProjectID); err != nil {
 			return err
 		}
 		for mIndex, model := range provider.Models {
@@ -557,7 +564,8 @@ func (s *Store) Save(state domain.GatewayState) error {
 func (s *Store) loadProviders() ([]domain.Provider, error) {
 	rows, err := s.reader().Query(`SELECT id, name, protocol, base_url, api_key_source, default_model, default_thinking_depth, health_status, auth_header, extra_endpoint,
 		auth_type, oauth_access_token, oauth_refresh_token, oauth_expires_at, oauth_scope, oauth_account_label, owner_user_id, disabled,
-		self_reg_token_hash, self_reg_token_preview, self_reg_created_at, self_reg_last_seen_at, deleted, deleted_at
+		self_reg_token_hash, self_reg_token_preview, self_reg_created_at, self_reg_last_seen_at, deleted, deleted_at,
+		coding_plan_provider, team_organization_id, team_project_id
 		FROM providers ORDER BY position, id`)
 	if err != nil {
 		return nil, err
@@ -571,9 +579,11 @@ func (s *Store) loadProviders() ([]domain.Provider, error) {
 		var selfRegTokenHash, selfRegTokenPreview, selfRegCreatedAt, selfRegLastSeenAt string
 		var deleted int
 		var deletedAt string
+		var codingPlanProvider, teamOrganizationID, teamProjectID string
 		if err := rows.Scan(&p.ID, &p.Name, &protocol, &p.BaseURL, &p.APIKeySource, &p.DefaultModel, &p.DefaultThinkingDepth, &p.HealthStatus, &p.AuthHeader, &p.ExtraEndpoint,
 			&p.AuthType, &accessToken, &refreshToken, &expiresAt, &scope, &accountLabel, &p.OwnerUserID, &disabled,
-			&selfRegTokenHash, &selfRegTokenPreview, &selfRegCreatedAt, &selfRegLastSeenAt, &deleted, &deletedAt); err != nil {
+			&selfRegTokenHash, &selfRegTokenPreview, &selfRegCreatedAt, &selfRegLastSeenAt, &deleted, &deletedAt,
+			&codingPlanProvider, &teamOrganizationID, &teamProjectID); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}
@@ -581,6 +591,9 @@ func (s *Store) loadProviders() ([]domain.Provider, error) {
 		p.Disabled = disabled != 0
 		p.Deleted = deleted != 0
 		p.DeletedAt = deletedAt
+		p.CodingPlanProvider = codingPlanProvider
+		p.TeamOrganizationID = teamOrganizationID
+		p.TeamProjectID = teamProjectID
 		if selfRegTokenHash != "" {
 			p.SelfRegistration = &domain.ProviderSelfRegistration{
 				TokenHash:    selfRegTokenHash,
@@ -925,14 +938,28 @@ func (s *Store) TouchAPIKey(id string, lastUsedAt string) error {
 // which serialized behind and blocked request-hot-path DB writes on every
 // token refresh.
 func (s *Store) UpdateProviderOAuth(providerID, accessToken, refreshToken, expiresAt, scope, accountLabel string) error {
-	_, err := s.db.Exec(`UPDATE providers SET
-		oauth_access_token = ?,
-		oauth_refresh_token = ?,
-		oauth_expires_at = ?,
-		oauth_scope = ?,
-		oauth_account_label = ?
-		WHERE id = ?`,
-		accessToken, refreshToken, expiresAt, scope, accountLabel, providerID)
+	var err error
+	for attempt := 0; attempt < 8; attempt++ {
+		_, err = s.db.Exec(`UPDATE providers SET
+			oauth_access_token = ?,
+			oauth_refresh_token = ?,
+			oauth_expires_at = ?,
+			oauth_scope = ?,
+			oauth_account_label = ?
+			WHERE id = ?`,
+			accessToken, refreshToken, expiresAt, scope, accountLabel, providerID)
+		if err == nil {
+			return nil
+		}
+		// SQLITE_BUSY / "database is locked": retry briefly. Losing a refresh
+		// persist leaves memory ahead of disk; a later restart then hits
+		// invalid_grant with the stale refresh token.
+		msg := err.Error()
+		if !strings.Contains(msg, "database is locked") && !strings.Contains(msg, "SQLITE_BUSY") {
+			return err
+		}
+		time.Sleep(time.Duration(20*(attempt+1)) * time.Millisecond)
+	}
 	return err
 }
 

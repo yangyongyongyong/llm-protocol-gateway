@@ -40,10 +40,10 @@ func TestNormalizeClaudePassThroughPayloadStripsVolatileFields(t *testing.T) {
 				"cache_control": map[string]any{"type": "ephemeral"},
 			},
 		},
-		"max_tokens":     1024,
-		"stream":         true,
-		"metadata":       map[string]any{"user_id": "opencode"},
-		"service_tier":   "standard",
+		"max_tokens":   1024,
+		"stream":       true,
+		"metadata":     map[string]any{"user_id": "opencode"},
+		"service_tier": "standard",
 		"context_management": map[string]any{
 			"edits": []any{},
 		},
@@ -79,9 +79,10 @@ func TestNormalizeClaudePassThroughPayloadStripsVolatileFields(t *testing.T) {
 	if _, exists := tool["cache_control"]; exists {
 		t.Fatalf("expected tool cache_control stripped before cloaking")
 	}
-	wantBudget := defaultClaudeMaxTokens("claude-sonnet-5")
-	if payload["max_tokens"] != wantBudget {
-		t.Fatalf("max_tokens=%#v want upstream budget %d (ignore client 1024)", payload["max_tokens"], wantBudget)
+	// normalize 本身保留客户端 max_tokens；真正按上游模型覆盖由
+	// rewriteClaudeUpstreamMaxTokens 在发送前完成。
+	if payload["max_tokens"] != 1024 {
+		t.Fatalf("max_tokens=%#v want client value 1024 preserved by normalize", payload["max_tokens"])
 	}
 }
 
@@ -121,9 +122,8 @@ func TestNormalizeClaudePassThroughPayloadPreservesToolBlocks(t *testing.T) {
 	if toolUse["name"] != "bash" || toolUse["id"] != "toolu_1" {
 		t.Fatalf("expected tool_use preserved, got %#v", toolUse)
 	}
-	wantBudget := defaultClaudeMaxTokens("claude-sonnet-5")
-	if payload["max_tokens"] != wantBudget {
-		t.Fatalf("max_tokens=%#v want %d", payload["max_tokens"], wantBudget)
+	if payload["max_tokens"] != 32 {
+		t.Fatalf("max_tokens=%#v want client 32 preserved by normalize", payload["max_tokens"])
 	}
 }
 

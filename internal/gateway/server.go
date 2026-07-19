@@ -244,6 +244,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /__providers/{id}/chatgpt-oauth/complete", s.handleChatGPTOAuthComplete)
 	mux.HandleFunc("POST /__providers/{id}/chatgpt-oauth/disconnect", s.handleChatGPTOAuthDisconnect)
 	mux.HandleFunc("GET /__providers/{id}/chatgpt-oauth/usage", s.handleChatGPTOAuthUsage)
+	mux.HandleFunc("GET /__providers/{id}/zhipu/usage", s.handleZhipuUsage)
 	mux.HandleFunc("DELETE /__providers/{id}", s.handleDeleteProvider)
 	mux.HandleFunc("GET /__providers/deleted", s.handleListDeletedProviders)
 	mux.HandleFunc("POST /__providers/{id}/restore", s.handleRestoreProvider)
@@ -1985,6 +1986,79 @@ func (s *Server) handleChatGPTOAuthUsage(w http.ResponseWriter, r *http.Request)
 		s.oauthUsageCache.set(cacheKey, report)
 	}
 	writeJSON(w, http.StatusOK, report)
+}
+
+// handleZhipuUsage returns Zhipu (智谱 / bigmodel) coding-plan quota for an
+// api_key provider whose BaseURL points at bigmodel.cn or z.ai. When the
+// provider carries a team organization + project ID, the team-plan endpoint
+// (?type=2 + bigmodel-organization / bigmodel-project headers) is queried;
+// otherwise the personal-plan endpoint is used.
+func (s *Server) handleZhipuUsage(w http.ResponseWriter, r *http.Request) {
+	providerID := r.PathValue("id")
+	if !s.requireProviderAccessForUser(w, r, providerID) {
+		return
+	}
+	provider, err := s.router.ProviderByID(providerID)
+	if err != nil {
+		writeOpenAIError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if !isZhipuBaseURL(provider.BaseURL) {
+		writeJSON(w, http.StatusOK, ZhipuUsageReport{Available: false, Error: "provider is not a Zhipu (bigmodel/z.ai) provider"})
+		return
+	}
+	apiKey := resolveProviderAuth(provider)
+	if strings.TrimSpace(apiKey) == "" {
+		writeJSON(w, http.StatusOK, ZhipuUsageReport{Available: false, Error: "provider has no API key configured (apiKeySource is empty)"})
+		return
+	}
+
+	cacheKey := "zhipu:" + providerID
+	forceRefresh := strings.EqualFold(r.URL.Query().Get("refresh"), "1") || strings.EqualFold(r.URL.Query().Get("refresh"), "true")
+	if forceRefresh {
+		s.oauthUsageCache.invalidate(cacheKey)
+	} else if cached, ok := s.oauthUsageCache.getAllowStale(cacheKey); ok {
+		if report, ok := cached.(ZhipuUsageReport); ok {
+			s.maybeRefreshZhipuUsageAsync(providerID)
+			writeJSON(w, http.StatusOK, report)
+			return
+		}
+	}
+
+	unlock := s.lockOAuthUsageFetch(cacheKey)
+	defer unlock()
+	if !forceRefresh {
+		if cached, ok := s.oauthUsageCache.get(cacheKey); ok {
+			if report, ok := cached.(ZhipuUsageReport); ok {
+				writeJSON(w, http.StatusOK, report)
+				return
+			}
+		}
+	}
+
+	report, err := fetchZhipuUsageForProvider(r.Context(), provider, apiKey)
+	if err != nil {
+		writeJSON(w, http.StatusOK, ZhipuUsageReport{Available: false, Error: err.Error()})
+		return
+	}
+	// Cache success + unsupported (非编程套餐) so card polling stays quiet.
+	if report.Available || report.Unsupported {
+		s.oauthUsageCache.set(cacheKey, report)
+	}
+	writeJSON(w, http.StatusOK, report)
+}
+
+// fetchZhipuUsageForProvider routes personal vs team plan by the presence of
+// both the organization + project IDs (or an explicit codingPlanProvider ==
+// "zhipu_team" tag).
+func fetchZhipuUsageForProvider(ctx context.Context, provider domain.Provider, apiKey string) (ZhipuUsageReport, error) {
+	org := strings.TrimSpace(provider.TeamOrganizationID)
+	project := strings.TrimSpace(provider.TeamProjectID)
+	team := strings.EqualFold(strings.TrimSpace(provider.CodingPlanProvider), "zhipu_team")
+	if team || (org != "" && project != "") {
+		return fetchZhipuTeamUsage(ctx, apiKey, org, project)
+	}
+	return fetchZhipuUsage(ctx, provider.BaseURL, apiKey)
 }
 
 func (s *Server) lockOAuthUsageFetch(key string) func() {
