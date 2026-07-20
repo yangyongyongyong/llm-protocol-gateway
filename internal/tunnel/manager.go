@@ -205,6 +205,53 @@ func withCloudflaredProtocol(args []string, protocol string) []string {
 	return out
 }
 
+// withCloudflaredEdgeDNS forces public resolvers so Clash/Shadowrocket Fake-IP
+// (e.g. 198.18.0.0/16) cannot poison Cloudflare edge discovery. Without this,
+// custom domains periodically return Cloudflare 502/530 while the local process
+// still appears "running".
+//
+// --edge-ip-version / --retries are tunnel-level flags (before "run").
+// --dns-resolver-addrs is a "run" subcommand flag (after "run").
+func withCloudflaredEdgeDNS(args []string) []string {
+	if len(args) == 0 {
+		return args
+	}
+	beforeRun := []string{
+		"--edge-ip-version", "4",
+		"--retries", "15",
+	}
+	afterRun := []string{
+		"--dns-resolver-addrs", "1.1.1.1:53",
+		"--dns-resolver-addrs", "1.0.0.1:53",
+		"--dns-resolver-addrs", "8.8.8.8:53",
+	}
+
+	runIdx := -1
+	for i, a := range args {
+		if a == "run" {
+			runIdx = i
+			break
+		}
+	}
+
+	out := make([]string, 0, len(args)+len(beforeRun)+len(afterRun))
+	if runIdx < 0 {
+		out = append(out, args[0])
+		out = append(out, beforeRun...)
+		out = append(out, args[1:]...)
+		out = append(out, afterRun...)
+		return out
+	}
+
+	out = append(out, args[0])
+	out = append(out, beforeRun...)
+	out = append(out, args[1:runIdx]...)
+	out = append(out, "run")
+	out = append(out, afterRun...)
+	out = append(out, args[runIdx+1:]...)
+	return out
+}
+
 func isQUICDialFailure(line string) bool {
 	if line == "" {
 		return false
@@ -221,7 +268,7 @@ func (m *Manager) defaultRun(ctx context.Context, args ...string) (*exec.Cmd, io
 	if err != nil {
 		return nil, nil, fmt.Errorf("cloudflared not found on PATH: install it (brew install cloudflared) and retry: %w", err)
 	}
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := exec.CommandContext(ctx, bin, withCloudflaredEdgeDNS(args)...)
 	// Never inherit macOS / Shadowrocket HTTP(S)/SOCKS proxies. cloudflared must
 	// dial Cloudflare edge directly; routing QUIC/HTTP2 through a local proxy
 	// commonly leaves a zombie process that still looks "running" while public

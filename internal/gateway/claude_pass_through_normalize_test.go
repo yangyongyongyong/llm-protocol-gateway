@@ -127,42 +127,6 @@ func TestNormalizeClaudePassThroughPayloadPreservesToolBlocks(t *testing.T) {
 	}
 }
 
-func TestNormalizeClaudePassThroughDropsEmptyTextAlongsideToolUse(t *testing.T) {
-	// Regression: some clients emit a placeholder {"type":"text","text":""}
-	// block next to tool_use in the same content array. Anthropic rejects
-	// that with 400 "messages: text content blocks must be non-empty" — the
-	// empty text block must be dropped, not forwarded.
-	payload := map[string]any{
-		"model": "claude-sonnet-5",
-		"messages": []any{
-			map[string]any{
-				"role": "assistant",
-				"content": []any{
-					map[string]any{"type": "text", "text": ""},
-					map[string]any{
-						"type":  "tool_use",
-						"id":    "toolu_1",
-						"name":  "bash",
-						"input": map[string]any{"command": "ls"},
-					},
-				},
-			},
-		},
-		"max_tokens": 32,
-	}
-	normalizeClaudePassThroughPayload(payload)
-
-	messages := payload["messages"].([]any)
-	blocks := messages[0].(map[string]any)["content"].([]any)
-	if len(blocks) != 1 {
-		t.Fatalf("blocks=%d want 1 (empty text dropped): %#v", len(blocks), blocks)
-	}
-	toolUse := blocks[0].(map[string]any)
-	if toolUse["type"] != "tool_use" || toolUse["id"] != "toolu_1" {
-		t.Fatalf("expected tool_use survives, got %#v", toolUse)
-	}
-}
-
 func TestRewriteClaudeUpstreamMaxTokensIgnoresClientBudget(t *testing.T) {
 	body := []byte(`{"model":"claude-fable-5","max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`)
 	out := rewriteClaudeUpstreamMaxTokens(body, domain.Provider{}, 0)
@@ -237,6 +201,57 @@ func TestNormalizeClaudePassThroughToolsKeepsWebSearchWithoutInputSchema(t *test
 	}
 	if custom["input_schema"] == nil {
 		t.Fatalf("custom tool must keep input_schema")
+	}
+}
+
+func TestNormalizeClaudePassThroughDropsEmptyTextBlocks(t *testing.T) {
+	payload := map[string]any{
+		"model": "claude-sonnet-5",
+		"messages": []any{
+			map[string]any{
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "text", "text": ""},
+					map[string]any{"type": "text", "text": "keep"},
+					map[string]any{"type": "text", "text": ""},
+				},
+			},
+			map[string]any{
+				"role": "assistant",
+				"content": []any{
+					map[string]any{"type": "text", "text": ""},
+					map[string]any{
+						"type":  "tool_use",
+						"id":    "toolu_1",
+						"name":  "Bash",
+						"input": map[string]any{},
+					},
+				},
+			},
+			map[string]any{
+				"role":    "user",
+				"content": []any{map[string]any{"type": "text", "text": ""}},
+			},
+		},
+		"max_tokens": 32,
+	}
+	normalizeClaudePassThroughPayload(payload)
+
+	messages := payload["messages"].([]any)
+	if len(messages) != 2 {
+		t.Fatalf("messages len=%d want 2 (all-empty message dropped): %#v", len(messages), messages)
+	}
+	user := messages[0].(map[string]any)
+	if user["content"] != "keep" {
+		t.Fatalf("user content=%#v want collapsed \"keep\"", user["content"])
+	}
+	assistant := messages[1].(map[string]any)
+	blocks := assistant["content"].([]any)
+	if len(blocks) != 1 {
+		t.Fatalf("assistant blocks=%d want 1 (empty text dropped): %#v", len(blocks), blocks)
+	}
+	if stringValue(blocks[0].(map[string]any)["type"]) != "tool_use" {
+		t.Fatalf("assistant block=%#v want tool_use", blocks[0])
 	}
 }
 
