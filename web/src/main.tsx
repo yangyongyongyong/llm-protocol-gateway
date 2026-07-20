@@ -480,6 +480,7 @@ type GatewayState = {
 };
 
 type LogEntry = {
+  id?: number;
   time: string;
   apiKeyId?: string;
   apiKeyName?: string;
@@ -2785,6 +2786,10 @@ function App() {
   const [logsOwnerFilter, setLogsOwnerFilter] = useState('');
   const [logsFrom, setLogsFrom] = useState('');
   const [logsTo, setLogsTo] = useState('');
+  // 分页快照：离开第 1 页时冻结当时最新日志 id 作为 beforeId 上界，之后翻页只在
+  // 「id <= 该值」的固定集合里做 offset，新日志(更大 id)不再挤动窗口——彻底解决
+  // 翻页后因新日志插入导致行乱跳/重复。回到第 1 页或换筛选条件时清空，恢复实时。
+  const logsSnapshotBeforeIdRef = useRef(0);
   const [requestLogRetentionDays, setRequestLogRetentionDays] = useState(7);
   const [usageFrom, setUsageFrom] = useState(() => formatLocalISODate(new Date()));
   const [usageTo, setUsageTo] = useState(() => formatLocalISODate(new Date()));
@@ -3820,6 +3825,10 @@ function App() {
     if (keyName) params.set('apiKeyName', keyName);
     if (logsProviderFilter) params.set('providerId', logsProviderFilter);
     if (logsOwnerFilter) params.set('ownerUserId', logsOwnerFilter);
+    // 第 1 页保持实时（不带 beforeId）；第 2 页及以后带上冻结的快照上界，保证翻页稳定。
+    if (page > 1 && logsSnapshotBeforeIdRef.current > 0) {
+      params.set('beforeId', String(logsSnapshotBeforeIdRef.current));
+    }
     return params;
   }
 
@@ -3828,6 +3837,14 @@ function App() {
   }
 
   async function refreshLogs(page = logsPage, fromOverride?: string, toOverride?: string, opts?: { silent?: boolean; apiKeyName?: string }) {
+    // 维护分页快照：回到第 1 页 -> 清空恢复实时；首次离开第 1 页 -> 用当前已知最新
+    // 日志 id 冻结上界（logs 已按时间倒序，logs[0] 即最新）。
+    if (page <= 1) {
+      logsSnapshotBeforeIdRef.current = 0;
+    } else if (logsSnapshotBeforeIdRef.current === 0) {
+      const newestId = logs[0]?.id;
+      if (typeof newestId === 'number' && newestId > 0) logsSnapshotBeforeIdRef.current = newestId;
+    }
     if (!opts?.silent) setLogsLoading(true);
     try {
       const response = await fetch(`${API_BASE}/__logs?${buildLogsQueryParams(page, false, fromOverride, toOverride, opts?.apiKeyName).toString()}`, { credentials: 'same-origin' });
@@ -7068,7 +7085,7 @@ function App() {
                 <div className="traffic-filter-fields">
                   <label className="field">
                     <span>状态</span>
-                    <select value={logsStatusFilter} onChange={(e) => setLogsStatusFilter(e.target.value as typeof logsStatusFilter)}>
+                    <select value={logsStatusFilter} onChange={(e) => { setLogsPage(1); setLogsStatusFilter(e.target.value as typeof logsStatusFilter); }}>
                       <option value="all">全部</option>
                       <option value="2xx">2xx</option>
                       <option value="4xx">4xx</option>
@@ -7079,7 +7096,7 @@ function App() {
                     <span>密钥名称</span>
                     <select
                       value={logsApiKeyName}
-                      onChange={(e) => setLogsApiKeyName(e.target.value)}
+                      onChange={(e) => { setLogsPage(1); setLogsApiKeyName(e.target.value); }}
                     >
                       <option value="">全部</option>
                       {(state.apiKeys || []).map((key) => (
@@ -7091,7 +7108,7 @@ function App() {
                     <span>输入 Provider</span>
                     <select
                       value={logsProviderFilter}
-                      onChange={(e) => setLogsProviderFilter(e.target.value)}
+                      onChange={(e) => { setLogsPage(1); setLogsProviderFilter(e.target.value); }}
                     >
                       <option value="">全部</option>
                       {(state.providers || []).map((provider) => (
@@ -7104,7 +7121,7 @@ function App() {
                       <span>用户</span>
                       <select
                         value={logsOwnerFilter}
-                        onChange={(e) => setLogsOwnerFilter(e.target.value)}
+                        onChange={(e) => { setLogsPage(1); setLogsOwnerFilter(e.target.value); }}
                       >
                         <option value="">全部</option>
                         <option value={LOG_OWNER_FILTER_ADMIN}>管理员</option>

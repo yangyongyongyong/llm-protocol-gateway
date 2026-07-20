@@ -10,10 +10,10 @@ import (
 )
 
 const (
-	requestLogSafetyCap     = 50000
-	defaultRequestLogDays   = 7
-	defaultRequestLogPage   = 100
-	maxRequestLogPageSize   = 500
+	requestLogSafetyCap   = 50000
+	defaultRequestLogDays = 7
+	defaultRequestLogPage = 100
+	maxRequestLogPageSize = 500
 	// incrementalVacuumThresholdPages 是触发增量回收的空闲页阈值。默认页大小
 	// 4 KiB，2560 页约 10 MiB：低于此不回收，避免频繁小额 IO；高于此才把空闲
 	// 空间还给操作系统。
@@ -194,6 +194,12 @@ func (s *Store) QueryRequestLogs(query monitor.RequestLogQuery) (monitor.Request
 		}
 	}
 
+	if query.BeforeID > 0 {
+		// Freeze the newest boundary so offset paging is stable against inserts.
+		where = append(where, "id <= ?")
+		args = append(args, query.BeforeID)
+	}
+
 	whereSQL := strings.Join(where, " AND ")
 	var total int
 	countArgs := append([]any{}, args...)
@@ -203,7 +209,7 @@ func (s *Store) QueryRequestLogs(query monitor.RequestLogQuery) (monitor.Request
 
 	offset := (page - 1) * pageSize
 	args = append(args, pageSize, offset)
-	selectCols := `time, api_key_id, api_key_name, route_id, provider_id, model, action, protocol_flow, path,
+	selectCols := `id, time, api_key_id, api_key_name, route_id, provider_id, model, action, protocol_flow, path,
 		status, input_tokens, output_tokens, cache_tokens, latency_ms, ttft_ms,
 		prep_ms, pre_upstream_ms, upstream_ttfb_ms, gateway_overhead_ms, convert_out_ms, post_ms, timing_flags,
 		client_host, client_ip, access_source,
@@ -244,6 +250,7 @@ func scanRequestLog(rows *sql.Rows) (monitor.RequestLog, error) {
 	var ttft, prep, preUp, upTTFB, overhead, convertOut, post sql.NullInt64
 	var timingFlags, clientHost, clientIP, accessSource sql.NullString
 	if err := rows.Scan(
+		&item.ID,
 		&timeValue,
 		&item.APIKeyID,
 		&item.APIKeyName,
@@ -285,6 +292,7 @@ func scanRequestLogSummary(rows *sql.Rows) (monitor.RequestLog, error) {
 	var ttft, prep, preUp, upTTFB, overhead, convertOut, post sql.NullInt64
 	var timingFlags, clientHost, clientIP, accessSource sql.NullString
 	if err := rows.Scan(
+		&item.ID,
 		&timeValue,
 		&item.APIKeyID,
 		&item.APIKeyName,

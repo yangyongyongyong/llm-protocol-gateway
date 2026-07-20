@@ -8,6 +8,10 @@ import (
 )
 
 type RequestLog struct {
+	// ID is the request_logs row id (monotonic autoincrement). Exposed so the
+	// console can freeze a stable pagination snapshot (beforeId) — offset paging
+	// on a time-desc list otherwise shifts as new logs arrive.
+	ID         int64     `json:"id,omitempty"`
 	Time       time.Time `json:"time"`
 	APIKeyID   string    `json:"apiKeyId,omitempty"`
 	APIKeyName string    `json:"apiKeyName,omitempty"`
@@ -63,6 +67,10 @@ type RequestLogQuery struct {
 	Page          int
 	PageSize      int
 	IncludeBodies bool // list views should omit heavy request/response bodies
+	// BeforeID, when > 0, restricts results to rows with id <= BeforeID. The
+	// console freezes this to the newest id at the moment it leaves page 1 so
+	// offset pagination stays stable while new logs keep arriving.
+	BeforeID int64
 }
 
 type RequestLogPage struct {

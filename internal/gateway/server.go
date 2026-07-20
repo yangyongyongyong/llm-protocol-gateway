@@ -433,6 +433,13 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 			query.To = parsed.Add(24 * time.Hour)
 		}
 	}
+	// beforeId freezes a pagination snapshot: the console captures the newest
+	// log id when leaving page 1 so offset paging stays stable as new logs arrive.
+	if beforeID := strings.TrimSpace(r.URL.Query().Get("beforeId")); beforeID != "" {
+		if parsed, err := strconv.ParseInt(beforeID, 10, 64); err == nil && parsed > 0 {
+			query.BeforeID = parsed
+		}
+	}
 	if s.requestLogStore != nil {
 		page, err := s.requestLogStore.QueryRequestLogs(query)
 		if err == nil {
