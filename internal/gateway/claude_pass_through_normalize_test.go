@@ -204,6 +204,55 @@ func TestNormalizeClaudePassThroughToolsKeepsWebSearchWithoutInputSchema(t *test
 	}
 }
 
+func TestNormalizeClaudePassThroughPreservesToolReferenceName(t *testing.T) {
+	payload := map[string]any{
+		"model": "claude-sonnet-5",
+		"messages": []any{
+			map[string]any{
+				"role": "user",
+				"content": []any{
+					map[string]any{
+						"type":        "tool_result",
+						"tool_use_id": "toolu_search_1",
+						"content": []any{
+							map[string]any{
+								"type":      "tool_reference",
+								"tool_name": "Bash",
+							},
+							map[string]any{
+								"type": "tool_reference",
+								"name": "Read", // client alias → tool_name
+							},
+							map[string]any{
+								"type": "tool_reference", // missing name → drop
+							},
+						},
+					},
+				},
+			},
+		},
+		"max_tokens": 32,
+	}
+	normalizeClaudePassThroughPayload(payload)
+
+	messages := payload["messages"].([]any)
+	user := messages[0].(map[string]any)
+	blocks := user["content"].([]any)
+	toolResult := blocks[0].(map[string]any)
+	inner := toolResult["content"].([]any)
+	if len(inner) != 2 {
+		t.Fatalf("inner blocks=%d want 2 (drop empty tool_reference): %#v", len(inner), inner)
+	}
+	ref0 := inner[0].(map[string]any)
+	if ref0["type"] != "tool_reference" || ref0["tool_name"] != "Bash" {
+		t.Fatalf("ref0=%#v", ref0)
+	}
+	ref1 := inner[1].(map[string]any)
+	if ref1["tool_name"] != "Read" {
+		t.Fatalf("ref1 tool_name=%#v want Read (mapped from name)", ref1)
+	}
+}
+
 func TestNormalizeClaudePassThroughToolsInjectsSchemaOnlyForCustomTools(t *testing.T) {
 	tools := normalizeClaudePassThroughTools([]any{
 		map[string]any{

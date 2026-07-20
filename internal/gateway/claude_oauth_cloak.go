@@ -13,9 +13,9 @@ import (
 )
 
 const (
-	claudeOAuthCCHSeed          = uint64(0x6E52736AC806831E)
-	claudeOAuthBillingVersion   = "2.1.108"
-	claudeOAuthAgentIdentifier  = "You are Claude Code, Anthropic's official CLI for Claude."
+	claudeOAuthCCHSeed               = uint64(0x6E52736AC806831E)
+	claudeOAuthBillingVersion        = "2.1.108"
+	claudeOAuthAgentIdentifier       = "You are Claude Code, Anthropic's official CLI for Claude."
 	claudeOAuthBillingCCHPlaceholder = "00000"
 )
 
@@ -278,25 +278,32 @@ func remapClaudeOAuthToolNames(payload map[string]any) {
 		if !ok {
 			continue
 		}
-		blocks, ok := entry["content"].([]any)
+		remapClaudeOAuthToolNamesInContent(entry["content"])
+	}
+}
+
+func remapClaudeOAuthToolNamesInContent(content any) {
+	blocks, ok := content.([]any)
+	if !ok {
+		return
+	}
+	for _, blockItem := range blocks {
+		block, ok := blockItem.(map[string]any)
 		if !ok {
 			continue
 		}
-		for _, blockItem := range blocks {
-			block, ok := blockItem.(map[string]any)
-			if !ok {
-				continue
+		switch stringValue(block["type"]) {
+		case "tool_use":
+			if mapped, changed := remapClaudeOAuthToolName(stringValue(block["name"])); changed {
+				block["name"] = mapped
 			}
-			switch stringValue(block["type"]) {
-			case "tool_use":
-				if mapped, changed := remapClaudeOAuthToolName(stringValue(block["name"])); changed {
-					block["name"] = mapped
-				}
-			case "tool_reference":
-				if mapped, changed := remapClaudeOAuthToolName(stringValue(block["tool_name"])); changed {
-					block["tool_name"] = mapped
-				}
+		case "tool_reference":
+			if mapped, changed := remapClaudeOAuthToolName(stringValue(block["tool_name"])); changed {
+				block["tool_name"] = mapped
 			}
+		case "tool_result":
+			// tool_search results nest tool_reference inside tool_result.content.
+			remapClaudeOAuthToolNamesInContent(block["content"])
 		}
 	}
 }

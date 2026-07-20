@@ -245,6 +245,27 @@ func normalizeClaudePassThroughContentBlock(block map[string]any) map[string]any
 			out["signature"] = signature
 		}
 		return out
+	case "tool_reference":
+		// Nested under tool_result.content (tool-search results). Anthropic
+		// requires tool_name; the default branch below only kept type/text and
+		// dropped it → 400 "tool_reference.tool_name: Field required".
+		name := stringValue(block["tool_name"])
+		if name == "" {
+			name = stringValue(block["name"]) // some clients misuse "name"
+		}
+		if name == "" {
+			return nil
+		}
+		return map[string]any{
+			"type":      "tool_reference",
+			"tool_name": name,
+		}
+	case "redacted_thinking":
+		out := map[string]any{"type": "redacted_thinking"}
+		if data, ok := block["data"]; ok {
+			out["data"] = data
+		}
+		return out
 	default:
 		blockType := stringValue(block["type"])
 		if blockType == "" {
