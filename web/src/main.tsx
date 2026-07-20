@@ -9977,11 +9977,16 @@ function MultiSelectFilter({ label, options, selected, onChange, allLabel, field
 
   React.useEffect(() => {
     if (!open) return;
+    // 用捕获阶段监听：Modal 的 modal-card 会在冒泡阶段对 mousedown 调用
+    // stopPropagation（防止点击弹窗内部误触发遮罩层的关闭逻辑），这会导致
+    // 挂在 document 冒泡阶段的“点击外部关闭”监听永远收不到事件——弹窗内的
+    // 下拉框因此选完选项后无法通过点击其他地方收起。捕获阶段先于冒泡阶段
+    // 触发，不受该 stopPropagation 影响。
     const onPointerDown = (event: MouseEvent) => {
       if (!rootRef.current?.contains(event.target as Node)) close();
     };
-    document.addEventListener('mousedown', onPointerDown);
-    return () => document.removeEventListener('mousedown', onPointerDown);
+    document.addEventListener('mousedown', onPointerDown, true);
+    return () => document.removeEventListener('mousedown', onPointerDown, true);
   }, [close, open]);
 
   React.useEffect(() => {
@@ -10015,8 +10020,14 @@ function MultiSelectFilter({ label, options, selected, onChange, allLabel, field
       return;
     }
     if (event.key === 'Escape') {
-      event.preventDefault();
-      close();
+      // 下拉框展开时：ESC 只收起下拉框，并阻止事件冒泡到 Modal 的全局 ESC 监听
+      // （否则整个弹窗会被一起关掉）。未展开时不拦截，让 ESC 正常关闭弹窗。
+      if (open) {
+        event.preventDefault();
+        event.stopPropagation();
+        close();
+      }
+      return;
     }
   };
 
@@ -10125,11 +10136,16 @@ function SearchableModelSelect({
 
   React.useEffect(() => {
     if (!open) return;
+    // 用捕获阶段监听：Modal 的 modal-card 会在冒泡阶段对 mousedown 调用
+    // stopPropagation（防止点击弹窗内部误触发遮罩层的关闭逻辑），这会导致
+    // 挂在 document 冒泡阶段的“点击外部关闭”监听永远收不到事件——弹窗内的
+    // 下拉框因此选完选项后无法通过点击其他地方收起。捕获阶段先于冒泡阶段
+    // 触发，不受该 stopPropagation 影响。
     const onPointerDown = (event: MouseEvent) => {
       if (!rootRef.current?.contains(event.target as Node)) close();
     };
-    document.addEventListener('mousedown', onPointerDown);
-    return () => document.removeEventListener('mousedown', onPointerDown);
+    document.addEventListener('mousedown', onPointerDown, true);
+    return () => document.removeEventListener('mousedown', onPointerDown, true);
   }, [close, open]);
 
   React.useEffect(() => {
@@ -10178,8 +10194,14 @@ function SearchableModelSelect({
       return;
     }
     if (event.key === 'Escape') {
-      event.preventDefault();
-      close();
+      // 下拉框展开时：ESC 只收起下拉框，并阻止事件冒泡到 Modal 的全局 ESC 监听
+      // （否则整个弹窗会被一起关掉）。未展开时不拦截，让 ESC 正常关闭弹窗。
+      if (open) {
+        event.preventDefault();
+        event.stopPropagation();
+        close();
+      }
+      return;
     }
   };
 

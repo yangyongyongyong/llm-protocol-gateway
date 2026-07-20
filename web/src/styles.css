@@ -2,6 +2,8 @@
   color-scheme: light;
   --panel: rgba(255, 255, 255, 0.78);
   --panel-solid: rgba(255, 255, 255, 0.92);
+  /* 悬浮下拉菜单专用：完全不透明，展开时干净盖住下方按钮/内容，避免透出重影。 */
+  --menu-solid: #ffffff;
   --surface: rgba(255, 255, 255, 0.66);
   --surface-strong: rgba(248, 250, 252, 0.92);
   --text: #172033;
@@ -36,6 +38,7 @@ html[data-theme="dark"] {
   color-scheme: dark;
   --panel: rgba(22, 27, 38, 0.88);
   --panel-solid: rgba(24, 30, 42, 0.96);
+  --menu-solid: #181e2a;
   --surface: rgba(30, 37, 52, 0.78);
   --surface-strong: rgba(28, 34, 48, 0.94);
   --text: #e8edf7;
@@ -525,8 +528,8 @@ html[data-theme="dark"] .api-key-client-config-actions .client-config-btn {
   padding: 6px;
   border-radius: 14px;
   border: 1px solid var(--border);
-  background: var(--panel-solid);
-  box-shadow: var(--shadow-soft);
+  background: var(--menu-solid);
+  box-shadow: var(--shadow);
 }
 .searchable-select-option {
   display: block;
