@@ -47,17 +47,17 @@ type Config struct {
 type Runtime struct {
 	mu sync.Mutex
 
-	db             *store.Store
-	logs           *monitor.Store
-	router         *gateway.Router
-	server         *gateway.Server
-	tunnelManager  *tunnel.Manager
-	httpServer     *http.Server
-	port           int
-	webExposed     bool
-	addrOverride   string // non-empty when PreferEnvAddr / Config.Addr forces host:port
-	started        bool
-	onListenChange func(addr string)
+	db              *store.Store
+	logs            *monitor.Store
+	router          *gateway.Router
+	server          *gateway.Server
+	tunnelManager   *tunnel.Manager
+	httpServer      *http.Server
+	port            int
+	webExposed      bool
+	addrOverride    string // non-empty when PreferEnvAddr / Config.Addr forces host:port
+	started         bool
+	onListenChange  func(addr string)
 	stopMaintenance chan struct{} // closed on Stop to end the storage maintenance loop
 }
 
@@ -239,6 +239,19 @@ func (rt *Runtime) Start(cfg Config) error {
 	tunnelManager := tunnel.NewManager(rt.port)
 	server.SetTunnelManager(tunnelManager)
 
+	// Fail-fast: bind the listen port synchronously BEFORE bringing up the
+	// tunnel. If another gateway instance already owns the port (e.g. a second
+	// supervisor spawned a duplicate), abort startup now — cmd/gateway exits
+	// non-zero. Otherwise the loser would keep running its tunnel manager and
+	// register a SECOND cloudflared for the same hostname, so Cloudflare splits
+	// public traffic across two tunnels of differing quality and latency turns
+	// erratic. Binding before RestorePublicAccess guarantees a duplicate never
+	// starts a phantom tunnel.
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("cannot bind gateway listen address %s (another gateway instance already running?): %w", addr, err)
+	}
+
 	httpServer := &http.Server{
 		Addr:              addr,
 		Handler:           server.Handler(),
@@ -252,8 +265,8 @@ func (rt *Runtime) Start(cfg Config) error {
 	rt.httpServer = httpServer
 
 	go func() {
-		slog.Info("gateway listening", "addr", httpServer.Addr)
-		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		slog.Info("gateway listening", "addr", addr)
+		if err := httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("gateway failed", "error", err)
 		}
 	}()
