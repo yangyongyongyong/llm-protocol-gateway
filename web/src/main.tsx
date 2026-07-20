@@ -7938,9 +7938,15 @@ function App() {
               })()}
             </div>
           )}
-          {editingProviderID && (providerDraft.authType === 'api_key' || providerDraft.authType === 'self_register') && (() => {
+          {editingProviderID && (() => {
             const editingProvider = state.providers.find((item) => item.id === editingProviderID);
             if (!editingProvider) return null;
+            // 只对「内网穿透自助注册」类 Provider 显示自助注册面板：要么本次会话显式把
+            // 连接方式切成了 self_register，要么该 Provider 后端已持久化 selfRegistration
+            // 状态。纯 API Key Provider 不再显示「生成注册令牌」——连接方式是互斥的，
+            // 生成注册令牌属于「内网穿透自助注册」这一种连接方式，不应出现在 API Key 下。
+            const isSelfRegisterProvider = providerDraft.authType === 'self_register' || !!editingProvider.selfRegistration;
+            if (!isSelfRegisterProvider) return null;
             const selfReg = editingProvider.selfRegistration;
             const promptText = buildSelfRegistrationPrompt(editingProvider, selfRegToken, window.location.origin);
             return (
