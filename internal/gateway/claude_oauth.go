@@ -656,12 +656,19 @@ func buildClaudeOAuthRequest(ctx context.Context, provider domain.Provider, body
 	if strings.TrimSpace(targetURL) == "" {
 		targetURL = claudeMessagesURL
 	}
+	countTokens := strings.Contains(strings.ToLower(targetURL), "count_tokens")
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		body = injectClaudeBillingHeader(body)
 	} else if _, ok := payload["messages"]; ok {
 		if nativePassThrough {
 			normalizeClaudePassThroughPayload(payload)
+		}
+		// /v1/messages/count_tokens rejects generation-only fields (notably
+		// max_tokens). normalizeClaudePassThroughPayload injects a default
+		// budget for Messages; strip it back out for token counting.
+		if countTokens {
+			sanitizeClaudeCountTokensPayload(payload)
 		}
 		applyClaudeOAuthCloaking(payload)
 		marshaled, marshalErr := marshalClaudeOAuthBody(payload)

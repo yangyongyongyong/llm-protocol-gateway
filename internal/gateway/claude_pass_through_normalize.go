@@ -57,6 +57,45 @@ func normalizeClaudePassThroughPayload(payload map[string]any) {
 	}
 }
 
+// claudeCountTokensDisallowedFields are generation-only Message fields that
+// Anthropic's /v1/messages/count_tokens rejects with
+// "…: Extra inputs are not permitted" (see Claude Code /context → count_tokens).
+// Allowed inputs include model/messages/system/tools/tool_choice/thinking/
+// output_config/cache_control — not max_tokens or sampling controls.
+var claudeCountTokensDisallowedFields = []string{
+	"max_tokens",
+	"stream",
+	"temperature",
+	"top_p",
+	"top_k",
+	"stop_sequences",
+	"metadata",
+	"service_tier",
+	"context_management",
+}
+
+func sanitizeClaudeCountTokensPayload(payload map[string]any) {
+	if payload == nil {
+		return
+	}
+	for _, key := range claudeCountTokensDisallowedFields {
+		delete(payload, key)
+	}
+}
+
+func sanitizeClaudeCountTokensBody(body []byte) []byte {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil || payload == nil {
+		return body
+	}
+	sanitizeClaudeCountTokensPayload(payload)
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
 // rewriteClaudeUpstreamMaxTokens 在 Claude 透传发送前，按实际上游模型写入 max_tokens，
 // 忽略 Claude Code 等客户端按「请求模型名」填的预算（模型覆盖场景会偏小截断）。
 // maxTokensOverride>0 时使用密钥级覆盖。

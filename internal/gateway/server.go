@@ -3299,6 +3299,10 @@ func (s *Server) proxyClaudeCountTokens(r *http.Request, provider domain.Provide
 		stub, _ := json.Marshal(map[string]any{"input_tokens": 1})
 		return http.StatusOK, stub, nil
 	}
+	// Claude Code /v1/messages/count_tokens must not carry generation fields.
+	// Clients sometimes include max_tokens; our Messages normalize path also
+	// injects a default — both yield: "max_tokens: Extra inputs are not permitted".
+	body = sanitizeClaudeCountTokensBody(body)
 	isOAuth := provider.AuthType == domain.AuthTypeClaudeOAuth
 	var request *http.Request
 	var err error
