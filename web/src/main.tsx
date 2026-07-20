@@ -3264,9 +3264,9 @@ function App() {
     })();
     // Tunnel restore is async after gateway start; keep UI in sync with live
     // __state (App WebView and browser otherwise diverge after first paint).
-    const timer = window.setInterval(() => {
+    const pollOnce = () => {
       void (async () => {
-        if (document.visibilityState === 'hidden') return;
+        if (!isDocumentActive()) return;
         const [connected, auth] = await Promise.all([refreshBackendHealth(), refreshAuthStatus()]);
         if (!connected) {
           await reconnectBackend(false);
@@ -3277,8 +3277,18 @@ function App() {
           void refreshRequestStats();
         }
       })();
-    }, 5000);
-    return () => window.clearInterval(timer);
+    };
+    const timer = window.setInterval(pollOnce, 5000);
+    // 重新回到前台（Chrome 变为最前台 / 标签页重新可见）时立即补一次刷新，
+    // 让底部“数据更新于”不必等到下一个 5s 周期才追上。
+    const onFocusResume = () => { if (isDocumentActive()) pollOnce(); };
+    window.addEventListener('focus', onFocusResume);
+    document.addEventListener('visibilitychange', onFocusResume);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus', onFocusResume);
+      document.removeEventListener('visibilitychange', onFocusResume);
+    };
   }, []);
 
   useEffect(() => {
@@ -3359,7 +3369,7 @@ function App() {
     void refreshLogs(logsPage, undefined, undefined, { silent: Boolean(cached?.items?.length) });
     if (logsPage !== 1) return;
     const timer = window.setInterval(() => {
-      if (document.visibilityState === 'hidden') return;
+      if (!isDocumentActive()) return;
       void refreshLogs(logsPage, undefined, undefined, { silent: true });
     }, 5000);
     return () => window.clearInterval(timer);
@@ -8463,12 +8473,28 @@ function writeOAuthUsageCache(path: string, data: unknown) {
   }
 }
 
+// isDocumentActive 判定「本页面所在 app 当前是否为用户前台」。
+// 注意：Chrome 切到别的 macOS app（失去系统焦点）时并不会触发 visibilitychange，
+// document.visibilityState 仍是 'visible'；只有 document.hasFocus() 会变成 false。
+// 所有后台自动轮询都用它兜底：非前台时一律跳过刷新，避免白白消耗后台算力。
+function isDocumentActive(): boolean {
+  if (typeof document === 'undefined') return true;
+  return document.visibilityState !== 'hidden' && document.hasFocus();
+}
+
 function usePageVisible() {
-  const [visible, setVisible] = React.useState(() => typeof document === 'undefined' || document.visibilityState !== 'hidden');
+  const [visible, setVisible] = React.useState(() => isDocumentActive());
   React.useEffect(() => {
-    const onVisibility = () => setVisible(document.visibilityState !== 'hidden');
-    document.addEventListener('visibilitychange', onVisibility);
-    return () => document.removeEventListener('visibilitychange', onVisibility);
+    const update = () => setVisible(isDocumentActive());
+    document.addEventListener('visibilitychange', update);
+    // 监听窗口 focus/blur：Chrome 非最前台时暂停，重新回到前台时恢复。
+    window.addEventListener('focus', update);
+    window.addEventListener('blur', update);
+    return () => {
+      document.removeEventListener('visibilitychange', update);
+      window.removeEventListener('focus', update);
+      window.removeEventListener('blur', update);
+    };
   }, []);
   return visible;
 }
@@ -8489,7 +8515,7 @@ function useOAuthUsageReport<T extends { available?: boolean; error?: string }>(
     const force = Boolean(opts?.force);
     const skipIfHidden = opts?.skipIfHidden !== false;
     const silent = Boolean(opts?.silent);
-    if (!force && skipIfHidden && typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+    if (!force && skipIfHidden && !isDocumentActive()) {
       return;
     }
     if (!silent && (force || reportRef.current == null)) {
@@ -8532,7 +8558,7 @@ function useOAuthUsageReport<T extends { available?: boolean; error?: string }>(
       void safeLoad({ force: false, skipIfHidden: false, silent: hadCachedReportRef.current });
     }
     const timer = window.setInterval(() => {
-      if (document.visibilityState === 'hidden') return;
+      if (!isDocumentActive()) return;
       void safeLoad({ force: false, skipIfHidden: true, silent: true });
     }, OAUTH_USAGE_POLL_MS);
 
