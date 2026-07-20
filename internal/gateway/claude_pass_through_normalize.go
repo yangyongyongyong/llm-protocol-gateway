@@ -204,9 +204,19 @@ func normalizeClaudePassThroughContentBlocks(blocks []any) []any {
 func normalizeClaudePassThroughContentBlock(block map[string]any) map[string]any {
 	switch stringValue(block["type"]) {
 	case "text":
+		// Anthropic rejects an explicit `{"type":"text","text":""}` block with
+		// "text content blocks must be non-empty" whenever it sits alongside
+		// other blocks (e.g. a tool_use-only assistant turn that some clients
+		// still emit with a placeholder empty text block). Single-block empty
+		// text already collapses to "" via normalizeClaudePassThroughMessageContent
+		// / gets dropped by isEmptyClaudeContent, so dropping it here is safe.
+		text := stringValue(block["text"])
+		if text == "" {
+			return nil
+		}
 		return map[string]any{
 			"type": "text",
-			"text": stringValue(block["text"]),
+			"text": text,
 		}
 	case "tool_use":
 		out := map[string]any{
