@@ -91,8 +91,104 @@ func (s *Server) proxyOpenAIResponses(w http.ResponseWriter, r *http.Request, pr
 	if err != nil {
 		return 0, TokenUsage{}, nil, err
 	}
+	// Strategy 3: when the same API key switches forwarding schemes mid-conversation
+	// the provider/backend changes, but Codex replays prior-turn reasoning items whose
+	// reasoning.encrypted_content was signed by the *previous* backend. A pure-passthrough
+	// route forwards that ciphertext verbatim, so the new backend returns
+	// invalid_encrypted_content. Detect that specific rejection, strip the reasoning
+	// items from `input`, and retry once. Same-provider replays are accepted upstream,
+	// so this never triggers there and reasoning continuity is preserved.
+	response = s.retryResponsesWithoutReasoningIfNeeded(r.Context(), r, provider, upstreamURL, body, r.Header.Get("Accept"), skipIncomingAuth, response)
 	defer response.Body.Close()
 	return writePassThroughResponse(w, response, clientStream, ParseResponsesUsage)
+}
+
+// retryResponsesWithoutReasoningIfNeeded implements Strategy 3 for the Responses
+// passthrough path (see proxyOpenAIResponses). It only acts on an upstream error
+// that mentions encrypted_content; otherwise the original response is returned
+// untouched (its buffered body restored so the caller can stream it as-is).
+func (s *Server) retryResponsesWithoutReasoningIfNeeded(
+	ctx context.Context,
+	r *http.Request,
+	provider domain.Provider,
+	upstreamURL string,
+	body []byte,
+	accept string,
+	skipIncomingAuth bool,
+	response *http.Response,
+) *http.Response {
+	if response == nil || response.StatusCode < 400 {
+		return response
+	}
+	// Error bodies are small; buffer so we can inspect and, if we do not retry,
+	// still replay the exact upstream error to the client.
+	errBody, readErr := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	restore := func() *http.Response {
+		response.Body = io.NopCloser(bytes.NewReader(errBody))
+		return response
+	}
+	if readErr != nil || !responsesErrorLooksLikeEncryptedContent(errBody) {
+		return restore()
+	}
+	strippedBody, changed := stripResponsesInputReasoning(body)
+	if !changed {
+		return restore()
+	}
+	retried, err := s.doOpenAIProviderRequest(ctx, r, provider, upstreamURL, strippedBody, accept, skipIncomingAuth)
+	if err != nil {
+		// Retry transport failed: surface the original upstream error, not a
+		// synthetic one, so the client/log sees what actually happened.
+		return restore()
+	}
+	return retried
+}
+
+// responsesErrorLooksLikeEncryptedContent reports whether an upstream error body
+// is the "replayed reasoning ciphertext this backend did not sign" failure
+// (OpenAI: invalid_encrypted_content). Kept lenient so backends that phrase it
+// differently still match, as long as they name encrypted_content.
+func responsesErrorLooksLikeEncryptedContent(errBody []byte) bool {
+	return bytes.Contains(bytes.ToLower(errBody), []byte("encrypted_content"))
+}
+
+// stripResponsesInputReasoning removes `reasoning` items (which carry the opaque
+// reasoning.encrypted_content) from a Responses request `input` array, and drops
+// any stray encrypted_content left on surviving items. Returns the rewritten
+// body and whether anything changed.
+func stripResponsesInputReasoning(body []byte) ([]byte, bool) {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body, false
+	}
+	input, ok := payload["input"].([]any)
+	if !ok || len(input) == 0 {
+		return body, false
+	}
+	filtered := make([]any, 0, len(input))
+	changed := false
+	for _, raw := range input {
+		if item, ok := raw.(map[string]any); ok {
+			if strings.EqualFold(stringValue(item["type"]), "reasoning") {
+				changed = true
+				continue
+			}
+			if _, has := item["encrypted_content"]; has {
+				delete(item, "encrypted_content")
+				changed = true
+			}
+		}
+		filtered = append(filtered, raw)
+	}
+	if !changed {
+		return body, false
+	}
+	payload["input"] = filtered
+	rewritten, err := json.Marshal(payload)
+	if err != nil {
+		return body, false
+	}
+	return rewritten, true
 }
 
 func (s *Server) proxyResponsesToOpenAIChat(w http.ResponseWriter, r *http.Request, provider domain.Provider, model string, openAIReq map[string]any, skipIncomingAuth bool) (int, TokenUsage, []byte, error) {
