@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -705,6 +706,29 @@ const (
 	logBodyCapOK    = 8 * 1024   // 2xx 请求体上限：8 KiB
 	logBodyCapError = 256 * 1024 // 非 2xx 请求体/响应体上限：256 KiB
 )
+
+// statusClientClosedRequest is nginx's 499 (Client Closed Request): the
+// downstream client disconnected/aborted before the (often slow, reasoning)
+// upstream finished, so the request context was canceled. This is a client
+// action, not a gateway/upstream fault — recording it as 499 (not 502) and
+// logging at info keeps the error log from being flooded with benign
+// cancellations.
+const statusClientClosedRequest = 499
+
+// isClientCanceled reports whether a request-flow error is due to the downstream
+// client going away. net/http cancels the request context when the underlying
+// connection closes; since upstream calls use r.Context() directly (no
+// gateway-imposed deadline), a non-nil r.Context().Err() means the client
+// canceled/disconnected. errors.Is covers wrapped context sentinels too.
+func isClientCanceled(r *http.Request, err error) bool {
+	if err == nil {
+		return false
+	}
+	if ctx := r.Context(); ctx != nil && ctx.Err() != nil {
+		return true
+	}
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
 
 func (s *Server) recordRequestLog(started time.Time, matchedKey domain.APIKey, gatewayKeyMatched bool, routeID, providerID, model, action, protocolFlow, path string, status int, usage TokenUsage, requestBody, responseBody []byte) {
 	s.recordRequestLogEx(started, matchedKey, gatewayKeyMatched, routeID, providerID, model, action, protocolFlow, path, status, usage, 0, "", "", "", nil, requestBody, responseBody)
@@ -2925,6 +2949,11 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 	status, usage, responseLog, decision, effectiveModel, err := s.executeProtocolFlowWithFailover(wrapTTFTWriterWithTiming(w, started, &ttftMs, timing), r, route, decision, model, req, domain.ProtocolOpenAIChat, gatewayKeyMatched, matchedKey, gatewayKeyMatched)
 	if err != nil {
+		if isClientCanceled(r, err) {
+			s.logs.AddApp("info", "chat request canceled by client", err.Error())
+			s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, effectiveModel, decision.Action, decision.ConversionLabel, r.URL.Path, statusClientClosedRequest, usage, ttftMs, body, []byte(err.Error()))
+			return
+		}
 		s.logs.AddApp("error", "chat request failed", err.Error())
 		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, effectiveModel, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
 		writeOpenAIError(w, http.StatusBadGateway, err.Error())
@@ -3018,6 +3047,11 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	status, usage, responseLog, decision, effectiveModel, err := s.executeProtocolFlowWithFailover(wrapTTFTWriterWithTiming(w, started, &ttftMs, timing), r, route, decision, model, req, domain.ProtocolOpenAIResponses, gatewayKeyMatched, matchedKey, gatewayKeyMatched)
 	if err != nil {
+		if isClientCanceled(r, err) {
+			s.logs.AddApp("info", "responses request canceled by client", err.Error())
+			s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, effectiveModel, decision.Action, decision.ConversionLabel, r.URL.Path, statusClientClosedRequest, usage, ttftMs, body, []byte(err.Error()))
+			return
+		}
 		s.logs.AddApp("error", "responses request failed", err.Error())
 		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, effectiveModel, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": err.Error(), "type": "gateway_error"}})
@@ -3195,6 +3229,11 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	status, usage, responseLog, decision, effectiveModel, err := s.executeProtocolFlowWithFailover(wrapTTFTWriterWithTiming(w, started, &ttftMs, timing), r, route, decision, model, req, domain.ProtocolClaude, gatewayKeyMatched, matchedKey, gatewayKeyMatched)
 	if err != nil {
+		if isClientCanceled(r, err) {
+			s.logs.AddApp("info", "claude messages canceled by client", err.Error())
+			s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, effectiveModel, decision.Action, decision.ConversionLabel, r.URL.Path, statusClientClosedRequest, usage, ttftMs, body, []byte(err.Error()))
+			return
+		}
 		s.logs.AddApp("error", "claude messages request failed", err.Error())
 		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, effectiveModel, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
 		writeClaudeError(w, http.StatusBadGateway, err.Error())
