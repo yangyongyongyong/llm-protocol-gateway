@@ -89,16 +89,23 @@ https://api.example.com/v1                     → 探测 https://api.example.co
 真实的连通性+鉴权检查（`fetchProviderModels` / `testProviderChat`）。
 
 ### 5.2 被标记为"异常"的条件
-一次真实转发请求失败且属于"可故障转移"类型时，Provider 会被标记为 `unavailable`
-（控制台显示"异常"），判定见 `shouldFailoverProvider`（`internal/gateway/provider_failover.go`）：
+真实转发失败时先经 `classifyProviderFailover`（`internal/gateway/provider_failover.go`）分成
+**软故障 / 硬故障**；两者都会触发备用 Provider 切换，但控制台"异常"更保守：
 
+**硬故障（立刻标异常）**
+- 明确的订阅/账单耗尽文案（`usage limit`、`insufficient_quota`、`credit balance` 等）
+- 明确的凭证失效（`invalid_grant`、`revoked`、`invalid api key` 等）
+- 对 `claude_oauth`：若缓存的 5h utilization ≥ 95%，上述 usage 文案保持硬故障；**< 95% 则降级为软故障**（避免额度面板未满却整卡标红）
+
+**软故障（连续 3 次 / 60s 才标异常）**
 - 传输层错误（连接失败/超时等）
 - HTTP 429 / 529 / 502 / 503 / 504
-- HTTP 401 / 403（凭证或账号问题）
-- 带配额/限流关键字的 400（quota、rate limit、billing、exceeded 等）
+- HTTP 401 / 403（无硬故障关键字时，例如 token 刷新竞态）
+- 带短期限流关键字的 400（`rate_limit` / `overloaded` 等）
 
-> 注意：普通的 400（如 thinking 块签名类错误）**不会**标记异常——它们由 thinking
+> 注意：普通的 400（如 thinking 块签名类错误）**不会** failover / 标记异常——它们由 thinking
 > 整流器就地修复重试，见 `internal/gateway/thinking_rectifier.go`。
+> 打标时 app log 会写 `provider marked unavailable kind=soft|hard reason=...`。
 
 ### 5.3 异常后的周期性重探
 后台协程 `StartProviderFailoverRecovery`（开机启动，`internal/app/runtime.go`）：

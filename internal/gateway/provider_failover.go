@@ -12,50 +12,149 @@ import (
 	"github.com/luca/llm-protocol-gateway/internal/domain"
 )
 
+// failoverClass distinguishes transient upstream issues from hard quota/auth
+// failures. Both still advance the backup chain; only hard (or repeated soft)
+// failures mark the provider UI as "unavailable".
+type failoverClass int
+
+const (
+	failoverNone failoverClass = iota
+	failoverSoft
+	failoverHard
+)
+
+const (
+	// Soft failures must repeat within this window before the provider is
+	// marked unavailable (avoids single 429/529/5xx blips painting "异常").
+	providerSoftFailureWindow     = 60 * time.Second
+	providerSoftFailureThreshold  = 3
+	providerSoftUnavailableTTL    = 1 * time.Minute
+	claudeUsageHardThresholdPct   = 95.0
+)
+
+// hardQuotaHints are narrow subscription/billing exhaustion signals. Broad
+// tokens like bare "quota" / "exceeded" / "rate limit" are intentionally
+// omitted — those usually mean short-lived throttling, not a dead provider.
+var hardQuotaHints = []string{
+	"insufficient_quota",
+	"usage limit",
+	"you've hit your",
+	"you have hit your",
+	"credit balance",
+	"billing",
+	"tokens exhausted",
+	"out of credits",
+	"quota exceeded",
+	"plan limit",
+}
+
+// hardAuthHints mark credential death (not a transient token-refresh race).
+var hardAuthHints = []string{
+	"invalid_grant",
+	"revoked",
+	"invalid_api_key",
+	"invalid x-api-key",
+	"invalid api key",
+	"api key not valid",
+}
+
+// softThrottleHints classify 400 bodies that are failover-worthy but not a
+// hard account/quota kill.
+var softThrottleHints = []string{
+	"rate_limit",
+	"rate limit",
+	"overloaded",
+	"capacity",
+}
+
+type providerUnavailableState struct {
+	nextRetry time.Time
+	hard      bool
+	reason    string
+}
+
+type providerSoftFailureState struct {
+	count       int
+	windowStart time.Time
+}
+
 // shouldFailoverProvider reports whether an upstream failure should advance to
 // the next backup provider for this API key.
 func shouldFailoverProvider(status int, body []byte, transportErr error) bool {
+	class, _ := classifyProviderFailover(status, body, transportErr, nil)
+	return class != failoverNone
+}
+
+// classifyProviderFailover returns soft/hard/none plus a short reason string.
+// fiveHourUtil, when non-nil, is the cached Claude OAuth 5h utilization
+// (0-100). Hard "usage limit" signals are downgraded to soft when utilization
+// is clearly under the hard threshold — matching the quota panel reality.
+func classifyProviderFailover(status int, body []byte, transportErr error, fiveHourUtil *float64) (failoverClass, string) {
 	if transportErr != nil {
-		return true
+		return failoverSoft, "transport: " + truncateReason(transportErr.Error())
 	}
-	if status == http.StatusTooManyRequests || status == 529 {
-		return true
-	}
-	if status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout {
-		return true
-	}
+
 	msg := strings.ToLower(summarizeUpstreamHTTPError(status, body))
-	quotaHints := []string{
-		"insufficient_quota",
-		"quota",
-		"rate_limit",
-		"rate limit",
-		"usage limit",
-		"credit balance",
-		"billing",
-		"exceeded",
-		"overloaded",
-		"capacity",
-		"tokens exhausted",
-		"out of credits",
-	}
-	if status == http.StatusUnauthorized || status == http.StatusForbidden {
-		for _, hint := range quotaHints {
-			if strings.Contains(msg, hint) {
-				return true
-			}
+	hardQuota := containsAnyHint(msg, hardQuotaHints)
+	hardAuth := containsAnyHint(msg, hardAuthHints)
+	softThrottle := containsAnyHint(msg, softThrottleHints)
+
+	switch {
+	case status == http.StatusTooManyRequests || status == 529:
+		if hardQuota {
+			return maybeDowngradeHardUsage(failoverHard, fmt.Sprintf("http_%d_usage", status), fiveHourUtil)
 		}
-		// Provider credential / account blocks are also failover-worthy.
-		return true
+		return failoverSoft, fmt.Sprintf("http_%d", status)
+	case status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout:
+		return failoverSoft, fmt.Sprintf("http_%d", status)
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		if hardQuota {
+			return maybeDowngradeHardUsage(failoverHard, fmt.Sprintf("http_%d_usage", status), fiveHourUtil)
+		}
+		if hardAuth {
+			return failoverHard, fmt.Sprintf("http_%d_auth", status)
+		}
+		// Transient auth (token refresh race, brief 403): failover yes, mark no
+		// until consecutive soft failures accumulate.
+		return failoverSoft, fmt.Sprintf("http_%d", status)
+	case status == http.StatusBadRequest:
+		if hardQuota {
+			return maybeDowngradeHardUsage(failoverHard, "http_400_usage", fiveHourUtil)
+		}
+		if softThrottle {
+			return failoverSoft, "http_400_throttle"
+		}
+		return failoverNone, ""
+	default:
+		return failoverNone, ""
 	}
-	if status == http.StatusBadRequest {
-		for _, hint := range quotaHints {
-			if strings.Contains(msg, hint) {
-				return true
-			}
+}
+
+func maybeDowngradeHardUsage(class failoverClass, reason string, fiveHourUtil *float64) (failoverClass, string) {
+	if class != failoverHard || fiveHourUtil == nil {
+		return class, reason
+	}
+	if *fiveHourUtil < claudeUsageHardThresholdPct {
+		return failoverSoft, fmt.Sprintf("%s (five_hour=%.1f<%.0f, softed)", reason, *fiveHourUtil, claudeUsageHardThresholdPct)
+	}
+	return class, fmt.Sprintf("%s (five_hour=%.1f)", reason, *fiveHourUtil)
+}
+
+func containsAnyHint(msg string, hints []string) bool {
+	for _, hint := range hints {
+		if hint != "" && strings.Contains(msg, hint) {
+			return true
 		}
 	}
 	return false
+}
+
+func truncateReason(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= 160 {
+		return s
+	}
+	return s[:160] + "…"
 }
 
 // failoverResponseWriter buffers error responses so the gateway can try the
@@ -173,21 +272,52 @@ func (w *failoverResponseWriter) FlushError() {
 	w.commitHeaders(status)
 }
 
-// markProviderUnavailable records that a live upstream request found
-// providerID unavailable, so /__state can surface a "unavailable"/"异常"
-// badge plus a countdown until the background recovery loop
-// (StartProviderFailoverRecovery) re-probes it. Safe for concurrent use.
-func (s *Server) markProviderUnavailable(providerID string) {
+// markProviderUnavailable records that providerID should show as
+// "unavailable"/"异常" until the background recovery loop re-probes it.
+// hard failures use the longer recovery interval; soft (repeated transient)
+// failures use a shorter TTL. Safe for concurrent use.
+func (s *Server) markProviderUnavailable(providerID string, hard bool, reason string) {
+	s.setProviderUnavailable(providerID, hard, reason, true)
+}
+
+// refreshProviderUnavailableCountdown extends nextRetryAt without re-logging
+// a fresh "marked unavailable" event (used by the recovery loop).
+func (s *Server) refreshProviderUnavailableCountdown(providerID string, hard bool, reason string) {
+	s.setProviderUnavailable(providerID, hard, reason, false)
+}
+
+func (s *Server) setProviderUnavailable(providerID string, hard bool, reason string, logMark bool) {
 	providerID = strings.TrimSpace(providerID)
 	if providerID == "" {
 		return
 	}
+	ttl := providerFailoverRecoveryInterval
+	if !hard {
+		ttl = providerSoftUnavailableTTL
+	}
+	reason = truncateReason(reason)
 	s.providerAvailabilityMu.Lock()
 	if s.providerAvailability == nil {
-		s.providerAvailability = make(map[string]time.Time)
+		s.providerAvailability = make(map[string]providerUnavailableState)
 	}
-	s.providerAvailability[providerID] = time.Now().Add(providerFailoverRecoveryInterval)
+	s.providerAvailability[providerID] = providerUnavailableState{
+		nextRetry: time.Now().Add(ttl),
+		hard:      hard,
+		reason:    reason,
+	}
 	s.providerAvailabilityMu.Unlock()
+	if !logMark {
+		return
+	}
+	kind := "soft"
+	if hard {
+		kind = "hard"
+	}
+	msg := fmt.Sprintf("provider=%s kind=%s reason=%s retry_in=%s", providerID, kind, reason, ttl)
+	if s.logs != nil {
+		s.logs.AddApp("warn", "provider marked unavailable", msg)
+	}
+	slog.Warn("provider marked unavailable", "provider", providerID, "hard", hard, "reason", reason)
 }
 
 // markProviderAvailable clears any tracked "unavailable" cooldown for
@@ -201,6 +331,9 @@ func (s *Server) markProviderAvailable(providerID string) {
 	if s.providerAvailability != nil {
 		delete(s.providerAvailability, providerID)
 	}
+	if s.providerSoftFailures != nil {
+		delete(s.providerSoftFailures, providerID)
+	}
 	s.providerAvailabilityMu.Unlock()
 }
 
@@ -209,8 +342,8 @@ func (s *Server) markProviderAvailable(providerID string) {
 func (s *Server) providerNextRetry(providerID string) (time.Time, bool) {
 	s.providerAvailabilityMu.Lock()
 	defer s.providerAvailabilityMu.Unlock()
-	t, ok := s.providerAvailability[providerID]
-	return t, ok
+	st, ok := s.providerAvailability[providerID]
+	return st.nextRetry, ok
 }
 
 // providerUnavailableIDs snapshots the currently-tracked unavailable provider
@@ -223,6 +356,64 @@ func (s *Server) providerUnavailableIDs() []string {
 		ids = append(ids, id)
 	}
 	return ids
+}
+
+func (s *Server) providerUnavailableSnapshot(providerID string) (providerUnavailableState, bool) {
+	s.providerAvailabilityMu.Lock()
+	defer s.providerAvailabilityMu.Unlock()
+	st, ok := s.providerAvailability[providerID]
+	return st, ok
+}
+
+func (s *Server) bumpSoftFailure(providerID string) int {
+	s.providerAvailabilityMu.Lock()
+	defer s.providerAvailabilityMu.Unlock()
+	if s.providerSoftFailures == nil {
+		s.providerSoftFailures = make(map[string]providerSoftFailureState)
+	}
+	now := time.Now()
+	st := s.providerSoftFailures[providerID]
+	if st.count == 0 || now.Sub(st.windowStart) > providerSoftFailureWindow {
+		st = providerSoftFailureState{count: 1, windowStart: now}
+	} else {
+		st.count++
+	}
+	s.providerSoftFailures[providerID] = st
+	return st.count
+}
+
+func (s *Server) clearSoftFailures(providerID string) {
+	s.providerAvailabilityMu.Lock()
+	defer s.providerAvailabilityMu.Unlock()
+	if s.providerSoftFailures != nil {
+		delete(s.providerSoftFailures, providerID)
+	}
+}
+
+// cachedClaudeFiveHourUtilization returns the (possibly stale) Claude OAuth
+// 5h utilization for providerID when a usage report is cached.
+func (s *Server) cachedClaudeFiveHourUtilization(providerID string) (float64, bool) {
+	if s == nil || s.oauthUsageCache == nil {
+		return 0, false
+	}
+	cached, ok := s.oauthUsageCache.getAllowStale("claude:" + providerID)
+	if !ok {
+		return 0, false
+	}
+	report, ok := cached.(ClaudeOAuthUsageReport)
+	if !ok || !report.Available || report.FiveHour == nil {
+		return 0, false
+	}
+	return report.FiveHour.Utilization, true
+}
+
+func (s *Server) classifyProviderFailover(providerID string, status int, body []byte, err error) (failoverClass, string) {
+	var utilPtr *float64
+	if util, ok := s.cachedClaudeFiveHourUtilization(providerID); ok {
+		u := util
+		utilPtr = &u
+	}
+	return classifyProviderFailover(status, body, err, utilPtr)
 }
 
 // applyProviderAvailability overlays the live-request availability tracker
@@ -240,21 +431,44 @@ func (s *Server) applyProviderAvailability(provider *domain.Provider) {
 }
 
 // recordProviderRequestOutcome updates the runtime availability tracker for
-// providerID based on one completed upstream attempt (mirrors the same
-// quota/auth/5xx/transport-error classification failover already uses via
-// shouldFailoverProvider), independent of whether a fallback chain exists.
+// providerID based on one completed upstream attempt. Failover-worthy soft
+// failures only paint "异常" after consecutive hits; hard quota/auth failures
+// mark immediately. Independent of whether a fallback chain exists.
 func (s *Server) recordProviderRequestOutcome(providerID string, status int, body []byte, err error) {
+	_ = s.applyProviderFailoverOutcome(providerID, status, body, err)
+}
+
+// applyProviderFailoverOutcome classifies the attempt, updates soft/hard
+// availability tracking, and returns whether the caller should advance to the
+// next backup provider.
+func (s *Server) applyProviderFailoverOutcome(providerID string, status int, body []byte, err error) bool {
 	providerID = strings.TrimSpace(providerID)
 	if providerID == "" {
-		return
+		return false
 	}
-	if shouldFailoverProvider(status, body, err) {
-		s.markProviderUnavailable(providerID)
-		return
+	class, reason := s.classifyProviderFailover(providerID, status, body, err)
+	if class == failoverNone {
+		if err == nil {
+			s.markProviderAvailable(providerID)
+		}
+		return false
 	}
-	if err == nil {
-		s.markProviderAvailable(providerID)
+	switch class {
+	case failoverHard:
+		s.clearSoftFailures(providerID)
+		s.markProviderUnavailable(providerID, true, reason)
+	case failoverSoft:
+		count := s.bumpSoftFailure(providerID)
+		if count >= providerSoftFailureThreshold {
+			s.markProviderUnavailable(providerID, false, fmt.Sprintf("%s consecutive=%d", reason, count))
+		} else if s.logs != nil {
+			s.logs.AddApp("info", "provider soft failure", fmt.Sprintf(
+				"provider=%s consecutive=%d/%d reason=%s",
+				providerID, count, providerSoftFailureThreshold, reason,
+			))
+		}
 	}
+	return true
 }
 
 func (s *Server) persistAPIKeyActiveProvider(keyID, providerID string) {
@@ -349,10 +563,7 @@ func (s *Server) executeProtocolFlowWithFailover(
 		status, usage, body, execErr := s.executeProtocolFlow(writer, r, route, attemptDecision, attemptModel, attemptReq, clientProtocol, skipIncomingAuth)
 		if execErr != nil {
 			lastStatus, lastUsage, lastBody, lastErr, lastModel = status, usage, nil, execErr, attemptModel
-			transportFailoverWorthy := shouldFailoverProvider(0, nil, execErr)
-			if transportFailoverWorthy {
-				s.markProviderUnavailable(providerID)
-			}
+			transportFailoverWorthy := s.applyProviderFailoverOutcome(providerID, 0, nil, execErr)
 			if canDefer && transportFailoverWorthy {
 				writer.Discard()
 				markTimingFlag(r.Context(), timingFlagFailoverRetry)
@@ -377,12 +588,7 @@ func (s *Server) executeProtocolFlowWithFailover(
 		}
 		lastStatus, lastUsage, lastBody, lastErr, lastModel = status, usage, respBody, nil, attemptModel
 
-		attemptFailoverWorthy := shouldFailoverProvider(status, respBody, nil)
-		if attemptFailoverWorthy {
-			s.markProviderUnavailable(providerID)
-		} else {
-			s.markProviderAvailable(providerID)
-		}
+		attemptFailoverWorthy := s.applyProviderFailoverOutcome(providerID, status, respBody, nil)
 		if canDefer && attemptFailoverWorthy {
 			writer.Discard()
 			markTimingFlag(r.Context(), timingFlagFailoverRetry)
@@ -520,8 +726,14 @@ func (s *Server) reprobeUnavailableProviders(ctx context.Context) {
 			slog.Info("provider recovered", "provider", id)
 			continue
 		}
-		// Still unavailable: refresh the countdown for the next cycle.
-		s.markProviderUnavailable(id)
+		// Still unavailable: refresh the countdown for the next cycle,
+		// preserving hard/soft classification from the original mark.
+		prev, _ := s.providerUnavailableSnapshot(id)
+		reason := prev.reason
+		if reason == "" {
+			reason = "reprobe_failed"
+		}
+		s.refreshProviderUnavailableCountdown(id, prev.hard, reason)
 	}
 }
 

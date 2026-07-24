@@ -90,12 +90,13 @@ type Server struct {
 	selfcheckJobs map[string]*selfcheckJob
 
 	// providerAvailability tracks providers that a live upstream request found
-	// unavailable (quota/auth/5xx/transport-error per shouldFailoverProvider),
-	// keyed by provider ID -> the next time the background recovery loop
-	// (StartProviderFailoverRecovery) will re-probe it. Runtime-only, never
-	// persisted; cleared as soon as a live request or probe succeeds again.
+	// unavailable (hard quota/auth, or repeated soft 429/5xx/transport failures),
+	// keyed by provider ID. Runtime-only, never persisted; cleared as soon as a
+	// live request or probe succeeds again. Soft failures require consecutive
+	// hits before appearing here (see classifyProviderFailover).
 	providerAvailabilityMu sync.Mutex
-	providerAvailability   map[string]time.Time
+	providerAvailability   map[string]providerUnavailableState
+	providerSoftFailures   map[string]providerSoftFailureState
 
 	// userActivity tracks each console user's latest API request time.
 	// In-memory values are exact; StartUserActivityFlush persists them at most
