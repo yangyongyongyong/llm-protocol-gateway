@@ -80,21 +80,104 @@ func stripClaudeThinkingBlocks(blocks []any) []any {
 	return out
 }
 
-// normalizeClaudeContentForOpenAI preserves structured content blocks (and
-// cache_control) when converting Claude requests to OpenAI Chat format.
-// Thinking blocks are dropped — Chat upstreams do not accept them.
+// claudeImageBlockToOpenAIChat converts Anthropic image source blocks into
+// OpenAI Chat Completions image_url parts. Passing Claude's type=image through
+// unchanged makes GLM/Z.AI return 400 "content[N].type type error".
+func claudeImageBlockToOpenAIChat(item map[string]any) map[string]any {
+	if item == nil {
+		return nil
+	}
+	source, _ := item["source"].(map[string]any)
+	if source == nil {
+		return nil
+	}
+	switch strings.ToLower(strings.TrimSpace(stringValue(source["type"]))) {
+	case "base64":
+		data := strings.TrimSpace(stringValue(source["data"]))
+		if data == "" {
+			return nil
+		}
+		mediaType := strings.TrimSpace(stringValue(source["media_type"]))
+		if mediaType == "" {
+			mediaType = "image/png"
+		}
+		return map[string]any{
+			"type": "image_url",
+			"image_url": map[string]any{
+				"url": "data:" + mediaType + ";base64," + data,
+			},
+		}
+	case "url":
+		url := strings.TrimSpace(stringValue(source["url"]))
+		if url == "" {
+			return nil
+		}
+		return map[string]any{
+			"type": "image_url",
+			"image_url": map[string]any{
+				"url": url,
+			},
+		}
+	default:
+		return nil
+	}
+}
+
+// normalizeClaudeContentBlocksForOpenAI maps Claude content blocks to shapes
+// OpenAI-compatible Chat upstreams accept. Drops thinking and other Claude-only
+// types; rewrites image → image_url; keeps plain text (without cache_control).
+func normalizeClaudeContentBlocksForOpenAI(blocks []any) []any {
+	if len(blocks) == 0 {
+		return blocks
+	}
+	out := make([]any, 0, len(blocks))
+	for _, block := range blocks {
+		item, ok := block.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch stringValue(item["type"]) {
+		case "thinking", "redacted_thinking":
+			continue
+		case "image":
+			if converted := claudeImageBlockToOpenAIChat(item); converted != nil {
+				out = append(out, converted)
+			}
+		case "image_url":
+			out = append(out, item)
+		case "text":
+			textBlock := map[string]any{"type": "text", "text": stringValue(item["text"])}
+			if cacheControl, ok := item["cache_control"]; ok {
+				textBlock["cache_control"] = cacheControl
+			}
+			out = append(out, textBlock)
+		default:
+			// tool_use / tool_result / document / unknown — not valid Chat
+			// content parts; callers that need tools handle them separately.
+			continue
+		}
+	}
+	return out
+}
+
+// normalizeClaudeContentForOpenAI preserves structured content blocks when
+// converting Claude requests to OpenAI Chat format. Thinking blocks are
+// dropped; Claude image blocks are rewritten to image_url.
 func normalizeClaudeContentForOpenAI(content any) any {
 	switch typed := content.(type) {
 	case string:
 		return typed
 	case []any:
-		blocks := stripClaudeThinkingBlocks(cloneContentBlocks(typed))
+		blocks := normalizeClaudeContentBlocksForOpenAI(cloneContentBlocks(typed))
 		if len(blocks) == 0 {
 			return ""
 		}
-		if len(blocks) == 1 && !contentBlockArrayHasCacheControl(blocks) {
-			if text, ok := blocks[0].(map[string]any)["text"].(string); ok && len(blocks[0].(map[string]any)) <= 2 {
-				return text
+		if len(blocks) == 1 {
+			block, _ := blocks[0].(map[string]any)
+			if stringValue(block["type"]) == "text" && !contentBlockArrayHasCacheControl(blocks) && len(block) <= 2 {
+				if text, ok := block["text"].(string); ok {
+					return text
+				}
 			}
 		}
 		return blocks

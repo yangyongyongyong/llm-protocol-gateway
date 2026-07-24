@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"net/http"
 	"testing"
 	"time"
@@ -19,6 +20,8 @@ func TestClassifyProviderFailover(t *testing.T) {
 		want   failoverClass
 	}{
 		{name: "transport", err: http.ErrHandlerTimeout, want: failoverSoft},
+		{name: "client cancel no failover", err: context.Canceled, want: failoverNone},
+		{name: "client deadline no failover", err: context.DeadlineExceeded, want: failoverNone},
 		{name: "429 soft", status: 429, want: failoverSoft},
 		{name: "529 soft", status: 529, want: failoverSoft},
 		{name: "503 soft", status: 503, want: failoverSoft},

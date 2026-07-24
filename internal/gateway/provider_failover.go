@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -85,12 +86,26 @@ func shouldFailoverProvider(status int, body []byte, transportErr error) bool {
 	return class != failoverNone
 }
 
+// isRequestContextCanceled reports client-gone / deadline errors. These must
+// NOT trigger provider failover: the backup attempt reuses r.Context(), which
+// is already done, so it would only produce a misleading "context canceled"
+// against the fallback URL (and leave Claude Code looking "stuck").
+func isRequestContextCanceled(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 // classifyProviderFailover returns soft/hard/none plus a short reason string.
 // fiveHourUtil, when non-nil, is the cached Claude OAuth 5h utilization
 // (0-100). Hard "usage limit" signals are downgraded to soft when utilization
 // is clearly under the hard threshold — matching the quota panel reality.
 func classifyProviderFailover(status int, body []byte, transportErr error, fiveHourUtil *float64) (failoverClass, string) {
 	if transportErr != nil {
+		if isRequestContextCanceled(transportErr) {
+			return failoverNone, "client_canceled"
+		}
 		return failoverSoft, "transport: " + truncateReason(transportErr.Error())
 	}
 
@@ -563,6 +578,16 @@ func (s *Server) executeProtocolFlowWithFailover(
 		status, usage, body, execErr := s.executeProtocolFlow(writer, r, route, attemptDecision, attemptModel, attemptReq, clientProtocol, skipIncomingAuth)
 		if execErr != nil {
 			lastStatus, lastUsage, lastBody, lastErr, lastModel = status, usage, nil, execErr, attemptModel
+			// Client already gone: never advance the chain (backup would reuse the
+			// same canceled context and surface a fake GLM/fallback cancel).
+			if isRequestContextCanceled(execErr) || (r.Context() != nil && r.Context().Err() != nil) {
+				if !writer.passthrough && writer.buf.Len() == 0 && writer.status == 0 {
+					writer.Discard()
+				} else {
+					writer.FlushError()
+				}
+				return status, usage, body, attemptDecision, attemptModel, execErr
+			}
 			transportFailoverWorthy := s.applyProviderFailoverOutcome(providerID, 0, nil, execErr)
 			if canDefer && transportFailoverWorthy {
 				writer.Discard()
@@ -587,6 +612,15 @@ func (s *Server) executeProtocolFlowWithFailover(
 			respBody = writer.BufferedBody()
 		}
 		lastStatus, lastUsage, lastBody, lastErr, lastModel = status, usage, respBody, nil, attemptModel
+
+		if r.Context() != nil && r.Context().Err() != nil {
+			// Upstream may have returned an error status, but the client is
+			// already gone — do not burn the fallback chain.
+			if !writer.passthrough {
+				writer.FlushError()
+			}
+			return status, usage, respBody, attemptDecision, attemptModel, r.Context().Err()
+		}
 
 		attemptFailoverWorthy := s.applyProviderFailoverOutcome(providerID, status, respBody, nil)
 		if canDefer && attemptFailoverWorthy {

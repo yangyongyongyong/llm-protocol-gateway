@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -99,6 +100,62 @@ func TestClaudeRequestToOpenAIChatPreservesCacheControl(t *testing.T) {
 	userBlock, ok := userContent[0].(map[string]any)
 	if !ok || userBlock["cache_control"] == nil {
 		t.Fatalf("expected cache_control on user block: %#v", userContent[0])
+	}
+}
+
+// 回归：2026-07-24 — Claude→GLM failover 把 type=image 原样带给 Chat 上游 → 1214 type error
+func TestClaudeRequestToOpenAIChatRewritesImageBlocks(t *testing.T) {
+	claudeReq := map[string]any{
+		"model": "claude-opus-4-8",
+		"messages": []any{
+			map[string]any{
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "text", "text": "what is in this image?"},
+					map[string]any{
+						"type": "image",
+						"source": map[string]any{
+							"type":       "base64",
+							"media_type": "image/png",
+							"data":       "abc123",
+						},
+					},
+					map[string]any{"type": "thinking", "thinking": "secret", "signature": "sig"},
+				},
+			},
+		},
+	}
+	openAIReq, err := claudeRequestToOpenAIChat(claudeReq, "glm-5.2")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	messages := openAIReq["messages"].([]any)
+	if len(messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(messages))
+	}
+	user, _ := messages[0].(map[string]any)
+	content, ok := user["content"].([]any)
+	if !ok {
+		t.Fatalf("expected multimodal content array, got %#v", user["content"])
+	}
+	if len(content) != 2 {
+		t.Fatalf("expected text+image_url only, got %#v", content)
+	}
+	textBlock, _ := content[0].(map[string]any)
+	if textBlock["type"] != "text" {
+		t.Fatalf("first block type=%#v", textBlock["type"])
+	}
+	imageBlock, _ := content[1].(map[string]any)
+	if imageBlock["type"] != "image_url" {
+		t.Fatalf("image must become image_url, got %#v", imageBlock)
+	}
+	imageURL, _ := imageBlock["image_url"].(map[string]any)
+	if imageURL["url"] != "data:image/png;base64,abc123" {
+		t.Fatalf("unexpected image url %#v", imageURL["url"])
+	}
+	raw, _ := json.Marshal(openAIReq)
+	if strings.Contains(string(raw), `"type":"thinking"`) || strings.Contains(string(raw), `"type":"image","source"`) {
+		t.Fatalf("converted body still contains Claude-only types: %s", raw)
 	}
 }
 
