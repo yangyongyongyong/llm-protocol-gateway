@@ -2458,6 +2458,11 @@ function formatLocalISODate(date: Date) {
   return `${y}-${m}-${d}`;
 }
 
+/** 单日且等于本地今天 → 视为「跟随今天」，跨日后侧边栏再进页会自动滚到新的今天。 */
+function isFollowingTodayRange(from: string, to: string, today = formatLocalISODate(new Date())) {
+  return Boolean(from) && from === to && from === today;
+}
+
 /** 用量统计日历：单击选单日，Shift+单击选区间，选完即回调。可选支持清除（不限日期）。 */
 function UsageRangeCalendar({ from, to, onSelect, onClear }: {
   from: string;
@@ -2784,8 +2789,8 @@ function App() {
   // 空字符串 = 全部；LOG_OWNER_FILTER_ADMIN = 管理员（无所属用户的旧密钥）；
   // 其余为具体用户 id。仅管理员可见/可用，与后端 ownedKeyIDsForOwnerFilter 对应。
   const [logsOwnerFilter, setLogsOwnerFilter] = useState('');
-  const [logsFrom, setLogsFrom] = useState('');
-  const [logsTo, setLogsTo] = useState('');
+  const [logsFrom, setLogsFrom] = useState(() => formatLocalISODate(new Date()));
+  const [logsTo, setLogsTo] = useState(() => formatLocalISODate(new Date()));
   // 分页快照：离开第 1 页时冻结当时最新日志的 time+id 作为上界，之后翻页只在
   // 该快照内做 offset。新日志不再挤动窗口。回到第 1 页或换筛选时清空。
   // 注意：绝不能把 logsPage 放进「拉日志」的 effect 依赖里再调 refreshLogs——
@@ -2795,6 +2800,10 @@ function App() {
   const logsSnapshotBeforeTimeRef = useRef('');
   const logsPageRef = useRef(1);
   const logsFetchGenRef = useRef(0);
+  // 「跟随今天」：默认/点「今天」/点选当日时为 true。跨午夜后侧边栏再进本页会滚到新的今天，
+  // 不必整页刷新。用户选了历史单日、多日区间或清除日期后为 false，不再自动改日期。
+  const logsFollowTodayRef = useRef(true);
+  const usageFollowTodayRef = useRef(true);
   useEffect(() => {
     logsPageRef.current = logsPage;
   }, [logsPage]);
@@ -3354,18 +3363,37 @@ function App() {
 
   useEffect(() => {
     if (activeNav !== 'usage-stats') return;
-    void refreshRequestStats(usageFrom, usageTo);
+    const today = formatLocalISODate(new Date());
+    if (usageFollowTodayRef.current) {
+      if (usageRangeRef.current.from !== today || usageRangeRef.current.to !== today) {
+        setUsageFrom(today);
+        setUsageTo(today);
+        usageRangeRef.current = { from: today, to: today };
+      }
+      void refreshRequestStats(today, today);
+    } else {
+      void refreshRequestStats(usageRangeRef.current.from, usageRangeRef.current.to);
+    }
     void refreshMonthlyDaily();
   }, [activeNav]);
 
   useEffect(() => {
     if (activeNav !== 'traffic-tokens') return;
+    // 跟随今天：跨午夜后从侧边栏再进本页，把日期滚到真实今天再拉日志。
+    const today = formatLocalISODate(new Date());
+    if (logsFollowTodayRef.current && (logsFrom !== today || logsTo !== today)) {
+      setLogsFrom(today);
+      setLogsTo(today);
+      // setState 异步，下面的缓存 key / refresh 必须用 today，不能读旧的 logsFrom。
+    }
+    const effectiveFrom = logsFollowTodayRef.current ? today : logsFrom;
+    const effectiveTo = logsFollowTodayRef.current ? today : logsTo;
     // 筛选条件 / 进入页面：回到第 1 页并拉一次。故意不依赖 logsPage——翻页只由
     // 按钮调用 refreshLogs(n)，避免 setLogsPage → effect → 再拉 的循环。
     logsSnapshotBeforeIdRef.current = 0;
     logsSnapshotBeforeTimeRef.current = '';
     const scope = uiCacheScope(authStatusRef.current);
-    const kind = `logs:p1:s${logsStatusFilter}:f${logsFrom}:t${logsTo}:k${logsApiKeyName.trim()}:pv${logsProviderFilter}:u${logsOwnerFilter}`;
+    const kind = `logs:p1:s${logsStatusFilter}:f${effectiveFrom}:t${effectiveTo}:k${logsApiKeyName.trim()}:pv${logsProviderFilter}:u${logsOwnerFilter}`;
     const cached = readUICache<{ items: LogEntry[]; total: number; page: number; fetchedAt?: string }>(scope, kind);
     if (cached?.items?.length) {
       setLogs(cached.items);
@@ -3377,7 +3405,7 @@ function App() {
       }
     }
     if (logsPageRef.current !== 1) setLogsPage(1);
-    void refreshLogs(1, undefined, undefined, { silent: Boolean(cached?.items?.length) });
+    void refreshLogs(1, effectiveFrom, effectiveTo, { silent: Boolean(cached?.items?.length) });
   }, [activeNav, logsStatusFilter, logsFrom, logsTo, logsApiKeyName, logsProviderFilter, logsOwnerFilter]);
 
   // 仅第 1 页自动轮询；翻到第 2 页及以后立刻停表，绝不自动刷新。
@@ -6512,6 +6540,7 @@ function App() {
                     from={usageFrom}
                     to={usageTo}
                     onSelect={(nextFrom, nextTo) => {
+                      usageFollowTodayRef.current = isFollowingTodayRange(nextFrom, nextTo);
                       setUsageFrom(nextFrom);
                       setUsageTo(nextTo);
                       void refreshRequestStats(nextFrom, nextTo);
@@ -6524,6 +6553,7 @@ function App() {
                 <UsageMonthlyTokenBars
                   points={monthlyDaily}
                   onPickDay={(date) => {
+                    usageFollowTodayRef.current = isFollowingTodayRange(date, date);
                     setUsageFrom(date);
                     setUsageTo(date);
                     void refreshRequestStats(date, date);
@@ -7086,11 +7116,13 @@ function App() {
                     from={logsFrom}
                     to={logsTo}
                     onSelect={(nextFrom, nextTo) => {
+                      logsFollowTodayRef.current = isFollowingTodayRange(nextFrom, nextTo);
                       setLogsFrom(nextFrom);
                       setLogsTo(nextTo);
                       void refreshLogs(1, nextFrom, nextTo);
                     }}
                     onClear={() => {
+                      logsFollowTodayRef.current = false;
                       setLogsFrom('');
                       setLogsTo('');
                       void refreshLogs(1, '', '');
