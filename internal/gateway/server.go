@@ -435,8 +435,15 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 			query.To = parsed.Add(24 * time.Hour)
 		}
 	}
-	// beforeId freezes a pagination snapshot: the console captures the newest
-	// log id when leaving page 1 so offset paging stays stable as new logs arrive.
+	// beforeTime / beforeId freeze a pagination snapshot: the console captures
+	// the newest log on page 1 so offset paging stays stable as new logs arrive.
+	if beforeTime := strings.TrimSpace(r.URL.Query().Get("beforeTime")); beforeTime != "" {
+		if parsed, err := time.Parse(time.RFC3339Nano, beforeTime); err == nil {
+			query.BeforeTime = parsed
+		} else if parsed, err := time.Parse(time.RFC3339, beforeTime); err == nil {
+			query.BeforeTime = parsed
+		}
+	}
 	if beforeID := strings.TrimSpace(r.URL.Query().Get("beforeId")); beforeID != "" {
 		if parsed, err := strconv.ParseInt(beforeID, 10, 64); err == nil && parsed > 0 {
 			query.BeforeID = parsed

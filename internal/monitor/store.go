@@ -71,6 +71,11 @@ type RequestLogQuery struct {
 	// console freezes this to the newest id at the moment it leaves page 1 so
 	// offset pagination stays stable while new logs keep arriving.
 	BeforeID int64
+	// BeforeTime, when set, freezes the newest log timestamp (RFC3339/RFC3339Nano)
+	// from page 1. Combined with BeforeID it matches ORDER BY time DESC, id DESC:
+	// time < BeforeTime OR (time = BeforeTime AND id <= BeforeID). When only
+	// BeforeTime is set, results are restricted to time <= BeforeTime.
+	BeforeTime time.Time
 }
 
 type RequestLogPage struct {
@@ -330,6 +335,20 @@ func (s *Store) Query(query RequestLogQuery) RequestLogPage {
 			if _, ok := keyIDSet[item.APIKeyID]; !ok {
 				continue
 			}
+		}
+		if !query.BeforeTime.IsZero() && query.BeforeID > 0 {
+			if item.Time.After(query.BeforeTime) {
+				continue
+			}
+			if item.Time.Equal(query.BeforeTime) && item.ID > query.BeforeID {
+				continue
+			}
+		} else if !query.BeforeTime.IsZero() {
+			if item.Time.After(query.BeforeTime) {
+				continue
+			}
+		} else if query.BeforeID > 0 && item.ID > query.BeforeID {
+			continue
 		}
 		filtered = append(filtered, item)
 	}

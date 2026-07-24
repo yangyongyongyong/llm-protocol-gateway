@@ -194,8 +194,16 @@ func (s *Store) QueryRequestLogs(query monitor.RequestLogQuery) (monitor.Request
 		}
 	}
 
-	if query.BeforeID > 0 {
-		// Freeze the newest boundary so offset paging is stable against inserts.
+	if !query.BeforeTime.IsZero() && query.BeforeID > 0 {
+		// Stable freeze matching ORDER BY time DESC, id DESC: keep the snapshot
+		// frontier (newest page-1 row) and everything older.
+		where = append(where, "(time < ? OR (time = ? AND id <= ?))")
+		ts := query.BeforeTime.UTC().Format(time.RFC3339Nano)
+		args = append(args, ts, ts, query.BeforeID)
+	} else if !query.BeforeTime.IsZero() {
+		where = append(where, "time <= ?")
+		args = append(args, query.BeforeTime.UTC().Format(time.RFC3339Nano))
+	} else if query.BeforeID > 0 {
 		where = append(where, "id <= ?")
 		args = append(args, query.BeforeID)
 	}

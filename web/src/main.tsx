@@ -2786,10 +2786,18 @@ function App() {
   const [logsOwnerFilter, setLogsOwnerFilter] = useState('');
   const [logsFrom, setLogsFrom] = useState('');
   const [logsTo, setLogsTo] = useState('');
-  // 分页快照：离开第 1 页时冻结当时最新日志 id 作为 beforeId 上界，之后翻页只在
-  // 「id <= 该值」的固定集合里做 offset，新日志(更大 id)不再挤动窗口——彻底解决
-  // 翻页后因新日志插入导致行乱跳/重复。回到第 1 页或换筛选条件时清空，恢复实时。
+  // 分页快照：离开第 1 页时冻结当时最新日志的 time+id 作为上界，之后翻页只在
+  // 该快照内做 offset。新日志不再挤动窗口。回到第 1 页或换筛选时清空。
+  // 注意：绝不能把 logsPage 放进「拉日志」的 effect 依赖里再调 refreshLogs——
+  // 否则翻页 setLogsPage 会再次触发拉取，再叠上第 1 页 5s 轮询的竞态，就会出现
+  // 「点下一页刷十几次 / 页码来回跳」。
   const logsSnapshotBeforeIdRef = useRef(0);
+  const logsSnapshotBeforeTimeRef = useRef('');
+  const logsPageRef = useRef(1);
+  const logsFetchGenRef = useRef(0);
+  useEffect(() => {
+    logsPageRef.current = logsPage;
+  }, [logsPage]);
   const [requestLogRetentionDays, setRequestLogRetentionDays] = useState(7);
   const [usageFrom, setUsageFrom] = useState(() => formatLocalISODate(new Date()));
   const [usageTo, setUsageTo] = useState(() => formatLocalISODate(new Date()));
@@ -3352,30 +3360,34 @@ function App() {
 
   useEffect(() => {
     if (activeNav !== 'traffic-tokens') return;
-    // 先用缓存秒开，再静默拉最新；只有第 1 页会每 5s 自动刷新。
-    // 原因：日志按时间倒序做 offset 分页，翻到第 2 页及以后本质是“偏移量 10~20”
-    // 这样一个位置窗口。如果继续自动刷新，新请求不断从最前面插入会导致这个窗口
-    // 对应的内容整体后移——用户正在看的行会被不断顶掉/替换，表现就是“翻页后日志
-    // 抖动乱跳”。锁定在第 1 页之外的页时只做一次性拉取（导航到该页/翻页/应用筛选
-    // 时触发），不再自动轮询；第 1 页保持原来的实时自动刷新。
+    // 筛选条件 / 进入页面：回到第 1 页并拉一次。故意不依赖 logsPage——翻页只由
+    // 按钮调用 refreshLogs(n)，避免 setLogsPage → effect → 再拉 的循环。
+    logsSnapshotBeforeIdRef.current = 0;
+    logsSnapshotBeforeTimeRef.current = '';
     const scope = uiCacheScope(authStatusRef.current);
-    const kind = `logs:p${logsPage}:s${logsStatusFilter}:f${logsFrom}:t${logsTo}:k${logsApiKeyName.trim()}:pv${logsProviderFilter}:u${logsOwnerFilter}`;
+    const kind = `logs:p1:s${logsStatusFilter}:f${logsFrom}:t${logsTo}:k${logsApiKeyName.trim()}:pv${logsProviderFilter}:u${logsOwnerFilter}`;
     const cached = readUICache<{ items: LogEntry[]; total: number; page: number; fetchedAt?: string }>(scope, kind);
-    if (cached?.items) {
+    if (cached?.items?.length) {
       setLogs(cached.items);
       setLogsTotal(cached.total || cached.items.length);
-      setLogsPage(cached.page || logsPage);
       setLogsFetchedOnce(true);
       if (cached.fetchedAt) {
         const at = new Date(cached.fetchedAt);
         if (!Number.isNaN(at.getTime())) setDataFetchedAt(at);
       }
     }
-    void refreshLogs(logsPage, undefined, undefined, { silent: Boolean(cached?.items?.length) });
+    if (logsPageRef.current !== 1) setLogsPage(1);
+    void refreshLogs(1, undefined, undefined, { silent: Boolean(cached?.items?.length) });
+  }, [activeNav, logsStatusFilter, logsFrom, logsTo, logsApiKeyName, logsProviderFilter, logsOwnerFilter]);
+
+  // 仅第 1 页自动轮询；翻到第 2 页及以后立刻停表，绝不自动刷新。
+  useEffect(() => {
+    if (activeNav !== 'traffic-tokens') return;
     if (logsPage !== 1) return;
     const timer = window.setInterval(() => {
       if (!isDocumentActive()) return;
-      void refreshLogs(logsPage, undefined, undefined, { silent: true });
+      if (logsPageRef.current !== 1) return;
+      void refreshLogs(1, undefined, undefined, { silent: true });
     }, 5000);
     return () => window.clearInterval(timer);
   }, [activeNav, logsPage, logsStatusFilter, logsFrom, logsTo, logsApiKeyName, logsProviderFilter, logsOwnerFilter]);
@@ -3770,7 +3782,7 @@ function App() {
         await Promise.all([
           refreshState(false),
           refreshRequestStats(),
-          ...(activeNav === 'traffic-tokens' ? [refreshLogs()] : []),
+          ...(activeNav === 'traffic-tokens' && logsPageRef.current === 1 ? [refreshLogs(1, undefined, undefined, { silent: true })] : []),
         ]);
         if (showFeedback) showToast('后端已重新连接');
         return true;
@@ -3825,9 +3837,10 @@ function App() {
     if (keyName) params.set('apiKeyName', keyName);
     if (logsProviderFilter) params.set('providerId', logsProviderFilter);
     if (logsOwnerFilter) params.set('ownerUserId', logsOwnerFilter);
-    // 第 1 页保持实时（不带 beforeId）；第 2 页及以后带上冻结的快照上界，保证翻页稳定。
-    if (page > 1 && logsSnapshotBeforeIdRef.current > 0) {
-      params.set('beforeId', String(logsSnapshotBeforeIdRef.current));
+    // 第 1 页保持实时；第 2 页及以后带上离开第 1 页时冻结的 newest time+id。
+    if (page > 1) {
+      if (logsSnapshotBeforeTimeRef.current) params.set('beforeTime', logsSnapshotBeforeTimeRef.current);
+      if (logsSnapshotBeforeIdRef.current > 0) params.set('beforeId', String(logsSnapshotBeforeIdRef.current));
     }
     return params;
   }
@@ -3836,38 +3849,45 @@ function App() {
     return `${log.time}|${log.path}|${log.status}|${log.model}|${log.latencyMs}`;
   }
 
-  async function refreshLogs(page = logsPage, fromOverride?: string, toOverride?: string, opts?: { silent?: boolean; apiKeyName?: string }) {
-    // 维护分页快照：回到第 1 页 -> 清空恢复实时；首次离开第 1 页 -> 用当前已知最新
-    // 日志 id 冻结上界（logs 已按时间倒序，logs[0] 即最新）。
-    if (page <= 1) {
+  async function refreshLogs(page = logsPageRef.current, fromOverride?: string, toOverride?: string, opts?: { silent?: boolean; apiKeyName?: string }) {
+    const targetPage = page < 1 ? 1 : page;
+    // 已离开第 1 页时，静默轮询连 gen 都不要递增，否则会把正在进行的翻页请求判成过期而丢弃。
+    if (opts?.silent && targetPage === 1 && logsPageRef.current !== 1) return;
+    const fetchGen = ++logsFetchGenRef.current;
+    // 维护分页快照：回到第 1 页清空；首次离开第 1 页时用当前列表最新一条冻结 time+id。
+    if (targetPage <= 1) {
       logsSnapshotBeforeIdRef.current = 0;
-    } else if (logsSnapshotBeforeIdRef.current === 0) {
-      const newestId = logs[0]?.id;
-      if (typeof newestId === 'number' && newestId > 0) logsSnapshotBeforeIdRef.current = newestId;
+      logsSnapshotBeforeTimeRef.current = '';
+    } else if (!logsSnapshotBeforeTimeRef.current && logsSnapshotBeforeIdRef.current === 0) {
+      const newest = logs[0];
+      if (newest?.time) logsSnapshotBeforeTimeRef.current = newest.time;
+      if (typeof newest?.id === 'number' && newest.id > 0) logsSnapshotBeforeIdRef.current = newest.id;
     }
     if (!opts?.silent) setLogsLoading(true);
     try {
-      const response = await fetch(`${API_BASE}/__logs?${buildLogsQueryParams(page, false, fromOverride, toOverride, opts?.apiKeyName).toString()}`, { credentials: 'same-origin' });
+      const response = await fetch(`${API_BASE}/__logs?${buildLogsQueryParams(targetPage, false, fromOverride, toOverride, opts?.apiKeyName).toString()}`, { credentials: 'same-origin' });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      // 过期响应直接丢弃：翻页与第 1 页轮询并发时，旧的 page=1 结果不能把页码打回去。
+      if (fetchGen !== logsFetchGenRef.current) return;
+      if (opts?.silent && logsPageRef.current !== targetPage) return;
       const data = await response.json() as LogPage | LogEntry[];
+      if (fetchGen !== logsFetchGenRef.current) return;
       let items: LogEntry[] = [];
       let total = 0;
-      let nextPage = page;
+      let nextPage = targetPage;
       if (Array.isArray(data)) {
         items = data;
         total = data.length;
         nextPage = 1;
-        setLogs(data);
-        setLogsTotal(data.length);
-        setLogsPage(1);
       } else {
         items = data.items || [];
         total = data.total || 0;
-        nextPage = data.page || page;
-        setLogs(items);
-        setLogsTotal(total);
-        setLogsPage(nextPage);
+        nextPage = data.page || targetPage;
       }
+      setLogs(items);
+      setLogsTotal(total);
+      setLogsPage((current) => (current === nextPage ? current : nextPage));
+      logsPageRef.current = nextPage;
       setLogsFetchedOnce(true);
       const fetchedAt = new Date();
       setDataFetchedAt(fetchedAt);
@@ -3882,9 +3902,9 @@ function App() {
       });
     } catch {
       // Keep UI usable when backend is down.
-      setLogsFetchedOnce(true);
+      if (fetchGen === logsFetchGenRef.current) setLogsFetchedOnce(true);
     } finally {
-      if (!opts?.silent) setLogsLoading(false);
+      if (!opts?.silent && fetchGen === logsFetchGenRef.current) setLogsLoading(false);
     }
   }
 
@@ -4360,8 +4380,8 @@ function App() {
         }
         showToast(result.success ? `对话测试成功：HTTP ${result.status}` : `对话测试未通过：${result.status || result.error || 'unknown'}`);
       }
-      if (activeNav === 'traffic-tokens' && logsFetchedOnce) {
-        await refreshLogs();
+      if (activeNav === 'traffic-tokens' && logsFetchedOnce && logsPageRef.current === 1) {
+        await refreshLogs(1, undefined, undefined, { silent: true });
       }
       await Promise.all([refreshRequestStats(), refreshAppLogs()]);
     } catch (error) {
