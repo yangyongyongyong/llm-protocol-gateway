@@ -8,6 +8,8 @@ func TestResolveModelContextLengthClaude(t *testing.T) {
 		reported int
 		want     int
 	}{
+		{"claude-opus-5", 0, contextLength1M},
+		{"claude-opus-5", 128000, contextLength1M},
 		{"claude-opus-4-8", 0, contextLength1M},
 		{"claude-opus-4-8", 128000, contextLength1M},
 		{"claude-opus-4-8[1m]", 0, contextLength1M},
@@ -70,6 +72,9 @@ func TestResolveModelContextLengthGLM(t *testing.T) {
 }
 
 func TestDefaultClaudeMaxTokens(t *testing.T) {
+	if got := defaultClaudeMaxTokens("claude-opus-5"); got != 128_000 {
+		t.Fatalf("claude-opus-5: got %d want 128000", got)
+	}
 	if got := defaultClaudeMaxTokens("claude-fable-5"); got != 128_000 {
 		t.Fatalf("claude-fable-5: got %d want 128000", got)
 	}

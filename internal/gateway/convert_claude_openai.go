@@ -216,6 +216,7 @@ func claudeModelRequiresAdaptiveThinking(model string) bool {
 	case strings.Contains(model, "sonnet-5"),
 		strings.Contains(model, "fable-5"),
 		strings.Contains(model, "mythos"),
+		strings.Contains(model, "opus-5"),
 		strings.Contains(model, "opus-4-7"),
 		strings.Contains(model, "opus-4-8"):
 		return true
@@ -237,8 +238,19 @@ func claudeModelSupportsXHighEffort(model string) bool {
 	return strings.Contains(model, "sonnet-5") ||
 		strings.Contains(model, "fable-5") ||
 		strings.Contains(model, "mythos") ||
+		strings.Contains(model, "opus-5") ||
 		strings.Contains(model, "opus-4-7") ||
 		strings.Contains(model, "opus-4-8")
+}
+
+// claudeModelSupportsMaxEffort: Opus 4.6+ and Claude 5 flagships expose the full
+// effort ladder including "max" (Opus 5 docs: low/medium/high/xhigh/max).
+func claudeModelSupportsMaxEffort(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if strings.Contains(model, "opus-4-6") {
+		return true
+	}
+	return claudeModelSupportsXHighEffort(model)
 }
 
 func normalizeReasoningEffort(depth string) string {
@@ -272,7 +284,7 @@ func mapReasoningEffortToClaudeEffort(depth, model string) string {
 		return "high"
 	}
 	model = strings.ToLower(strings.TrimSpace(model))
-	if depth == "max" && !strings.Contains(model, "opus-4-6") {
+	if depth == "max" && !claudeModelSupportsMaxEffort(model) {
 		return "high"
 	}
 	if depth == "xhigh" && !claudeModelSupportsXHighEffort(model) {

@@ -85,8 +85,8 @@ func normalizeModelContextID(modelID string) string {
 }
 
 // knownClaudeContextLength returns Anthropic/Claude-family context windows.
-// Current flagship Opus/Sonnet generations are native 1M; older Claude 4.5-era
-// models (and Haiku) remain 200k.
+// Current flagship Opus 5 / Opus 4.6+ / Sonnet 5 generations are native 1M;
+// older Claude 4.5-era models (and Haiku) remain 200k.
 func knownClaudeContextLength(modelID string) (int, bool) {
 	base := strings.TrimSpace(resolveClaudeModelAlias(normalizeModelContextID(modelID)))
 	if !isClaudeFamilyModelID(base) {
@@ -110,6 +110,8 @@ func isClaudeFamilyModelID(modelID string) bool {
 func isClaude1MContextModel(modelID string) bool {
 	id := normalizeModelContextID(modelID)
 	markers := []string{
+		"claude-opus-5",
+		"opus-5",
 		"claude-opus-4-8",
 		"claude-opus-4-7",
 		"claude-opus-4-6",
