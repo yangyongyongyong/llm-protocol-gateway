@@ -26,7 +26,8 @@ func wrapTTFTWriterWithTiming(w http.ResponseWriter, started time.Time, ttftMs *
 }
 
 func (w *ttftResponseWriter) Write(p []byte) (int, error) {
-	if !w.wrote && len(p) > 0 {
+	// SSE comment keep-alives (": ping") are not a model first-token.
+	if !w.wrote && len(p) > 0 && !isSSECommentPayload(p) {
 		w.wrote = true
 		if w.ttftMs != nil && *w.ttftMs <= 0 {
 			*w.ttftMs = time.Since(w.started).Milliseconds()
@@ -36,6 +37,16 @@ func (w *ttftResponseWriter) Write(p []byte) (int, error) {
 		}
 	}
 	return w.ResponseWriter.Write(p)
+}
+
+// isSSECommentPayload reports whether p is solely an SSE comment frame
+// (lines starting with ':'). Used so streaming heartbeats do not pollute TTFT.
+func isSSECommentPayload(p []byte) bool {
+	i := 0
+	for i < len(p) && (p[i] == ' ' || p[i] == '\t' || p[i] == '\n' || p[i] == '\r') {
+		i++
+	}
+	return i < len(p) && p[i] == ':'
 }
 
 func (w *ttftResponseWriter) Flush() {

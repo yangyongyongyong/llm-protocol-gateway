@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 )
 
 // 同 Provider 上游空流最多尝试次数（含首次）。偶发 SSE 建连后无 chunk 时自动重试。
@@ -37,9 +38,11 @@ func isThinkingOnlyEmptyStreamError(err error) bool {
 	return errors.Is(err, errThinkingOnlyEmptyResponse)
 }
 
-// deferredSSEWriter 推迟 WriteHeader，直到首次 Write（或显式 Commit）。
+// deferredSSEWriter 推迟 WriteHeader，直到首次 Write / heartbeat（或显式 Commit）。
 // 用于流式转换：上游空流时尚未向客户端提交任何字节，可安全同 Provider 重试。
+// mu 串行化正常 SSE 写出与后台 heartbeat，避免并发写 ResponseWriter。
 type deferredSSEWriter struct {
+	mu          sync.Mutex
 	base        http.ResponseWriter
 	header      http.Header
 	status      int
@@ -56,6 +59,8 @@ func newDeferredSSEWriter(base http.ResponseWriter) *deferredSSEWriter {
 }
 
 func (w *deferredSSEWriter) Header() http.Header {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.wroteHeader {
 		return w.base.Header()
 	}
@@ -63,6 +68,8 @@ func (w *deferredSSEWriter) Header() http.Header {
 }
 
 func (w *deferredSSEWriter) WriteHeader(statusCode int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.wroteHeader {
 		return
 	}
@@ -70,14 +77,18 @@ func (w *deferredSSEWriter) WriteHeader(statusCode int) {
 }
 
 func (w *deferredSSEWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if !w.wroteHeader {
-		w.commit(w.status)
+		w.commitLocked(w.status)
 	}
 	w.wroteBody = true
 	return w.base.Write(p)
 }
 
 func (w *deferredSSEWriter) Flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if !w.wroteHeader {
 		return
 	}
@@ -86,7 +97,31 @@ func (w *deferredSSEWriter) Flush() {
 	}
 }
 
+// WriteSSEHeartbeat commits headers if needed and writes an SSE comment
+// keep-alive. Deliberately does NOT set wroteBody so short thinking-only /
+// empty-stream retries remain possible until a real data frame is written.
+func (w *deferredSSEWriter) WriteSSEHeartbeat() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.wroteHeader {
+		w.commitLocked(w.status)
+	}
+	if _, err := w.base.Write(sseHeartbeatComment); err != nil {
+		return err
+	}
+	if f, ok := w.base.(http.Flusher); ok {
+		f.Flush()
+	}
+	return nil
+}
+
 func (w *deferredSSEWriter) commit(statusCode int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.commitLocked(statusCode)
+}
+
+func (w *deferredSSEWriter) commitLocked(statusCode int) {
 	if w.wroteHeader {
 		return
 	}
@@ -103,9 +138,13 @@ func (w *deferredSSEWriter) commit(statusCode int) {
 }
 
 func (w *deferredSSEWriter) Committed() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	return w.wroteHeader || w.wroteBody
 }
 
 func (w *deferredSSEWriter) WroteBody() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	return w.wroteBody
 }

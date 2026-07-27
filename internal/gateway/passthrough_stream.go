@@ -37,7 +37,8 @@ func (b *limitedBuffer) Bytes() []byte {
 }
 
 // flushWriter writes to the response and flushes after each Write so SSE
-// chunks reach the client immediately.
+// chunks reach the client immediately. When w already flushes internally
+// (e.g. sseHeartbeatResponseWriter), flusher may be nil.
 type flushWriter struct {
 	w       http.ResponseWriter
 	flusher http.Flusher
@@ -105,15 +106,16 @@ func writePassThroughResponse(w http.ResponseWriter, response *http.Response, st
 	if w.Header().Get("Connection") == "" {
 		w.Header().Set("Connection", "keep-alive")
 	}
-	w.WriteHeader(response.StatusCode)
+	hw := newSSEHeartbeatResponseWriter(w)
+	hw.WriteHeader(response.StatusCode)
+	stopHeartbeat := startSSEHeartbeat(hw, sseHeartbeatInterval)
+	defer stopHeartbeat()
+	hw.Flush()
 
-	var flusher http.Flusher
-	if f, ok := w.(http.Flusher); ok {
-		flusher = f
-		flusher.Flush()
-	}
 	tee := &limitedBuffer{max: passThroughLogBufferMax}
-	writer := io.MultiWriter(&flushWriter{w: w, flusher: flusher}, tee)
+	// hw.Write already serializes; flush after each chunk via flushWriter so
+	// we do not re-enter hw.Flush while holding hw's write lock.
+	writer := io.MultiWriter(&flushWriter{w: hw, flusher: hw}, tee)
 	if _, copyErr := io.Copy(writer, response.Body); copyErr != nil {
 		return response.StatusCode, TokenUsage{}, tee.Bytes(), copyErr
 	}

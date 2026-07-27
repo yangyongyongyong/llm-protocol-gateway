@@ -468,9 +468,16 @@ func (s *Server) finishConvertedProxy(w http.ResponseWriter, response *http.Resp
 			_, writeErr := dw.Write(converted)
 			return response.StatusCode, TokenUsage{}, converted, writeErr, false
 		}
+		// Keep the downstream SSE path warm during long upstream thinking /
+		// quiet gaps so Cloudflare (and similar proxies) do not idle-cut the
+		// stream. Heartbeats are SSE comments and do not set wroteBody; once
+		// they commit headers, Committed() becomes true and empty-stream
+		// retries are intentionally skipped (client already saw a 200).
+		stopHeartbeat := startSSEHeartbeat(dw, sseHeartbeatInterval)
+		defer stopHeartbeat()
 		usage, streamErr := streamConvert(dw, response.Body, model)
-		if streamErr != nil && (isEmptyUpstreamStreamError(streamErr) || isThinkingOnlyEmptyStreamError(streamErr)) && !dw.WroteBody() {
-			// 尚未向客户端写出任何 SSE 字节，可安全同 Provider 重试。
+		if streamErr != nil && (isEmptyUpstreamStreamError(streamErr) || isThinkingOnlyEmptyStreamError(streamErr)) && !dw.Committed() {
+			// 尚未向客户端提交任何字节（含 heartbeat），可安全同 Provider 重试。
 			return response.StatusCode, usage, nil, streamErr, true
 		}
 		if !dw.Committed() {
