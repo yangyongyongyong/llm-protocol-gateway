@@ -1061,6 +1061,29 @@ function trafficLogKeyLabel(log: LogEntry) {
   return log.apiKeyName?.trim() || '未绑定 Key';
 }
 
+/**
+ * 悬浮提示：先给完整的当前密钥名（列宽不够时会被省略号截断），再补一行 ID。
+ * apiKeyId 是创建时按当时名字生成的固定 slug，改名后就和名字不一致了，
+ * 必须标上「ID:」前缀，否则看起来像是另一把不存在的密钥。
+ */
+function trafficLogKeyTitle(log: LogEntry) {
+  const name = trafficLogKeyLabel(log);
+  const id = log.apiKeyId?.trim();
+  return id && id !== name ? `${name}\nID: ${id}` : name;
+}
+
+/**
+ * 「来源」悬浮提示：IP 列已从表格移除（密钥名更需要宽度），把客户端 IP 和
+ * Host 收进来源列的提示里，详情弹窗中也仍然可见，信息不丢。
+ */
+function trafficLogSourceTitle(log: LogEntry) {
+  const parts = [
+    log.clientIp?.trim() ? `IP: ${log.clientIp.trim()}` : '',
+    log.clientHost?.trim() ? `Host: ${log.clientHost.trim()}` : '',
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join('\n') : undefined;
+}
+
 function trafficLogProviderLabel(log: LogEntry, providers: Provider[]) {
   return providerUsageLabel(log.providerId || '_unknown', providers);
 }
@@ -1074,7 +1097,7 @@ function formatTrafficLogDetail(log: LogEntry, providers: Provider[] = []) {
     '=== Traffic Request Log Detail ===',
     `time: ${new Date(log.time).toLocaleString()}`,
     `status: HTTP ${log.status}`,
-    `apiKey: ${trafficLogKeyLabel(log)}${log.apiKeyId ? ` (${log.apiKeyId})` : ''}`,
+    `apiKey: ${trafficLogKeyLabel(log)}${log.apiKeyId ? ` (ID: ${log.apiKeyId})` : ''}`,
     `user: ${log.userName || '-'}`,
     `route: ${log.routeId}`,
     `provider: ${trafficLogProviderLabel(log, providers)}${log.providerId ? ` (${log.providerId})` : ''}`,
@@ -1083,6 +1106,7 @@ function formatTrafficLogDetail(log: LogEntry, providers: Provider[] = []) {
     `protocolFlow: ${log.protocolFlow}`,
     `path: ${log.path}`,
     `accessSource: ${log.accessSource || '-'}`,
+    `clientIp: ${log.clientIp || '-'}${log.clientHost ? ` (host: ${log.clientHost})` : ''}`,
     `latency: ${log.latencyMs}ms`,
     `ttft: ${log.ttftMs != null ? `${log.ttftMs}ms` : '-'}`,
     `timing: prep=${log.prepMs ?? 0}ms preUpstream=${log.preUpstreamMs ?? 0}ms upstreamTtfb=${log.upstreamTtfbMs ?? 0}ms overhead=${log.gatewayOverheadMs ?? 0}ms convertOut=${log.convertOutMs ?? 0}ms post=${log.postMs ?? 0}ms`,
@@ -7396,7 +7420,6 @@ function App() {
                       <span>时间</span>
                       <span>状态</span>
                       <span>来源</span>
-                      <span>IP</span>
                       <span>密钥</span>
                       <span>用户</span>
                       <span>输入 Provider</span>
@@ -7411,9 +7434,8 @@ function App() {
                         <div className="log-row-main traffic-log-row">
                           <span className="log-time">{new Date(log.time).toLocaleString()}</span>
                           <Badge tone={statusTone(log.status)}>{log.status}</Badge>
-                          <span className="log-source" title={log.clientHost || undefined}>{accessSourceLabel(log.accessSource)}</span>
-                          <span className="log-ip" title={log.clientIp || undefined}>{log.clientIp || '—'}</span>
-                          <span className="log-key" title={log.apiKeyId || undefined}>{trafficLogKeyLabel(log)}</span>
+                          <span className="log-source" title={trafficLogSourceTitle(log)}>{accessSourceLabel(log.accessSource)}</span>
+                          <span className="log-key" title={trafficLogKeyTitle(log)}>{trafficLogKeyLabel(log)}</span>
                           <span className="log-user" title={log.userName || undefined}>{log.userName || '—'}</span>
                           <span className="log-provider" title={log.providerId || undefined}>{trafficLogProviderLabel(log, state.providers || [])}</span>
                           <span className="log-model">{log.model}</span>

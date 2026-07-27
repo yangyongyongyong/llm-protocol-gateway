@@ -597,7 +597,10 @@ html[data-theme="dark"] .api-key-client-config-actions .client-config-btn {
 .log-row.error { background: rgba(239, 68, 68, 0.06); }
 .log-table { display: grid; gap: 8px; margin-top: 12px; width: 100%; min-width: 0; }
 .log-header, .log-row-main { display: grid; grid-template-columns: 78px 70px 92px minmax(0, 0.75fr) minmax(0, 0.9fr) minmax(0, 1.1fr) 68px 52px; gap: 10px; align-items: center; min-width: 0; }
-.traffic-log-header, .traffic-log-row { grid-template-columns: 120px 64px 56px minmax(0, 0.6fr) minmax(0, 0.5fr) minmax(0, 0.5fr) minmax(0, 0.65fr) minmax(0, 0.65fr) minmax(0, 0.9fr) 60px 60px 52px; }
+/* 列宽：时间/状态/来源/IP/密钥/用户/Provider/模型/Token/TTFT/耗时/详情。
+   密钥名由用户自定义，容易比其余列长，故给它最大的弹性份额；用户名（管理员/
+   用户名）与 IP 相对固定，让出空间。 */
+.traffic-log-header, .traffic-log-row { grid-template-columns: 120px 64px 56px minmax(140px, 1.3fr) minmax(0, 0.45fr) minmax(0, 0.7fr) minmax(0, 0.7fr) minmax(0, 0.85fr) 60px 60px 52px; }
 .log-ip { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 11px; color: var(--muted); }
 .log-provider { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font-size: 12px; font-weight: 700; }
 .log-header { padding: 0 12px 2px; color: var(--subtle); font-size: 11px; font-weight: 780; letter-spacing: 0.03em; }
