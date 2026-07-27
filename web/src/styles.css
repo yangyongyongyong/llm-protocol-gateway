@@ -281,6 +281,18 @@ html[data-theme="dark"] .usage-calendar-day.edge { background: #3b82f6; color: #
 .icon-btn.danger { color: #991b1b; background: var(--red-soft); }
 .grid-4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
 .metric { padding: 18px; min-height: 132px; display: flex; flex-direction: column; justify-content: space-between; overflow: hidden; position: relative; border-radius: 20px; }
+.host-metrics-strip {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+.host-metrics-strip .metric {
+  min-height: 108px;
+  padding: 16px 18px;
+}
+@media (max-width: 720px) {
+  .host-metrics-strip { grid-template-columns: 1fr; }
+}
 .metric:after { content: ""; position: absolute; right: -28px; top: -28px; width: 90px; height: 90px; border-radius: 50%; background: rgba(37, 99, 235, 0.08); }
 .metric-label { color: var(--muted); font-size: 13px; font-weight: 700; }
 .metric-value { margin-top: 10px; font-size: 30px; font-weight: 880; letter-spacing: -0.05em; }
@@ -719,3 +731,48 @@ html[data-theme="dark"] .mini-btn { color: #93c5fd; }
   gap: 12px;
 }
 .auth-card .field { margin: 0; }
+
+/* 机器状态页：指标卡网格 + 占用条 + 主机信息表 */
+.machine-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+.machine-grid .metric { min-height: 122px; padding: 16px 18px; }
+@media (max-width: 1080px) { .machine-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 720px) { .machine-grid { grid-template-columns: 1fr; } }
+.usage-bar {
+  position: relative;
+  margin-top: 10px;
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.25);
+  overflow: hidden;
+}
+.usage-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: #2563eb;
+  transition: width 0.4s ease;
+}
+.usage-bar.warn > span { background: #d97706; }
+.usage-bar.danger > span { background: #dc2626; }
+.machine-facts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px 18px;
+}
+@media (max-width: 900px) { .machine-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 620px) { .machine-facts { grid-template-columns: 1fr; } }
+.machine-fact {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(148, 163, 184, 0.08);
+}
+.machine-fact > span { color: var(--muted); font-size: 12px; font-weight: 700; }
+.machine-fact > b { font-size: 13px; font-weight: 800; text-align: right; word-break: break-all; }

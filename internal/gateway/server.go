@@ -103,6 +103,10 @@ type Server struct {
 	// once per userActivityPersistMinGap per user (see user_activity.go).
 	userActivityMu sync.Mutex
 	userActivity   map[string]*userActivityEntry
+
+	// hostMetrics samples CPU load/temp only while the admin homepage is
+	// polling /__host-metrics; the loop auto-stops when clients go idle.
+	hostMetrics *hostMetricsSampler
 }
 
 func NewServer(router *Router, logs *monitor.Store, stateSaver ...StateSaver) *Server {
@@ -190,6 +194,7 @@ func (s *Server) SaveState() error {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /__health", s.handleHealth)
+	mux.HandleFunc("GET /__host-metrics", s.handleHostMetrics)
 	mux.HandleFunc("GET /__auth/status", s.handleAuthStatus)
 	mux.HandleFunc("POST /__auth/setup", s.handleAuthSetup)
 	mux.HandleFunc("POST /__auth/login", s.handleAuthLogin)

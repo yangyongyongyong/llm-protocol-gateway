@@ -11,18 +11,19 @@ import (
 )
 
 var uiNavPaths = map[string]struct{}{
-	"/":                  {},
-	"/login":             {},
-	"/input-providers":   {},
-	"/models-menu":       {},
-	"/api-keys":          {},
-	"/output-providers":  {},
-	"/usage-stats":       {},
-	"/public-access":     {},
-	"/traffic-tokens":    {},
-	"/users":             {},
-	"/self-check":        {},
-	"/settings":          {},
+	"/":                 {},
+	"/login":            {},
+	"/input-providers":  {},
+	"/models-menu":      {},
+	"/api-keys":         {},
+	"/output-providers": {},
+	"/usage-stats":      {},
+	"/public-access":    {},
+	"/traffic-tokens":   {},
+	"/users":            {},
+	"/self-check":       {},
+	"/machine":          {},
+	"/settings":         {},
 }
 
 func findWebDistDir() string {

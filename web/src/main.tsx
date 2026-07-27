@@ -92,12 +92,51 @@ type PublicAccessSettings = {
   runtimeUrl?: string;
   tunnelName?: string;
   tunnelToken?: string;
+  credentialsFile?: string;
   tunnelConfigFile?: string;
   publicBaseUrl?: string;
   uiPublicBaseUrl?: string;
   status: string;
   statusMessage: string;
   tunnel?: TunnelRuntime;
+};
+
+type HostMetrics = {
+  load1: number;
+  load5: number;
+  load15: number;
+  cpuPercent: number;
+  cpuCount: number;
+  tempC?: number;
+  tempAvailable: boolean;
+  tempSource?: string;
+  thermalPressure?: string;
+  thermalPressureAvailable?: boolean;
+  thermalPressureSource?: string;
+  memTotal?: number;
+  memUsed?: number;
+  memPercent?: number;
+  memAvailable?: boolean;
+  swapTotal?: number;
+  swapUsed?: number;
+  diskTotal?: number;
+  diskUsed?: number;
+  diskPercent?: number;
+  diskAvailable?: boolean;
+  netRxBytes?: number;
+  netTxBytes?: number;
+  netRxRate?: number;
+  netTxRate?: number;
+  netRateReady?: boolean;
+  netAvailable?: boolean;
+  netInterfaces?: number;
+  hostname?: string;
+  platform?: string;
+  uptimeSeconds?: number;
+  processUptimeSeconds?: number;
+  goroutines?: number;
+  processHeapMiB?: number;
+  collectedAt?: string;
 };
 
 type ClaudeOAuthInfo = {
@@ -796,9 +835,10 @@ const navItems = [
   { id: 'traffic-tokens', label: 'API 日志' },
   { id: 'users', label: '用户管理' },
   { id: 'self-check', label: '自检' },
+  { id: 'machine', label: '机器状态' },
   { id: 'settings', label: '设置' },
 ] as const;
-const navIcons = ['◉', '☰', '🔑', '⌘', '▣', '↗', '≡', '👥', '✓', '⚙'];
+const navIcons = ['◉', '☰', '🔑', '⌘', '▣', '↗', '≡', '👥', '✓', '🖥', '⚙'];
 type NavItemID = typeof navItems[number]['id'];
 
 // 核心配置项：新用户只需依次配好这两个即可使用，侧边栏置顶并加底色区分。
@@ -2451,6 +2491,101 @@ function Metric({ label, value, note }: { label: string; value: string; note: st
   );
 }
 
+function thermalPressureLabel(level?: string) {
+  switch ((level || '').toLowerCase()) {
+    case 'nominal': return '正常';
+    case 'fair': return '偏高';
+    case 'serious': return '较高';
+    case 'critical': return '过高';
+    default: return level || '—';
+  }
+}
+
+const TEMP_SOURCE_LABELS: Record<string, string> = {
+  'iokit/cpu-cluster': 'CPU 核心簇传感器',
+  'iokit/cpu': 'CPU 传感器',
+  'iokit/soc-die': 'SoC 芯片传感器',
+  'iokit/soc': 'SoC 封装传感器',
+  'powermetrics/smc': 'powermetrics SMC',
+};
+
+function tempSourceLabel(source?: string) {
+  if (!source) return '已采样';
+  return `来源 ${TEMP_SOURCE_LABELS[source] || source}`;
+}
+
+function formatBytes(bytes?: number, digits = 1): string {
+  if (bytes == null || !Number.isFinite(bytes) || bytes < 0) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  let value = bytes;
+  let i = 0;
+  while (value >= 1024 && i < units.length - 1) {
+    value /= 1024;
+    i += 1;
+  }
+  return `${value.toFixed(i === 0 ? 0 : digits)} ${units[i]}`;
+}
+
+function formatRate(bytesPerSecond?: number): string {
+  if (bytesPerSecond == null || !Number.isFinite(bytesPerSecond) || bytesPerSecond < 0) return '—';
+  return `${formatBytes(bytesPerSecond)}/s`;
+}
+
+function formatDuration(seconds?: number): string {
+  if (seconds == null || !Number.isFinite(seconds) || seconds <= 0) return '—';
+  const total = Math.floor(seconds);
+  const d = Math.floor(total / 86400);
+  const h = Math.floor((total % 86400) / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  if (d > 0) return `${d} 天 ${h} 小时`;
+  if (h > 0) return `${h} 小时 ${m} 分`;
+  if (m > 0) return `${m} 分 ${total % 60} 秒`;
+  return `${total} 秒`;
+}
+
+/** 0–100 的占用条，>=90% 判危险、>=75% 判警告。 */
+function UsageBar({ percent }: { percent?: number }) {
+  const value = Math.max(0, Math.min(100, percent ?? 0));
+  const tone = value >= 90 ? 'danger' : value >= 75 ? 'warn' : 'ok';
+  return (
+    <div className={`usage-bar ${tone}`} role="presentation">
+      <span style={{ width: `${value}%` }} />
+    </div>
+  );
+}
+
+function MachineMetric({ label, value, note, percent }: { label: string; value: string; note: string; percent?: number }) {
+  return (
+    <div className="card metric machine-metric">
+      <div>
+        <div className="metric-label">{label}</div>
+        <div className="metric-value">{value}</div>
+        {percent != null ? <UsageBar percent={percent} /> : null}
+      </div>
+      <div className="metric-note">{note}</div>
+    </div>
+  );
+}
+
+function hostTempMetric(hostMetrics: HostMetrics | null): { value: string; note: string } {
+  if (!hostMetrics) {
+    return { value: '—', note: '主页可见时每 10 秒刷新' };
+  }
+  if (hostMetrics.tempAvailable && hostMetrics.tempC != null) {
+    return {
+      value: `${hostMetrics.tempC.toFixed(1)}°C`,
+      note: tempSourceLabel(hostMetrics.tempSource),
+    };
+  }
+  if (hostMetrics.thermalPressureAvailable && hostMetrics.thermalPressure) {
+    return {
+      value: thermalPressureLabel(hostMetrics.thermalPressure),
+      note: `热力等级 ${hostMetrics.thermalPressure}（本机无 ℃ 接口）`,
+    };
+  }
+  return { value: '—', note: '本机未暴露温度传感器' };
+}
+
 function formatLocalISODate(date: Date) {
   const y = date.getFullYear();
   const m = String(date.getMonth() + 1).padStart(2, '0');
@@ -2841,7 +2976,11 @@ function App() {
   const [cloudflareAuthPending, setCloudflareAuthPending] = useState(false);
   const [showManualToken, setShowManualToken] = useState(false);
   const cloudflarePollRef = useRef<number | null>(null);
+  // 5s __state 轮询会不断换新 publicAccess 对象（含 tunnel 状态）。用指纹跳过
+  // 「仅运行时变化」的同步，避免正在编辑的子域名前缀被已保存域名盖回去。
+  const publicAccessFormSyncRef = useRef('');
   const [tunnelBusy, setTunnelBusy] = useState(false);
+  const [hostMetrics, setHostMetrics] = useState<HostMetrics | null>(null);
   // null = 尚未探测，避免刷新瞬间误闪「后端未连接」
   const [backendConnected, setBackendConnected] = useState<boolean | null>(null);
   const [backendReconnecting, setBackendReconnecting] = useState(false);
@@ -3315,10 +3454,26 @@ function App() {
 
   useEffect(() => {
     const nextPublicAccess = { ...defaultPublicAccess, ...state.publicAccess };
+    // 只在表单相关的持久化字段变化时同步；tunnel.status / statusMessage 变化不碰输入框。
+    const formSyncKey = [
+      nextPublicAccess.mode || '',
+      nextPublicAccess.enabled ? '1' : '0',
+      nextPublicAccess.customDomain || '',
+      nextPublicAccess.uiDomain || '',
+      nextPublicAccess.exposeApi === false ? '0' : '1',
+      nextPublicAccess.exposeUi === false ? '0' : '1',
+      nextPublicAccess.tunnelName || '',
+      nextPublicAccess.credentialsFile || '',
+      nextPublicAccess.tunnelConfigFile || '',
+    ].join('\0');
+    if (formSyncKey === publicAccessFormSyncRef.current) {
+      return;
+    }
+    publicAccessFormSyncRef.current = formSyncKey;
+
     setPublicDraft(nextPublicAccess);
     // Only sync subdomain prefixes from persisted hostnames. When domains are
-    // empty (pre-bind), keep the user's in-progress edits — the 5s health poll
-    // would otherwise reset them to gateway/console on every refresh.
+    // empty (pre-bind), keep the user's in-progress edits.
     const { prefix, root } = splitCustomDomain(nextPublicAccess.customDomain);
     if (nextPublicAccess.customDomain) {
       setCustomDomainPrefix(prefix || 'gateway');
@@ -3333,7 +3488,6 @@ function App() {
     setCustomDomainRoot((current) => {
       if (root) return root;
       if (current) return current;
-      // Keep previously saved lucadesign.uk only when already present in settings.
       return '';
     });
   }, [state.publicAccess]);
@@ -3359,6 +3513,41 @@ function App() {
       void refreshCloudflareAuthStatus();
       void refreshState(false);
     }
+  }, [activeNav]);
+
+  // 机器状态：仅该页可见时每 5s 拉一次；离开/后台则停，服务端无请求会自停采样。
+  useEffect(() => {
+    if (activeNav !== 'machine') {
+      setHostMetrics(null);
+      return;
+    }
+    let cancelled = false;
+    let timer: number | null = null;
+    const tick = () => {
+      if (cancelled) return;
+      if (!isDocumentActive()) return;
+      void (async () => {
+        try {
+          const response = await fetch(`${API_BASE}/__host-metrics`, { credentials: 'include' });
+          if (!response.ok || cancelled) return;
+          const data = await response.json() as HostMetrics;
+          if (!cancelled) setHostMetrics(data);
+        } catch {
+          // ignore transient errors; next tick retries
+        }
+      })();
+    };
+    tick();
+    timer = window.setInterval(tick, 5000);
+    const onResume = () => { if (isDocumentActive()) tick(); };
+    window.addEventListener('focus', onResume);
+    document.addEventListener('visibilitychange', onResume);
+    return () => {
+      cancelled = true;
+      if (timer != null) window.clearInterval(timer);
+      window.removeEventListener('focus', onResume);
+      document.removeEventListener('visibilitychange', onResume);
+    };
   }, [activeNav]);
 
   useEffect(() => {
@@ -5967,6 +6156,7 @@ function App() {
   const localURL = endpointURL(selectedEndpoint);
   const publicAccess = state.publicAccess || defaultPublicAccess;
   const tunnel = publicAccess.tunnel;
+  const hostTemp = hostTempMetric(hostMetrics);
   const tunnelRunning = tunnel?.status === 'running';
   const livePublicURL = activePublicBaseURL(publicAccess, tunnelRunning);
   const liveUIPublicURL = activeUIPublicBaseURL(publicAccess, tunnelRunning);
@@ -7544,6 +7734,88 @@ function App() {
               ) : (
                 <div className="empty-state" style={{ marginTop: 16 }}>勾选 Provider 后点击「开始自检」。每个 Provider 会并行跑 6 个用例（3 个客户端 × 对话/工具调用）。</div>
               )}
+            </div>
+          </section>
+          )}
+
+          {activeNav === 'machine' && !isNormalUser && (
+          <section className="section-full">
+            <div className="panel-header" style={{ marginBottom: 0 }}>
+              <div>
+                <h2 className="panel-title">机器状态</h2>
+                <p className="panel-desc">
+                  网关所在主机的实时运行指标（仅管理员可见）。页面打开时每 5 秒拉取一次，离开本页后服务端自动停止采样。
+                </p>
+              </div>
+              <div className="panel-header-actions">
+                <span className="hint-line">
+                  {hostMetrics?.collectedAt
+                    ? `采样于 ${new Date(hostMetrics.collectedAt).toLocaleTimeString()}`
+                    : '正在读取…'}
+                </span>
+              </div>
+            </div>
+
+            <div className="machine-grid">
+              <MachineMetric
+                label="CPU 负载"
+                value={hostMetrics ? `${hostMetrics.cpuPercent.toFixed(0)}%` : '—'}
+                percent={hostMetrics?.cpuPercent}
+                note={hostMetrics
+                  ? `load ${hostMetrics.load1.toFixed(2)} / ${hostMetrics.load5.toFixed(2)} / ${hostMetrics.load15.toFixed(2)} · ${hostMetrics.cpuCount} 核`
+                  : '读取中…'}
+              />
+              <MachineMetric label="CPU 温度" value={hostTemp.value} note={hostTemp.note} />
+              <MachineMetric
+                label="内存占用"
+                value={hostMetrics?.memAvailable ? `${(hostMetrics.memPercent ?? 0).toFixed(0)}%` : '—'}
+                percent={hostMetrics?.memAvailable ? hostMetrics.memPercent : undefined}
+                note={hostMetrics?.memAvailable
+                  ? `${formatBytes(hostMetrics.memUsed)} / ${formatBytes(hostMetrics.memTotal)}${hostMetrics.swapUsed ? ` · 交换 ${formatBytes(hostMetrics.swapUsed)}` : ''}`
+                  : '本机未提供内存指标'}
+              />
+              <MachineMetric
+                label="磁盘占用"
+                value={hostMetrics?.diskAvailable ? `${(hostMetrics.diskPercent ?? 0).toFixed(0)}%` : '—'}
+                percent={hostMetrics?.diskAvailable ? hostMetrics.diskPercent : undefined}
+                note={hostMetrics?.diskAvailable
+                  ? `${formatBytes(hostMetrics.diskUsed)} / ${formatBytes(hostMetrics.diskTotal)} · 根分区`
+                  : '本机未提供磁盘指标'}
+              />
+              <MachineMetric
+                label="网络下行"
+                value={hostMetrics?.netRateReady ? formatRate(hostMetrics.netRxRate) : '—'}
+                note={hostMetrics?.netAvailable
+                  ? `累计接收 ${formatBytes(hostMetrics.netRxBytes)} · ${hostMetrics.netInterfaces ?? 0} 个物理网卡`
+                  : '本机未提供网卡计数'}
+              />
+              <MachineMetric
+                label="网络上行"
+                value={hostMetrics?.netRateReady ? formatRate(hostMetrics.netTxRate) : '—'}
+                note={hostMetrics?.netAvailable
+                  ? `累计发送 ${formatBytes(hostMetrics.netTxBytes)}${hostMetrics.netRateReady ? '' : ' · 速率需两次采样'}`
+                  : '本机未提供网卡计数'}
+              />
+            </div>
+
+            <div className="card panel">
+              <div className="panel-header">
+                <div>
+                  <h2 className="panel-title">主机与进程</h2>
+                  <p className="panel-desc">用于排查「网关卡顿 / 掉线」时快速判断是机器压力还是进程本身的问题。</p>
+                </div>
+              </div>
+              <div className="machine-facts">
+                <div className="machine-fact"><span>主机名</span><b>{hostMetrics?.hostname || '—'}</b></div>
+                <div className="machine-fact"><span>平台</span><b>{hostMetrics?.platform || '—'}</b></div>
+                <div className="machine-fact"><span>CPU 核心</span><b>{hostMetrics ? `${hostMetrics.cpuCount} 核` : '—'}</b></div>
+                <div className="machine-fact"><span>开机时长</span><b>{formatDuration(hostMetrics?.uptimeSeconds)}</b></div>
+                <div className="machine-fact"><span>网关运行时长</span><b>{formatDuration(hostMetrics?.processUptimeSeconds)}</b></div>
+                <div className="machine-fact"><span>热力等级</span><b>{hostMetrics?.thermalPressureAvailable ? thermalPressureLabel(hostMetrics.thermalPressure) : '—'}</b></div>
+                <div className="machine-fact"><span>Goroutine</span><b>{hostMetrics?.goroutines ?? '—'}</b></div>
+                <div className="machine-fact"><span>网关堆内存</span><b>{hostMetrics?.processHeapMiB != null ? `${hostMetrics.processHeapMiB.toFixed(1)} MiB` : '—'}</b></div>
+                <div className="machine-fact"><span>交换分区</span><b>{hostMetrics?.swapTotal ? `${formatBytes(hostMetrics.swapUsed)} / ${formatBytes(hostMetrics.swapTotal)}` : '未启用'}</b></div>
+              </div>
             </div>
           </section>
           )}
