@@ -454,12 +454,15 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 			query.BeforeID = parsed
 		}
 	}
+	// 密钥改名后，历史日志仍存着旧名字：按不变的 ID 过滤，才能筛出改名前的记录。
+	query = resolveLogKeyNameFilter(s.router.State().APIKeys, query)
 	if s.requestLogStore != nil {
 		page, err := s.requestLogStore.QueryRequestLogs(query)
 		if err == nil {
 			if !query.IncludeBodies {
 				stripRequestLogBodies(page.Items)
 			}
+			s.fillRequestLogKeyNames(page.Items)
 			s.fillRequestLogUserNames(page.Items)
 			writeJSON(w, http.StatusOK, page)
 			return
@@ -470,6 +473,7 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	if !query.IncludeBodies {
 		stripRequestLogBodies(page.Items)
 	}
+	s.fillRequestLogKeyNames(page.Items)
 	s.fillRequestLogUserNames(page.Items)
 	writeJSON(w, http.StatusOK, page)
 }
@@ -533,6 +537,7 @@ func (s *Server) handleRequestStats(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		snapshot := s.logs.UsageStatsRangeForKeys(now, from, to, keyIDs)
+		s.fillUsageKeyNames(&snapshot)
 		s.requestStatsCache.set(userCacheKey, snapshot)
 		w.Header().Set("Cache-Control", "private, max-age=5")
 		writeJSON(w, http.StatusOK, snapshot)
@@ -544,6 +549,7 @@ func (s *Server) handleRequestStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	snapshot := s.logs.UsageStatsRange(now, from, to)
+	s.fillUsageKeyNames(&snapshot)
 	s.fillUsageUserNames(&snapshot)
 	s.requestStatsCache.set(cacheKey, snapshot)
 	w.Header().Set("Cache-Control", "private, max-age=5")
