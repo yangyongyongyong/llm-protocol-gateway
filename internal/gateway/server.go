@@ -3938,7 +3938,8 @@ func (s *Server) proxyOpenAIToClaudeMessages(w http.ResponseWriter, r *http.Requ
 		}
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		w.WriteHeader(response.StatusCode)
+		hw := newSSEHeartbeatResponseWriter(w)
+		hw.WriteHeader(response.StatusCode)
 		if response.StatusCode < 200 || response.StatusCode >= 300 {
 			responseBody, readErr := io.ReadAll(response.Body)
 			if readErr != nil {
@@ -3948,13 +3949,16 @@ func (s *Server) proxyOpenAIToClaudeMessages(w http.ResponseWriter, r *http.Requ
 			_ = json.Unmarshal(responseBody, &payload)
 			claudeBody, _, convErr := openAIErrorValueToClaude(errorValueOrBody(payload, response.StatusCode, responseBody), model)
 			if convErr != nil || len(claudeBody) == 0 {
-				_, writeErr := w.Write(responseBody)
+				_, writeErr := hw.Write(responseBody)
 				return response.StatusCode, TokenUsage{}, responseBody, writeErr
 			}
-			_, writeErr := w.Write(claudeBody)
+			_, writeErr := hw.Write(claudeBody)
 			return response.StatusCode, TokenUsage{}, claudeBody, writeErr
 		}
-		usage, streamErr := streamOpenAIChatToClaudeEvents(w, response.Body, model)
+		// Chat→Claude 直写流（未走 finishConvertedProxy），同样需要心跳防反代空闲断流。
+		stopHeartbeat := startSSEHeartbeat(hw, sseHeartbeatInterval)
+		defer stopHeartbeat()
+		usage, streamErr := streamOpenAIChatToClaudeEvents(hw, response.Body, model)
 		return response.StatusCode, usage, nil, streamErr
 	}
 
@@ -4321,7 +4325,8 @@ func (s *Server) proxyClaudeToOpenAIChat(w http.ResponseWriter, r *http.Request,
 		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		w.WriteHeader(response.StatusCode)
+		hw := newSSEHeartbeatResponseWriter(w)
+		hw.WriteHeader(response.StatusCode)
 		if response.StatusCode < 200 || response.StatusCode >= 300 {
 			responseBody, readErr := io.ReadAll(response.Body)
 			if readErr != nil {
@@ -4329,13 +4334,16 @@ func (s *Server) proxyClaudeToOpenAIChat(w http.ResponseWriter, r *http.Request,
 			}
 			openAIBody, _, convErr := claudeResponseToOpenAIChat(responseBody, model, clientToolNames)
 			if convErr != nil || len(openAIBody) == 0 {
-				_, writeErr := w.Write(responseBody)
+				_, writeErr := hw.Write(responseBody)
 				return response.StatusCode, TokenUsage{}, responseBody, writeErr
 			}
-			_, writeErr := w.Write(openAIBody)
+			_, writeErr := hw.Write(openAIBody)
 			return response.StatusCode, TokenUsage{}, openAIBody, writeErr
 		}
-		usage, streamErr := streamClaudeToOpenAIChatEvents(w, response.Body, model, clientToolNames)
+		// Claude→Chat 直写流（未走 finishConvertedProxy），同样需要心跳防反代空闲断流。
+		stopHeartbeat := startSSEHeartbeat(hw, sseHeartbeatInterval)
+		defer stopHeartbeat()
+		usage, streamErr := streamClaudeToOpenAIChatEvents(hw, response.Body, model, clientToolNames)
 		return response.StatusCode, usage, nil, streamErr
 	}
 

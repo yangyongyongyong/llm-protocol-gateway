@@ -89,6 +89,31 @@ func TestFinishConvertedProxyHeartbeatBlocksEmptyRetry(t *testing.T) {
 	}
 }
 
+func TestSSEHeartbeatResponseWriterSerializesWithStreamFlush(t *testing.T) {
+	// Chat↔Claude converters call Write then Flush on the same writer; the
+	// heartbeat wrapper must not deadlock under that pattern.
+	rec := httptest.NewRecorder()
+	hw := newSSEHeartbeatResponseWriter(rec)
+	hw.WriteHeader(http.StatusOK)
+	stop := startSSEHeartbeat(hw, 15*time.Millisecond)
+	defer stop()
+
+	for i := 0; i < 20; i++ {
+		if _, err := fmt.Fprintf(hw, "data: %d\n\n", i); err != nil {
+			t.Fatal(err)
+		}
+		hw.Flush()
+	}
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if strings.Contains(rec.Body.String(), ": ping") {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("expected heartbeat amid flushed chunks, body=%q", rec.Body.String())
+}
+
 func TestTTFTIgnoresSSECommentHeartbeat(t *testing.T) {
 	rec := httptest.NewRecorder()
 	var ttft int64
