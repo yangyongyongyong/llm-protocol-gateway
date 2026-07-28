@@ -200,7 +200,7 @@ func (s *Server) proxyResponsesToOpenAIChat(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Server) proxyOpenAIChatToResponses(w http.ResponseWriter, r *http.Request, provider domain.Provider, model string, responsesReq map[string]any, skipIncomingAuth bool) (int, TokenUsage, []byte, error) {
-	chatReq, err := responsesToOpenAIChatRequest(responsesReq, model)
+	chatReq, toolCtx, err := responsesToOpenAIChatRequest(responsesReq, model)
 	if err != nil {
 		return 0, TokenUsage{}, nil, err
 	}
@@ -210,10 +210,13 @@ func (s *Server) proxyOpenAIChatToResponses(w http.ResponseWriter, r *http.Reque
 	if provider.AuthType == domain.AuthTypeCursorOAuth {
 		opts = CursorChatToResponsesStreamOptions()
 	}
+	opts.ToolContext = toolCtx
 	streamConvert := func(w http.ResponseWriter, reader io.Reader, model string) (TokenUsage, error) {
 		return streamOpenAIChatToResponsesEventsWithOptions(w, reader, model, opts)
 	}
-	return s.proxyConvertedThroughChat(w, r, provider, model, chatReq, skipIncomingAuth, openAIChatToResponsesResponse, streamConvert)
+	return s.proxyConvertedThroughChat(w, r, provider, model, chatReq, skipIncomingAuth, func(chatBody []byte, model string) ([]byte, TokenUsage, error) {
+		return openAIChatToResponsesResponseWithTools(chatBody, model, toolCtx)
+	}, streamConvert)
 }
 
 func (s *Server) proxyResponsesToClaudeMessages(w http.ResponseWriter, r *http.Request, provider domain.Provider, model string, claudeReq map[string]any, skipIncomingAuth bool) (int, TokenUsage, []byte, error) {

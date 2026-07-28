@@ -101,7 +101,7 @@ func TestResponsesToOpenAIChatRequest(t *testing.T) {
 		"instructions": "be helpful",
 		"input":        "hello",
 	}
-	chatReq, err := responsesToOpenAIChatRequest(responsesReq, "gpt-5")
+	chatReq, _, err := responsesToOpenAIChatRequest(responsesReq, "gpt-5")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestResponsesInputImageConvertsToChatImageURL(t *testing.T) {
 			},
 		},
 	}
-	chatReq, err := responsesToOpenAIChatRequest(responsesReq, "gpt-5.3-codex")
+	chatReq, _, err := responsesToOpenAIChatRequest(responsesReq, "gpt-5.3-codex")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestResponsesInputImageObjectURLConvertsToChatImageURL(t *testing.T) {
 			},
 		},
 	}
-	chatReq, err := responsesToOpenAIChatRequest(responsesReq, "gpt-5.3-codex")
+	chatReq, _, err := responsesToOpenAIChatRequest(responsesReq, "gpt-5.3-codex")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

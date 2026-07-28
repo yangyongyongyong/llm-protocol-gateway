@@ -299,6 +299,14 @@ func responsesToolChoiceToOpenAIChat(choice any) any {
 		switch choiceType {
 		case "auto", "none", "required":
 			return choiceType
+		case "namespace":
+			// Codex namespace tool_choice has no Chat equivalent; degrade to auto.
+			return "auto"
+		case "tool_search":
+			return map[string]any{
+				"type":     "function",
+				"function": map[string]any{"name": codexToolSearchProxyName},
+			}
 		case "function":
 			if functionValue, ok := typed["function"].(map[string]any); ok {
 				if name := stringValue(functionValue["name"]); name != "" {

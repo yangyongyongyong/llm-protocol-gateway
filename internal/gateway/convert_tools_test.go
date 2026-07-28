@@ -449,7 +449,7 @@ func TestResponsesToolsToOpenAIChatNormalizesCustomAndDropsBuiltins(t *testing.T
 		},
 		"tool_choice": map[string]any{"type": "function", "name": "shell"},
 	}
-	chatReq, err := responsesToOpenAIChatRequest(responsesReq, "glm-5.1")
+	chatReq, _, err := responsesToOpenAIChatRequest(responsesReq, "glm-5.1")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -536,7 +536,7 @@ func TestResponsesToOpenAIChatMergesAssistantPreambleWithFunctionCall(t *testing
 			},
 		},
 	}
-	chatReq, err := responsesToOpenAIChatRequest(responsesReq, "glm-4.5")
+	chatReq, _, err := responsesToOpenAIChatRequest(responsesReq, "glm-4.5")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -583,7 +583,7 @@ func TestResponsesToOpenAIChatAppendsParallelFunctionCalls(t *testing.T) {
 			},
 		},
 	}
-	chatReq, err := responsesToOpenAIChatRequest(responsesReq, "glm-4.5")
+	chatReq, _, err := responsesToOpenAIChatRequest(responsesReq, "glm-4.5")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

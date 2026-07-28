@@ -46,6 +46,9 @@ type ChatToResponsesStreamOptions struct {
 	// when content is empty. Cursor bridge often streams reasoning-only chunks;
 	// Claude→Chat and standard OpenAI Chat should not rely on this.
 	AllowReasoningFallback bool
+	// ToolContext restores Codex namespace / custom / tool_search identity when
+	// converting Chat tool_calls back to Responses items. Optional.
+	ToolContext *codexToolContext
 }
 
 // StandardChatToResponsesStreamOptions is the shared default for non-Cursor paths
@@ -90,14 +93,16 @@ type chatToResponsesStreamState struct {
 }
 
 type streamingToolCallState struct {
-	itemID           string
-	callID           string
-	name             string
-	arguments        strings.Builder
-	writtenArguments int
-	outputIndex      int
-	opened           bool
-	done             bool
+	itemID             string
+	callID             string
+	name               string // Responses-facing name (may be bare after restore)
+	flatName           string // Chat / Claude flat name used for restore lookup
+	arguments          strings.Builder
+	writtenArguments   int
+	outputIndex        int
+	opened             bool
+	done               bool
+	responsesItemType  string // function_call | custom_tool_call | tool_search_call
 }
 
 func (s *chatToResponsesStreamState) nextSeq() int {
@@ -302,13 +307,14 @@ func (s *chatToResponsesStreamState) handleToolCallDelta(rawToolCalls []any) err
 		}
 		if functionValue, ok := call["function"].(map[string]any); ok {
 			if name := stringValue(functionValue["name"]); name != "" {
+				state.flatName = name
 				state.name = name
 			}
 			if args := stringValue(functionValue["arguments"]); args != "" {
 				state.arguments.WriteString(args)
 			}
 		}
-		if state.callID == "" || state.name == "" {
+		if state.callID == "" || state.flatName == "" {
 			continue
 		}
 		if err := s.ensureResponseCreated(); err != nil {
@@ -322,22 +328,41 @@ func (s *chatToResponsesStreamState) handleToolCallDelta(rawToolCalls []any) err
 			}
 			state.outputIndex = s.outputIndex
 			state.itemID = fmt.Sprintf("fc_%d", time.Now().UnixNano())
+			startArgs := state.arguments.String()
+			item := map[string]any{
+				"id":      state.itemID,
+				"type":    "function_call",
+				"call_id": state.callID,
+				"name":    state.flatName,
+				"status":  "in_progress",
+			}
+			respType := "function_call"
+			if s.opts.ToolContext != nil {
+				item = s.opts.ToolContext.buildResponsesToolCallItem(state.itemID, state.callID, state.flatName, startArgs, "in_progress")
+				item["id"] = state.itemID
+				respType = stringValue(item["type"])
+				if respType == "" {
+					respType = "function_call"
+				}
+			}
+			state.responsesItemType = respType
+			if display := stringValue(item["name"]); display != "" {
+				state.name = display
+			}
 			if err := writeResponsesSSEEvent(s.w, "response.output_item.added", map[string]any{
 				"type":            "response.output_item.added",
 				"sequence_number": s.nextSeq(),
 				"output_index":    state.outputIndex,
-				"item": map[string]any{
-					"id":      state.itemID,
-					"type":    "function_call",
-					"call_id": state.callID,
-					"name":    state.name,
-					"status":  "in_progress",
-				},
+				"item":            item,
 			}); err != nil {
 				return err
 			}
 			state.opened = true
 			s.outputIndex++
+		}
+		// Custom / tool_search arguments are finalized at close time (cc-switch).
+		if s.opts.ToolContext != nil && s.opts.ToolContext.isCustomOrToolSearchFlatName(state.flatName) {
+			continue
 		}
 		args := state.arguments.String()
 		if len(args) > state.writtenArguments {
@@ -361,29 +386,55 @@ func (s *chatToResponsesStreamState) finalizeToolCalls() error {
 		if !state.opened || state.done {
 			continue
 		}
-		args := state.arguments.String()
-		if err := writeResponsesSSEEvent(s.w, "response.function_call_arguments.done", map[string]any{
-			"type":            "response.function_call_arguments.done",
-			"sequence_number": s.nextSeq(),
-			"item_id":         state.itemID,
-			"output_index":    state.outputIndex,
-			"name":            state.name,
-			"arguments":       args,
-		}); err != nil {
-			return err
-		}
-		if err := writeResponsesSSEEvent(s.w, "response.output_item.done", map[string]any{
-			"type":            "response.output_item.done",
-			"sequence_number": s.nextSeq(),
-			"output_index":    state.outputIndex,
-			"item": map[string]any{
+		args := emptyArgsFallback(state.arguments.String())
+		var item map[string]any
+		if s.opts.ToolContext != nil {
+			item = s.opts.ToolContext.buildResponsesToolCallItem(state.itemID, state.callID, state.flatName, args, "completed")
+			item["id"] = state.itemID
+		} else {
+			item = map[string]any{
 				"id":        state.itemID,
 				"type":      "function_call",
 				"call_id":   state.callID,
 				"name":      state.name,
 				"arguments": args,
 				"status":    "completed",
-			},
+			}
+		}
+		itemType := stringValue(item["type"])
+		if itemType == "" {
+			itemType = state.responsesItemType
+		}
+		switch itemType {
+		case "custom_tool_call":
+			if err := writeResponsesSSEEvent(s.w, "response.custom_tool_call_input.done", map[string]any{
+				"type":            "response.custom_tool_call_input.done",
+				"sequence_number": s.nextSeq(),
+				"item_id":         state.itemID,
+				"output_index":    state.outputIndex,
+				"input":           stringValue(item["input"]),
+			}); err != nil {
+				return err
+			}
+		case "tool_search_call":
+			// No partial deltas were streamed; arguments land on the final item.
+		default:
+			if err := writeResponsesSSEEvent(s.w, "response.function_call_arguments.done", map[string]any{
+				"type":            "response.function_call_arguments.done",
+				"sequence_number": s.nextSeq(),
+				"item_id":         state.itemID,
+				"output_index":    state.outputIndex,
+				"name":            stringValue(item["name"]),
+				"arguments":       emptyArgsFallback(stringValue(item["arguments"])),
+			}); err != nil {
+				return err
+			}
+		}
+		if err := writeResponsesSSEEvent(s.w, "response.output_item.done", map[string]any{
+			"type":            "response.output_item.done",
+			"sequence_number": s.nextSeq(),
+			"output_index":    state.outputIndex,
+			"item":            item,
 		}); err != nil {
 			return err
 		}
@@ -412,12 +463,19 @@ func (s *chatToResponsesStreamState) buildCompletedOutput() []map[string]any {
 		if !call.opened {
 			continue
 		}
+		args := emptyArgsFallback(call.arguments.String())
+		if s.opts.ToolContext != nil {
+			item := s.opts.ToolContext.buildResponsesToolCallItem(call.itemID, call.callID, call.flatName, args, "completed")
+			item["id"] = call.itemID
+			output = append(output, item)
+			continue
+		}
 		output = append(output, map[string]any{
 			"id":        call.itemID,
 			"type":      "function_call",
 			"call_id":   call.callID,
 			"name":      call.name,
-			"arguments": call.arguments.String(),
+			"arguments": args,
 			"status":    "completed",
 		})
 	}

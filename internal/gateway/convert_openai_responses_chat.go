@@ -316,7 +316,38 @@ func appendChatFunctionCall(messages []map[string]any, callID, name, arguments s
 	})
 }
 
-func chatMessagesFromResponsesInput(input any) ([]map[string]any, error) {
+// chatToolCallArgumentsFromResponsesItem builds Chat tool_calls[].function.arguments
+// JSON for a Responses call item (function / custom / tool_search).
+func chatToolCallArgumentsFromResponsesItem(entry map[string]any, itemType string) string {
+	switch itemType {
+	case "custom_tool_call":
+		input := entry["input"]
+		if input == nil {
+			input = ""
+		}
+		raw, err := json.Marshal(map[string]any{codexCustomToolInputField: input})
+		if err != nil {
+			return `{"input":""}`
+		}
+		return string(raw)
+	case "tool_search_call":
+		if args, ok := entry["arguments"].(map[string]any); ok {
+			raw, err := json.Marshal(args)
+			if err != nil {
+				return "{}"
+			}
+			return string(raw)
+		}
+		if s := stringValue(entry["arguments"]); s != "" {
+			return emptyArgsFallback(s)
+		}
+		return "{}"
+	default:
+		return emptyArgsFallback(stringValue(entry["arguments"]))
+	}
+}
+
+func chatMessagesFromResponsesInput(input any, ctx *codexToolContext) ([]map[string]any, error) {
 	messages := make([]map[string]any, 0, 8)
 	switch typed := input.(type) {
 	case string:
@@ -349,16 +380,26 @@ func chatMessagesFromResponsesInput(input any) ([]map[string]any, error) {
 				messages = append(messages, map[string]any{"role": role, "content": content})
 				continue
 			}
-			if itemType == "function_call" {
-				callID := sanitizeResponsesCallID(stringValue(entry["call_id"]))
+			if itemType == "function_call" || itemType == "custom_tool_call" || itemType == "tool_search_call" {
+				callID := sanitizeResponsesCallID(firstNonEmpty(stringValue(entry["call_id"]), stringValue(entry["id"])))
 				name := stringValue(entry["name"])
-				if callID == "" || name == "" {
+				namespace := stringValue(entry["namespace"])
+				if itemType == "tool_search_call" && name == "" {
+					name = codexToolSearchProxyName
+				}
+				flat := name
+				if ctx != nil {
+					flat = ctx.flatNameForCall(name, namespace)
+				} else if namespace != "" {
+					flat = flattenNamespaceToolName(namespace, name)
+				}
+				if callID == "" || flat == "" {
 					continue
 				}
-				messages = appendChatFunctionCall(messages, callID, name, stringValue(entry["arguments"]))
+				messages = appendChatFunctionCall(messages, callID, flat, chatToolCallArgumentsFromResponsesItem(entry, itemType))
 				continue
 			}
-			if itemType == "function_call_output" {
+			if itemType == "function_call_output" || itemType == "custom_tool_call_output" || itemType == "tool_search_output" {
 				callID := sanitizeResponsesCallID(stringValue(entry["call_id"]))
 				if callID == "" {
 					continue
@@ -400,16 +441,19 @@ func chatMessagesFromResponsesInput(input any) ([]map[string]any, error) {
 }
 
 // responsesToOpenAIChatRequest converts an OpenAI Responses API request to an
-// OpenAI Chat Completions request.
-func responsesToOpenAIChatRequest(responsesReq map[string]any, model string) (map[string]any, error) {
+// OpenAI Chat Completions request. The returned codexToolContext must be reused
+// on the Chat→Responses hop so namespace / custom / tool_search identity can be
+// restored for Codex.
+func responsesToOpenAIChatRequest(responsesReq map[string]any, model string) (map[string]any, *codexToolContext, error) {
+	toolCtx := buildCodexToolContextFromRequest(responsesReq)
 	chatReq := map[string]any{"model": model}
 	messages := make([]map[string]any, 0, 8)
 	if instructions := strings.TrimSpace(stringValue(responsesReq["instructions"])); instructions != "" {
 		messages = append(messages, map[string]any{"role": "system", "content": instructions})
 	}
-	inputMessages, err := chatMessagesFromResponsesInput(responsesReq["input"])
+	inputMessages, err := chatMessagesFromResponsesInput(responsesReq["input"], toolCtx)
 	if err != nil {
-		return nil, err
+		return nil, toolCtx, err
 	}
 	messages = append(messages, inputMessages...)
 	messageItems := make([]any, 0, len(messages))
@@ -438,8 +482,27 @@ func responsesToOpenAIChatRequest(responsesReq map[string]any, model string) (ma
 			chatReq["reasoning_effort"] = effort
 		}
 	}
-	copyResponsesToolsToChat(responsesReq, chatReq)
-	return chatReq, nil
+	// Flatten Codex namespace / tool_search / custom into Chat function tools.
+	if claudeTools := toolCtx.ClaudeTools(); len(claudeTools) > 0 {
+		out := make([]any, 0, len(claudeTools))
+		for _, item := range claudeTools {
+			tool, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			out = append(out, claudeToolToOpenAI(tool))
+		}
+		if len(out) > 0 {
+			chatReq["tools"] = out
+		}
+	}
+	if rawChoice, exists := responsesReq["tool_choice"]; exists {
+		normalized := toolCtx.normalizeToolChoice(rawChoice)
+		if converted := responsesToolChoiceToOpenAIChat(normalized); converted != nil {
+			chatReq["tool_choice"] = converted
+		}
+	}
+	return chatReq, toolCtx, nil
 }
 
 func responsesToOpenAIChatResponse(responsesBody []byte, model string) ([]byte, TokenUsage, error) {
@@ -516,6 +579,10 @@ func responsesToOpenAIChatResponse(responsesBody []byte, model string) ([]byte, 
 }
 
 func openAIChatToResponsesResponse(chatBody []byte, model string) ([]byte, TokenUsage, error) {
+	return openAIChatToResponsesResponseWithTools(chatBody, model, nil)
+}
+
+func openAIChatToResponsesResponseWithTools(chatBody []byte, model string, toolCtx *codexToolContext) ([]byte, TokenUsage, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(chatBody, &payload); err != nil {
 		return nil, TokenUsage{}, err
@@ -550,7 +617,7 @@ func openAIChatToResponsesResponse(chatBody []byte, model string) ([]byte, Token
 	status := "completed"
 	if rawToolCalls, ok := message["tool_calls"].([]any); ok && len(rawToolCalls) > 0 {
 		output = make([]map[string]any, 0, len(rawToolCalls))
-		for _, item := range rawToolCalls {
+		for i, item := range rawToolCalls {
 			call, ok := item.(map[string]any)
 			if !ok {
 				continue
@@ -560,12 +627,21 @@ func openAIChatToResponsesResponse(chatBody []byte, model string) ([]byte, Token
 			if name == "" {
 				continue
 			}
-			output = append(output, map[string]any{
-				"type":      "function_call",
-				"call_id":   sanitizeResponsesCallID(stringValue(call["id"])),
-				"name":      name,
-				"arguments": stringValue(functionValue["arguments"]),
-			})
+			callID := sanitizeResponsesCallID(stringValue(call["id"]))
+			args := emptyArgsFallback(stringValue(functionValue["arguments"]))
+			itemID := fmt.Sprintf("fc_%d", i)
+			if toolCtx != nil {
+				output = append(output, toolCtx.buildResponsesToolCallItem(itemID, callID, name, args, "completed"))
+			} else {
+				output = append(output, map[string]any{
+					"id":        itemID,
+					"type":      "function_call",
+					"call_id":   callID,
+					"name":      name,
+					"arguments": args,
+					"status":    "completed",
+				})
+			}
 		}
 		text = ""
 	}
