@@ -4326,65 +4326,26 @@ func (s *Server) proxyClaudeToOpenAIChat(w http.ResponseWriter, r *http.Request,
 	if stream {
 		accept = "text/event-stream"
 	}
-	response, err := s.doClaudeProviderRequest(r.Context(), r, provider, upstreamBody, accept)
-	if err != nil {
-		return 0, TokenUsage{}, nil, err
-	}
-	defer response.Body.Close()
-
-	if stream {
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		hw := newSSEHeartbeatResponseWriter(w)
-		hw.WriteHeader(response.StatusCode)
-		if response.StatusCode < 200 || response.StatusCode >= 300 {
-			responseBody, readErr := io.ReadAll(response.Body)
-			if readErr != nil {
-				return response.StatusCode, TokenUsage{}, nil, readErr
-			}
-			openAIBody, _, convErr := claudeResponseToOpenAIChat(responseBody, model, clientToolNames)
-			if convErr != nil || len(openAIBody) == 0 {
-				_, writeErr := hw.Write(responseBody)
-				return response.StatusCode, TokenUsage{}, responseBody, writeErr
-			}
-			_, writeErr := hw.Write(openAIBody)
-			return response.StatusCode, TokenUsage{}, openAIBody, writeErr
+	send := func() (*http.Response, error) {
+		response, err := s.doClaudeProviderRequest(r.Context(), r, provider, upstreamBody, accept)
+		if err != nil || response == nil || response.StatusCode != http.StatusBadRequest {
+			return response, err
 		}
-		// Claude→Chat 直写流（未走 finishConvertedProxy），同样需要心跳防反代空闲断流。
-		stopHeartbeat := startSSEHeartbeat(hw, sseHeartbeatInterval)
-		defer stopHeartbeat()
-		usage, streamErr := streamClaudeToOpenAIChatEvents(hw, response.Body, model, clientToolNames)
-		return response.StatusCode, usage, nil, streamErr
-	}
-
-	responseBody, readErr := io.ReadAll(response.Body)
-	if readErr != nil {
-		return 0, TokenUsage{}, nil, readErr
-	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		openAIBody, _, convErr := claudeResponseToOpenAIChat(responseBody, model, clientToolNames)
-		if convErr != nil || len(openAIBody) == 0 {
-			w.WriteHeader(response.StatusCode)
-			_, writeErr := w.Write(responseBody)
-			return response.StatusCode, TokenUsage{}, responseBody, writeErr
+		// Thinking 签名整流：Chat→Claude 历史回放也可能触发 cannot be modified。
+		if rectified, ok := s.maybeRectifyClaudeThinkingResend(r, provider, upstreamBody, response, func(b []byte) (*http.Response, error) {
+			return s.doClaudeProviderRequest(r.Context(), r, provider, b, accept)
+		}); ok {
+			return rectified, nil
 		}
-		w.WriteHeader(response.StatusCode)
-		_, writeErr := w.Write(openAIBody)
-		return response.StatusCode, TokenUsage{}, openAIBody, writeErr
+		return response, nil
 	}
-
-	openAIBody, usage, err := claudeResponseToOpenAIChat(responseBody, model, clientToolNames)
-	if err != nil {
-		return 0, TokenUsage{}, nil, err
+	convert := func(body []byte, modelName string) ([]byte, TokenUsage, error) {
+		return claudeResponseToOpenAIChat(body, modelName, clientToolNames)
 	}
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(openAIBody)))
-	w.WriteHeader(http.StatusOK)
-	if _, writeErr := w.Write(openAIBody); writeErr != nil {
-		return http.StatusOK, usage, openAIBody, writeErr
+	streamConvert := func(w http.ResponseWriter, reader io.Reader, modelName string) (TokenUsage, error) {
+		return streamClaudeToOpenAIChatEvents(w, reader, modelName, clientToolNames)
 	}
-	return http.StatusOK, usage, openAIBody, nil
+	return s.finishConvertedProxyWithEmptyStreamRetry(w, r, model, stream, send, convert, streamConvert)
 }
 
 func applyProviderAuth(request *http.Request, provider domain.Provider, incomingAuth string) {

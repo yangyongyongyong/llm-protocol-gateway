@@ -26,19 +26,26 @@ func writeOpenAISSEChunk(w http.ResponseWriter, payload any) error {
 
 // streamClaudeToOpenAIChatEvents reads an Anthropic Messages API SSE stream and
 // writes an OpenAI Chat Completions SSE stream to w.
+//
+// If the upstream turn completes (end_turn) with no visible text/tool_use —
+// only thinking / redacted_thinking — this returns errThinkingOnlyEmptyResponse
+// without writing any client bytes so finishConvertedProxy can retry.
 func streamClaudeToOpenAIChatEvents(w http.ResponseWriter, reader io.Reader, model string, clientToolNames map[string]struct{}) (TokenUsage, error) {
 	chunkID := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	resolvedModel := strings.TrimSpace(model)
 	usage := TokenUsage{}
-	stopReason := ""
+	claudeStopReason := ""
 	sentRole := false
 	openAIToolIndex := -1
 	currentToolOpenAIIndex := -1
+	sawVisibleOutput := false
+	sawAnyEvent := false
 
 	emitToolCallDelta := func(toolIndex int, id string, name string, arguments string) error {
 		if id == "" && name == "" && arguments == "" {
 			return nil
 		}
+		sawVisibleOutput = true
 		toolCall := map[string]any{"index": toolIndex}
 		if id != "" {
 			toolCall["id"] = id
@@ -91,6 +98,7 @@ func streamClaudeToOpenAIChatEvents(w http.ResponseWriter, reader io.Reader, mod
 		if err := json.Unmarshal([]byte(payload), &event); err != nil {
 			continue
 		}
+		sawAnyEvent = true
 		if errorValue, ok := event["error"]; ok {
 			body, _, convErr := claudeErrorValueToOpenAI(errorValue, resolvedModel)
 			if convErr == nil && len(body) > 0 {
@@ -115,12 +123,16 @@ func streamClaudeToOpenAIChatEvents(w http.ResponseWriter, reader io.Reader, mod
 			}
 		case "content_block_start":
 			block, _ := event["content_block"].(map[string]any)
-			if stringValue(block["type"]) == "tool_use" {
+			blockType := stringValue(block["type"])
+			switch blockType {
+			case "tool_use", "server_tool_use", "mcp_tool_use":
 				openAIToolIndex++
 				currentToolOpenAIIndex = openAIToolIndex
 				if err := emitToolCallDelta(currentToolOpenAIIndex, stringValue(block["id"]), resolveOpenAIToolNameFromClaude(stringValue(block["name"]), clientToolNames), ""); err != nil {
 					return usage, err
 				}
+			case "thinking", "redacted_thinking":
+				// Ignored for Chat clients; tracked only for thinking-only detection.
 			}
 		case "content_block_delta":
 			delta, _ := event["delta"].(map[string]any)
@@ -142,11 +154,14 @@ func streamClaudeToOpenAIChatEvents(w http.ResponseWriter, reader io.Reader, mod
 					return usage, err
 				}
 				continue
+			case "thinking_delta", "signature_delta":
+				continue
 			}
 			text := stringValue(delta["text"])
 			if text == "" {
 				continue
 			}
+			sawVisibleOutput = true
 			deltaPayload := map[string]any{"content": text}
 			if !sentRole {
 				deltaPayload["role"] = "assistant"
@@ -169,7 +184,9 @@ func streamClaudeToOpenAIChatEvents(w http.ResponseWriter, reader io.Reader, mod
 			currentToolOpenAIIndex = -1
 		case "message_delta":
 			if delta, ok := event["delta"].(map[string]any); ok {
-				stopReason = mapClaudeStopReasonToOpenAI(stringValue(delta["stop_reason"]))
+				if reason := strings.TrimSpace(stringValue(delta["stop_reason"])); reason != "" {
+					claudeStopReason = reason
+				}
 			}
 			if usageValue, ok := event["usage"].(map[string]any); ok {
 				usage = parseClaudeUsageMap(usageValue)
@@ -180,6 +197,26 @@ func streamClaudeToOpenAIChatEvents(w http.ResponseWriter, reader io.Reader, mod
 		return usage, err
 	}
 
+	if !sawAnyEvent {
+		return usage, fmt.Errorf("openai stream ended without any events")
+	}
+
+	// Completed turn with zero visible output (thinking-only): retryable, do not
+	// flush a silent stop chunk to Cursor (looks like a dead sub-agent).
+	switch claudeStopReason {
+	case "", "end_turn":
+		if !sawVisibleOutput {
+			return usage, errThinkingOnlyEmptyResponse
+		}
+	case "max_tokens", "tool_use", "refusal", "pause_turn":
+		// Not the silent-completed-empty bug.
+	default:
+		if !sawVisibleOutput {
+			return usage, errThinkingOnlyEmptyResponse
+		}
+	}
+
+	stopReason := mapClaudeStopReasonToOpenAI(claudeStopReason)
 	if stopReason == "" {
 		stopReason = "stop"
 	}

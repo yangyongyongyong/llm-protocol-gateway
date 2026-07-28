@@ -219,3 +219,134 @@ func TestStreamClaudeToOpenAIChatEvents(t *testing.T) {
 		t.Fatalf("expected DONE marker, got %q", body)
 	}
 }
+
+func TestOpenAIChatToClaudeRequestParallelToolCalls(t *testing.T) {
+	openAIReq := map[string]any{
+		"model": "claude-sonnet-5",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "hi"},
+		},
+		"tools": []any{
+			map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name":       "lookup",
+					"parameters":  map[string]any{"type": "object"},
+				},
+			},
+		},
+		"parallel_tool_calls": false,
+	}
+	claudeReq, err := openAIChatToClaudeRequest(openAIReq, "claude-sonnet-5", 0)
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	choice, _ := claudeReq["tool_choice"].(map[string]any)
+	if choice["disable_parallel_tool_use"] != true {
+		t.Fatalf("expected disable_parallel_tool_use, got %#v", claudeReq["tool_choice"])
+	}
+}
+
+func TestClaudeResponseToOpenAIChatThinkingOnlyEmptyIsRetryable(t *testing.T) {
+	claudeResp := map[string]any{
+		"id":    "msg_thinking_only",
+		"model": "claude-sonnet-5",
+		"content": []any{
+			map[string]any{"type": "thinking", "thinking": "", "signature": "sig-empty"},
+		},
+		"stop_reason": "end_turn",
+		"usage":       map[string]any{"input_tokens": 100, "output_tokens": 2},
+	}
+	body, _ := json.Marshal(claudeResp)
+	out, usage, err := claudeResponseToOpenAIChat(body, "claude-sonnet-5", nil)
+	if out != nil {
+		t.Fatalf("expected nil body on retryable error, got %s", out)
+	}
+	if !isThinkingOnlyEmptyStreamError(err) {
+		t.Fatalf("expected thinking-only-empty error, got %v", err)
+	}
+	if usage.OutputTokens != 2 {
+		t.Fatalf("usage not populated on error path: %+v", usage)
+	}
+}
+
+func TestClaudeResponseToOpenAIChatMaxTokensThinkingOnlyIsNotFlagged(t *testing.T) {
+	claudeResp := map[string]any{
+		"id":    "msg_truncated",
+		"model": "claude-sonnet-5",
+		"content": []any{
+			map[string]any{"type": "thinking", "thinking": "still going", "signature": "sig-2"},
+		},
+		"stop_reason": "max_tokens",
+		"usage":       map[string]any{"input_tokens": 100, "output_tokens": 500},
+	}
+	body, _ := json.Marshal(claudeResp)
+	out, _, err := claudeResponseToOpenAIChat(body, "claude-sonnet-5", nil)
+	if err != nil {
+		t.Fatalf("max_tokens truncation must not be flagged: %v", err)
+	}
+	if len(out) == 0 {
+		t.Fatal("expected non-empty body")
+	}
+}
+
+func TestStreamClaudeToOpenAIChatThinkingOnlyEmptyIsRetryable(t *testing.T) {
+	sse := strings.Join([]string{
+		`data: {"type":"message_start","message":{"id":"msg_1","model":"claude-sonnet-5"}}`,
+		``,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`,
+		``,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-abc"}}`,
+		``,
+		`data: {"type":"content_block_stop","index":0}`,
+		``,
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}`,
+		``,
+		`data: {"type":"message_stop"}`,
+		``,
+		``,
+	}, "\n")
+
+	rec := httptest.NewRecorder()
+	usage, err := streamClaudeToOpenAIChatEvents(rec, strings.NewReader(sse), "claude-sonnet-5", nil)
+	if !isThinkingOnlyEmptyStreamError(err) {
+		t.Fatalf("expected thinking-only-empty error, got %v", err)
+	}
+	if usage.OutputTokens != 3 {
+		t.Fatalf("usage not populated: %+v", usage)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("client must not receive any bytes on retryable thinking-only stream, got %q", rec.Body.String())
+	}
+}
+
+func TestStreamClaudeToOpenAIChatWithToolUseIsNotRetryable(t *testing.T) {
+	sse := strings.Join([]string{
+		`data: {"type":"message_start","message":{"id":"msg_1","model":"claude-sonnet-5"}}`,
+		``,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"Shell"}}`,
+		``,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"cmd\":\"ls\"}"}}`,
+		``,
+		`data: {"type":"content_block_stop","index":0}`,
+		``,
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":8}}`,
+		``,
+		`data: {"type":"message_stop"}`,
+		``,
+		``,
+	}, "\n")
+
+	rec := httptest.NewRecorder()
+	_, err := streamClaudeToOpenAIChatEvents(rec, strings.NewReader(sse), "claude-sonnet-5", nil)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "tool_calls") {
+		t.Fatalf("expected tool_calls in stream, got %q", body)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("expected DONE marker, got %q", body)
+	}
+}

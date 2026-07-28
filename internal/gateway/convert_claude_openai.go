@@ -207,6 +207,8 @@ func openAIChatToClaudeRequest(openAIReq map[string]any, model string, maxTokens
 	copyToolsField(openAIReq, claudeReq, true)
 	copyToolChoiceField(openAIReq, claudeReq, true)
 	applyOpenAIThinkingToClaudeRequest(openAIReq, claudeReq, model)
+	// Cursor / Chat clients may set parallel_tool_calls=false; map onto Claude.
+	applyResponsesParallelToolCallsToClaude(openAIReq, claudeReq)
 	return claudeReq, nil
 }
 
@@ -447,9 +449,13 @@ func claudeResponseToOpenAIChat(claudeResp []byte, model string, clientToolNames
 		return claudeErrorValueToOpenAI(errorValue, model)
 	}
 
+	usage := ParseClaudeUsage(claudeResp)
+	if isClaudeThinkingOnlyEmptyChat(payload) {
+		return nil, usage, errThinkingOnlyEmptyResponse
+	}
+
 	assistantMessage := claudeResponseContentToOpenAIAssistantMessage(payload["content"], clientToolNames)
 	stopReason := mapClaudeStopReasonToOpenAI(stringValue(payload["stop_reason"]))
-	usage := ParseClaudeUsage(claudeResp)
 	openAIUsage := claudeUsageToOpenAIUsage(usage, extractCacheUsage(claudeResp))
 
 	response := map[string]any{
@@ -466,6 +472,47 @@ func claudeResponseToOpenAIChat(claudeResp []byte, model string, clientToolNames
 	}
 	body, err := json.Marshal(response)
 	return body, usage, err
+}
+
+// isClaudeThinkingOnlyEmptyChat reports a completed Claude Messages turn with
+// no visible text/tool_use (only thinking/redacted_thinking or empty content).
+// max_tokens truncation is excluded — that needs a bigger budget, not a retry.
+func isClaudeThinkingOnlyEmptyChat(payload map[string]any) bool {
+	if payload == nil {
+		return true
+	}
+	stop := strings.TrimSpace(stringValue(payload["stop_reason"]))
+	switch stop {
+	case "max_tokens", "tool_use", "refusal", "pause_turn":
+		return false
+	case "", "end_turn":
+		// completed-empty candidates
+	default:
+		// Unknown stop reasons with no visible output still look like silent turns.
+	}
+	content, _ := payload["content"].([]any)
+	for _, raw := range content {
+		block, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch stringValue(block["type"]) {
+		case "thinking", "redacted_thinking":
+			continue
+		case "text":
+			if strings.TrimSpace(stringValue(block["text"])) != "" {
+				return false
+			}
+		case "tool_use", "server_tool_use", "mcp_tool_use":
+			return false
+		default:
+			// Any other content block counts as visible output.
+			if strings.TrimSpace(stringValue(block["type"])) != "" {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func claudeErrorValueToOpenAI(errorValue any, model string) ([]byte, TokenUsage, error) {
