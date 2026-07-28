@@ -169,13 +169,19 @@ func stripResponsesInputReasoning(body []byte) ([]byte, bool) {
 	changed := false
 	for _, raw := range input {
 		if item, ok := raw.(map[string]any); ok {
-			if strings.EqualFold(stringValue(item["type"]), "reasoning") {
+			itemType := strings.TrimSpace(strings.ToLower(stringValue(item["type"])))
+			if itemType == "reasoning" {
 				changed = true
 				continue
 			}
-			if _, has := item["encrypted_content"]; has {
-				delete(item, "encrypted_content")
-				changed = true
+			// agent_message / inter-agent carriers may keep encrypted_content as
+			// the task body. Only strip stray ciphertext on other item types
+			// (OpenAI rejects foreign reasoning ciphertext).
+			if itemType != "agent_message" && itemType != "inter_agent_communication" {
+				if _, has := item["encrypted_content"]; has {
+					delete(item, "encrypted_content")
+					changed = true
+				}
 			}
 		}
 		filtered = append(filtered, raw)

@@ -42,11 +42,37 @@ func TestStripResponsesInputReasoningDropsReasoningItems(t *testing.T) {
 	}
 }
 
-func TestStripResponsesInputReasoningNoReasoningIsNoop(t *testing.T) {
-	body := []byte(`{"model":"gpt-5.5","input":[{"type":"message","role":"user","content":"hi"}]}`)
+func TestStripResponsesInputReasoningKeepsAgentMessageEncryptedContent(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{"type":"agent_message","author":"/root","recipient":"/root/a","encrypted_content":"task-ciphertext","content":[]},
+			{"type":"reasoning","id":"rs_1","encrypted_content":"reason-cipher"},
+			{"type":"message","role":"user","content":"hi","encrypted_content":"stray"}
+		]
+	}`)
 	out, changed := stripResponsesInputReasoning(body)
-	if changed {
-		t.Fatalf("expected changed=false; out=%s", out)
+	if !changed {
+		t.Fatal("expected changed=true")
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	input := parsed["input"].([]any)
+	if len(input) != 2 {
+		t.Fatalf("input len=%d want 2 (reasoning dropped)", len(input))
+	}
+	am := input[0].(map[string]any)
+	if stringValue(am["type"]) != "agent_message" {
+		t.Fatalf("first item=%#v", am)
+	}
+	if stringValue(am["encrypted_content"]) != "task-ciphertext" {
+		t.Fatalf("agent_message encrypted_content must be preserved, got %#v", am)
+	}
+	msg := input[1].(map[string]any)
+	if _, has := msg["encrypted_content"]; has {
+		t.Fatalf("stray encrypted_content on message should be stripped: %#v", msg)
 	}
 }
 

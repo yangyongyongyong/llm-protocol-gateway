@@ -415,6 +415,16 @@ func chatMessagesFromResponsesInput(input any, ctx *codexToolContext) ([]map[str
 				})
 				continue
 			}
+			if itemType == "additional_tools" {
+				// Merged into chatReq.tools via buildCodexToolContextFromRequest.
+				continue
+			}
+			if itemType == "agent_message" {
+				if text := responsesAgentMessagePlainText(entry); strings.TrimSpace(text) != "" {
+					messages = append(messages, map[string]any{"role": "user", "content": text})
+				}
+				continue
+			}
 			role := strings.TrimSpace(stringValue(entry["role"]))
 			if role == "" {
 				continue

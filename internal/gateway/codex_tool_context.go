@@ -67,7 +67,11 @@ func codexToolContextFromClientNames(names map[string]struct{}) *codexToolContex
 }
 
 // buildCodexToolContextFromRequest parses Responses tools (+ tools loaded via
-// prior tool_search_output in input history) into Claude-callable tools.
+// prior tool_search_output / additional_tools in input history) into
+// Claude-callable tools. Newer Codex clients (Responses Lite / sub-agents)
+// declare runtime tools only in input items shaped as
+// {"type":"additional_tools","tools":[...]} — matching sub2api
+// EffectiveResponsesTools.
 func buildCodexToolContextFromRequest(responsesReq map[string]any) *codexToolContext {
 	ctx := newCodexToolContext()
 	if responsesReq == nil {
@@ -80,6 +84,7 @@ func buildCodexToolContextFromRequest(responsesReq map[string]any) *codexToolCon
 		}
 		ctx.addResponseTool(tool)
 	}
+	collectAdditionalToolsFromInput(responsesReq["input"], ctx)
 	collectToolSearchOutputTools(responsesReq["input"], ctx)
 	return ctx
 }
@@ -259,6 +264,33 @@ func collectToolSearchOutputTools(value any, ctx *codexToolContext) {
 		}
 		for _, child := range typed {
 			collectToolSearchOutputTools(child, ctx)
+		}
+	}
+}
+
+// collectAdditionalToolsFromInput promotes Codex Responses Lite
+// `additional_tools` carriers into the Claude/Chat tool list. These items must
+// never become chat messages (they have role=developer but no content).
+func collectAdditionalToolsFromInput(input any, ctx *codexToolContext) {
+	if ctx == nil || input == nil {
+		return
+	}
+	items, ok := input.([]any)
+	if !ok {
+		return
+	}
+	for _, raw := range items {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(strings.ToLower(stringValue(item["type"]))) != "additional_tools" {
+			continue
+		}
+		for _, rawTool := range asMapSlice(item["tools"]) {
+			if tool, ok := rawTool.(map[string]any); ok {
+				ctx.addResponseTool(tool)
+			}
 		}
 	}
 }

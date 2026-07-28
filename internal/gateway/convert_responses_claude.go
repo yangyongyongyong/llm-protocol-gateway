@@ -224,6 +224,13 @@ func responsesInputToClaudeMessages(input any, ctx *codexToolContext) []map[stri
 					"tool_use_id": callID,
 					"content":     toolResultContentToString(item["output"]),
 				})
+			case "additional_tools":
+				// Tools already merged via collectAdditionalToolsFromInput; not a message.
+				continue
+			case "agent_message":
+				if text := responsesAgentMessagePlainText(item); isMeaningfulText(text) {
+					pushClaudeBlock(&messages, "user", map[string]any{"type": "text", "text": text})
+				}
 			case "reasoning":
 				if block, ok := decodeAnthropicThinkingBlock(stringValue(item["encrypted_content"])); ok {
 					pushClaudeBlock(&messages, "assistant", block)

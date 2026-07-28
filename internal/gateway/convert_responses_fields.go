@@ -66,11 +66,9 @@ func responsesTextFormatToClaudeOutputFormat(format map[string]any) map[string]a
 		}
 		out := map[string]any{
 			"type":   "json_schema",
-			"schema": schema,
+			"schema": sanitizeClaudeStructuredOutputSchema(schema),
 		}
-		if name := stringValue(format["name"]); name != "" {
-			out["name"] = name
-		}
+		// Claude GA structured outputs reject format.name ("Extra inputs are not permitted").
 		return out
 	case "json_object":
 		// Claude has no dedicated json_object mode; approximate with a loose object schema.
@@ -83,6 +81,52 @@ func responsesTextFormatToClaudeOutputFormat(format map[string]any) map[string]a
 	default:
 		// "text" or unknown — leave Claude unconstrained.
 		return nil
+	}
+}
+
+// sanitizeClaudeStructuredOutputSchema drops JSON Schema keywords Claude's
+// output_config.format rejects (observed: maxItems/minItems/maxLength/minLength/$schema).
+func sanitizeClaudeStructuredOutputSchema(schema any) any {
+	switch typed := schema.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, value := range typed {
+			switch key {
+			case "$schema", "maxItems", "minItems", "maxLength", "minLength", "maxProperties", "minProperties", "uniqueItems", "exclusiveMinimum", "exclusiveMaximum":
+				continue
+			case "properties":
+				if props, ok := value.(map[string]any); ok {
+					cleaned := make(map[string]any, len(props))
+					for propName, propSchema := range props {
+						cleaned[propName] = sanitizeClaudeStructuredOutputSchema(propSchema)
+					}
+					out[key] = cleaned
+					continue
+				}
+			case "items":
+				out[key] = sanitizeClaudeStructuredOutputSchema(value)
+				continue
+			case "anyOf", "oneOf", "allOf", "prefixItems":
+				if list, ok := value.([]any); ok {
+					cleaned := make([]any, 0, len(list))
+					for _, entry := range list {
+						cleaned = append(cleaned, sanitizeClaudeStructuredOutputSchema(entry))
+					}
+					out[key] = cleaned
+					continue
+				}
+			}
+			out[key] = sanitizeClaudeStructuredOutputSchema(value)
+		}
+		return out
+	case []any:
+		out := make([]any, 0, len(typed))
+		for _, entry := range typed {
+			out = append(out, sanitizeClaudeStructuredOutputSchema(entry))
+		}
+		return out
+	default:
+		return schema
 	}
 }
 
@@ -305,4 +349,58 @@ func mediaTypeFromFilename(name string) string {
 	default:
 		return ""
 	}
+}
+
+// responsesAgentMessagePlainText extracts the inter-agent channel body Codex
+// places in type:"agent_message" input items (spawn / followup_task /
+// send_message). Without this, Chat conversion drops the item (no role) and
+// sub-agents only see an empty task payload.
+//
+// Multi-agent v2 (Codex PR #26210 / #28368) stores the task body in
+// content[].type=="encrypted_content". Official OpenAI Responses decrypts that
+// server-side for the recipient model. Third-party backends (Claude via this
+// gateway) never run that encryption step: Codex still labels the field
+// "encrypted" and forwards the model-emitted plaintext as the opaque value.
+// Passing it through is therefore required for sub-agent tasks to work here.
+func responsesAgentMessagePlainText(item map[string]any) string {
+	if item == nil {
+		return ""
+	}
+	var parts []string
+	sawEncryptedPart := false
+	switch content := item["content"].(type) {
+	case string:
+		if strings.TrimSpace(content) != "" {
+			parts = append(parts, content)
+		}
+	case []any:
+		for _, raw := range content {
+			part, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch strings.TrimSpace(strings.ToLower(stringValue(part["type"]))) {
+			case "", "input_text", "output_text", "text":
+				if text := strings.TrimSpace(stringValue(part["text"])); text != "" {
+					parts = append(parts, text)
+				}
+			case "encrypted_content":
+				sawEncryptedPart = true
+				if text := strings.TrimSpace(firstNonEmpty(
+					stringValue(part["encrypted_content"]),
+					stringValue(part["text"]),
+					stringValue(part["content"]),
+				)); text != "" {
+					parts = append(parts, text)
+				}
+			}
+		}
+	}
+	if !sawEncryptedPart {
+		if enc := strings.TrimSpace(stringValue(item["encrypted_content"])); enc != "" {
+			// Item-level carrier (InterAgentCommunication projected as agent_message).
+			parts = append(parts, enc)
+		}
+	}
+	return strings.Join(parts, "\n")
 }
