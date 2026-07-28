@@ -309,6 +309,60 @@ func TestCodexToolContextStreamCustomAndToolSearch(t *testing.T) {
 	}
 }
 
+func TestCodexToolContextOAuthCloakedCustomRestore(t *testing.T) {
+	toolCtx := buildCodexToolContextFromRequest(map[string]any{
+		"tools": []any{
+			map[string]any{"type": "custom", "name": "exec", "description": "JS orchestrator"},
+		},
+	})
+	if !toolCtx.isCustomOrToolSearchFlatName("Exec") {
+		t.Fatal("OAuth-cloaked Exec should still be recognized as custom")
+	}
+	item := toolCtx.buildResponsesToolCallItem("fc_1", "call_1", "Exec", `{"input":"await tools.shell({command:'ls'})"}`, "completed")
+	if item["type"] != "custom_tool_call" || item["name"] != "exec" {
+		t.Fatalf("cloaked Exec must restore to custom_tool_call exec, got %#v", item)
+	}
+	if item["input"] != "await tools.shell({command:'ls'})" {
+		t.Fatalf("custom input unwrap failed: %#v", item["input"])
+	}
+}
+
+func TestStreamClaudeToResponsesOAuthCloakedCustomSuppressesFunctionDeltas(t *testing.T) {
+	toolCtx := buildCodexToolContextFromRequest(map[string]any{
+		"tools": []any{
+			map[string]any{"type": "custom", "name": "exec"},
+		},
+	})
+	sse := "" +
+		"event: message_start\n" +
+		"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" +
+		"event: content_block_start\n" +
+		"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_exec\",\"name\":\"Exec\",\"input\":{}}}\n\n" +
+		"event: content_block_delta\n" +
+		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"input\\\":\\\"hi\\\"}\"}}\n\n" +
+		"event: content_block_stop\n" +
+		"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+		"event: message_delta\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":2}}\n\n" +
+		"event: message_stop\n" +
+		"data: {\"type\":\"message_stop\"}\n\n"
+
+	rec := httptest.NewRecorder()
+	if _, err := streamClaudeToResponsesEventsDirect(rec, bytes.NewReader([]byte(sse)), "claude-opus-5", toolCtx); err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "custom_tool_call") {
+		t.Fatalf("expected custom_tool_call for cloaked Exec, got: %s", body)
+	}
+	if strings.Contains(body, "response.function_call_arguments.delta") {
+		t.Fatalf("cloaked custom tool must not emit function_call_arguments.delta: %s", body)
+	}
+	if !strings.Contains(body, "response.custom_tool_call_input.done") {
+		t.Fatalf("expected custom_tool_call_input.done: %s", body)
+	}
+}
+
 func TestResponsesToolsToOpenAIChatKeepsNamespace(t *testing.T) {
 	tools := []any{
 		map[string]any{

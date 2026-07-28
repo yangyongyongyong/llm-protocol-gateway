@@ -121,6 +121,14 @@ func (c *codexToolContext) addClaudeTool(flatName string, spec codexToolSpec, cl
 	c.flatToSpec[flatName] = spec
 	c.rememberClientName(flatName)
 	c.rememberClientName(spec.Name)
+	// Claude OAuth cloaking remaps lowercase/snake tools to TitleCase (exec → Exec)
+	// before the upstream round-trip. Index the cloaked alias so stream/non-stream
+	// restore still recognizes custom / tool_search / namespace kinds.
+	if cloaked, changed := remapClaudeOAuthToolName(flatName); changed && cloaked != "" && cloaked != flatName {
+		if _, exists := c.flatToSpec[cloaked]; !exists {
+			c.flatToSpec[cloaked] = spec
+		}
+	}
 	c.claudeTools = append(c.claudeTools, claudeTool)
 }
 
@@ -273,6 +281,33 @@ func (c *codexToolContext) flatNameForCall(name, namespace string) string {
 	return name
 }
 
+// lookupSpec resolves a Claude-facing tool name (possibly OAuth-cloaked) back
+// to the Codex tool spec registered from the original Responses request.
+func (c *codexToolContext) lookupSpec(claudeName string) (codexToolSpec, bool) {
+	if c == nil {
+		return codexToolSpec{}, false
+	}
+	claudeName = strings.TrimSpace(claudeName)
+	if claudeName == "" {
+		return codexToolSpec{}, false
+	}
+	if spec, ok := c.flatToSpec[claudeName]; ok {
+		return spec, true
+	}
+	resolved := sanitizeResponsesToolName(claudeName, c.ClientToolNames())
+	if resolved != "" && resolved != claudeName {
+		if spec, ok := c.flatToSpec[resolved]; ok {
+			return spec, true
+		}
+	}
+	if lower := strings.ToLower(claudeName); lower != claudeName {
+		if spec, ok := c.flatToSpec[lower]; ok {
+			return spec, true
+		}
+	}
+	return codexToolSpec{}, false
+}
+
 // buildResponsesToolCallItem maps a Claude tool_use (flat name + JSON args)
 // back into the Responses item shape Codex expects.
 func (c *codexToolContext) buildResponsesToolCallItem(itemID, callID, claudeName, arguments, status string) map[string]any {
@@ -285,16 +320,8 @@ func (c *codexToolContext) buildResponsesToolCallItem(itemID, callID, claudeName
 	} else {
 		resolvedName = sanitizeResponsesToolName(claudeName, nil)
 	}
-	lookupName := claudeName
 	if c != nil {
-		if _, ok := c.flatToSpec[claudeName]; ok {
-			lookupName = claudeName
-		} else if _, ok := c.flatToSpec[resolvedName]; ok {
-			lookupName = resolvedName
-		}
-	}
-	if c != nil {
-		if spec, ok := c.flatToSpec[lookupName]; ok {
+		if spec, ok := c.lookupSpec(claudeName); ok {
 			switch spec.Kind {
 			case codexToolKindToolSearch:
 				return map[string]any{
@@ -349,10 +376,7 @@ func (c *codexToolContext) buildResponsesToolCallItem(itemID, callID, claudeName
 }
 
 func (c *codexToolContext) isCustomOrToolSearchFlatName(flatName string) bool {
-	if c == nil {
-		return false
-	}
-	spec, ok := c.flatToSpec[flatName]
+	spec, ok := c.lookupSpec(flatName)
 	if !ok {
 		return false
 	}
