@@ -170,7 +170,9 @@ func responsesContentPartToClaudeBlock(part map[string]any) map[string]any {
 
 // responsesInputToClaudeMessages re-nests the flat Responses input[] back into
 // Anthropic messages, restoring signed thinking blocks from encrypted_content.
-func responsesInputToClaudeMessages(input any) []map[string]any {
+// When ctx is non-nil, namespace-qualified / custom / tool_search calls are
+// flattened to Claude tool_use names that match the request-side tool list.
+func responsesInputToClaudeMessages(input any, ctx *codexToolContext) []map[string]any {
 	messages := make([]map[string]any, 0, 8)
 	switch typed := input.(type) {
 	case string:
@@ -187,17 +189,28 @@ func responsesInputToClaudeMessages(input any) []map[string]any {
 				continue
 			}
 			switch stringValue(item["type"]) {
-			case "function_call":
+			case "function_call", "custom_tool_call", "tool_search_call":
+				itemType := stringValue(item["type"])
 				callID := sanitizeAnthropicToolUseID(firstNonEmpty(stringValue(item["call_id"]), stringValue(item["id"])))
 				name := stringValue(item["name"])
-				if name == "" {
+				namespace := stringValue(item["namespace"])
+				if itemType == "tool_search_call" && name == "" {
+					name = codexToolSearchProxyName
+				}
+				flat := name
+				if ctx != nil {
+					flat = ctx.flatNameForCall(name, namespace)
+				} else if namespace != "" {
+					flat = flattenNamespaceToolName(namespace, name)
+				}
+				if flat == "" {
 					continue
 				}
 				pushClaudeBlock(&messages, "assistant", map[string]any{
 					"type":  "tool_use",
 					"id":    callID,
-					"name":  name,
-					"input": parseJSONArguments(stringValue(item["arguments"])),
+					"name":  flat,
+					"input": toolCallInputForClaude(item, itemType),
 				})
 			case "function_call_output", "custom_tool_call_output", "tool_search_output":
 				callID := sanitizeAnthropicToolUseID(stringValue(item["call_id"]))
@@ -313,18 +326,21 @@ func ensureLeadingClaudeUser(messages []map[string]any) []map[string]any {
 // responsesToClaudeRequestDirect converts a Responses request directly into an
 // Anthropic Messages request (no OpenAI-Chat intermediate). Thinking/effort
 // mapping reuses the existing Chat↔Claude helpers so behavior stays consistent.
-func responsesToClaudeRequestDirect(responsesReq map[string]any, model string, maxTokensOverride int) (map[string]any, error) {
+// The returned codexToolContext must be reused on the response hop so namespace /
+// custom / tool_search identity can be restored for Codex.
+func responsesToClaudeRequestDirect(responsesReq map[string]any, model string, maxTokensOverride int) (map[string]any, *codexToolContext, error) {
 	claudeReq := map[string]any{"model": model}
+	toolCtx := buildCodexToolContextFromRequest(responsesReq)
 
 	if instructions := strings.TrimSpace(stringValue(responsesReq["instructions"])); instructions != "" {
 		claudeReq["system"] = instructions
 	}
 
-	messages := responsesInputToClaudeMessages(responsesReq["input"])
+	messages := responsesInputToClaudeMessages(responsesReq["input"], toolCtx)
 	messages = dropTrailingAssistantThinking(messages)
 	messages = ensureLeadingClaudeUser(messages)
 	if len(messages) == 0 {
-		return nil, fmt.Errorf("responses request has no usable input items")
+		return nil, toolCtx, fmt.Errorf("responses request has no usable input items")
 	}
 	claudeMessages := make([]any, 0, len(messages))
 	for _, m := range messages {
@@ -345,12 +361,18 @@ func responsesToClaudeRequestDirect(responsesReq map[string]any, model string, m
 		}
 	}
 
-	// Tools: reuse the Responses→Chat tool normalization, then Chat→Claude tool
-	// shape (both are pure shape maps, not a protocol hop).
-	chatToolCarrier := map[string]any{}
-	copyResponsesToolsToChat(responsesReq, chatToolCarrier)
-	copyToolsField(chatToolCarrier, claudeReq, true)
-	copyToolChoiceField(chatToolCarrier, claudeReq, true)
+	// Tools: flatten Codex namespace / tool_search / custom into Claude tools.
+	if tools := toolCtx.ClaudeTools(); len(tools) > 0 {
+		claudeReq["tools"] = tools
+	}
+	if rawChoice, exists := responsesReq["tool_choice"]; exists {
+		normalized := toolCtx.normalizeToolChoice(rawChoice)
+		chatCarrier := map[string]any{}
+		if normalized != nil {
+			chatCarrier["tool_choice"] = normalized
+		}
+		copyToolChoiceField(chatCarrier, claudeReq, true)
+	}
 
 	// reasoning.effort → Claude thinking (reuse the shared mapping).
 	if reasoning, ok := responsesReq["reasoning"].(map[string]any); ok {
@@ -364,7 +386,7 @@ func responsesToClaudeRequestDirect(responsesReq map[string]any, model string, m
 		normalizeClaudeTemperatureForThinking(claudeReq)
 	}
 
-	return claudeReq, nil
+	return claudeReq, toolCtx, nil
 }
 
 // sanitizeResponsesToolName restores the client's original tool name (pre-cloak)
@@ -375,8 +397,8 @@ func sanitizeResponsesToolName(claudeName string, clientToolNames map[string]str
 
 // claudeToResponsesResponseDirect converts a non-streamed Anthropic Messages
 // response directly into a Responses response, preserving signed thinking blocks
-// as reasoning items and restoring client tool names.
-func claudeToResponsesResponseDirect(claudeBody []byte, model string, clientToolNames map[string]struct{}) ([]byte, TokenUsage, error) {
+// as reasoning items and restoring client tool names / Codex namespace identity.
+func claudeToResponsesResponseDirect(claudeBody []byte, model string, toolCtx *codexToolContext) ([]byte, TokenUsage, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(claudeBody, &payload); err != nil {
 		return nil, TokenUsage{}, err
@@ -415,6 +437,11 @@ func claudeToResponsesResponseDirect(claudeBody []byte, model string, clientTool
 		textParts = make([]any, 0, 4)
 	}
 
+	clientNames := map[string]struct{}(nil)
+	if toolCtx != nil {
+		clientNames = toolCtx.ClientToolNames()
+	}
+
 	if blocks, ok := payload["content"].([]any); ok {
 		for _, raw := range blocks {
 			block, ok := raw.(map[string]any)
@@ -433,21 +460,26 @@ func claudeToResponsesResponseDirect(claudeBody []byte, model string, clientTool
 			case "tool_use":
 				flushText()
 				callID := sanitizeResponsesCallID(stringValue(block["id"]))
-				name := sanitizeResponsesToolName(stringValue(block["name"]), clientToolNames)
+				claudeName := stringValue(block["name"])
 				args := "{}"
 				if input := block["input"]; input != nil {
 					if raw, err := json.Marshal(input); err == nil {
 						args = string(raw)
 					}
 				}
-				output = append(output, map[string]any{
-					"id":        fmt.Sprintf("%s_call_%d", responseID, len(output)),
-					"type":      "function_call",
-					"status":    "completed",
-					"call_id":   callID,
-					"name":      name,
-					"arguments": args,
-				})
+				itemID := fmt.Sprintf("%s_call_%d", responseID, len(output))
+				if toolCtx != nil {
+					output = append(output, toolCtx.buildResponsesToolCallItem(itemID, callID, claudeName, args, "completed"))
+				} else {
+					output = append(output, map[string]any{
+						"id":        itemID,
+						"type":      "function_call",
+						"status":    "completed",
+						"call_id":   callID,
+						"name":      sanitizeResponsesToolName(claudeName, clientNames),
+						"arguments": args,
+					})
+				}
 			case "thinking", "redacted_thinking":
 				flushText()
 				if item, ok := responsesReasoningItemFromAnthropicBlock(fmt.Sprintf("rs_%s_%d", responseID, len(output)), block); ok {

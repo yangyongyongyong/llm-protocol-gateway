@@ -16,7 +16,7 @@ func TestResponsesToClaudeRequestDirectBasic(t *testing.T) {
 		"max_output_tokens": float64(1024),
 		"reasoning":         map[string]any{"effort": "high"},
 	}
-	claudeReq, err := responsesToClaudeRequestDirect(responsesReq, "claude-sonnet-5", 0)
+	claudeReq, _, err := responsesToClaudeRequestDirect(responsesReq, "claude-sonnet-5", 0)
 	if err != nil {
 		t.Fatalf("convert: %v", err)
 	}
@@ -50,7 +50,7 @@ func TestClaudeToResponsesDirectThinkingRoundTrip(t *testing.T) {
 	}
 	body, _ := json.Marshal(claudeResp)
 	clientTools := map[string]struct{}{"exec_command": {}}
-	out, _, err := claudeToResponsesResponseDirect(body, "claude-sonnet-5", clientTools)
+	out, _, err := claudeToResponsesResponseDirect(body, "claude-sonnet-5", codexToolContextFromClientNames(clientTools))
 	if err != nil {
 		t.Fatalf("convert: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestClaudeToResponsesDirectThinkingRoundTrip(t *testing.T) {
 			map[string]any{"type": "function_call_output", "call_id": "tu_1", "output": "ok"},
 		},
 	}
-	claudeReq, err := responsesToClaudeRequestDirect(replayReq, "claude-sonnet-5", 0)
+	claudeReq, _, err := responsesToClaudeRequestDirect(replayReq, "claude-sonnet-5", 0)
 	if err != nil {
 		t.Fatalf("replay convert: %v", err)
 	}
@@ -235,7 +235,7 @@ func TestResponsesToClaudeDropsTrailingThinking(t *testing.T) {
 			map[string]any{"type": "message", "role": "user", "content": "again"},
 		},
 	}
-	claudeReq, err := responsesToClaudeRequestDirect(responsesReq, "claude-sonnet-5", 0)
+	claudeReq, _, err := responsesToClaudeRequestDirect(responsesReq, "claude-sonnet-5", 0)
 	if err != nil {
 		t.Fatalf("convert: %v", err)
 	}

@@ -28,7 +28,8 @@ type claudeDirectBlockState struct {
 	outputIndex       int
 	itemID            string
 	callID            string
-	name              string
+	name              string // Responses-facing name (may be bare after restore)
+	flatName          string // Claude tool_use name (flatten key)
 	accum             strings.Builder
 	startInput        string
 	sourceBlock       map[string]any
@@ -36,6 +37,7 @@ type claudeDirectBlockState struct {
 	done              bool
 	writtenArgs       int
 	messageOpened     bool
+	responsesItemType string // function_call | custom_tool_call | tool_search_call
 }
 
 // visibilityGatedSSEWriter buffers written SSE bytes until markVisible is
@@ -100,11 +102,11 @@ func (v *visibilityGatedSSEWriter) markVisible() {
 func (v *visibilityGatedSSEWriter) everVisible() bool { return v.visible }
 
 type claudeToResponsesDirectStreamState struct {
-	w               http.ResponseWriter
-	visGate         *visibilityGatedSSEWriter
-	model           string
-	responseID      string
-	clientToolNames map[string]struct{}
+	w       http.ResponseWriter
+	visGate *visibilityGatedSSEWriter
+	model   string
+	responseID string
+	toolCtx *codexToolContext
 
 	seq             int
 	outputIndex     int
@@ -117,15 +119,15 @@ type claudeToResponsesDirectStreamState struct {
 	outputItems []map[string]any
 }
 
-func newClaudeToResponsesDirectStreamState(w http.ResponseWriter, model string, clientToolNames map[string]struct{}) *claudeToResponsesDirectStreamState {
+func newClaudeToResponsesDirectStreamState(w http.ResponseWriter, model string, toolCtx *codexToolContext) *claudeToResponsesDirectStreamState {
 	gate := newVisibilityGatedSSEWriter(w)
 	return &claudeToResponsesDirectStreamState{
-		w:               gate,
-		visGate:         gate,
-		model:           model,
-		responseID:      fmt.Sprintf("resp_%d", time.Now().UnixNano()),
-		clientToolNames: clientToolNames,
-		blocks:          make(map[int]*claudeDirectBlockState),
+		w:          gate,
+		visGate:    gate,
+		model:      model,
+		responseID: fmt.Sprintf("resp_%d", time.Now().UnixNano()),
+		toolCtx:    toolCtx,
+		blocks:     make(map[int]*claudeDirectBlockState),
 	}
 }
 
@@ -242,8 +244,7 @@ func (s *claudeToResponsesDirectStreamState) handleContentBlockStart(event map[s
 		s.visGate.markVisible()
 		outputIndex := s.nextOutputIndex()
 		callID := sanitizeResponsesCallID(stringValue(block["id"]))
-		name := sanitizeResponsesToolName(stringValue(block["name"]), s.clientToolNames)
-		itemID := fmt.Sprintf("fc_%s_%d", s.responseID, outputIndex)
+		flatName := stringValue(block["name"])
 		startInput := ""
 		if input := block["input"]; input != nil {
 			if m, ok := input.(map[string]any); ok && len(m) > 0 {
@@ -252,28 +253,48 @@ func (s *claudeToResponsesDirectStreamState) handleContentBlockStart(event map[s
 				}
 			}
 		}
+		itemID := fmt.Sprintf("fc_%s_%d", s.responseID, outputIndex)
+		item := map[string]any{
+			"id":      itemID,
+			"type":    "function_call",
+			"call_id": callID,
+			"name":    sanitizeResponsesToolName(flatName, nil),
+			"status":  "in_progress",
+		}
+		respType := "function_call"
+		if s.toolCtx != nil {
+			item = s.toolCtx.buildResponsesToolCallItem(itemID, callID, flatName, startInput, "in_progress")
+			respType = stringValue(item["type"])
+			if respType == "" {
+				respType = "function_call"
+			}
+			// Keep item id stable for subsequent deltas/done events.
+			item["id"] = itemID
+		} else {
+			item["name"] = sanitizeResponsesToolName(flatName, nil)
+		}
+		displayName := stringValue(item["name"])
+		if displayName == "" {
+			displayName = flatName
+		}
 		if err := writeResponsesSSEEvent(s.w, "response.output_item.added", map[string]any{
 			"type":            "response.output_item.added",
 			"sequence_number": s.nextSeq(),
 			"output_index":    outputIndex,
-			"item": map[string]any{
-				"id":      itemID,
-				"type":    "function_call",
-				"call_id": callID,
-				"name":    name,
-				"status":  "in_progress",
-			},
+			"item":            item,
 		}); err != nil {
 			return err
 		}
 		s.blocks[index] = &claudeDirectBlockState{
-			kind:        claudeDirectBlockTool,
-			outputIndex: outputIndex,
-			itemID:      itemID,
-			callID:      callID,
-			name:        name,
-			startInput:  startInput,
-			sourceBlock: cloneAnyMap(block),
+			kind:              claudeDirectBlockTool,
+			outputIndex:       outputIndex,
+			itemID:            itemID,
+			callID:            callID,
+			name:              displayName,
+			flatName:          flatName,
+			startInput:        startInput,
+			sourceBlock:       cloneAnyMap(block),
+			responsesItemType: respType,
 		}
 
 	case "thinking", "redacted_thinking":
@@ -348,6 +369,10 @@ func (s *claudeToResponsesDirectStreamState) handleContentBlockDelta(event map[s
 			return nil
 		}
 		block.accum.WriteString(partial)
+		// Custom / tool_search arguments are finalized at close time (cc-switch).
+		if s.toolCtx != nil && s.toolCtx.isCustomOrToolSearchFlatName(block.flatName) {
+			return nil
+		}
 		if err := writeResponsesSSEEvent(s.w, "response.function_call_arguments.delta", map[string]any{
 			"type":            "response.function_call_arguments.delta",
 			"sequence_number": s.nextSeq(),
@@ -450,23 +475,46 @@ func (s *claudeToResponsesDirectStreamState) closeBlock(index int) error {
 		if strings.TrimSpace(args) == "" {
 			args = "{}"
 		}
-		if err := writeResponsesSSEEvent(s.w, "response.function_call_arguments.done", map[string]any{
-			"type":            "response.function_call_arguments.done",
-			"sequence_number": s.nextSeq(),
-			"item_id":         block.itemID,
-			"output_index":    block.outputIndex,
-			"name":            block.name,
-			"arguments":       args,
-		}); err != nil {
-			return err
+		var item map[string]any
+		if s.toolCtx != nil {
+			item = s.toolCtx.buildResponsesToolCallItem(block.itemID, block.callID, block.flatName, args, "completed")
+			item["id"] = block.itemID
+		} else {
+			item = map[string]any{
+				"id":        block.itemID,
+				"type":      "function_call",
+				"call_id":   block.callID,
+				"name":      block.name,
+				"arguments": args,
+				"status":    "completed",
+			}
 		}
-		item := map[string]any{
-			"id":        block.itemID,
-			"type":      "function_call",
-			"call_id":   block.callID,
-			"name":      block.name,
-			"arguments": args,
-			"status":    "completed",
+		itemType := stringValue(item["type"])
+		switch itemType {
+		case "custom_tool_call":
+			input := stringValue(item["input"])
+			if err := writeResponsesSSEEvent(s.w, "response.custom_tool_call_input.done", map[string]any{
+				"type":            "response.custom_tool_call_input.done",
+				"sequence_number": s.nextSeq(),
+				"item_id":         block.itemID,
+				"output_index":    block.outputIndex,
+				"input":           input,
+			}); err != nil {
+				return err
+			}
+		case "tool_search_call":
+			// No partial deltas were streamed; arguments land on the final item.
+		default:
+			if err := writeResponsesSSEEvent(s.w, "response.function_call_arguments.done", map[string]any{
+				"type":            "response.function_call_arguments.done",
+				"sequence_number": s.nextSeq(),
+				"item_id":         block.itemID,
+				"output_index":    block.outputIndex,
+				"name":            stringValue(item["name"]),
+				"arguments":       emptyArgsFallback(stringValue(item["arguments"])),
+			}); err != nil {
+				return err
+			}
 		}
 		if err := writeResponsesSSEEvent(s.w, "response.output_item.done", map[string]any{
 			"type":            "response.output_item.done",
@@ -587,8 +635,8 @@ func (s *claudeToResponsesDirectStreamState) finalize() error {
 
 // streamClaudeToResponsesEventsDirect reads Anthropic Messages SSE and writes
 // OpenAI Responses SSE directly (no Chat intermediate).
-func streamClaudeToResponsesEventsDirect(w http.ResponseWriter, reader io.Reader, model string, clientToolNames map[string]struct{}) (TokenUsage, error) {
-	state := newClaudeToResponsesDirectStreamState(w, model, clientToolNames)
+func streamClaudeToResponsesEventsDirect(w http.ResponseWriter, reader io.Reader, model string, toolCtx *codexToolContext) (TokenUsage, error) {
+	state := newClaudeToResponsesDirectStreamState(w, model, toolCtx)
 
 	// Only tee (buffer) the raw upstream SSE bytes when the near-empty debug
 	// dump is enabled, so this has zero overhead in normal operation.

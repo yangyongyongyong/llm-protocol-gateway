@@ -257,6 +257,22 @@ func responsesToolsToOpenAIChat(tools []any) []any {
 	if len(tools) == 0 {
 		return nil
 	}
+	// Reuse Codex flatten so namespace / tool_search / custom survive the Chat hop.
+	carrier := map[string]any{"tools": tools}
+	ctx := buildCodexToolContextFromRequest(carrier)
+	if claudeTools := ctx.ClaudeTools(); len(claudeTools) > 0 {
+		out := make([]any, 0, len(claudeTools))
+		for _, item := range claudeTools {
+			tool, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			out = append(out, claudeToolToOpenAI(tool))
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
 	out := make([]any, 0, len(tools))
 	for _, item := range tools {
 		tool, ok := item.(map[string]any)

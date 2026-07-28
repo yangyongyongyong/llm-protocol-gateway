@@ -614,7 +614,8 @@ func chatErrorValueToResponses(errorValue any, model string) ([]byte, TokenUsage
 
 // responsesToClaudeRequest converts Responses → Claude directly (no Chat IR).
 func responsesToClaudeRequest(responsesReq map[string]any, model string) (map[string]any, error) {
-	return responsesToClaudeRequestDirect(responsesReq, model, 0)
+	req, _, err := responsesToClaudeRequestDirect(responsesReq, model, 0)
+	return req, err
 }
 
 // claudeToResponsesRequest converts Claude → Responses directly (no Chat IR).
@@ -635,5 +636,5 @@ func claudeToResponsesResponse(claudeBody []byte, model string) ([]byte, TokenUs
 // (pre-cloaking) when converting a non-streamed Claude response back to
 // Responses. Passing nil preserves the legacy behavior.
 func claudeToResponsesResponseWithTools(claudeBody []byte, model string, clientToolNames map[string]struct{}) ([]byte, TokenUsage, error) {
-	return claudeToResponsesResponseDirect(claudeBody, model, clientToolNames)
+	return claudeToResponsesResponseDirect(claudeBody, model, codexToolContextFromClientNames(clientToolNames))
 }

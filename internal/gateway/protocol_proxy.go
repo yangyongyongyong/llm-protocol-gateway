@@ -226,20 +226,18 @@ func (s *Server) proxyResponsesToClaudeMessages(w http.ResponseWriter, r *http.R
 }
 
 func (s *Server) proxyClaudeToResponses(w http.ResponseWriter, r *http.Request, provider domain.Provider, model string, responsesReq map[string]any, skipIncomingAuth bool) (int, TokenUsage, []byte, error) {
-	// Capture the tool names the client (e.g. Codex) actually registered so the
-	// response hop can restore them. Claude OAuth cloaking renames tools to
-	// TitleCase upstream (exec_command → ExecCommand); without the original
-	// names the client receives an unknown tool and reports "unsupported call".
+	// Capture Codex tool context (namespace / custom / tool_search flatten map)
+	// so the response hop can restore identity. Also covers Claude OAuth
+	// TitleCase cloaking via ClientToolNames().
 	model = applyProviderModelMapping(provider, model)
-	clientToolNames := extractOpenAIToolNames(responsesReq)
-	claudeReq, err := responsesToClaudeRequestDirect(responsesReq, model, maxOutputTokensOverrideFrom(r.Context()))
+	claudeReq, toolCtx, err := responsesToClaudeRequestDirect(responsesReq, model, maxOutputTokensOverrideFrom(r.Context()))
 	if err != nil {
 		return 0, TokenUsage{}, nil, err
 	}
 	return s.proxyConvertedThroughClaude(w, r, provider, model, claudeReq, skipIncomingAuth, func(claudeBody []byte, model string) ([]byte, TokenUsage, error) {
-		return claudeToResponsesResponseDirect(claudeBody, model, clientToolNames)
+		return claudeToResponsesResponseDirect(claudeBody, model, toolCtx)
 	}, func(w http.ResponseWriter, reader io.Reader, model string) (TokenUsage, error) {
-		return streamClaudeToResponsesEventsDirect(w, reader, model, clientToolNames)
+		return streamClaudeToResponsesEventsDirect(w, reader, model, toolCtx)
 	})
 }
 
