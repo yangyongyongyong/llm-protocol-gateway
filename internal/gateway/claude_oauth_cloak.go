@@ -199,6 +199,14 @@ func remapClaudeOAuthToolName(name string) (string, bool) {
 	if name == "" {
 		return "", false
 	}
+	// MCP namespaced tools ("mcp__<server>__<tool>") are a protocol convention,
+	// not a "third-party lowercase/snake_case" tool name — PascalCasing them
+	// (mcp__test__ping_server → McpTestPingServer) breaks every MCP server
+	// behind this OAuth route, since the client only recognizes the original
+	// mcp__ name. Leave these untouched.
+	if strings.HasPrefix(name, "mcp__") {
+		return name, false
+	}
 	if mapped, ok := oauthToolRenameMap[strings.ToLower(name)]; ok {
 		return mapped, mapped != name
 	}

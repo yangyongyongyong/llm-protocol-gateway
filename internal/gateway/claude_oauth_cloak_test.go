@@ -39,9 +39,68 @@ func TestRemapClaudeOAuthToolNames(t *testing.T) {
 	}
 }
 
+func TestRemapClaudeOAuthToolNamePreservesMCPNamespacedNames(t *testing.T) {
+	// mcp__<server>__<tool> is a protocol convention (namespacing), not a
+	// "third-party lowercase/snake_case" client tool name; PascalCasing it
+	// (mcp__test__ping_server → McpTestPingServer) breaks every MCP server
+	// behind Claude OAuth, since the client only recognizes the mcp__ form.
+	cases := []string{
+		"mcp__test__ping_server",
+		"mcp__files__read",
+		"mcp__playwright__browser_click",
+	}
+	for _, name := range cases {
+		got, changed := remapClaudeOAuthToolName(name)
+		if changed || got != name {
+			t.Fatalf("remapClaudeOAuthToolName(%q) = (%q, %v); want unchanged", name, got, changed)
+		}
+	}
+
+	payload := map[string]any{
+		"tools": []any{
+			map[string]any{"name": "mcp__test__ping_server", "description": "ping"},
+			map[string]any{"name": "bash"},
+		},
+		"messages": []any{
+			map[string]any{
+				"role": "assistant",
+				"content": []any{
+					map[string]any{"type": "tool_use", "id": "toolu_1", "name": "mcp__test__ping_server"},
+					map[string]any{
+						"type":        "tool_result",
+						"tool_use_id": "toolu_search",
+						"content": []any{
+							map[string]any{"type": "tool_reference", "tool_name": "mcp__test__ping_server"},
+						},
+					},
+				},
+			},
+		},
+	}
+	remapClaudeOAuthToolNames(payload)
+
+	tools := payload["tools"].([]any)
+	if tools[0].(map[string]any)["name"] != "mcp__test__ping_server" {
+		t.Fatalf("mcp tool name changed: %#v", tools[0])
+	}
+	if tools[1].(map[string]any)["name"] != "Bash" {
+		t.Fatalf("expected non-mcp tool still cloaked to Bash, got %#v", tools[1])
+	}
+	blocks := payload["messages"].([]any)[0].(map[string]any)["content"].([]any)
+	toolUse := blocks[0].(map[string]any)
+	if toolUse["name"] != "mcp__test__ping_server" {
+		t.Fatalf("tool_use mcp name changed: %#v", toolUse["name"])
+	}
+	toolResult := blocks[1].(map[string]any)
+	ref := toolResult["content"].([]any)[0].(map[string]any)
+	if ref["tool_name"] != "mcp__test__ping_server" {
+		t.Fatalf("nested tool_reference mcp name changed: %#v", ref["tool_name"])
+	}
+}
+
 func TestApplyClaudeOAuthCloakingReplacesOpenCodeSystem(t *testing.T) {
 	payload := map[string]any{
-		"model": "claude-sonnet-5",
+		"model":  "claude-sonnet-5",
 		"system": "You are OpenCode, the best coding agent on the planet.",
 		"messages": []any{
 			map[string]any{"role": "user", "content": "hello"},
@@ -92,7 +151,7 @@ func TestClaudeOAuthBillingHTTPHeaderValue(t *testing.T) {
 
 func TestSignClaudeOAuthCCH(t *testing.T) {
 	payload := map[string]any{
-		"model": "claude-sonnet-5",
+		"model":  "claude-sonnet-5",
 		"system": buildClaudeOAuthCloakedSystem(),
 		"messages": []any{
 			map[string]any{"role": "user", "content": "hi"},
