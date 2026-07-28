@@ -151,7 +151,7 @@ func pushClaudeToolResult(messages *[]map[string]any, block map[string]any) {
 }
 
 // responsesContentPartToClaudeBlock converts one Responses content part
-// (input_text/output_text/input_image/text) into a Claude content block.
+// (input_text/output_text/input_image/input_file/text) into a Claude content block.
 func responsesContentPartToClaudeBlock(part map[string]any) map[string]any {
 	switch stringValue(part["type"]) {
 	case "input_text", "output_text", "text":
@@ -164,6 +164,8 @@ func responsesContentPartToClaudeBlock(part map[string]any) map[string]any {
 				return claude
 			}
 		}
+	case "input_file":
+		return responsesInputFileToClaudeBlock(part)
 	}
 	return nil
 }
@@ -226,7 +228,7 @@ func responsesInputToClaudeMessages(input any, ctx *codexToolContext) []map[stri
 				if block, ok := decodeAnthropicThinkingBlock(stringValue(item["encrypted_content"])); ok {
 					pushClaudeBlock(&messages, "assistant", block)
 				}
-			case "input_text", "output_text", "text", "input_image":
+			case "input_text", "output_text", "text", "input_image", "input_file":
 				role := firstNonEmpty(stringValue(item["role"]), "user")
 				if role != "assistant" {
 					role = "user"
@@ -348,8 +350,8 @@ func responsesToClaudeRequestDirect(responsesReq map[string]any, model string, m
 	}
 	claudeReq["messages"] = claudeMessages
 
-	// 预算按实际上游 model 参数计算；密钥覆盖 >0 时优先。忽略客户端 max_output_tokens。
-	claudeReq["max_tokens"] = effectiveClaudeMaxTokens(model, maxTokensOverride)
+	// 预算：密钥覆盖 / 模型默认为硬顶；客户端 max_output_tokens 只能下调。
+	claudeReq["max_tokens"] = resolveClaudeMaxTokensFromResponses(responsesReq, model, maxTokensOverride)
 	if stream, ok := responsesReq["stream"].(bool); ok && stream {
 		claudeReq["stream"] = true
 	} else {
@@ -385,6 +387,10 @@ func responsesToClaudeRequestDirect(responsesReq map[string]any, model string, m
 		applyAdaptiveThinking(claudeReq, "high")
 		normalizeClaudeTemperatureForThinking(claudeReq)
 	}
+
+	// text.format → output_config.format (merge after thinking so effort is kept).
+	applyResponsesTextFormatToClaude(responsesReq, claudeReq)
+	applyResponsesParallelToolCallsToClaude(responsesReq, claudeReq)
 
 	return claudeReq, toolCtx, nil
 }

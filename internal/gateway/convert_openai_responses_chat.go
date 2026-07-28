@@ -233,6 +233,8 @@ func responsesInputBlockToChat(block map[string]any) map[string]any {
 			}
 		}
 		if url == "" {
+			// Some clients put a bare URL / data URL on unrelated keys; ignore file_id
+			// (no local Files resolver).
 			return nil
 		}
 		imageURL := map[string]any{"url": url}
@@ -240,6 +242,8 @@ func responsesInputBlockToChat(block map[string]any) map[string]any {
 			imageURL["detail"] = detail
 		}
 		return map[string]any{"type": "image_url", "image_url": imageURL}
+	case "input_file":
+		return responsesInputFileToChatBlock(block)
 	case "image_url", "text":
 		if cloned := cloneAnyMap(block); cloned != nil {
 			return cloned
@@ -502,6 +506,8 @@ func responsesToOpenAIChatRequest(responsesReq map[string]any, model string) (ma
 			chatReq["tool_choice"] = converted
 		}
 	}
+	applyResponsesTextFormatToChat(responsesReq, chatReq)
+	applyResponsesParallelToolCallsToChat(responsesReq, chatReq)
 	return chatReq, toolCtx, nil
 }
 

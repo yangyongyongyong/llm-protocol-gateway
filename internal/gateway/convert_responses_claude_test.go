@@ -34,6 +34,9 @@ func TestResponsesToClaudeRequestDirectBasic(t *testing.T) {
 	if claudeReq["thinking"] == nil {
 		t.Fatalf("thinking should be set for sonnet-5 with high effort")
 	}
+	if got := int(int64FromAny(claudeReq["max_tokens"])); got != 1024 {
+		t.Fatalf("max_tokens should follow client max_output_tokens, got %d", got)
+	}
 }
 
 func TestClaudeToResponsesDirectThinkingRoundTrip(t *testing.T) {
