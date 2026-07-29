@@ -24,9 +24,9 @@ func TestProtocolConversionMatrixImplemented(t *testing.T) {
 				continue
 			}
 			decision := domain.RouteDecision{
-				Action:        "convert",
-				InputProtocol: provider,
-				OutputProtocol: client,
+				Action:          "convert",
+				InputProtocol:   provider,
+				OutputProtocol:  client,
 				ConversionLabel: provider.DisplayName() + " -> " + client.DisplayName(),
 			}
 			if !protocolConversionImplemented(client, decision) {
@@ -92,6 +92,148 @@ func TestOpenAIChatToResponsesRequest(t *testing.T) {
 	reasoning, ok := responsesReq["reasoning"].(map[string]any)
 	if !ok || reasoning["effort"] != "medium" {
 		t.Fatalf("expected reasoning effort medium, got %#v", responsesReq["reasoning"])
+	}
+}
+
+func TestOpenAIChatToResponsesRequestRewritesChatTextParts(t *testing.T) {
+	// Cursor / Chat clients send multimodal-style [{type:text}]; Responses upstream
+	// rejects bare "text" (must be input_text / output_text).
+	chatReq := map[string]any{
+		"model": "gpt-5.5",
+		"messages": []any{
+			map[string]any{"role": "system", "content": "sys"},
+			map[string]any{"role": "user", "content": "plain string context"},
+			map[string]any{
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "text", "text": "hello"},
+				},
+			},
+			map[string]any{
+				"role": "assistant",
+				"content": []any{
+					map[string]any{"type": "text", "text": "hi there"},
+				},
+			},
+			map[string]any{
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "text", "text": "see this"},
+					map[string]any{
+						"type": "image_url",
+						"image_url": map[string]any{
+							"url":    "data:image/png;base64,abc",
+							"detail": "high",
+						},
+					},
+				},
+			},
+		},
+	}
+	responsesReq, err := openAIChatToResponsesRequest(chatReq, "gpt-5.5")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	input, ok := responsesReq["input"].([]any)
+	if !ok || len(input) != 4 {
+		t.Fatalf("expected 4 input items, got %#v", responsesReq["input"])
+	}
+
+	user0, _ := input[0].(map[string]any)
+	parts0, _ := user0["content"].([]any)
+	p0, _ := parts0[0].(map[string]any)
+	if stringValue(p0["type"]) != "input_text" || stringValue(p0["text"]) != "plain string context" {
+		t.Fatalf("user string -> input_text: %#v", p0)
+	}
+
+	user1, _ := input[1].(map[string]any)
+	parts1, _ := user1["content"].([]any)
+	p1, _ := parts1[0].(map[string]any)
+	if stringValue(p1["type"]) != "input_text" || stringValue(p1["text"]) != "hello" {
+		t.Fatalf("user text part -> input_text: %#v", p1)
+	}
+
+	asst, _ := input[2].(map[string]any)
+	partsA, _ := asst["content"].([]any)
+	pa, _ := partsA[0].(map[string]any)
+	if stringValue(pa["type"]) != "output_text" || stringValue(pa["text"]) != "hi there" {
+		t.Fatalf("assistant text part -> output_text: %#v", pa)
+	}
+
+	user2, _ := input[3].(map[string]any)
+	parts2, _ := user2["content"].([]any)
+	if len(parts2) != 2 {
+		t.Fatalf("expected text+image parts, got %#v", parts2)
+	}
+	img, _ := parts2[1].(map[string]any)
+	if stringValue(img["type"]) != "input_image" {
+		t.Fatalf("image_url -> input_image: %#v", img)
+	}
+	if stringValue(img["image_url"]) != "data:image/png;base64,abc" {
+		t.Fatalf("expected image url string, got %#v", img)
+	}
+	if stringValue(img["detail"]) != "high" {
+		t.Fatalf("expected detail high, got %#v", img)
+	}
+}
+
+func TestOpenAIChatToResponsesRequestMapsFileAudioRefusal(t *testing.T) {
+	chatReq := map[string]any{
+		"messages": []any{
+			map[string]any{
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "text", "text": "attach"},
+					map[string]any{
+						"type": "file",
+						"file": map[string]any{
+							"file_id":  "file_123",
+							"filename": "notes.pdf",
+						},
+					},
+					map[string]any{
+						"type": "input_audio",
+						"input_audio": map[string]any{
+							"data":   "AAAA",
+							"format": "wav",
+						},
+					},
+				},
+			},
+			map[string]any{
+				"role": "assistant",
+				"content": []any{
+					map[string]any{"type": "refusal", "refusal": "nope"},
+				},
+			},
+		},
+	}
+	responsesReq, err := openAIChatToResponsesRequest(chatReq, "gpt-5.5")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	input := responsesReq["input"].([]any)
+	user, _ := input[0].(map[string]any)
+	parts := user["content"].([]any)
+	if len(parts) != 3 {
+		t.Fatalf("expected 3 user parts, got %#v", parts)
+	}
+	filePart, _ := parts[1].(map[string]any)
+	if stringValue(filePart["type"]) != "input_file" || stringValue(filePart["file_id"]) != "file_123" {
+		t.Fatalf("file -> input_file: %#v", filePart)
+	}
+	if stringValue(filePart["filename"]) != "notes.pdf" {
+		t.Fatalf("expected filename notes.pdf, got %#v", filePart)
+	}
+	audioPart, _ := parts[2].(map[string]any)
+	if stringValue(audioPart["type"]) != "input_audio" {
+		t.Fatalf("input_audio passthrough: %#v", audioPart)
+	}
+	asst, _ := input[1].(map[string]any)
+	asstParts := asst["content"].([]any)
+	refusal, _ := asstParts[0].(map[string]any)
+	if stringValue(refusal["type"]) != "refusal" || stringValue(refusal["refusal"]) != "nope" {
+		t.Fatalf("refusal mapping: %#v", refusal)
 	}
 }
 

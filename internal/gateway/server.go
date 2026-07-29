@@ -229,6 +229,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /__providers/{id}/self-register", s.handleProviderSelfRegister)
 	mux.HandleFunc("POST /__providers/{id}/self-check/health", s.handleProviderSelfCheckHealth)
 	mux.HandleFunc("POST /__providers/{id}/self-check/chat", s.handleProviderSelfCheckChat)
+	mux.HandleFunc("POST /__providers/{id}/self-check/conformance", s.handleProviderSelfCheckConformance)
+	mux.HandleFunc("POST /__providers/{id}/conformance", s.handleProviderConformance)
 	mux.HandleFunc("GET /__providers/{id}/auth-preview", s.handleProviderAuthPreview)
 	mux.HandleFunc("POST /__providers/{id}/chat-test", s.handleProviderChatTest)
 	mux.HandleFunc("POST /__providers/{id}/cache-test", s.handleProviderCacheTest)

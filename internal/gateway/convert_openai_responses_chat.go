@@ -7,12 +7,197 @@ import (
 	"time"
 )
 
-func normalizeResponsesContent(content any) any {
+func responsesTextBlockType(role string) string {
+	if strings.EqualFold(strings.TrimSpace(role), "assistant") {
+		return "output_text"
+	}
+	return "input_text"
+}
+
+// chatContentBlockToResponses rewrites one Chat Completions content part into a
+// Responses input content part. Aligned with cc-switch convert_messages_to_input /
+// responses_content_to_chat_content (farion1231/cc-switch): Chat uses type=text /
+// image_url / file; Responses expects input_text / output_text / input_image / input_file.
+func chatContentBlockToResponses(block map[string]any, role string) map[string]any {
+	if block == nil {
+		return nil
+	}
+	blockType := strings.TrimSpace(stringValue(block["type"]))
+	switch blockType {
+	case "", "text":
+		text := stringValue(block["text"])
+		if text == "" {
+			return nil
+		}
+		return map[string]any{"type": responsesTextBlockType(role), "text": text}
+	case "input_text", "output_text":
+		text := stringValue(block["text"])
+		if text == "" {
+			return nil
+		}
+		outType := blockType
+		if role == "assistant" && blockType == "input_text" {
+			outType = "output_text"
+		} else if role != "assistant" && blockType == "output_text" {
+			outType = "input_text"
+		}
+		return map[string]any{"type": outType, "text": text}
+	case "refusal":
+		text := firstNonEmpty(stringValue(block["refusal"]), stringValue(block["text"]))
+		if text == "" {
+			return nil
+		}
+		return map[string]any{"type": "refusal", "refusal": text}
+	case "image_url":
+		return chatImageURLToResponsesInputImage(block)
+	case "input_image":
+		// Already Responses-shaped, but Chat clients sometimes nest {url,detail}.
+		if normalized := normalizeResponsesInputImage(block); normalized != nil {
+			return normalized
+		}
+		return nil
+	case "file":
+		return chatFileToResponsesInputFile(block)
+	case "input_file":
+		if cloned := cloneAnyMap(block); cloned != nil {
+			cloned["type"] = "input_file"
+			delete(cloned, "cache_control")
+			return cloned
+		}
+		return nil
+	case "input_audio":
+		if cloned := cloneAnyMap(block); cloned != nil {
+			cloned["type"] = "input_audio"
+			delete(cloned, "cache_control")
+			return cloned
+		}
+		return nil
+	case "computer_screenshot", "summary_text", "tether_browsing_display":
+		if cloned := cloneAnyMap(block); cloned != nil {
+			delete(cloned, "cache_control")
+			return cloned
+		}
+		return nil
+	default:
+		// Unknown Chat part: if it has text, treat as typed text; otherwise drop.
+		if text := stringValue(block["text"]); text != "" {
+			return map[string]any{"type": responsesTextBlockType(role), "text": text}
+		}
+		return nil
+	}
+}
+
+// chatImageURLToResponsesInputImage mirrors cc-switch responses_image_from_chat_media:
+// image_url becomes a string URL with optional top-level detail.
+func chatImageURLToResponsesInputImage(block map[string]any) map[string]any {
+	url := ""
+	detail := ""
+	switch typed := block["image_url"].(type) {
+	case string:
+		url = strings.TrimSpace(typed)
+	case map[string]any:
+		url = strings.TrimSpace(stringValue(typed["url"]))
+		detail = strings.TrimSpace(stringValue(typed["detail"]))
+	}
+	if detail == "" {
+		detail = strings.TrimSpace(stringValue(block["detail"]))
+	}
+	if url == "" {
+		return nil
+	}
+	out := map[string]any{"type": "input_image", "image_url": url}
+	if detail != "" {
+		out["detail"] = detail
+	}
+	return out
+}
+
+func normalizeResponsesInputImage(block map[string]any) map[string]any {
+	switch typed := block["image_url"].(type) {
+	case string:
+		url := strings.TrimSpace(typed)
+		if url == "" {
+			return nil
+		}
+		out := map[string]any{"type": "input_image", "image_url": url}
+		if detail := strings.TrimSpace(stringValue(block["detail"])); detail != "" {
+			out["detail"] = detail
+		}
+		return out
+	case map[string]any:
+		return chatImageURLToResponsesInputImage(map[string]any{
+			"image_url": typed,
+			"detail":    block["detail"],
+		})
+	default:
+		return nil
+	}
+}
+
+// chatFileToResponsesInputFile maps Chat Completions {type:file,file:{...}} to
+// Responses input_file (cc-switch chat_file_from_input_file reverse).
+func chatFileToResponsesInputFile(block map[string]any) map[string]any {
+	out := map[string]any{"type": "input_file"}
+	hasRef := false
+	switch typed := block["file"].(type) {
+	case map[string]any:
+		for _, key := range []string{"file_id", "file_data", "filename", "file_url"} {
+			if v := typed[key]; v != nil && strings.TrimSpace(fmt.Sprint(v)) != "" {
+				out[key] = v
+				if key == "file_id" || key == "file_data" || key == "file_url" {
+					hasRef = true
+				}
+			}
+		}
+	case string:
+		id := strings.TrimSpace(typed)
+		if id != "" {
+			out["file_id"] = id
+			hasRef = true
+		}
+	}
+	// Also accept top-level Responses-ish fields on a Chat "file" part.
+	for _, key := range []string{"file_id", "file_data", "filename", "file_url"} {
+		if _, exists := out[key]; exists {
+			continue
+		}
+		if v := block[key]; v != nil && strings.TrimSpace(fmt.Sprint(v)) != "" {
+			out[key] = v
+			if key == "file_id" || key == "file_data" || key == "file_url" {
+				hasRef = true
+			}
+		}
+	}
+	if !hasRef {
+		return nil
+	}
+	return out
+}
+
+// normalizeChatContentForResponses converts Chat message content into Responses
+// content (string left for setResponsesInput, or a typed part array).
+func normalizeChatContentForResponses(content any, role string) any {
 	switch typed := content.(type) {
 	case string:
 		return typed
 	case []any:
-		return cloneContentBlocks(typed)
+		blocks := make([]any, 0, len(typed))
+		for _, item := range typed {
+			switch part := item.(type) {
+			case string:
+				if text := strings.TrimSpace(part); text != "" {
+					blocks = append(blocks, map[string]any{"type": responsesTextBlockType(role), "text": text})
+				}
+			case map[string]any:
+				if converted := chatContentBlockToResponses(part, role); converted != nil {
+					blocks = append(blocks, converted)
+				}
+			}
+		}
+		if len(blocks) == 0 {
+			return ""
+		}
+		return blocks
 	default:
 		text := strings.TrimSpace(fmt.Sprint(content))
 		if text == "" {
@@ -120,7 +305,10 @@ func inputItemsFromChatMessages(messages []any) ([]any, string, error) {
 		if role == "assistant" {
 			if rawToolCalls, ok := entry["tool_calls"].([]any); ok && len(rawToolCalls) > 0 {
 				if content := entry["content"]; content != nil && !isEmptyOpenAIContent(content) {
-					inputItems = append(inputItems, map[string]any{"role": "assistant", "content": normalizeResponsesContent(content)})
+					inputItems = append(inputItems, map[string]any{
+						"role":    "assistant",
+						"content": normalizeChatContentForResponses(content, "assistant"),
+					})
 				}
 				for _, toolItem := range rawToolCalls {
 					call, ok := toolItem.(map[string]any)
@@ -145,7 +333,7 @@ func inputItemsFromChatMessages(messages []any) ([]any, string, error) {
 		if role != "user" && role != "assistant" {
 			continue
 		}
-		content := normalizeResponsesContent(entry["content"])
+		content := normalizeChatContentForResponses(entry["content"], role)
 		if isEmptyOpenAIContent(content) {
 			continue
 		}
@@ -165,10 +353,15 @@ func setResponsesInput(responsesReq map[string]any, inputItems []any) {
 		if !ok {
 			continue
 		}
-		if text, ok := entry["content"].(string); ok {
+		role := strings.TrimSpace(stringValue(entry["role"]))
+		switch content := entry["content"].(type) {
+		case string:
 			entry["content"] = []any{
-				map[string]any{"type": "input_text", "text": text},
+				map[string]any{"type": responsesTextBlockType(role), "text": content},
 			}
+		case []any:
+			// Defense in depth: rewrite any leftover Chat-shaped parts.
+			entry["content"] = normalizeChatContentForResponses(content, role)
 		}
 	}
 	responsesReq["input"] = inputItems
@@ -214,8 +407,14 @@ func openAIChatToResponsesRequest(chatReq map[string]any, model string) (map[str
 func responsesInputBlockToChat(block map[string]any) map[string]any {
 	blockType := strings.TrimSpace(stringValue(block["type"]))
 	switch blockType {
-	case "input_text", "output_text":
+	case "input_text", "output_text", "text":
 		text := stringValue(block["text"])
+		if text == "" {
+			return nil
+		}
+		return map[string]any{"type": "text", "text": text}
+	case "refusal":
+		text := firstNonEmpty(stringValue(block["refusal"]), stringValue(block["text"]))
 		if text == "" {
 			return nil
 		}
@@ -233,8 +432,6 @@ func responsesInputBlockToChat(block map[string]any) map[string]any {
 			}
 		}
 		if url == "" {
-			// Some clients put a bare URL / data URL on unrelated keys; ignore file_id
-			// (no local Files resolver).
 			return nil
 		}
 		imageURL := map[string]any{"url": url}
@@ -243,8 +440,18 @@ func responsesInputBlockToChat(block map[string]any) map[string]any {
 		}
 		return map[string]any{"type": "image_url", "image_url": imageURL}
 	case "input_file":
+		// Prefer native Chat file parts when file_id/file_data exist (cc-switch).
+		if file := responsesInputFileToChatFile(block); file != nil {
+			return map[string]any{"type": "file", "file": file}
+		}
 		return responsesInputFileToChatBlock(block)
-	case "image_url", "text":
+	case "input_audio":
+		if cloned := cloneAnyMap(block); cloned != nil {
+			cloned["type"] = "input_audio"
+			return cloned
+		}
+		return nil
+	case "image_url":
 		if cloned := cloneAnyMap(block); cloned != nil {
 			return cloned
 		}

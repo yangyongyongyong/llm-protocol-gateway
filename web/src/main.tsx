@@ -1359,32 +1359,28 @@ ${protocolMenu}
   隧道给的公网地址
 - 以后如果想换成另一种协议实现，不用回控制台改，下次注册时把 protocol 换成新值即可
 
-【4. 自检（注册成功后立刻做，方便我确认配置对不对）】
-网关另外提供两个自检接口，都用第 3 步同一个注册令牌鉴权（Authorization: Bearer），
-和登录账号无关：
+【4. 协议 conformance（注册成功后立刻跑，直到必过项全绿）】
+网关提供协议套件诊断（用第 3 步同一个注册令牌鉴权）：
 
-(a) 健康检查——验证网关能不能连通并鉴权成功访问到我的服务：
-    curl -X POST "${originBase}/__providers/${provider.id}/self-check/health" \\
+    curl -X POST "${originBase}/__providers/${provider.id}/self-check/conformance" \\
       -H "Authorization: Bearer ${tokenLine}"
-    返回 {"success": true/false, "status": ..., "latencyMs": ...}。
-    **必须连续调用 3 次、3 次都是 success=true 才算通过**；只要有一次失败就要停下来排查
-    （常见原因：baseUrl 没跟上、SHARED_SECRET 不对、protocol 和 authHeader 没匹配上），
-    不要略过这一步直接进入下一步。
 
-(b) 对话测试——验证完整的请求/响应链路是通的：
-    curl -X POST "${originBase}/__providers/${provider.id}/self-check/chat" \\
-      -H "Authorization: Bearer ${tokenLine}"
-    不需要也不能自定义测试内容，网关固定发送"2+2等于几"这句话，只要拿到一次
-    success=true 就算通过，不用重复调用。
-    返回里的 preview 字段是模型的真实回复，可以打印出来供我人工确认回答是否正常。
+按你声明的 protocol 自动跑：models 鉴权、非流式形状、流式 SSE、usage 字段、
+cache 命中（后两项为建议项）。返回 JSON：
+  - success / passedRequired = true 表示必过项全部通过（可以认为协议合格）
+  - passedAll = true 表示建议项也全过
+  - cases[] 每条含 id/severity/passed/detail/hint
 
-请把这两个自检步骤也写进脚本里：每次注册成功后自动跑一遍（a）和（b），
-在日志里打印清晰的"自检通过/自检失败"结果，方便我不用打开浏览器就知道配置对不对。
+脚本应：注册成功后调用 conformance；若 success=false，根据 cases[].hint 修本地服务，
+再重新调用，直到 success=true。不要无限重试烧 token——改完再测。
+建议项（usage_fields / cache_hit）失败不阻断接入，但控制台缓存命中可能一直为 0。
+
+（可选兼容）仍可用旧的 health×3 与 chat 自检，但新脚本优先只用 conformance。
 
 【5. 整合成一个常驻脚本】
 - 启动本地服务 -> 启动 cloudflared 隧道 -> 解析出公网 URL -> 调用注册接口（带上 protocol）
-  -> 注册成功后跑一遍上面的自检（a）（b） -> 持续监控隧道进程，一旦断线/重启就重新走一遍
-  解析+注册+自检
+  -> 注册成功后跑 conformance 直到 success=true -> 持续监控隧道进程，一旦断线/重启就重新走一遍
+  解析+注册+conformance
 - 可以用 Python/Bash 都行，帮我把这五步串成一个可以后台常驻运行的脚本`;
 }
 
@@ -4794,6 +4790,37 @@ function App() {
     }
   }
 
+  async function runProviderConformance(provider: Provider) {
+    if (provider.authType === 'claude_oauth' || provider.authType === 'cursor_oauth' || provider.authType === 'chatgpt_oauth') {
+      showToast('协议诊断仅支持 Bearer（api_key）自建上游');
+      return;
+    }
+    setTestingProviderID(provider.id);
+    try {
+      const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(provider.id)}/conformance`, { method: 'POST' });
+      if (!response.ok) throw new Error(await response.text());
+      const report = await response.json() as {
+        success?: boolean;
+        passedRequired?: boolean;
+        passedAll?: boolean;
+        summary?: string;
+        requiredPassed?: number;
+        requiredTotal?: number;
+        recommendedPassed?: number;
+        recommendedTotal?: number;
+      };
+      const req = `${report.requiredPassed ?? 0}/${report.requiredTotal ?? 0}`;
+      const rec = `${report.recommendedPassed ?? 0}/${report.recommendedTotal ?? 0}`;
+      showToast(report.success
+        ? `协议诊断通过（必过 ${req} · 建议 ${rec}）${report.passedAll ? ' · 含建议项' : ''}`
+        : `协议诊断未通过：${report.summary || `必过 ${req}`}`);
+    } catch (error) {
+      showToast(`协议诊断失败：${String(error)}`);
+    } finally {
+      setTestingProviderID('');
+    }
+  }
+
   function parseClaudeOAuthInput(raw: string): { code: string; state: string } {
     const trimmed = raw.trim();
     if (!trimmed) return { code: '', state: '' };
@@ -6749,6 +6776,7 @@ function App() {
                         }}
                         onTest={() => void fetchProviderModels(provider.id, provider.name, true)}
                         onChatTest={() => openChatTestForProvider(provider)}
+                        onConformance={() => void runProviderConformance(provider)}
                         onEdit={() => openEditProviderModal(provider)}
                         onClone={() => openCloneProviderModal(provider)}
                         onDelete={() => void deleteProvider(provider.id, provider.name)}
@@ -8375,10 +8403,10 @@ function App() {
               <div className="self-register-panel">
                 <div className="hint-line">
                   适合"用户自己内网穿透暴露服务"的场景：生成专属令牌后，对方脚本可直接调用接口更新
-                  baseUrl / apiKeySource，协议（chat/response/claude 三选一）也由脚本在这次调用里
+                  baseUrl / apiKeySource，协议（chat/responses/claude 三选一）也由脚本在这次调用里
                   声明——这是唯一的协议来源，控制台不提供协议选择/修改入口；还能顺带声明自定义
-                  authHeader，无需登录控制台账号。同一个令牌还能触发两个自检接口（健康检查需连续
-                  3 次成功、对话测试固定问"2+2等于几"成功 1 次即可），方便对方脚本自己确认配置对不对。
+                  authHeader，无需登录控制台账号。同一个令牌应调用协议 conformance
+                  （/self-check/conformance）直到 success=true，按 cases[].hint 修本地实现。
                   令牌只能操作这一个 Provider，改不了别的。是否异常仍按真实请求失败判定，这里不做
                   心跳超时告警。
                 </div>

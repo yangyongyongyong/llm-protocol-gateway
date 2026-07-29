@@ -278,7 +278,9 @@ func isSelfCheckPath(method, path string) bool {
 	if method != http.MethodPost || !strings.HasPrefix(path, "/__providers/") {
 		return false
 	}
-	return strings.HasSuffix(path, "/self-check/health") || strings.HasSuffix(path, "/self-check/chat")
+	return strings.HasSuffix(path, "/self-check/health") ||
+		strings.HasSuffix(path, "/self-check/chat") ||
+		strings.HasSuffix(path, "/self-check/conformance")
 }
 
 // handleProviderSelfCheckHealth lets a self-registered provider's own script

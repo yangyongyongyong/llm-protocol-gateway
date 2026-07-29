@@ -229,10 +229,11 @@ func TestIsUserAllowedPathProviderUsage(t *testing.T) {
 		{http.MethodPost, "/__providers/p1/self-register-token/revoke", true},
 		{http.MethodGet, "/__providers/p1/self-register-token", false},
 		{http.MethodPatch, "/__providers/p1/self-register", false},
-		// self-check（health/chat）跟 self-register 一样完全绕过本中间件走
+		// self-check（health/chat/conformance）跟 self-register 一样完全绕过本中间件走
 		// Bearer 令牌鉴权，见 TestIsSelfCheckPath。
 		{http.MethodPost, "/__providers/p1/self-check/health", false},
 		{http.MethodPost, "/__providers/p1/self-check/chat", false},
+		{http.MethodPost, "/__providers/p1/self-check/conformance", false},
 		{http.MethodPost, "/__providers/export", false},
 		{http.MethodPost, "/__providers/import", false},
 		// PATCH /__providers/export 命中 PATCH /__providers/{id}（id="export"），

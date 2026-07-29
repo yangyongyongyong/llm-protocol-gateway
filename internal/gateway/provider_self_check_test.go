@@ -19,6 +19,7 @@ func TestIsSelfCheckPath(t *testing.T) {
 	}{
 		{http.MethodPost, "/__providers/p1/self-check/health", true},
 		{http.MethodPost, "/__providers/p1/self-check/chat", true},
+		{http.MethodPost, "/__providers/p1/self-check/conformance", true},
 		{http.MethodGet, "/__providers/p1/self-check/health", false},
 		{http.MethodPost, "/__providers/p1/self-register", false},
 		{http.MethodPost, "/__providers/p1/self-register-token", false},

@@ -186,7 +186,7 @@ func isUserProviderManagementPath(method, path string) bool {
 	}
 	if len(parts) == 2 {
 		switch parts[1] {
-		case "test", "chat-test", "cache-test", "thinking-test", "self-register-token":
+		case "test", "chat-test", "cache-test", "thinking-test", "conformance", "self-register-token":
 			return method == http.MethodPost
 		case "auth-preview":
 			return method == http.MethodGet

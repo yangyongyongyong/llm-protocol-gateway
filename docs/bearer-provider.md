@@ -173,12 +173,32 @@ Content-Type: application/json
   loopback / 私网 IP / `localhost` / `*.local` / `*.internal` 等内网目标。
 - 成功回填后会自动清除该 Provider 的"异常"标记。
 
-### 7.3 自检接口（用自注册令牌，供脚本联调）
+### 7.3 协议 conformance（推荐）与旧自检
+机器侧用自注册令牌调用：
 ```
-POST /__providers/{id}/self-check/health   # 连通性+鉴权（等价"获取模型"）
-POST /__providers/{id}/self-check/chat      # 端到端对话（固定 prompt "2+2等于几"）
+POST /__providers/{id}/self-check/conformance
+Authorization: Bearer <自注册令牌>
 ```
-建议脚本对 health 连续调用 3 次并要求全部成功，再认为已正确接入。
+按 Provider 当前 `protocol` 跑一套用例：
+
+| id | 级别 | 含义 |
+| --- | --- | --- |
+| `models` | required | `/models` 鉴权连通 |
+| `nonstream_shape` | required | 非流式 JSON 形状 + 可提取助手文本 |
+| `stream_shape` | required | SSE 事件序列（Chat 需 `[DONE]`；Responses/Claude 需对应事件） |
+| `usage_fields` | recommended | usage 字段齐全（Responses 需 `input_tokens_details.cached_tokens`，即使为 0） |
+| `cache_hit` | recommended | 两轮探测是否回报 cache 命中 |
+
+返回要点：`success`/`passedRequired` 表示必过项全过；`passedAll` 含建议项；`cases[].hint` 给出修复提示。  
+脚本应改完再重跑，直到 `success=true`（不要在网关侧重试死循环）。
+
+控制台会话可用：`POST /__providers/{id}/conformance`（owner/admin）。
+
+兼容旧接口（仍可用）：
+```
+POST /__providers/{id}/self-check/health   # 连通性+鉴权
+POST /__providers/{id}/self-check/chat      # 端到端对话（固定 prompt）
+```
 
 ---
 
@@ -215,5 +235,5 @@ curl -X PATCH https://<网关公网域名>/__providers/<id>/self-register \
 - 模型地址推导：`internal/gateway/server.go`（`deriveModelsURL` / `fetchProviderModels`）
 - 异常判定与后台重探：`internal/gateway/provider_failover.go`
 - 后台恢复循环启动：`internal/app/runtime.go`（`StartProviderFailoverRecovery`）
-- 自注册 / 自检：`internal/gateway/provider_self_register.go`
+- 自注册 / 自检 / conformance：`internal/gateway/provider_self_register.go`、`provider_conformance.go`
 - thinking 签名整流器：`internal/gateway/thinking_rectifier.go`

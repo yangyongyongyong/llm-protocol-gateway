@@ -331,6 +331,30 @@ func responsesInputFileToChatBlock(part map[string]any) map[string]any {
 	return nil
 }
 
+// responsesInputFileToChatFile mirrors cc-switch chat_file_from_input_file:
+// only emit a native Chat file payload when file_id or file_data is present.
+func responsesInputFileToChatFile(part map[string]any) map[string]any {
+	if part == nil {
+		return nil
+	}
+	fileID := strings.TrimSpace(stringValue(part["file_id"]))
+	fileData := strings.TrimSpace(stringValue(part["file_data"]))
+	if fileID == "" && fileData == "" {
+		return nil
+	}
+	out := map[string]any{}
+	if fileID != "" {
+		out["file_id"] = fileID
+	}
+	if fileData != "" {
+		out["file_data"] = fileData
+	}
+	if name := strings.TrimSpace(stringValue(part["filename"])); name != "" {
+		out["filename"] = name
+	}
+	return out
+}
+
 func mediaTypeFromFilename(name string) string {
 	name = strings.ToLower(strings.TrimSpace(name))
 	switch {
