@@ -5,7 +5,10 @@ package gateway
 /*
 #cgo LDFLAGS: -framework CoreFoundation -framework IOKit
 #include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <mach/mach.h>
@@ -152,8 +155,142 @@ static int gw_read_if_counters(gw_if_counter_t *out, int max) {
 	freeifaddrs(head);
 	return n;
 }
+
+// ---- AppleSMC fan RPM (80-byte SMCKeyData protocol) --------------------
+
+typedef struct { uint8_t major, minor, build, reserved; uint16_t release; } gw_smc_version_t;
+typedef struct { uint16_t version, length; uint32_t cpu_plimit, gpu_plimit, mem_plimit; } gw_smc_plimit_t;
+typedef struct { uint32_t dataSize; uint32_t dataType; uint8_t dataAttributes; } gw_smc_keyinfo_t;
+typedef struct {
+	uint32_t key;
+	gw_smc_version_t vers;
+	gw_smc_plimit_t pLimitData;
+	gw_smc_keyinfo_t keyInfo;
+	uint8_t result;
+	uint8_t status;
+	uint8_t data8;
+	uint32_t data32;
+	uint8_t bytes[32];
+} gw_smc_keydata_t;
+
+enum {
+	gw_kSMCHandleYPCEvent = 2,
+	gw_kSMCReadKey = 5,
+	gw_kSMCGetKeyInfo = 9
+};
+
+typedef struct {
+	int    id;
+	char   name[32];
+	double rpm;
+	double min_rpm;
+	double max_rpm;
+} gw_fan_t;
+
+static uint32_t gw_smc_fourcc(const char *s) {
+	return ((uint32_t)(unsigned char)s[0] << 24) |
+		((uint32_t)(unsigned char)s[1] << 16) |
+		((uint32_t)(unsigned char)s[2] << 8) |
+		(uint32_t)(unsigned char)s[3];
+}
+
+static int gw_smc_call(io_connect_t conn, uint32_t selector, gw_smc_keydata_t *in, gw_smc_keydata_t *out) {
+	size_t outsz = sizeof(*out);
+	return IOConnectCallStructMethod(conn, selector, in, sizeof(*in), out, &outsz) == KERN_SUCCESS;
+}
+
+static int gw_smc_read_key(io_connect_t conn, const char *key, uint8_t *buf, uint32_t *size, uint32_t *type) {
+	gw_smc_keydata_t in, out;
+	memset(&in, 0, sizeof(in));
+	memset(&out, 0, sizeof(out));
+	in.key = gw_smc_fourcc(key);
+	in.data8 = gw_kSMCGetKeyInfo;
+	if (!gw_smc_call(conn, gw_kSMCHandleYPCEvent, &in, &out) || out.result != 0) return 0;
+	*size = out.keyInfo.dataSize;
+	*type = out.keyInfo.dataType;
+	memset(&in, 0, sizeof(in));
+	memset(&out, 0, sizeof(out));
+	in.key = gw_smc_fourcc(key);
+	in.keyInfo.dataSize = *size;
+	in.data8 = gw_kSMCReadKey;
+	if (!gw_smc_call(conn, gw_kSMCHandleYPCEvent, &in, &out) || out.result != 0) return 0;
+	if (*size > 32) *size = 32;
+	memcpy(buf, out.bytes, *size);
+	return 1;
+}
+
+static int gw_smc_read_float(io_connect_t conn, const char *key, double *out) {
+	uint8_t buf[32];
+	uint32_t size = 0, type = 0;
+	if (!gw_smc_read_key(conn, key, buf, &size, &type) || size == 0) return 0;
+	if (type == gw_smc_fourcc("flt ") && size >= 4) {
+		float f;
+		memcpy(&f, buf, 4);
+		*out = (double)f;
+		return 1;
+	}
+	if (type == gw_smc_fourcc("fpe2") && size >= 2) {
+		*out = (double)(((uint16_t)buf[0] << 8) | buf[1]) / 4.0;
+		return 1;
+	}
+	if (type == gw_smc_fourcc("ui8 ") && size >= 1) {
+		*out = (double)buf[0];
+		return 1;
+	}
+	if (type == gw_smc_fourcc("ui16") && size >= 2) {
+		*out = (double)(((uint16_t)buf[0] << 8) | buf[1]);
+		return 1;
+	}
+	return 0;
+}
+
+static int gw_smc_read_u8(io_connect_t conn, const char *key, int *out) {
+	double v = 0;
+	if (!gw_smc_read_float(conn, key, &v)) return 0;
+	*out = (int)v;
+	return 1;
+}
+
+// gw_read_fans fills out[] with up to max fans from AppleSMC. Returns count or -1.
+static int gw_read_fans(gw_fan_t *out, int max) {
+	if (!out || max <= 0) return -1;
+	io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"));
+	if (!svc) return -1;
+	io_connect_t conn = 0;
+	kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
+	IOObjectRelease(svc);
+	if (kr != KERN_SUCCESS || !conn) return -1;
+
+	int nFans = 0;
+	if (!gw_smc_read_u8(conn, "FNum", &nFans) || nFans <= 0) {
+		IOServiceClose(conn);
+		return 0;
+	}
+	if (nFans > max) nFans = max;
+
+	int n = 0;
+	for (int i = 0; i < nFans; i++) {
+		char kAc[5], kMn[5], kMx[5];
+		snprintf(kAc, sizeof(kAc), "F%dAc", i);
+		snprintf(kMn, sizeof(kMn), "F%dMn", i);
+		snprintf(kMx, sizeof(kMx), "F%dMx", i);
+		double rpm = 0, minv = 0, maxv = 0;
+		if (!gw_smc_read_float(conn, kAc, &rpm)) continue;
+		(void)gw_smc_read_float(conn, kMn, &minv);
+		(void)gw_smc_read_float(conn, kMx, &maxv);
+		out[n].id = i;
+		snprintf(out[n].name, sizeof(out[n].name), "Fan %d", i);
+		out[n].rpm = rpm;
+		out[n].min_rpm = minv;
+		out[n].max_rpm = maxv;
+		n++;
+	}
+	IOServiceClose(conn);
+	return n;
+}
 */
 import "C"
+import "math"
 
 const darwinMaxTempSensors = 128
 
@@ -199,6 +336,37 @@ func darwinReadInterfaceCounters() []interfaceCounter {
 			Name: C.GoString(&buf[i].name[0]),
 			RX:   uint64(buf[i].rx),
 			TX:   uint64(buf[i].tx),
+		})
+	}
+	return out
+}
+
+const darwinMaxFans = 8
+
+// darwinReadFans returns chassis fan RPM readings via AppleSMC (no root required for reads).
+func darwinReadFans() []HostFanSpeed {
+	buf := make([]C.gw_fan_t, darwinMaxFans)
+	n := int(C.gw_read_fans(&buf[0], C.int(darwinMaxFans)))
+	if n <= 0 {
+		return nil
+	}
+	out := make([]HostFanSpeed, 0, n)
+	for i := 0; i < n; i++ {
+		rpm := float64(buf[i].rpm)
+		minRPM := float64(buf[i].min_rpm)
+		maxRPM := float64(buf[i].max_rpm)
+		name := C.GoString(&buf[i].name[0])
+		if n == 1 {
+			name = "系统风扇"
+		}
+		out = append(out, HostFanSpeed{
+			ID:      int(buf[i].id),
+			Name:    name,
+			RPM:     math.Round(rpm),
+			MinRPM:  math.Round(minRPM),
+			MaxRPM:  math.Round(maxRPM),
+			Percent: roundTemp(fanSpeedPercent(rpm, minRPM, maxRPM)),
+			Source:  "smc",
 		})
 	}
 	return out

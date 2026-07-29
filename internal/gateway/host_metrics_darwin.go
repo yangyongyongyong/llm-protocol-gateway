@@ -5,7 +5,6 @@ package gateway
 import (
 	"context"
 	"encoding/binary"
-	"math"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -73,6 +72,8 @@ func collectHostMetrics(prev any) hostMetricsCollectResult {
 	}
 	m.SwapTotal, m.SwapUsed = darwinSwapUsage()
 	m.applyDiskRoot()
+	applyDiskTemps(&m)
+	applyFanSpeeds(&m)
 	m.UptimeSeconds = darwinUptimeSeconds()
 	m.applyProcess()
 
@@ -256,8 +257,6 @@ func pickCPUTempFromSensors(readings []tempSensorReading) (float64, string, bool
 }
 
 func isPlausibleCPUTemp(v float64) bool { return v > 1 && v < 150 }
-
-func roundTemp(v float64) float64 { return math.Round(v*10) / 10 }
 
 // darwinThermalPressure reads Nominal/Fair/Serious/Critical via the "thermal" sampler
 // (still present on macOS 15+/26 when "smc" Celsius is gone).

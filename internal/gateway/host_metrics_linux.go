@@ -63,6 +63,8 @@ func collectHostMetrics(prev any) hostMetricsCollectResult {
 	}
 	m.SwapTotal, m.SwapUsed = parseProcSwap(readFileQuiet("/proc/meminfo"))
 	m.applyDiskRoot()
+	applyDiskTemps(&m)
+	applyFanSpeeds(&m)
 	m.UptimeSeconds = linuxUptimeSeconds()
 	m.applyProcess()
 

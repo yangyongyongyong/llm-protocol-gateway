@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"math"
 	"net/http"
 	"os"
 	"runtime"
@@ -51,6 +52,12 @@ type HostMetrics struct {
 	DiskPercent   float64 `json:"diskPercent,omitempty"`
 	DiskAvailable bool    `json:"diskAvailable"`
 
+	// Physical disk temperatures (SMART / NVMe), when smartctl is available.
+	DiskTemps []HostDiskTemp `json:"diskTemps,omitempty"`
+
+	// Chassis / CPU fans (SMC on macOS, hwmon on Linux).
+	Fans []HostFanSpeed `json:"fans,omitempty"`
+
 	// Network counters since boot + per-second rates across samples.
 	NetRxBytes    uint64  `json:"netRxBytes,omitempty"`
 	NetTxBytes    uint64  `json:"netTxBytes,omitempty"`
@@ -69,6 +76,37 @@ type HostMetrics struct {
 	ProcessHeapMiB float64 `json:"processHeapMiB,omitempty"`
 
 	CollectedAt time.Time `json:"collectedAt"`
+}
+
+// HostDiskTemp is one physical disk's temperature reading for the machine page.
+type HostDiskTemp struct {
+	Device   string  `json:"device"`             // e.g. disk0 / nvme0n1
+	Model    string  `json:"model,omitempty"`    // SMART / MediaName
+	TempC    float64 `json:"tempC"`              // Celsius
+	Internal *bool   `json:"internal,omitempty"` // darwin: built-in vs external
+	Source   string  `json:"source,omitempty"`   // smartctl/nvme, smartctl/ata, …
+}
+
+// HostFanSpeed is one chassis/CPU fan reading for the machine page.
+type HostFanSpeed struct {
+	ID      int     `json:"id"`
+	Name    string  `json:"name,omitempty"`
+	RPM     float64 `json:"rpm"`
+	MinRPM  float64 `json:"minRpm,omitempty"`
+	MaxRPM  float64 `json:"maxRpm,omitempty"`
+	Percent float64 `json:"percent"` // 0–100, relative to min..max (or 0..max)
+	Source  string  `json:"source,omitempty"`
+}
+
+// fanSpeedPercent maps actual RPM into 0–100 using the fan's usable range.
+func fanSpeedPercent(rpm, minRPM, maxRPM float64) float64 {
+	if maxRPM > minRPM && minRPM >= 0 {
+		return clampFloat((rpm-minRPM)/(maxRPM-minRPM)*100, 0, 100)
+	}
+	if maxRPM > 0 {
+		return clampFloat(rpm/maxRPM*100, 0, 100)
+	}
+	return 0
 }
 
 // netCounters is a cumulative byte snapshot used to derive per-second rates.
@@ -254,6 +292,8 @@ func clampFloat(v, lo, hi float64) float64 {
 	}
 	return v
 }
+
+func roundTemp(v float64) float64 { return math.Round(v*10) / 10 }
 
 func parsePowermetricsCPUTemp(out []byte) (float64, bool) {
 	for _, line := range bytes.Split(out, []byte("\n")) {

@@ -123,6 +123,8 @@ type HostMetrics = {
   diskUsed?: number;
   diskPercent?: number;
   diskAvailable?: boolean;
+  diskTemps?: HostDiskTemp[];
+  fans?: HostFanSpeed[];
   netRxBytes?: number;
   netTxBytes?: number;
   netRxRate?: number;
@@ -137,6 +139,24 @@ type HostMetrics = {
   goroutines?: number;
   processHeapMiB?: number;
   collectedAt?: string;
+};
+
+type HostDiskTemp = {
+  device: string;
+  model?: string;
+  tempC: number;
+  internal?: boolean;
+  source?: string;
+};
+
+type HostFanSpeed = {
+  id: number;
+  name?: string;
+  rpm: number;
+  minRpm?: number;
+  maxRpm?: number;
+  percent: number;
+  source?: string;
 };
 
 type ClaudeOAuthInfo = {
@@ -2608,6 +2628,37 @@ function hostTempMetric(hostMetrics: HostMetrics | null): { value: string; note:
     };
   }
   return { value: '—', note: '本机未暴露温度传感器' };
+}
+
+function diskTempLabel(disk: HostDiskTemp, index: number, total: number): string {
+  if (disk.internal === true) return '内置硬盘温度';
+  if (disk.internal === false) return '外置硬盘温度';
+  if (total > 1) return `硬盘温度 ${index + 1}`;
+  return '硬盘温度';
+}
+
+function diskTempNote(disk: HostDiskTemp): string {
+  const parts: string[] = [];
+  if (disk.model) parts.push(disk.model);
+  if (disk.device) parts.push(disk.device);
+  return parts.join(' · ') || (disk.source ? `来源 ${disk.source}` : 'SMART');
+}
+
+function fanSpeedLabel(fan: HostFanSpeed, index: number, total: number): string {
+  if (fan.name) return fan.name;
+  if (total > 1) return `风扇 ${index + 1}`;
+  return '风扇转速';
+}
+
+function fanSpeedNote(fan: HostFanSpeed): string {
+  const parts: string[] = [];
+  if (fan.minRpm != null && fan.maxRpm != null && fan.maxRpm > 0) {
+    parts.push(`${Math.round(fan.minRpm)}–${Math.round(fan.maxRpm)} RPM`);
+  }
+  if (Number.isFinite(fan.percent)) {
+    parts.push(`${fan.percent.toFixed(0)}%`);
+  }
+  return parts.join(' · ') || (fan.source ? `来源 ${fan.source}` : 'SMC');
 }
 
 function formatLocalISODate(date: Date) {
@@ -7788,6 +7839,19 @@ function App() {
                   : '读取中…'}
               />
               <MachineMetric label="CPU 温度" value={hostTemp.value} note={hostTemp.note} />
+              {hostMetrics?.fans && hostMetrics.fans.length > 0 ? (
+                hostMetrics.fans.map((fan, index, list) => (
+                  <MachineMetric
+                    key={`fan-${fan.id}-${index}`}
+                    label={fanSpeedLabel(fan, index, list.length)}
+                    value={`${Math.round(fan.rpm).toLocaleString()} RPM`}
+                    percent={fan.percent}
+                    note={fanSpeedNote(fan)}
+                  />
+                ))
+              ) : hostMetrics ? (
+                <MachineMetric label="风扇转速" value="—" note="未检测到风扇（或本机无风扇）" />
+              ) : null}
               <MachineMetric
                 label="内存占用"
                 value={hostMetrics?.memAvailable ? `${(hostMetrics.memPercent ?? 0).toFixed(0)}%` : '—'}
@@ -7804,6 +7868,18 @@ function App() {
                   ? `${formatBytes(hostMetrics.diskUsed)} / ${formatBytes(hostMetrics.diskTotal)} · 根分区`
                   : '本机未提供磁盘指标'}
               />
+              {hostMetrics?.diskTemps && hostMetrics.diskTemps.length > 0 ? (
+                hostMetrics.diskTemps.map((disk, index, list) => (
+                  <MachineMetric
+                    key={disk.device || `disk-temp-${index}`}
+                    label={diskTempLabel(disk, index, list.length)}
+                    value={`${disk.tempC.toFixed(0)}°C`}
+                    note={diskTempNote(disk)}
+                  />
+                ))
+              ) : hostMetrics ? (
+                <MachineMetric label="硬盘温度" value="—" note="未检测到（需安装 smartctl）" />
+              ) : null}
               <MachineMetric
                 label="网络下行"
                 value={hostMetrics?.netRateReady ? formatRate(hostMetrics.netRxRate) : '—'}
