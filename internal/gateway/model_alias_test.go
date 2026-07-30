@@ -48,6 +48,19 @@ func TestResolveConsumerModelLogsAliasMapping(t *testing.T) {
 	}
 }
 
+func TestFinalizeRequestLogModelKeepsAliasAfterFailover(t *testing.T) {
+	got := finalizeRequestLogModel("luca-glm5.2 -> glm5.2", "glm5.2", "glm5.2-backup")
+	if got != "luca-glm5.2 -> glm5.2-backup" {
+		t.Fatalf("got=%q", got)
+	}
+	if got := finalizeRequestLogModel("glm5.2", "glm5.2", "glm5.2"); got != "glm5.2" {
+		t.Fatalf("passthrough got=%q", got)
+	}
+	if got := finalizeRequestLogModel("", "glm5.2", ""); got != "glm5.2" {
+		t.Fatalf("empty logModel got=%q", got)
+	}
+}
+
 func TestResolveModelOverrideAlwaysWins(t *testing.T) {
 	router := NewRouter(domain.GatewayState{
 		Providers: []domain.Provider{{ID: "p1", DefaultModel: "default-model"}},

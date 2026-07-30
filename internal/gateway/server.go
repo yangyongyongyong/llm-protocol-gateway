@@ -2958,7 +2958,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestModel, _ := req["model"].(string)
-	model, _ := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
+	model, logModel := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
 	r = attachAPIKeyMaxOutputTokens(r, matchedKey, gatewayKeyMatched)
 	thinkingOverride := ""
 	if gatewayKeyMatched {
@@ -2967,7 +2967,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	stream, _ := req["stream"].(bool)
 	if s.rejectIfStreamDisabledForKey(w, gatewayKeyMatched, matchedKey, stream, domain.ProtocolOpenAIChat) {
-		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, model, "rejected", "stream disabled", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, []byte(`stream disabled`))
+		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, finalizeRequestLogModel(logModel, model, model), "rejected", "stream disabled", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, []byte(`stream disabled`))
 		return
 	}
 	status := http.StatusOK
@@ -2987,20 +2987,21 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		timing.markPrepReady()
 	}
 	status, usage, responseLog, decision, effectiveModel, err := s.executeProtocolFlowWithFailover(wrapTTFTWriterWithTiming(w, started, &ttftMs, timing), r, route, decision, model, req, domain.ProtocolOpenAIChat, gatewayKeyMatched, matchedKey, gatewayKeyMatched)
+	logModel = finalizeRequestLogModel(logModel, model, effectiveModel)
 	if err != nil {
 		if isClientCanceled(r, err) {
 			s.logs.AddApp("info", "chat request canceled by client", err.Error())
-			s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, effectiveModel, decision.Action, decision.ConversionLabel, r.URL.Path, statusClientClosedRequest, usage, ttftMs, body, []byte(err.Error()))
+			s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, decision.Action, decision.ConversionLabel, r.URL.Path, statusClientClosedRequest, usage, ttftMs, body, []byte(err.Error()))
 			return
 		}
 		s.logs.AddApp("error", "chat request failed", err.Error())
-		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, effectiveModel, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
+		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
 		writeOpenAIError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, effectiveModel, decision.Action, decision.ConversionLabel, r.URL.Path, status, usage, ttftMs, body, responseLog)
-	s.logs.AddApp("debug", "handled chat request", fmt.Sprintf("route=%s model=%s status=%d", route.ID, effectiveModel, status))
-	slog.Info("handled chat request", "route", route.ID, "model", effectiveModel, "action", decision.Action, "stream", stream)
+	s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, decision.Action, decision.ConversionLabel, r.URL.Path, status, usage, ttftMs, body, responseLog)
+	s.logs.AddApp("debug", "handled chat request", fmt.Sprintf("route=%s model=%s status=%d", route.ID, logModel, status))
+	slog.Info("handled chat request", "route", route.ID, "model", logModel, "action", decision.Action, "stream", stream)
 }
 
 func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
@@ -3060,7 +3061,7 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestModel, _ := req["model"].(string)
-	model, _ := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
+	model, logModel := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
 	r = attachAPIKeyMaxOutputTokens(r, matchedKey, gatewayKeyMatched)
 	thinkingOverride := ""
 	if gatewayKeyMatched {
@@ -3069,7 +3070,7 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 
 	stream, _ := req["stream"].(bool)
 	if s.rejectIfStreamDisabledForKey(w, gatewayKeyMatched, matchedKey, stream, domain.ProtocolOpenAIResponses) {
-		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, model, "rejected", "stream disabled", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, []byte(`stream disabled`))
+		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, finalizeRequestLogModel(logModel, model, model), "rejected", "stream disabled", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, []byte(`stream disabled`))
 		return
 	}
 	status := http.StatusOK
@@ -3085,20 +3086,21 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		timing.markPrepReady()
 	}
 	status, usage, responseLog, decision, effectiveModel, err := s.executeProtocolFlowWithFailover(wrapTTFTWriterWithTiming(w, started, &ttftMs, timing), r, route, decision, model, req, domain.ProtocolOpenAIResponses, gatewayKeyMatched, matchedKey, gatewayKeyMatched)
+	logModel = finalizeRequestLogModel(logModel, model, effectiveModel)
 	if err != nil {
 		if isClientCanceled(r, err) {
 			s.logs.AddApp("info", "responses request canceled by client", err.Error())
-			s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, effectiveModel, decision.Action, decision.ConversionLabel, r.URL.Path, statusClientClosedRequest, usage, ttftMs, body, []byte(err.Error()))
+			s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, decision.Action, decision.ConversionLabel, r.URL.Path, statusClientClosedRequest, usage, ttftMs, body, []byte(err.Error()))
 			return
 		}
 		s.logs.AddApp("error", "responses request failed", err.Error())
-		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, effectiveModel, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
+		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": err.Error(), "type": "gateway_error"}})
 		return
 	}
-	s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, effectiveModel, decision.Action, decision.ConversionLabel, r.URL.Path, status, usage, ttftMs, body, responseLog)
-	s.logs.AddApp("debug", "handled responses request", fmt.Sprintf("route=%s model=%s status=%d", route.ID, effectiveModel, status))
-	slog.Info("handled responses request", "route", route.ID, "model", effectiveModel, "action", decision.Action, "stream", stream)
+	s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, decision.Action, decision.ConversionLabel, r.URL.Path, status, usage, ttftMs, body, responseLog)
+	s.logs.AddApp("debug", "handled responses request", fmt.Sprintf("route=%s model=%s status=%d", route.ID, logModel, status))
+	slog.Info("handled responses request", "route", route.ID, "model", logModel, "action", decision.Action, "stream", stream)
 }
 
 func (s *Server) handleOpenAIImagesGenerations(w http.ResponseWriter, r *http.Request) {
@@ -3154,10 +3156,14 @@ func (s *Server) handleOpenAIImagesGenerations(w http.ResponseWriter, r *http.Re
 	}
 
 	requestModel, _ := req["model"].(string)
-	model, _ := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
+	model, logModel := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
 	if strings.TrimSpace(model) == "" {
 		model = "gpt-image-2"
+		if strings.TrimSpace(logModel) == "" || logModel == "request-model-not-set" {
+			logModel = model
+		}
 	}
+	logModel = finalizeRequestLogModel(logModel, model, model)
 	req["model"] = model
 	body, err = json.Marshal(req)
 	if err != nil {
@@ -3174,13 +3180,13 @@ func (s *Server) handleOpenAIImagesGenerations(w http.ResponseWriter, r *http.Re
 	status, usage, responseLog, err := s.proxyOpenAIImages(w, r, provider, model, body, gatewayKeyMatched)
 	if err != nil {
 		s.logs.AddApp("error", "image generation request failed", err.Error())
-		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, "pass_through", "images/generations", r.URL.Path, http.StatusBadGateway, usage, body, []byte(err.Error()))
+		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, "pass_through", "images/generations", r.URL.Path, http.StatusBadGateway, usage, body, []byte(err.Error()))
 		writeOpenAIError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, "pass_through", "images/generations", r.URL.Path, status, usage, body, responseLog)
-	s.logs.AddApp("debug", "handled image generation request", fmt.Sprintf("route=%s model=%s status=%d", route.ID, model, status))
-	slog.Info("handled image generation request", "route", route.ID, "model", model, "status", status)
+	s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, "pass_through", "images/generations", r.URL.Path, status, usage, body, responseLog)
+	s.logs.AddApp("debug", "handled image generation request", fmt.Sprintf("route=%s model=%s status=%d", route.ID, logModel, status))
+	slog.Info("handled image generation request", "route", route.ID, "model", logModel, "status", status)
 }
 
 // handleClaudeMessages serves POST /anthropic/v1/messages, the native
@@ -3249,12 +3255,12 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestModel, _ := req["model"].(string)
-	model, _ := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
+	model, logModel := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
 	r = attachAPIKeyMaxOutputTokens(r, matchedKey, gatewayKeyMatched)
 
 	stream, _ := req["stream"].(bool)
 	if s.rejectIfStreamDisabledForKey(w, gatewayKeyMatched, matchedKey, stream, domain.ProtocolClaude) {
-		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, model, "rejected", "stream disabled", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, []byte(`stream disabled`))
+		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, finalizeRequestLogModel(logModel, model, model), "rejected", "stream disabled", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, []byte(`stream disabled`))
 		return
 	}
 	status := http.StatusOK
@@ -3267,19 +3273,20 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 		timing.markPrepReady()
 	}
 	status, usage, responseLog, decision, effectiveModel, err := s.executeProtocolFlowWithFailover(wrapTTFTWriterWithTiming(w, started, &ttftMs, timing), r, route, decision, model, req, domain.ProtocolClaude, gatewayKeyMatched, matchedKey, gatewayKeyMatched)
+	logModel = finalizeRequestLogModel(logModel, model, effectiveModel)
 	if err != nil {
 		if isClientCanceled(r, err) {
 			s.logs.AddApp("info", "claude messages canceled by client", err.Error())
-			s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, effectiveModel, decision.Action, decision.ConversionLabel, r.URL.Path, statusClientClosedRequest, usage, ttftMs, body, []byte(err.Error()))
+			s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, decision.Action, decision.ConversionLabel, r.URL.Path, statusClientClosedRequest, usage, ttftMs, body, []byte(err.Error()))
 			return
 		}
 		s.logs.AddApp("error", "claude messages request failed", err.Error())
-		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, effectiveModel, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
+		s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, decision.Action, decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, usage, ttftMs, body, []byte(err.Error()))
 		writeClaudeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, effectiveModel, decision.Action, decision.ConversionLabel, r.URL.Path, status, usage, ttftMs, body, responseLog)
-	s.logs.AddApp("debug", "handled claude messages request", fmt.Sprintf("route=%s model=%s status=%d stream=%v", route.ID, effectiveModel, status, stream))
+	s.recordRequestLogFromRequestTTFT(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, decision.Action, decision.ConversionLabel, r.URL.Path, status, usage, ttftMs, body, responseLog)
+	s.logs.AddApp("debug", "handled claude messages request", fmt.Sprintf("route=%s model=%s status=%d stream=%v", route.ID, logModel, status, stream))
 }
 
 // handleClaudeCountTokens proxies Anthropic's token counting endpoint, which
@@ -3320,11 +3327,12 @@ func (s *Server) handleClaudeCountTokens(w http.ResponseWriter, r *http.Request)
 	}
 
 	requestModel, _ := req["model"].(string)
-	model, _ := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
+	model, logModel := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
 	if model == "" || model == "request-model-not-set" {
 		writeClaudeError(w, http.StatusBadRequest, "model is required")
 		return
 	}
+	logModel = finalizeRequestLogModel(logModel, model, model)
 	req["model"] = model
 	upstreamBody, err := json.Marshal(req)
 	if err != nil {
@@ -3339,7 +3347,7 @@ func (s *Server) handleClaudeCountTokens(w http.ResponseWriter, r *http.Request)
 	}
 	status, responseBody, err := s.proxyClaudeCountTokens(r, provider, upstreamBody)
 	if err != nil {
-		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, "pass_through", decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, TokenUsage{}, body, []byte(err.Error()))
+		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, "pass_through", decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, TokenUsage{}, body, []byte(err.Error()))
 		writeClaudeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
@@ -3348,7 +3356,7 @@ func (s *Server) handleClaudeCountTokens(w http.ResponseWriter, r *http.Request)
 	}
 	w.WriteHeader(status)
 	_, _ = w.Write(responseBody)
-	s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, model, "pass_through", decision.ConversionLabel, r.URL.Path, status, TokenUsage{}, body, responseBody)
+	s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, "pass_through", decision.ConversionLabel, r.URL.Path, status, TokenUsage{}, body, responseBody)
 }
 
 func (s *Server) resolveClaudeConsumerRoute(r *http.Request) (domain.Route, domain.APIKey, bool, error) {

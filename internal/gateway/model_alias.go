@@ -83,6 +83,26 @@ func resolveConsumerModel(router *Router, route domain.Route, key domain.APIKey,
 	return model, logModel
 }
 
+// finalizeRequestLogModel keeps "alias -> real" in API logs when a mapping was
+// applied, while reflecting the effective upstream model (e.g. after failover).
+func finalizeRequestLogModel(logModel, resolvedModel, effectiveModel string) string {
+	effective := strings.TrimSpace(effectiveModel)
+	if effective == "" {
+		effective = strings.TrimSpace(resolvedModel)
+	}
+	logModel = strings.TrimSpace(logModel)
+	if logModel == "" {
+		return effective
+	}
+	if alias, _, ok := strings.Cut(logModel, " -> "); ok {
+		alias = strings.TrimSpace(alias)
+		if alias != "" && alias != effective {
+			return alias + " -> " + effective
+		}
+	}
+	return effective
+}
+
 func providerHasModel(provider domain.Provider, model string) bool {
 	model = strings.TrimSpace(model)
 	if model == "" {
