@@ -309,6 +309,7 @@ html[data-theme="dark"] .usage-calendar-day.edge { background: #3b82f6; color: #
 .panel-header-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
 .providers-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 16px; margin-bottom: 14px; }
 .providers-toolbar-meta { color: var(--muted); font-size: 12px; font-weight: 700; }
+.providers-filter-toolbar { display: grid; gap: 12px; margin-bottom: 14px; }
 .provider-select { align-items: flex-start; gap: 10px; margin-bottom: 0; }
 .provider-select .provider-name { margin: 0; }
 .provider-card.selected { border-color: rgba(37, 99, 235, 0.5); box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.18); }

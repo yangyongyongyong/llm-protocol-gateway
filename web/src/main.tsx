@@ -1484,6 +1484,35 @@ function providerOptionLabel(provider: Provider) {
   return `${provider.name} (${protocolLabel(provider.protocol)})`;
 }
 
+type ProviderConnectKind = 'api_key' | 'self_register' | 'claude_oauth' | 'cursor_oauth' | 'chatgpt_oauth';
+
+function providerConnectKind(provider: Provider): ProviderConnectKind {
+  if (provider.authType === 'claude_oauth') return 'claude_oauth';
+  if (provider.authType === 'cursor_oauth') return 'cursor_oauth';
+  if (provider.authType === 'chatgpt_oauth') return 'chatgpt_oauth';
+  if (provider.selfRegistration) return 'self_register';
+  return 'api_key';
+}
+
+function providerConnectLabel(kind: ProviderConnectKind): string {
+  switch (kind) {
+    case 'claude_oauth': return '登录 Claude 账号 (OAuth)';
+    case 'cursor_oauth': return '登录 Cursor 账号 (OAuth)';
+    case 'chatgpt_oauth': return '登录 ChatGPT 账号 (OAuth)';
+    case 'self_register': return '内网穿透自助注册（Bearer 令牌）';
+    default: return 'API Key';
+  }
+}
+
+const PROVIDER_CONNECT_FILTERS: Array<{ id: '' | ProviderConnectKind; label: string }> = [
+  { id: '', label: '全部连接方式' },
+  { id: 'api_key', label: 'API Key' },
+  { id: 'self_register', label: '内网穿透自助注册' },
+  { id: 'claude_oauth', label: 'Claude OAuth' },
+  { id: 'cursor_oauth', label: 'Cursor OAuth' },
+  { id: 'chatgpt_oauth', label: 'ChatGPT OAuth' },
+];
+
 function buildApiKeyPatchBody(key: APIKey, patch: Partial<APIKey> = {}) {
   return {
     name: (patch.name ?? key.name).trim(),
@@ -3195,6 +3224,8 @@ function App() {
   });
   const [modelsProviderFilter, setModelsProviderFilter] = useState('__all__');
   const [modelsSearchQuery, setModelsSearchQuery] = useState('');
+  const [providersSearchQuery, setProvidersSearchQuery] = useState('');
+  const [providersConnectFilter, setProvidersConnectFilter] = useState<'' | ProviderConnectKind>('');
 
   const selectedRoute = useMemo(
     () => state.routes.find((route) => route.id === selectedRouteID) || state.routes[0],
@@ -3287,6 +3318,38 @@ function App() {
       return a.name.localeCompare(b.name, 'zh');
     });
   }, [state.providers, recentProviderRequestCounts]);
+
+  const providersSearch = useMemo(() => {
+    const query = providersSearchQuery.trim();
+    if (!query) return { matcher: null as null | ((text: string) => boolean), error: '' };
+    try {
+      const re = new RegExp(query, 'i');
+      return { matcher: (text: string) => re.test(text), error: '' };
+    } catch (err) {
+      const needle = query.toLowerCase();
+      return {
+        matcher: (text: string) => text.toLowerCase().includes(needle),
+        error: err instanceof Error ? err.message : '无效的正则表达式',
+      };
+    }
+  }, [providersSearchQuery]);
+
+  const filteredProviders = useMemo(() => {
+    return sortedProviders.filter((provider) => {
+      if (providersConnectFilter && providerConnectKind(provider) !== providersConnectFilter) {
+        return false;
+      }
+      if (!providersSearch.matcher) return true;
+      const haystack = [
+        provider.name,
+        provider.id,
+        provider.baseUrl || '',
+        providerConnectLabel(providerConnectKind(provider)),
+        protocolLabel(provider.protocol),
+      ].join(' ');
+      return providersSearch.matcher(haystack);
+    });
+  }, [sortedProviders, providersConnectFilter, providersSearch]);
 
   const modelsMenuProviders = useMemo(() => {
     const providerIDs = new Set(state.models.map((model) => model.providerId));
@@ -4892,12 +4955,7 @@ function App() {
   }
 
   function resolveProviderAuthType(provider: Provider): 'api_key' | 'claude_oauth' | 'cursor_oauth' | 'chatgpt_oauth' | 'self_register' {
-    if (provider.authType === 'claude_oauth') return 'claude_oauth';
-    if (provider.authType === 'cursor_oauth') return 'cursor_oauth';
-    if (provider.authType === 'chatgpt_oauth') return 'chatgpt_oauth';
-    // 后端自助注册 Provider 仍持久化为 authType=api_key，靠 selfRegistration 区分。
-    if (provider.selfRegistration) return 'self_register';
-    return 'api_key';
+    return providerConnectKind(provider);
   }
 
   function openEditProviderModal(provider: Provider) {
@@ -6708,18 +6766,64 @@ function App() {
                   </div>
                 ) : null}
               </div>
-              {!isNormalUser && sortedProviders.length > 0 ? (
+              <div className="providers-filter-toolbar">
+                <div className="models-search-row">
+                  <input
+                    className="models-search-input"
+                    type="search"
+                    value={providersSearchQuery}
+                    placeholder="按名称 / ID / 地址检索，支持正则，如 tuya|claude"
+                    onChange={(event) => setProvidersSearchQuery(event.target.value)}
+                    aria-label="Provider 名称检索"
+                  />
+                  {providersSearchQuery.trim() ? (
+                    <button className="mini-btn" type="button" onClick={() => setProvidersSearchQuery('')}>清除</button>
+                  ) : null}
+                </div>
+                {providersSearch.error ? (
+                  <div className="hint-line error">正则无效，已回退为普通包含匹配：{providersSearch.error}</div>
+                ) : null}
+                <div className="models-filter-group">
+                  {PROVIDER_CONNECT_FILTERS.map((item) => (
+                    <button
+                      key={item.id || 'all'}
+                      type="button"
+                      className={`models-filter-chip ${providersConnectFilter === item.id ? 'active' : ''}`}
+                      onClick={() => setProvidersConnectFilter(item.id)}
+                    >
+                      {item.label}
+                      {item.id === ''
+                        ? ` (${sortedProviders.length})`
+                        : ` (${sortedProviders.filter((provider) => providerConnectKind(provider) === item.id).length})`}
+                    </button>
+                  ))}
+                </div>
+                <div className="models-toolbar-meta">
+                  显示 {filteredProviders.length} / {sortedProviders.length}
+                  {providersSearchQuery.trim() ? ` · 检索「${providersSearchQuery.trim()}」` : ''}
+                  {providersConnectFilter ? ` · ${providerConnectLabel(providersConnectFilter)}` : ''}
+                </div>
+              </div>
+              {!isNormalUser && filteredProviders.length > 0 ? (
                 <div className="providers-toolbar">
                   <label className="checkbox-field">
                     <input
                       type="checkbox"
-                      checked={selectedExportProviderIDs.length > 0 && selectedExportProviderIDs.length === sortedProviders.length}
+                      checked={filteredProviders.length > 0 && filteredProviders.every((provider) => selectedExportProviderIDs.includes(provider.id))}
                       onChange={(event) => {
-                        if (event.target.checked) selectAllExportProviders();
-                        else clearExportProviderSelection();
+                        if (event.target.checked) {
+                          setSelectedExportProviderIDs((current) => {
+                            const next = new Set(current);
+                            for (const provider of filteredProviders) next.add(provider.id);
+                            return [...next];
+                          });
+                        } else {
+                          const remove = new Set(filteredProviders.map((provider) => provider.id));
+                          setSelectedExportProviderIDs((current) => current.filter((id) => !remove.has(id)));
+                        }
                       }}
                     />
-                    <span>全选</span>
+                    <span>全选当前结果</span>
                   </label>
                   <span className="providers-toolbar-meta">已选 {selectedExportProviderIDs.length} / {sortedProviders.length}</span>
                   {selectedExportProviderIDs.length > 0 ? (
@@ -6731,9 +6835,11 @@ function App() {
                 <div className="empty-state">
                   {isNormalUser ? '暂无可用 Provider。可点击「添加输入 Provider」创建自己的 Provider，或联系管理员为你分配。' : '暂无 Provider。点击「添加输入 Provider」创建。'}
                 </div>
+              ) : filteredProviders.length === 0 ? (
+                <div className="empty-state">没有匹配的 Provider，请调整检索词或连接方式过滤。</div>
               ) : (
                 <div className="provider-card-grid">
-                  {sortedProviders.map((provider) => {
+                  {filteredProviders.map((provider) => {
                     const usedCount = (state.apiKeys || []).filter((key) => (
                       apiKeyReferencesProvider(key, state.routes, provider.id)
                     )).length;
