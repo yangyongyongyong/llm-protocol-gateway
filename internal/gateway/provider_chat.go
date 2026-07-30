@@ -35,7 +35,7 @@ func buildProviderChatMessages(req providerChatTestRequest) []map[string]any {
 		userPrompt = strings.TrimSpace(req.Message)
 	}
 	if userPrompt == "" {
-		userPrompt = "1+1等于几"
+		userPrompt = "x+5等于几"
 	}
 	messages := make([]map[string]any, 0, 2)
 	if systemPrompt != "" {
@@ -51,7 +51,7 @@ func buildProviderCacheRound2Messages(req providerChatTestRequest, assistantCont
 		userPrompt = strings.TrimSpace(req.Message)
 	}
 	if userPrompt == "" {
-		userPrompt = "1+1等于几"
+		userPrompt = "x+5等于几"
 	}
 	roundMessages := []map[string]any{{"role": "user", "content": userPrompt}}
 	if strings.TrimSpace(assistantContent) != "" {
@@ -114,7 +114,7 @@ func buildProviderCacheRound1UserPrompt(req providerChatTestRequest) string {
 		userPrompt = strings.TrimSpace(req.Message)
 	}
 	if userPrompt == "" {
-		userPrompt = "1+1等于几"
+		userPrompt = "x+5等于几"
 	}
 	return userPrompt
 }
@@ -137,7 +137,7 @@ func buildProviderClaudeChatPayload(model string, req providerChatTestRequest) m
 		userPrompt = strings.TrimSpace(req.Message)
 	}
 	if userPrompt == "" {
-		userPrompt = "1+1等于几"
+		userPrompt = "x+5等于几"
 	}
 	resolvedModel := resolveProviderTestModel(model)
 	if resolvedModel == "" {
@@ -164,7 +164,7 @@ func buildProviderResponsesChatPayload(model string, req providerChatTestRequest
 		userPrompt = strings.TrimSpace(req.Message)
 	}
 	if userPrompt == "" {
-		userPrompt = "1+1等于几"
+		userPrompt = "x+5等于几"
 	}
 	resolvedModel := resolveProviderTestModel(model)
 	if resolvedModel == "" {

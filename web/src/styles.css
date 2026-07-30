@@ -657,6 +657,15 @@ html[data-theme="dark"] .api-key-client-config-actions .client-config-btn {
 .app-log-context { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); color: var(--muted); }
 .single-line { grid-template-columns: minmax(0, 220px); }
 .modal-backdrop { position: fixed; inset: 0; display: grid; place-items: center; padding: 24px; background: rgba(15, 23, 42, 0.38); backdrop-filter: blur(12px); }
+/* 非阻塞弹层：不遮罩/不模糊列表，其它 Provider 卡片保持可点、外观不变 */
+.modal-backdrop.non-blocking {
+  background: transparent;
+  backdrop-filter: none;
+  pointer-events: none;
+  place-items: end center;
+  padding: 24px 24px 36px;
+}
+.modal-backdrop.non-blocking .modal-card { pointer-events: auto; box-shadow: var(--shadow), 0 18px 48px rgba(15, 23, 42, 0.18); }
 .modal-card { width: min(720px, calc(100vw - 36px)); max-height: calc(100vh - 48px); overflow: auto; border-radius: 24px; border: 1px solid var(--border); background: var(--panel-solid); box-shadow: var(--shadow); padding: 22px; }
 html[data-theme="dark"] .usage-row,
 html[data-theme="dark"] .usage-chart-card,

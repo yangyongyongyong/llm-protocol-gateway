@@ -2393,7 +2393,7 @@ func (s *Server) testClaudeOAuthProviderChat(r *http.Request, provider domain.Pr
 		userPrompt = strings.TrimSpace(req.Message)
 	}
 	if userPrompt == "" {
-		userPrompt = "1+1等于几"
+		userPrompt = "x+5等于几"
 	}
 
 	payload := map[string]any{

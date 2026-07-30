@@ -788,8 +788,8 @@ const CODEX_MODEL_CATALOG_REL = '.codex/lpg-model-catalog.json';
 const CODEX_MODEL_CATALOG_DISPLAY = `~/${CODEX_MODEL_CATALOG_REL}`;
 
 const defaultProviderChatTestOptions: ProviderChatTestOptions = {
-  systemPrompt: '你数学老师,下面问你一些问题',
-  userPrompt: '1+1等于几',
+  systemPrompt: 'x=10',
+  userPrompt: 'x+5等于几',
   thinkingField: 'reasoning_effort',
   thinkingValue: 'medium',
 };
@@ -2220,7 +2220,7 @@ function resolveProviderChatURL(provider: Provider, model: string) {
 function buildProviderChatMessages(options: ProviderChatTestOptions) {
   const messages: Array<{ role: string; content: string }> = [];
   const systemPrompt = options.systemPrompt.trim();
-  const userPrompt = options.userPrompt.trim() || '1+1等于几';
+  const userPrompt = options.userPrompt.trim() || 'x+5等于几';
   if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
   messages.push({ role: 'user', content: userPrompt });
   return messages;
@@ -2280,7 +2280,7 @@ function buildClaudeOAuthChatCurl(provider: Provider, model: string, options: Pr
     model: resolvedModel,
     max_tokens: 4096,
     system: options.systemPrompt.trim() || undefined,
-    messages: [{ role: 'user', content: options.userPrompt.trim() || '1+1等于几' }],
+    messages: [{ role: 'user', content: options.userPrompt.trim() || 'x+5等于几' }],
     stream: false,
   };
   const body = JSON.stringify(payload, null, 2);
@@ -3121,7 +3121,9 @@ function App() {
   const [chatTestModel, setChatTestModel] = useState('');
   const [chatTestMessage, setChatTestMessage] = useState('ping from UI');
   const [chatTestResult, setChatTestResult] = useState<RouteTestResult | null>(null);
-  const [chatTestLoading, setChatTestLoading] = useState(false);
+  // 按「kind:id」隔离进行中的对话测试，避免一个 Provider 测试中把其它卡片按钮一起弄灰。
+  const [chatTestingKeys, setChatTestingKeys] = useState<string[]>([]);
+  const chatTestContextRef = useRef<ChatTestContext | null>(null);
   const [providerChatOptions, setProviderChatOptions] = useState<ProviderChatTestOptions>(defaultProviderChatTestOptions);
   const [providerAuthPreview, setProviderAuthPreview] = useState<ProviderAuthPreview | null>(null);
   const [cacheTestResult, setCacheTestResult] = useState<ProviderCacheTestResult | null>(null);
@@ -4665,25 +4667,44 @@ function App() {
       showToast('请先选择测试对象');
       return;
     }
-    setChatTestLoading(true);
-    setChatTestResult(null);
-    setCacheTestResult(null);
-    setThinkingTestResult(null);
-    setCacheTestOpen(false);
-    setThinkingTestOpen(false);
+    const target = chatTestContext;
+    const targetKey = `${target.kind}:${target.id}`;
+    let alreadyRunning = false;
+    setChatTestingKeys((keys) => {
+      if (keys.includes(targetKey)) {
+        alreadyRunning = true;
+        return keys;
+      }
+      return [...keys, targetKey];
+    });
+    if (alreadyRunning) {
+      showToast('该对象正在测试中');
+      return;
+    }
+    const stillCurrent = () => {
+      const current = chatTestContextRef.current;
+      return !!current && current.kind === target.kind && current.id === target.id;
+    };
+    if (stillCurrent()) {
+      setChatTestResult(null);
+      setCacheTestResult(null);
+      setThinkingTestResult(null);
+      setCacheTestOpen(false);
+      setThinkingTestOpen(false);
+    }
     try {
-      if (chatTestContext.kind === 'route') {
-        const response = await fetch(`${API_BASE}/__routes/${encodeURIComponent(chatTestContext.id)}/test`, {
+      if (target.kind === 'route') {
+        const response = await fetch(`${API_BASE}/__routes/${encodeURIComponent(target.id)}/test`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ model: chatTestModel.trim(), message: chatTestMessage.trim() }),
         });
         const result = await response.json() as RouteTestResult;
-        setChatTestResult(result);
+        if (stillCurrent()) setChatTestResult(result);
         showToast(result.success ? `对话测试成功：HTTP ${result.status}` : `对话测试未通过：${result.status || result.error || 'unknown'}`);
       } else {
-        const providerPath = `${API_BASE}/__providers/${encodeURIComponent(chatTestContext.id)}`;
-        const provider = state.providers.find((item) => item.id === chatTestContext.id);
+        const providerPath = `${API_BASE}/__providers/${encodeURIComponent(target.id)}`;
+        const provider = state.providers.find((item) => item.id === target.id);
         // ChatGPT OAuth / pure Responses providers only support the main chat-test path.
         const supportsExtraTests = provider?.authType !== 'chatgpt_oauth'
           && provider?.protocol !== 'openai_responses';
@@ -4703,7 +4724,7 @@ function App() {
           body: JSON.stringify(baseBody),
         });
         const result = await mainResponse.json() as RouteTestResult;
-        setChatTestResult(result);
+        if (stillCurrent()) setChatTestResult(result);
         if (supportsExtraTests) {
           const [cacheResponse, thinkingResponse] = await Promise.all([
             fetch(`${providerPath}/cache-test`, {
@@ -4719,11 +4740,13 @@ function App() {
           ]);
           const cacheResult = await cacheResponse.json() as ProviderCacheTestResult;
           const thinkingResult = await thinkingResponse.json() as ProviderThinkingTestResult;
-          setCacheTestResult(cacheResult);
-          setThinkingTestResult(thinkingResult);
-          setCacheTestOpen(true);
-          setThinkingTestOpen(true);
-        } else {
+          if (stillCurrent()) {
+            setCacheTestResult(cacheResult);
+            setThinkingTestResult(thinkingResult);
+            setCacheTestOpen(true);
+            setThinkingTestOpen(true);
+          }
+        } else if (stillCurrent()) {
           setCacheTestResult(null);
           setThinkingTestResult(null);
           setCacheTestOpen(false);
@@ -4736,10 +4759,10 @@ function App() {
       }
       await Promise.all([refreshRequestStats(), refreshAppLogs()]);
     } catch (error) {
-      setChatTestResult({ success: false, error: String(error) });
+      if (stillCurrent()) setChatTestResult({ success: false, error: String(error) });
       showToast(`对话测试失败：${String(error)}`);
     } finally {
-      setChatTestLoading(false);
+      setChatTestingKeys((keys) => keys.filter((key) => key !== targetKey));
     }
   }
 
@@ -6347,6 +6370,8 @@ function App() {
   const chatTestProvider = chatTestContext?.kind === 'provider'
     ? state.providers.find((item) => item.id === chatTestContext.id)
     : chatTestRoute ? state.providers.find((item) => item.id === chatTestRoute.providerId) : undefined;
+  chatTestContextRef.current = chatTestContext;
+  const chatTestLoading = chatTestContext ? chatTestingKeys.includes(`${chatTestContext.kind}:${chatTestContext.id}`) : false;
   const chatTestModels = chatTestProvider ? state.models.filter((model) => model.providerId === chatTestProvider.id) : [];
   const refreshingChatTestModels = chatTestProvider ? testingProviderID === chatTestProvider.id : false;
   const chatTestBoundApiKey = chatTestContext?.kind === 'route'
@@ -6857,6 +6882,7 @@ function App() {
                         healthStatus={provider.healthStatus || 'unchecked'}
                         nextRetryAt={provider.nextRetryAt}
                         testing={testingProviderID === provider.id}
+                        chatTesting={chatTestingKeys.includes(`provider:${provider.id}`)}
                         readOnly={isNormalUser && provider.ownerUserId !== authStatus?.userId}
                         selectable={!isNormalUser}
                         providerDisabled={!!provider.disabled}
@@ -8238,7 +8264,7 @@ function App() {
       )}
 
       {cacheTestOpen && cacheTestResult && (
-        <Modal title="Cache 测试结果" description="两轮会话：第二轮包含第一轮上下文，检查 usage 中的 cache 命中字段。" onClose={() => setCacheTestOpen(false)}>
+        <Modal title="Cache 测试结果" description="两轮会话：第二轮包含第一轮上下文，检查 usage 中的 cache 命中字段。" blocking={false} onClose={() => setCacheTestOpen(false)}>
           <div className={`test-result-card ${cacheTestResult.success ? 'ok' : 'fail'}`}>
             <div className="test-result-head">
               <Badge tone={cacheTestResult.success ? 'green' : statusTone(cacheTestResult.status)}>{testResultBadge(cacheTestResult.success)}</Badge>
@@ -8262,7 +8288,7 @@ function App() {
       )}
 
       {thinkingTestOpen && thinkingTestResult && (
-        <Modal title="Thinking 测试结果" description="按协议注入 thinking 相关字段，并展示上游响应。" onClose={() => setThinkingTestOpen(false)}>
+        <Modal title="Thinking 测试结果" description="按协议注入 thinking 相关字段，并展示上游响应。" blocking={false} onClose={() => setThinkingTestOpen(false)}>
           <div className={`test-result-card ${thinkingTestResult.success ? 'ok' : 'fail'}`}>
             <div className="test-result-head">
               <Badge tone={thinkingTestResult.success ? 'green' : statusTone(thinkingTestResult.status)}>{testResultBadge(thinkingTestResult.success)}</Badge>
@@ -8615,7 +8641,7 @@ function App() {
       )}
 
       {chatTestOpen && chatTestContext && (
-        <Modal title={chatTestContext.title} description={chatTestContext.description} onClose={() => setChatTestOpen(false)}>
+        <Modal title={chatTestContext.title} description={chatTestContext.description} blocking={false} onClose={() => setChatTestOpen(false)}>
           <div className="modal-toolbar">
             <button className="btn primary" disabled={chatTestLoading || !backendConnected} onClick={() => void runChatTest()}>{chatTestLoading ? '测试中…' : '运行测试'}</button>
           </div>
@@ -9406,7 +9432,7 @@ function ChatGPTOAuthUsagePanel({ providerId, connected, compact }: { providerId
   );
 }
 
-function ProviderCard({ active, selected, name, providerId, protocol, tone, url, usedCount, healthStatus, nextRetryAt, testing, readOnly, selectable, providerDisabled, onToggleEnabled, subtitle, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, cursorBridge, authorizedUserCount, onShowUsers, onToggleSelect, onClick, onTest, onChatTest, onConformance, onEdit, onClone, onDelete }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; usedCount: number; healthStatus: string; nextRetryAt?: string; testing: boolean; readOnly?: boolean; selectable?: boolean; providerDisabled?: boolean; onToggleEnabled?: () => void; subtitle?: string; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; cursorBridge?: CursorBridgeRuntime; authorizedUserCount?: number; onShowUsers?: () => void; onToggleSelect: () => void; onClick: () => void; onTest: () => void; onChatTest: () => void; onConformance?: () => void; onEdit: () => void; onClone: () => void; onDelete: () => void }) {
+function ProviderCard({ active, selected, name, providerId, protocol, tone, url, usedCount, healthStatus, nextRetryAt, testing, chatTesting, readOnly, selectable, providerDisabled, onToggleEnabled, subtitle, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, cursorBridge, authorizedUserCount, onShowUsers, onToggleSelect, onClick, onTest, onChatTest, onConformance, onEdit, onClone, onDelete }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; usedCount: number; healthStatus: string; nextRetryAt?: string; testing: boolean; chatTesting?: boolean; readOnly?: boolean; selectable?: boolean; providerDisabled?: boolean; onToggleEnabled?: () => void; subtitle?: string; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; cursorBridge?: CursorBridgeRuntime; authorizedUserCount?: number; onShowUsers?: () => void; onToggleSelect: () => void; onClick: () => void; onTest: () => void; onChatTest: () => void; onConformance?: () => void; onEdit: () => void; onClone: () => void; onDelete: () => void }) {
   const oauthConnected = isClaudeOAuth ? claudeOAuthConnected : isCursorOAuth ? cursorOAuthConnected : isChatGPTOAuth ? chatgptOAuthConnected : false;
   const showOAuthBadge = isClaudeOAuth || isCursorOAuth || isChatGPTOAuth;
   const isUnavailable = healthStatus === 'unavailable';
@@ -9468,7 +9494,7 @@ function ProviderCard({ active, selected, name, providerId, protocol, tone, url,
       {!readOnly ? (
         <div className="provider-actions">
           <button className="icon-btn" disabled={testing} onClick={(event) => { event.stopPropagation(); onTest(); }} title="从 Provider 接口获取可用模型">{testing ? '获取中' : '获取模型'}</button>
-          <button className="icon-btn" onClick={(event) => { event.stopPropagation(); onChatTest(); }} title="直连上游对话接口测试">对话测试</button>
+          <button className="icon-btn" disabled={!!chatTesting} onClick={(event) => { event.stopPropagation(); onChatTest(); }} title="直连上游对话接口测试">{chatTesting ? '测试中' : '对话测试'}</button>
           <button className="icon-btn" onClick={(event) => { event.stopPropagation(); onEdit(); }} title="编辑 Provider">编辑</button>
           <button className="icon-btn" onClick={(event) => { event.stopPropagation(); onClone(); }} title="克隆为新 Provider">克隆</button>
           <button className="icon-btn danger" disabled={usedCount > 0} onClick={(event) => { event.stopPropagation(); onDelete(); }} title={usedCount > 0 ? '该 Provider 正被 API Key 引用' : '删除 Provider'}>删除</button>
@@ -11044,7 +11070,7 @@ function ensureModalEscapeListener() {
   });
 }
 
-function Modal({ title, description, children, onClose, size = 'default' }: { title: string; description: string; children: React.ReactNode; onClose: () => void; size?: 'default' | 'wide' }) {
+function Modal({ title, description, children, onClose, size = 'default', blocking = true }: { title: string; description: string; children: React.ReactNode; onClose: () => void; size?: 'default' | 'wide'; blocking?: boolean }) {
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
   const layerRef = useRef<{ id: number; zIndex: number } | null>(null);
@@ -11069,7 +11095,11 @@ function Modal({ title, description, children, onClose, size = 'default' }: { ti
   }, []);
 
   return (
-    <div className="modal-backdrop" style={{ zIndex: layerRef.current.zIndex }} onMouseDown={() => onCloseRef.current()}>
+    <div
+      className={`modal-backdrop${blocking ? '' : ' non-blocking'}`}
+      style={{ zIndex: layerRef.current.zIndex }}
+      onMouseDown={blocking ? () => onCloseRef.current() : undefined}
+    >
       <div className={`modal-card${size === 'wide' ? ' wide' : ''}`} onMouseDown={(event) => event.stopPropagation()}>
         <div className="modal-header">
           <div>
