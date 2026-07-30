@@ -485,7 +485,8 @@ html[data-theme="dark"] .api-key-client-config-actions .client-config-btn {
 .model-mapping-model { min-width: 0; }
 .model-mapping-model-id { font-family: var(--mono); font-size: 13px; font-weight: 800; color: #243045; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .model-mapping-model-meta { margin-top: 4px; color: var(--muted); font-size: 11px; font-weight: 700; }
-.model-mapping-row input { width: 100%; min-height: 42px; height: 42px; box-sizing: border-box; padding: 0 12px; border-radius: 14px; border: 1px solid rgba(15, 23, 42, 0.1); background: rgba(255, 255, 255, 0.9); }
+.model-mapping-row input { width: 100%; min-height: 42px; height: 42px; box-sizing: border-box; padding: 0 12px; border-radius: 14px; border: 1px solid var(--border); color: var(--text); background: var(--surface-strong); }
+.model-mapping-row input::placeholder { color: var(--subtle); }
 .field { display: grid; gap: 7px; }
 .field label { color: var(--muted); font-size: 12px; font-weight: 780; }
 .field input:not([type="checkbox"]):not([type="radio"]), .field select { width: 100%; outline: none; padding: 0 12px; min-height: 42px; height: 42px; box-sizing: border-box; border-radius: 14px; border: 1px solid var(--border); color: var(--text); background: var(--surface-strong); line-height: 1.2; }
@@ -687,6 +688,20 @@ html[data-theme="dark"] .side-stats-key-name,
 html[data-theme="dark"] .model-mapping-model-id,
 html[data-theme="dark"] .claude-usage-head {
   color: var(--text);
+}
+html[data-theme="dark"] .model-mapping-prefix-bar {
+  background: var(--surface);
+  border-color: rgba(96, 165, 250, 0.22);
+}
+html[data-theme="dark"] .model-mapping-btn {
+  color: #93c5fd;
+  background: var(--blue-soft);
+  border-color: rgba(96, 165, 250, 0.35);
+  box-shadow: none;
+}
+html[data-theme="dark"] .model-mapping-btn:hover:not(:disabled) {
+  background: rgba(59, 130, 246, 0.32);
+  border-color: rgba(96, 165, 250, 0.5);
 }
 html[data-theme="dark"] .status-pill { color: #86efac; }
 html[data-theme="dark"] .status-pill.off { color: #fca5a5; }
