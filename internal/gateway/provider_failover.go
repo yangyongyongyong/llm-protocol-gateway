@@ -437,6 +437,14 @@ func (s *Server) classifyProviderFailover(providerID string, status int, body []
 // with nextRetryAt, even if its persisted HealthStatus still reflects an
 // earlier manual "获取模型" check.
 func (s *Server) applyProviderAvailability(provider *domain.Provider) {
+	if provider == nil {
+		return
+	}
+	if provider.Disabled {
+		// 禁用后不展示「异常 / N秒后重试」覆盖层，也不诱导后台重探。
+		provider.NextRetryAt = ""
+		return
+	}
 	nextRetry, unavailable := s.providerNextRetry(provider.ID)
 	if !unavailable {
 		return
@@ -460,6 +468,14 @@ func (s *Server) applyProviderFailoverOutcome(providerID string, status int, bod
 	providerID = strings.TrimSpace(providerID)
 	if providerID == "" {
 		return false
+	}
+	if s.router != nil {
+		if provider, lookupErr := s.router.ProviderByID(providerID); lookupErr == nil && provider.Disabled {
+			// 已禁用：不再写入 unavailable，也不参与后续重探刷日志。
+			s.markProviderAvailable(providerID)
+			class, _ := s.classifyProviderFailover(providerID, status, body, err)
+			return class != failoverNone
+		}
 	}
 	class, reason := s.classifyProviderFailover(providerID, status, body, err)
 	if class == failoverNone {
@@ -719,7 +735,8 @@ func (s *Server) recoverAPIKeyPreferredProviders(ctx context.Context) {
 			available, cached := probeCache[providerID]
 			if !cached {
 				provider, err := s.router.ProviderByID(providerID)
-				if err != nil {
+				if err != nil || provider.Disabled {
+					// 已删除或管理员禁用：不当作可回切目标，也不发探测流量。
 					probeCache[providerID] = false
 					continue
 				}
@@ -754,9 +771,19 @@ func (s *Server) reprobeUnavailableProviders(ctx context.Context) {
 			s.markProviderAvailable(id)
 			continue
 		}
+		if provider.Disabled {
+			// 管理员已禁用：停止可用性重探，避免无效 /models 刷日志。
+			s.markProviderAvailable(id)
+			if s.logs != nil {
+				s.logs.AddApp("info", "provider unavailable cleared (disabled)", fmt.Sprintf("provider=%s", id))
+			}
+			continue
+		}
 		if s.probeProviderAvailable(ctx, provider) {
 			s.markProviderAvailable(id)
-			s.logs.AddApp("info", "provider recovered", fmt.Sprintf("provider=%s", id))
+			if s.logs != nil {
+				s.logs.AddApp("info", "provider recovered", fmt.Sprintf("provider=%s", id))
+			}
 			slog.Info("provider recovered", "provider", id)
 			continue
 		}

@@ -1600,6 +1600,8 @@ func (s *Server) handleSetProviderEnabled(w http.ResponseWriter, r *http.Request
 	if *payload.Enabled {
 		s.logs.AddApp("info", "provider enabled", updated.ID)
 	} else {
+		// 禁用即停止可用性重探：清掉内存里的 unavailable 标记，避免后台继续打 /models。
+		s.markProviderAvailable(updated.ID)
 		s.logs.AddApp("info", "provider disabled", updated.ID)
 	}
 	writeJSON(w, http.StatusOK, redactProviderForClient(updated))
@@ -1876,6 +1878,10 @@ func (s *Server) handleClaudeOAuthUsage(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusOK, ClaudeOAuthUsageReport{Available: false, Error: "provider is not using Claude OAuth"})
 		return
 	}
+	if provider.Disabled {
+		writeJSON(w, http.StatusOK, ClaudeOAuthUsageReport{Available: false, Error: "provider disabled"})
+		return
+	}
 	if provider.ClaudeOAuth == nil || strings.TrimSpace(provider.ClaudeOAuth.RefreshToken) == "" {
 		writeJSON(w, http.StatusOK, ClaudeOAuthUsageReport{Available: false, Error: "Claude OAuth 未连接"})
 		return
@@ -1936,6 +1942,10 @@ func (s *Server) handleCursorOAuthUsage(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusOK, CursorOAuthUsageReport{Available: false, Error: "provider is not using Cursor OAuth"})
 		return
 	}
+	if provider.Disabled {
+		writeJSON(w, http.StatusOK, CursorOAuthUsageReport{Available: false, Error: "provider disabled"})
+		return
+	}
 	if provider.CursorOAuth == nil || strings.TrimSpace(provider.CursorOAuth.RefreshToken) == "" {
 		writeJSON(w, http.StatusOK, CursorOAuthUsageReport{Available: false, Error: "Cursor OAuth 未连接"})
 		return
@@ -1994,6 +2004,10 @@ func (s *Server) handleChatGPTOAuthUsage(w http.ResponseWriter, r *http.Request)
 	}
 	if provider.AuthType != domain.AuthTypeChatGPTOAuth {
 		writeJSON(w, http.StatusOK, ChatGPTOAuthUsageReport{Available: false, Error: "provider is not using ChatGPT OAuth"})
+		return
+	}
+	if provider.Disabled {
+		writeJSON(w, http.StatusOK, ChatGPTOAuthUsageReport{Available: false, Error: "provider disabled"})
 		return
 	}
 	if provider.ChatGPTOAuth == nil || strings.TrimSpace(provider.ChatGPTOAuth.RefreshToken) == "" {
@@ -2057,6 +2071,10 @@ func (s *Server) handleZhipuUsage(w http.ResponseWriter, r *http.Request) {
 	}
 	if !isZhipuBaseURL(provider.BaseURL) {
 		writeJSON(w, http.StatusOK, ZhipuUsageReport{Available: false, Error: "provider is not a Zhipu (bigmodel/z.ai) provider"})
+		return
+	}
+	if provider.Disabled {
+		writeJSON(w, http.StatusOK, ZhipuUsageReport{Available: false, Error: "provider disabled"})
 		return
 	}
 	apiKey := resolveProviderAuth(provider)

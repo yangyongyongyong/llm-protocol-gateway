@@ -30,7 +30,7 @@ func (s *Server) StartOAuthUsageBackgroundRefresh(ctx context.Context) {
 
 func (s *Server) refreshAllOAuthUsage(ctx context.Context) {
 	for _, provider := range s.router.State().Providers {
-		if provider.Deleted {
+		if provider.Deleted || provider.Disabled {
 			continue
 		}
 		switch provider.AuthType {
@@ -79,7 +79,7 @@ func (s *Server) maybeRefreshZhipuUsageAsync(providerID string) {
 
 func (s *Server) refreshZhipuUsageHoldingLock(providerID string) {
 	provider, err := s.router.ProviderByID(providerID)
-	if err != nil {
+	if err != nil || provider.Disabled {
 		return
 	}
 	if !isZhipuBaseURL(provider.BaseURL) {
@@ -176,7 +176,7 @@ func (s *Server) refreshClaudeOAuthUsageHoldingLock(providerID string) {
 	}
 
 	provider, err := s.router.ProviderByID(providerID)
-	if err != nil {
+	if err != nil || provider.Disabled {
 		return
 	}
 	refreshed, err := s.ensureFreshClaudeToken(provider)
@@ -203,7 +203,7 @@ func (s *Server) refreshCursorOAuthUsageHoldingLock(providerID string) {
 	}
 
 	provider, err := s.router.ProviderByID(providerID)
-	if err != nil {
+	if err != nil || provider.Disabled {
 		return
 	}
 	refreshed, err := s.ensureFreshCursorToken(provider)
@@ -228,7 +228,7 @@ func (s *Server) refreshChatGPTOAuthUsageHoldingLock(providerID string) {
 	}
 
 	provider, err := s.router.ProviderByID(providerID)
-	if err != nil {
+	if err != nil || provider.Disabled {
 		return
 	}
 	refreshed, err := s.ensureFreshChatGPTToken(provider)

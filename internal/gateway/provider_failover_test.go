@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/luca/llm-protocol-gateway/internal/domain"
 )
 
 func TestClassifyProviderFailover(t *testing.T) {
@@ -145,6 +147,43 @@ func TestSoftFailureWindowResets(t *testing.T) {
 	s.providerAvailabilityMu.Unlock()
 	if count != 1 {
 		t.Fatalf("window expiry should reset count to 1, got %d", count)
+	}
+}
+
+func TestReprobeUnavailableProvidersSkipsDisabled(t *testing.T) {
+	t.Parallel()
+	router := NewRouter(domain.GatewayState{
+		Providers: []domain.Provider{
+			{ID: "tuya-claude-pro", Name: "tuya", Protocol: domain.ProtocolClaude, AuthType: domain.AuthTypeClaudeOAuth, Disabled: true},
+			{ID: "hj-claude", Name: "hj", Protocol: domain.ProtocolClaude, AuthType: domain.AuthTypeClaudeOAuth, Disabled: true, HealthStatus: "healthy"},
+		},
+	})
+	s := NewServer(router, nil)
+	s.markProviderUnavailable("tuya-claude-pro", true, "usage_limit")
+	if _, ok := s.providerNextRetry("tuya-claude-pro"); !ok {
+		t.Fatal("precondition: tuya should be tracked unavailable")
+	}
+	// Disabled provider must be cleared without issuing a probe (probe would hit network).
+	s.reprobeUnavailableProviders(context.Background())
+	if _, ok := s.providerNextRetry("tuya-claude-pro"); ok {
+		t.Fatal("disabled provider must stop unavailable reprobe tracking")
+	}
+}
+
+func TestApplyProviderFailoverOutcomeIgnoresDisabled(t *testing.T) {
+	t.Parallel()
+	router := NewRouter(domain.GatewayState{
+		Providers: []domain.Provider{
+			{ID: "tuya-claude-pro", Protocol: domain.ProtocolClaude, AuthType: domain.AuthTypeClaudeOAuth, Disabled: true},
+		},
+	})
+	s := NewServer(router, nil)
+	body := []byte(`{"error":{"message":"insufficient_quota"}}`)
+	if !s.applyProviderFailoverOutcome("tuya-claude-pro", 400, body, nil) {
+		t.Fatal("failover class should still be true for chain advance decisions")
+	}
+	if _, ok := s.providerNextRetry("tuya-claude-pro"); ok {
+		t.Fatal("disabled provider must not be marked unavailable")
 	}
 }
 
