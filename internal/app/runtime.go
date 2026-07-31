@@ -286,7 +286,7 @@ func (rt *Runtime) Start(cfg Config) error {
 		if err := db.MaintainStorage(); err != nil {
 			slog.Warn("storage maintenance failed", "error", err)
 		}
-		logs.PruneUsageStatsBefore(time.Now().AddDate(0, 0, -retentionDays))
+		// 每日用量汇总永久保留；仅清理请求明细，不裁剪 usage_daily。
 		if persisted, err := db.ListRequestLogs(1000); err != nil {
 			slog.Warn("request log restore failed", "error", err)
 		} else if len(persisted) > 0 {

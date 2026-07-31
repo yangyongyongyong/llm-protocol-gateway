@@ -244,6 +244,8 @@ func (s *Store) ResetUsageStats() {
 }
 
 func (s *Store) PruneUsageStatsBefore(cutoffDay time.Time) {
+	// Kept for tests / rare admin tooling. Request-log retention must NOT call
+	// this — daily usage aggregates are retained permanently.
 	loc := cutoffDay.Location()
 	cutoff := time.Date(cutoffDay.Year(), cutoffDay.Month(), cutoffDay.Day(), 0, 0, 0, 0, loc)
 	s.mu.Lock()

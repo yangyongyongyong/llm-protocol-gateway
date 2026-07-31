@@ -38,9 +38,14 @@ type UsageDayBuckets struct {
 }
 
 // UsageDailyStore persists per-day usage aggregates to SQLite.
+// Daily aggregates are retained permanently; request log retention must not prune them.
 type UsageDailyStore interface {
 	ApplyUsageDelta(delta UsagePersistDelta) error
+	// LoadUsageSince loads aggregates for day >= since. Zero since loads all history.
 	LoadUsageSince(since time.Time) (map[string]UsageDayBuckets, *RequestLog, error)
+	// ClearUsageSince deletes aggregates for day >= since (used when replaying
+	// request logs for the still-retained detail window). Older days are kept.
+	ClearUsageSince(since time.Time) error
 	PruneUsageBefore(cutoffDay time.Time) error
 	ClearUsageDaily() error
 }

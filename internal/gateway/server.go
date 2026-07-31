@@ -611,11 +611,12 @@ const (
 	usageBucketSchemaVersion    = "2" // v2 adds the output_protocol dimension
 )
 
-// RebuildUsageStats loads persisted daily aggregates, or replays request logs once
-// to backfill when the usage_daily tables are empty or the bucket schema changed.
+// RebuildUsageStats loads persisted daily aggregates (kept permanently), or
+// rebuilds only the window still covered by request-log retention when the
+// bucket schema changed / recent aggregates drift from logs.
 func (s *Server) RebuildUsageStats() {
 	retention := s.RequestLogRetentionDays()
-	since := time.Now().AddDate(0, 0, -retention)
+	logSince := time.Now().AddDate(0, 0, -retention)
 
 	settings, _ := s.usageDailyStore.(interface {
 		Setting(string) string
@@ -624,31 +625,46 @@ func (s *Server) RebuildUsageStats() {
 	needsBackfill := settings != nil && settings.Setting(usageBucketSchemaSettingKey) != usageBucketSchemaVersion
 
 	if s.usageDailyStore != nil {
-		days, last, err := s.usageDailyStore.LoadUsageSince(since)
+		days, last, err := s.usageDailyStore.LoadUsageSince(time.Time{})
 		if err != nil {
 			s.logs.AddApp("warn", "load usage daily aggregates failed", err.Error())
-		} else if !needsBackfill && len(days) > 0 && s.usageDailyAggregatesMatchLogs(days) {
+		} else if !needsBackfill && len(days) > 0 && s.usageDailyAggregatesMatchLogs(days, logSince) {
 			s.logs.ResetUsageStats()
 			s.logs.BootstrapUsageDays(days, last)
 			return
 		}
-		if err := s.usageDailyStore.ClearUsageDaily(); err != nil {
-			s.logs.AddApp("warn", "clear usage daily aggregates failed", err.Error())
+		// Only clear the still-retained detail window, then replay logs into it.
+		// Older daily aggregates are permanent and must survive rebuilds.
+		if err := s.usageDailyStore.ClearUsageSince(logSince); err != nil {
+			s.logs.AddApp("warn", "clear recent usage daily aggregates failed", err.Error())
 		}
+		preserved, preservedLast, loadErr := s.usageDailyStore.LoadUsageSince(time.Time{})
+		s.logs.ResetUsageStats()
+		if loadErr != nil {
+			s.logs.AddApp("warn", "reload preserved usage daily aggregates failed", loadErr.Error())
+		} else if len(preserved) > 0 {
+			s.logs.BootstrapUsageDays(preserved, preservedLast)
+		}
+		s.rebuildUsageStatsFromLogs(logSince)
+		if settings != nil {
+			if err := settings.SetSetting(usageBucketSchemaSettingKey, usageBucketSchemaVersion); err != nil {
+				s.logs.AddApp("warn", "persist usage bucket schema version failed", err.Error())
+			}
+		}
+		return
 	}
 
-	s.rebuildUsageStatsFromLogs(since)
-	if settings != nil {
-		if err := settings.SetSetting(usageBucketSchemaSettingKey, usageBucketSchemaVersion); err != nil {
-			s.logs.AddApp("warn", "persist usage bucket schema version failed", err.Error())
-		}
-	}
+	s.rebuildUsageStatsFromLogs(logSince)
 }
 
-func (s *Server) usageDailyAggregatesMatchLogs(days map[string]monitor.UsageDayBuckets) bool {
+func (s *Server) usageDailyAggregatesMatchLogs(days map[string]monitor.UsageDayBuckets, logSince time.Time) bool {
+	sinceDay := logSince.Local().Format("2006-01-02")
 	var agg int64
-	for _, day := range days {
-		agg += day.Total.RequestCount
+	for day, buckets := range days {
+		if day < sinceDay {
+			continue
+		}
+		agg += buckets.Total.RequestCount
 	}
 	if agg == 0 {
 		return false
@@ -908,7 +924,7 @@ func (s *Server) handleSetRequestLogRetention(w http.ResponseWriter, r *http.Req
 	if s.requestLogStore != nil {
 		_ = s.requestLogStore.PruneRequestLogs(days)
 	}
-	s.logs.PruneUsageStatsBefore(time.Now().AddDate(0, 0, -days))
+	// 每日用量汇总永久保留，不随请求明细保留天数一起裁剪。
 	s.logs.AddApp("info", "request log retention updated", fmt.Sprintf("days=%d", days))
 	writeJSON(w, http.StatusOK, map[string]any{"requestLogRetentionDays": days})
 }

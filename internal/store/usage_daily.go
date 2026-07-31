@@ -128,12 +128,24 @@ func upsertUsageBucket(tx *sql.Tx, day, bucketType, bucketID, bucketName string,
 }
 
 func (s *Store) LoadUsageSince(since time.Time) (map[string]monitor.UsageDayBuckets, *monitor.RequestLog, error) {
-	sinceDay := since.Local().Format("2006-01-02")
-	rows, err := s.reader().Query(`SELECT day, bucket_type, bucket_id, bucket_name,
-		request_count, input_tokens, output_tokens, cache_tokens,
-		status_2xx, status_4xx, status_5xx, status_other,
-		latency_sum, ttft_sum, ttft_count
-		FROM usage_daily_buckets WHERE day >= ? ORDER BY day`, sinceDay)
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if since.IsZero() {
+		rows, err = s.reader().Query(`SELECT day, bucket_type, bucket_id, bucket_name,
+			request_count, input_tokens, output_tokens, cache_tokens,
+			status_2xx, status_4xx, status_5xx, status_other,
+			latency_sum, ttft_sum, ttft_count
+			FROM usage_daily_buckets ORDER BY day`)
+	} else {
+		sinceDay := since.Local().Format("2006-01-02")
+		rows, err = s.reader().Query(`SELECT day, bucket_type, bucket_id, bucket_name,
+			request_count, input_tokens, output_tokens, cache_tokens,
+			status_2xx, status_4xx, status_5xx, status_other,
+			latency_sum, ttft_sum, ttft_count
+			FROM usage_daily_buckets WHERE day >= ? ORDER BY day`, sinceDay)
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -235,6 +247,19 @@ func (s *Store) PruneUsageBefore(cutoffDay time.Time) error {
 	cutoff := cutoffDay.Local().Format("2006-01-02")
 	if _, err := s.db.Exec(`DELETE FROM usage_daily_buckets WHERE day < ?`, cutoff); err != nil {
 		return fmt.Errorf("prune usage_daily_buckets: %w", err)
+	}
+	return nil
+}
+
+// ClearUsageSince removes aggregates for day >= since so that window can be
+// rebuilt from request logs, while older permanent daily rows stay intact.
+func (s *Store) ClearUsageSince(since time.Time) error {
+	if since.IsZero() {
+		return s.ClearUsageDaily()
+	}
+	sinceDay := since.Local().Format("2006-01-02")
+	if _, err := s.db.Exec(`DELETE FROM usage_daily_buckets WHERE day >= ?`, sinceDay); err != nil {
+		return fmt.Errorf("clear usage_daily_buckets since %s: %w", sinceDay, err)
 	}
 	return nil
 }

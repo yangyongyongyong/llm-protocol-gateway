@@ -81,11 +81,40 @@ func TestUsageDailyPrune(t *testing.T) {
 	if err := s.PruneUsageBefore(cutoff); err != nil {
 		t.Fatal(err)
 	}
-	days, _, err := s.LoadUsageSince(time.Date(2026, 1, 1, 0, 0, 0, 0, time.Local))
+	days, _, err := s.LoadUsageSince(time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(days) != 0 {
 		t.Fatalf("expected prune, got %+v", days)
+	}
+}
+
+func TestUsageDailyClearSinceKeepsOlderDays(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "gateway.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	for _, day := range []string{"2026-07-01", "2026-07-10", "2026-07-20"} {
+		if err := s.ApplyUsageDelta(monitor.UsagePersistDelta{
+			Day: day, KeyID: "k1", KeyName: "main", ProviderID: "p1",
+			StatusClass: "2xx", InputTokens: 10, OutputTokens: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.ClearUsageSince(time.Date(2026, 7, 10, 0, 0, 0, 0, time.Local)); err != nil {
+		t.Fatal(err)
+	}
+	days, _, err := s.LoadUsageSince(time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(days) != 1 || days["2026-07-01"].Total.RequestCount != 1 {
+		t.Fatalf("expected only 2026-07-01 preserved, got %+v", days)
 	}
 }
