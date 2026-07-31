@@ -62,6 +62,11 @@ func TestShouldRectifyThinkingSignature(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "empty thinking block must contain thinking",
+			body: `{"type":"error","error":{"type":"invalid_request_error","message":"messages.2.content.0.thinking: each thinking block must contain thinking"}}`,
+			want: true,
+		},
+		{
 			name: "unrelated timeout",
 			body: `{"error":{"message":"request timeout"}}`,
 			want: false,

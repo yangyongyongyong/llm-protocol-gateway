@@ -43,6 +43,23 @@ var oauthToolRenameMap = map[string]string{
 	"tasklist":     "TaskList",
 }
 
+// anthropicServerToolNames are Anthropic built-in / server-tool *canonical names*
+// that must never be OAuth-TitleCased. Same failure class as mcp__ preservation
+// (9dc8e1d): the generic snake_case→TitleCase path turns web_search→WebSearch
+// (and web_fetch→WebFetch, code_execution→CodeExecution), then tool_choice /
+// history no longer matches tools[] and Anthropic returns
+// "Tool 'WebSearch' not found in provided tools".
+//
+// Only list names that are unambiguously Anthropic server tools — do NOT add
+// names that Claude Code / Codex also use as client tools and intentionally
+// cloak (e.g. bash→Bash, tool_search→ToolSearch). Those stay protected via the
+// request-scoped serverToolNames set when tools[].type is a server discriminator.
+var anthropicServerToolNames = map[string]struct{}{
+	"web_search":     {},
+	"web_fetch":      {},
+	"code_execution": {},
+}
+
 var oauthToolRenameReverseMap = func() map[string]string {
 	out := make(map[string]string, len(oauthToolRenameMap))
 	for original, renamed := range oauthToolRenameMap {
@@ -50,6 +67,11 @@ var oauthToolRenameReverseMap = func() map[string]string {
 	}
 	return out
 }()
+
+func isAnthropicServerToolName(name string) bool {
+	_, ok := anthropicServerToolNames[strings.ToLower(strings.TrimSpace(name))]
+	return ok
+}
 
 // applyClaudeOAuthCloaking rewrites OAuth upstream bodies so Anthropic attributes
 // traffic to the Claude Code plan bucket instead of extra usage.
@@ -207,6 +229,10 @@ func remapClaudeOAuthToolName(name string) (string, bool) {
 	if strings.HasPrefix(name, "mcp__") {
 		return name, false
 	}
+	// Anthropic server tools keep snake_case canonical names (web_search, …).
+	if isAnthropicServerToolName(name) {
+		return name, false
+	}
 	if mapped, ok := oauthToolRenameMap[strings.ToLower(name)]; ok {
 		return mapped, mapped != name
 	}
@@ -251,6 +277,10 @@ func snakeOrLowerToTitleCase(name string) string {
 }
 
 func remapClaudeOAuthToolNames(payload map[string]any) {
+	// Collect Anthropic server-tool names from tools[] (type != "" && != custom).
+	// These must stay snake_case in tool_choice and message history even when
+	// the name also appears in oauthToolRenameMap (e.g. server bash_* vs client bash).
+	serverToolNames := map[string]struct{}{}
 	if rawTools, ok := payload["tools"].([]any); ok && len(rawTools) > 0 {
 		updated := make([]any, 0, len(rawTools))
 		for _, item := range rawTools {
@@ -259,6 +289,9 @@ func remapClaudeOAuthToolNames(payload map[string]any) {
 				continue
 			}
 			if toolType := stringValue(tool["type"]); toolType != "" && toolType != "custom" {
+				if name := stringValue(tool["name"]); name != "" {
+					serverToolNames[name] = struct{}{}
+				}
 				updated = append(updated, tool)
 				continue
 			}
@@ -272,8 +305,11 @@ func remapClaudeOAuthToolNames(payload map[string]any) {
 	}
 
 	if choice, ok := payload["tool_choice"].(map[string]any); ok && stringValue(choice["type"]) == "tool" {
-		if mapped, changed := remapClaudeOAuthToolName(stringValue(choice["name"])); changed {
-			choice["name"] = mapped
+		name := stringValue(choice["name"])
+		if !shouldPreserveOAuthToolName(name, serverToolNames) {
+			if mapped, changed := remapClaudeOAuthToolName(name); changed {
+				choice["name"] = mapped
+			}
 		}
 	}
 
@@ -286,11 +322,26 @@ func remapClaudeOAuthToolNames(payload map[string]any) {
 		if !ok {
 			continue
 		}
-		remapClaudeOAuthToolNamesInContent(entry["content"])
+		remapClaudeOAuthToolNamesInContent(entry["content"], serverToolNames)
 	}
 }
 
-func remapClaudeOAuthToolNamesInContent(content any) {
+// shouldPreserveOAuthToolName reports names that must stay unchanged under
+// OAuth cloaking: Anthropic server tools (hard denylist + request-scoped).
+func shouldPreserveOAuthToolName(name string, serverToolNames map[string]struct{}) bool {
+	if name == "" {
+		return false
+	}
+	if isAnthropicServerToolName(name) {
+		return true
+	}
+	if _, ok := serverToolNames[name]; ok {
+		return true
+	}
+	return false
+}
+
+func remapClaudeOAuthToolNamesInContent(content any, serverToolNames map[string]struct{}) {
 	blocks, ok := content.([]any)
 	if !ok {
 		return
@@ -301,17 +352,27 @@ func remapClaudeOAuthToolNamesInContent(content any) {
 			continue
 		}
 		switch stringValue(block["type"]) {
+		case "server_tool_use":
+			// Anthropic server-tool calls keep their canonical name; never cloak.
 		case "tool_use":
-			if mapped, changed := remapClaudeOAuthToolName(stringValue(block["name"])); changed {
+			name := stringValue(block["name"])
+			if shouldPreserveOAuthToolName(name, serverToolNames) {
+				continue
+			}
+			if mapped, changed := remapClaudeOAuthToolName(name); changed {
 				block["name"] = mapped
 			}
 		case "tool_reference":
-			if mapped, changed := remapClaudeOAuthToolName(stringValue(block["tool_name"])); changed {
+			name := stringValue(block["tool_name"])
+			if shouldPreserveOAuthToolName(name, serverToolNames) {
+				continue
+			}
+			if mapped, changed := remapClaudeOAuthToolName(name); changed {
 				block["tool_name"] = mapped
 			}
 		case "tool_result":
 			// tool_search results nest tool_reference inside tool_result.content.
-			remapClaudeOAuthToolNamesInContent(block["content"])
+			remapClaudeOAuthToolNamesInContent(block["content"], serverToolNames)
 		}
 	}
 }

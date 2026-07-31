@@ -39,6 +39,145 @@ func TestRemapClaudeOAuthToolNames(t *testing.T) {
 	}
 }
 
+func TestRemapClaudeOAuthToolNamesPreservesServerWebSearchToolChoice(t *testing.T) {
+	// Regression: 2026-07-31 16:30 — OAuth cloaking TitleCased tool_choice
+	// web_search → WebSearch while leaving the server tool name as web_search,
+	// causing Anthropic 400: Tool 'WebSearch' not found in provided tools.
+	payload := map[string]any{
+		"tools": []any{
+			map[string]any{
+				"type":     "web_search_20250305",
+				"name":     "web_search",
+				"max_uses": 8,
+			},
+			map[string]any{"name": "bash", "description": "run shell"},
+		},
+		"tool_choice": map[string]any{"type": "tool", "name": "web_search"},
+	}
+	remapClaudeOAuthToolNames(payload)
+
+	tools := payload["tools"].([]any)
+	web := tools[0].(map[string]any)
+	if web["name"] != "web_search" {
+		t.Fatalf("server tool name changed: %#v", web)
+	}
+	if tools[1].(map[string]any)["name"] != "Bash" {
+		t.Fatalf("client tool should still cloak to Bash, got %#v", tools[1])
+	}
+	choice := payload["tool_choice"].(map[string]any)
+	if choice["name"] != "web_search" {
+		t.Fatalf("server tool_choice must stay web_search, got %#v", choice)
+	}
+}
+
+func TestRemapClaudeOAuthToolNamePreservesAnthropicServerToolNames(t *testing.T) {
+	// Root-level hard denylist: even without a tools[] context, server tool
+	// names must not TitleCase (same class as mcp__ preservation).
+	for _, name := range []string{"web_search", "web_fetch", "code_execution"} {
+		got, changed := remapClaudeOAuthToolName(name)
+		if changed || got != name {
+			t.Fatalf("remapClaudeOAuthToolName(%q) = (%q, %v); want unchanged", name, got, changed)
+		}
+	}
+	// Claude Code client webfetch (no underscore) still cloaks to WebFetch.
+	if got, changed := remapClaudeOAuthToolName("webfetch"); !changed || got != "WebFetch" {
+		t.Fatalf("client webfetch should cloak to WebFetch, got (%q, %v)", got, changed)
+	}
+}
+
+func TestRemapClaudeOAuthToolNamesPreservesAllServerToolSurfaces(t *testing.T) {
+	payload := map[string]any{
+		"tools": []any{
+			map[string]any{"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
+			map[string]any{"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 5},
+			map[string]any{"type": "code_execution_20250522", "name": "code_execution"},
+			// Server bash_* must NOT become Bash even though client bash does.
+			map[string]any{"type": "bash_20250124", "name": "bash"},
+			map[string]any{"name": "read", "description": "read file"},
+		},
+		"tool_choice": map[string]any{"type": "tool", "name": "web_fetch"},
+		"messages": []any{
+			map[string]any{
+				"role": "assistant",
+				"content": []any{
+					map[string]any{"type": "server_tool_use", "id": "srv_1", "name": "web_search", "input": map[string]any{"query": "q"}},
+					map[string]any{"type": "tool_use", "id": "toolu_1", "name": "web_fetch", "input": map[string]any{"url": "https://example.com"}},
+					map[string]any{"type": "tool_use", "id": "toolu_2", "name": "bash", "input": map[string]any{"command": "ls"}},
+					map[string]any{"type": "tool_use", "id": "toolu_3", "name": "write", "input": map[string]any{}},
+					map[string]any{
+						"type":        "tool_result",
+						"tool_use_id": "toolu_search",
+						"content": []any{
+							map[string]any{"type": "tool_reference", "tool_name": "code_execution"},
+							map[string]any{"type": "tool_reference", "tool_name": "read"},
+						},
+					},
+				},
+			},
+		},
+	}
+	remapClaudeOAuthToolNames(payload)
+
+	tools := payload["tools"].([]any)
+	wantToolNames := []string{"web_search", "web_fetch", "code_execution", "bash", "Read"}
+	for i, want := range wantToolNames {
+		got := tools[i].(map[string]any)["name"]
+		if got != want {
+			t.Fatalf("tools[%d].name=%#v want %q", i, got, want)
+		}
+	}
+	if payload["tool_choice"].(map[string]any)["name"] != "web_fetch" {
+		t.Fatalf("tool_choice web_fetch remapped: %#v", payload["tool_choice"])
+	}
+	blocks := payload["messages"].([]any)[0].(map[string]any)["content"].([]any)
+	assertName := func(i int, field, want string) {
+		t.Helper()
+		block := blocks[i].(map[string]any)
+		if got := stringValue(block[field]); got != want {
+			t.Fatalf("blocks[%d].%s=%q want %q (block=%#v)", i, field, got, want, block)
+		}
+	}
+	assertName(0, "name", "web_search")      // server_tool_use
+	assertName(1, "name", "web_fetch")       // hard denylist
+	assertName(2, "name", "bash")            // request-scoped server tool
+	assertName(3, "name", "Write")           // client tool still cloaked
+	refs := blocks[4].(map[string]any)["content"].([]any)
+	if stringValue(refs[0].(map[string]any)["tool_name"]) != "code_execution" {
+		t.Fatalf("nested code_execution remapped: %#v", refs[0])
+	}
+	if stringValue(refs[1].(map[string]any)["tool_name"]) != "Read" {
+		t.Fatalf("nested client read should cloak to Read, got %#v", refs[1])
+	}
+}
+
+func TestApplyClaudeOAuthCloakingPreservesWebSearchToolChoice(t *testing.T) {
+	// Full cloaking path matching OpenCode / Claude Code web-search subagent.
+	payload := map[string]any{
+		"model": "claude-sonnet-5",
+		"system": []any{
+			map[string]any{"type": "text", "text": "You are an assistant for performing a web search tool use"},
+		},
+		"messages": []any{
+			map[string]any{
+				"role":    "user",
+				"content": []any{map[string]any{"type": "text", "text": "Perform a web search for the query: test"}},
+			},
+		},
+		"tools": []any{
+			map[string]any{"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
+		},
+		"tool_choice": map[string]any{"type": "tool", "name": "web_search"},
+	}
+	applyClaudeOAuthCloaking(payload)
+	if payload["tool_choice"].(map[string]any)["name"] != "web_search" {
+		t.Fatalf("full cloaking remapped web_search tool_choice: %#v", payload["tool_choice"])
+	}
+	tools := payload["tools"].([]any)
+	if tools[0].(map[string]any)["name"] != "web_search" {
+		t.Fatalf("full cloaking remapped web_search tool: %#v", tools[0])
+	}
+}
+
 func TestRemapClaudeOAuthToolNamePreservesMCPNamespacedNames(t *testing.T) {
 	// mcp__<server>__<tool> is a protocol convention (namespacing), not a
 	// "third-party lowercase/snake_case" client tool name; PascalCasing it

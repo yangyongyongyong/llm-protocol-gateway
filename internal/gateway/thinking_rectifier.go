@@ -96,6 +96,13 @@ func shouldRectifyThinkingSignature(body []byte) bool {
 		(strings.Contains(lower, "thinking") || strings.Contains(lower, "redacted_thinking")) {
 		return true
 	}
+	// 场景7：历史 thinking 块正文为空（thinking="" 且无有效 signature）。
+	// Claude Code / 客户端偶发把空 thinking 占位块写进多轮历史，上游 Anthropic
+	// 直接 400。剥离空块后重试即可（与签名类错误同一整流路径）。
+	// 例："messages.2.content.0.thinking: each thinking block must contain thinking"
+	if strings.Contains(lower, "each thinking block must contain thinking") {
+		return true
+	}
 	return false
 }
 
