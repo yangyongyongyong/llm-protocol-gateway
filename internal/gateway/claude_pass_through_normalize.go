@@ -49,12 +49,37 @@ func normalizeClaudePassThroughPayload(payload map[string]any) {
 			normalized["thinking"] = normalizedThinking
 		}
 	}
+	sanitizeClaudePassThroughDisabledThinkingEffort(normalized)
 	for key := range payload {
 		delete(payload, key)
 	}
 	for key, value := range normalized {
 		payload[key] = value
 	}
+}
+
+// sanitizeClaudePassThroughDisabledThinkingEffort clamps output_config.effort when
+// thinking is disabled. Anthropic Opus 5+ rejects effort "xhigh"/"max" with
+// thinking.type=disabled (400: use effort 'high' or below, or enable thinking).
+// Claude Code / clients sometimes send that incompatible pair on pass-through.
+func sanitizeClaudePassThroughDisabledThinkingEffort(payload map[string]any) {
+	if payload == nil {
+		return
+	}
+	thinking, _ := payload["thinking"].(map[string]any)
+	if strings.ToLower(strings.TrimSpace(stringValue(thinking["type"]))) != "disabled" {
+		return
+	}
+	cfg, _ := payload["output_config"].(map[string]any)
+	if cfg == nil {
+		return
+	}
+	effort := strings.ToLower(strings.TrimSpace(stringValue(cfg["effort"])))
+	if effort != "xhigh" && effort != "max" {
+		return
+	}
+	cfg["effort"] = "high"
+	payload["output_config"] = cfg
 }
 
 // claudeCountTokensDisallowedFields are generation-only Message fields that
@@ -110,6 +135,7 @@ func rewriteClaudeUpstreamMaxTokens(body []byte, provider domain.Provider, maxTo
 		payload["model"] = model
 	}
 	payload["max_tokens"] = effectiveClaudeMaxTokens(model, maxTokensOverride)
+	sanitizeClaudePassThroughDisabledThinkingEffort(payload)
 	out, err := json.Marshal(payload)
 	if err != nil {
 		return body

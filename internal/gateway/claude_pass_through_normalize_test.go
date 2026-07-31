@@ -339,3 +339,74 @@ func TestNormalizeClaudePassThroughToolsInjectsSchemaOnlyForCustomTools(t *testi
 		}
 	}
 }
+
+func TestNormalizeClaudePassThroughClampsXHighWhenThinkingDisabled(t *testing.T) {
+	// Regression: 2026-07-31 17:12:56 — Claude Code sent thinking:disabled +
+	// output_config.effort:xhigh → Anthropic 400 on Opus 5.
+	payload := map[string]any{
+		"model":         "claude-opus-5",
+		"messages":      []any{map[string]any{"role": "user", "content": "hi"}},
+		"thinking":      map[string]any{"type": "disabled"},
+		"output_config": map[string]any{"effort": "xhigh"},
+		"max_tokens":    64000,
+	}
+	normalizeClaudePassThroughPayload(payload)
+	cfg := payload["output_config"].(map[string]any)
+	if cfg["effort"] != "high" {
+		t.Fatalf("expected effort clamped to high, got %#v", cfg)
+	}
+	if payload["thinking"].(map[string]any)["type"] != "disabled" {
+		t.Fatalf("thinking.disabled must be preserved, got %#v", payload["thinking"])
+	}
+
+	// max / xhigh both clamp; high stays.
+	for _, effort := range []string{"max", "xhigh"} {
+		p := map[string]any{
+			"model":         "claude-opus-5",
+			"messages":      []any{map[string]any{"role": "user", "content": "hi"}},
+			"thinking":      map[string]any{"type": "disabled"},
+			"output_config": map[string]any{"effort": effort},
+			"max_tokens":    1024,
+		}
+		normalizeClaudePassThroughPayload(p)
+		if p["output_config"].(map[string]any)["effort"] != "high" {
+			t.Fatalf("effort %q should clamp to high, got %#v", effort, p["output_config"])
+		}
+	}
+	ok := map[string]any{
+		"model":         "claude-opus-5",
+		"messages":      []any{map[string]any{"role": "user", "content": "hi"}},
+		"thinking":      map[string]any{"type": "disabled"},
+		"output_config": map[string]any{"effort": "high"},
+		"max_tokens":    1024,
+	}
+	normalizeClaudePassThroughPayload(ok)
+	if ok["output_config"].(map[string]any)["effort"] != "high" {
+		t.Fatalf("high should stay high, got %#v", ok["output_config"])
+	}
+
+	// adaptive + xhigh must not be clamped.
+	adaptive := map[string]any{
+		"model":         "claude-opus-5",
+		"messages":      []any{map[string]any{"role": "user", "content": "hi"}},
+		"thinking":      map[string]any{"type": "adaptive"},
+		"output_config": map[string]any{"effort": "xhigh"},
+		"max_tokens":    1024,
+	}
+	normalizeClaudePassThroughPayload(adaptive)
+	if adaptive["output_config"].(map[string]any)["effort"] != "xhigh" {
+		t.Fatalf("adaptive+xhigh must stay, got %#v", adaptive["output_config"])
+	}
+}
+
+func TestRewriteClaudeUpstreamMaxTokensAlsoClampsDisabledXHigh(t *testing.T) {
+	body := []byte(`{"model":"claude-opus-5","thinking":{"type":"disabled"},"output_config":{"effort":"xhigh"},"max_tokens":100}`)
+	out := rewriteClaudeUpstreamMaxTokens(body, domain.Provider{}, 0)
+	var payload map[string]any
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["output_config"].(map[string]any)["effort"] != "high" {
+		t.Fatalf("rewrite path should clamp xhigh, got %#v", payload["output_config"])
+	}
+}
