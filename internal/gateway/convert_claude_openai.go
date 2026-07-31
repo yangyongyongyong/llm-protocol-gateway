@@ -227,6 +227,18 @@ func claudeModelRequiresAdaptiveThinking(model string) bool {
 	}
 }
 
+// claudeModelRejectsDisabledThinking reports models that reject
+// thinking.type=disabled outright on native pass-through (Anthropic 400:
+// "thinking.type.disabled is not supported for this model"). Unlike opus-5,
+// which accepts disabled and only rejects disabled+xhigh, these models must
+// fall back to adaptive. Kept to models with an observed 400, not the full
+// requires-adaptive set — opus-5 accepts disabled and has a regression test
+// pinning that behavior.
+func claudeModelRejectsDisabledThinking(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	return strings.Contains(model, "fable-5")
+}
+
 func claudeModelSupportsAdaptiveThinking(model string) bool {
 	if claudeModelRequiresAdaptiveThinking(model) {
 		return true

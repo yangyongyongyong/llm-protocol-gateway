@@ -58,16 +58,37 @@ func normalizeClaudePassThroughPayload(payload map[string]any) {
 	}
 }
 
-// sanitizeClaudePassThroughDisabledThinkingEffort clamps output_config.effort when
-// thinking is disabled. Anthropic Opus 5+ rejects effort "xhigh"/"max" with
-// thinking.type=disabled (400: use effort 'high' or below, or enable thinking).
-// Claude Code / clients sometimes send that incompatible pair on pass-through.
+// sanitizeClaudePassThroughDisabledThinkingEffort reconciles thinking.type=disabled
+// with the upstream model on native pass-through:
+//   - Models that reject disabled outright (fable-5) are rewritten to
+//     adaptive+effort:low, matching the Chat->Claude conversion path.
+//   - Models that accept disabled but reject high-effort pairings (Opus 5+)
+//     have output_config.effort clamped from xhigh/max down to high
+//     (400: use effort 'high' or below, or enable thinking).
+//
+// Claude Code / clients sometimes send these incompatible pairs on pass-through.
 func sanitizeClaudePassThroughDisabledThinkingEffort(payload map[string]any) {
 	if payload == nil {
 		return
 	}
 	thinking, _ := payload["thinking"].(map[string]any)
 	if strings.ToLower(strings.TrimSpace(stringValue(thinking["type"]))) != "disabled" {
+		return
+	}
+	// Some models (fable-5) reject thinking.type=disabled outright — 400
+	// "thinking.type.disabled is not supported for this model". Rewrite to
+	// adaptive+low, matching the Chat->Claude conversion path
+	// (normalizeExplicitThinkingForModel). opus-5 accepts disabled, so it
+	// falls through to the effort clamp below instead.
+	model := strings.TrimSpace(stringValue(payload["model"]))
+	if claudeModelRejectsDisabledThinking(model) {
+		payload["thinking"] = map[string]any{"type": "adaptive"}
+		cfg, _ := payload["output_config"].(map[string]any)
+		if cfg == nil {
+			cfg = map[string]any{}
+		}
+		cfg["effort"] = "low"
+		payload["output_config"] = cfg
 		return
 	}
 	cfg, _ := payload["output_config"].(map[string]any)

@@ -340,6 +340,56 @@ func TestNormalizeClaudePassThroughToolsInjectsSchemaOnlyForCustomTools(t *testi
 	}
 }
 
+func TestNormalizeClaudePassThroughRewritesDisabledForFable5(t *testing.T) {
+	// Regression: 2026-08-01 02:26:46 (Beijing) — Claude Code sent
+	// thinking:disabled to claude-fable-5, which rejects disabled outright
+	// (400 "thinking.type.disabled is not supported for this model").
+	// Must rewrite to adaptive+effort:low, not merely clamp effort.
+	payload := map[string]any{
+		"model":         "claude-fable-5",
+		"messages":      []any{map[string]any{"role": "user", "content": "hi"}},
+		"thinking":      map[string]any{"type": "disabled"},
+		"output_config": map[string]any{"effort": "high"},
+		"max_tokens":    1024,
+	}
+	normalizeClaudePassThroughPayload(payload)
+	th := payload["thinking"].(map[string]any)
+	if th["type"] != "adaptive" {
+		t.Fatalf("fable-5 disabled must become adaptive, got %#v", th)
+	}
+	if payload["output_config"].(map[string]any)["effort"] != "low" {
+		t.Fatalf("fable-5 disabled must set effort=low, got %#v", payload["output_config"])
+	}
+
+	// No output_config present: adaptive rewrite must still create effort:low.
+	bare := map[string]any{
+		"model":      "claude-fable-5",
+		"messages":   []any{map[string]any{"role": "user", "content": "hi"}},
+		"thinking":   map[string]any{"type": "disabled"},
+		"max_tokens": 1024,
+	}
+	normalizeClaudePassThroughPayload(bare)
+	if bare["thinking"].(map[string]any)["type"] != "adaptive" {
+		t.Fatalf("fable-5 bare disabled must become adaptive, got %#v", bare["thinking"])
+	}
+	if bare["output_config"].(map[string]any)["effort"] != "low" {
+		t.Fatalf("fable-5 bare disabled must set effort=low, got %#v", bare["output_config"])
+	}
+
+	// opus-5 accepts disabled — must be preserved, not rewritten to adaptive.
+	opus := map[string]any{
+		"model":         "claude-opus-5",
+		"messages":      []any{map[string]any{"role": "user", "content": "hi"}},
+		"thinking":      map[string]any{"type": "disabled"},
+		"output_config": map[string]any{"effort": "high"},
+		"max_tokens":    1024,
+	}
+	normalizeClaudePassThroughPayload(opus)
+	if opus["thinking"].(map[string]any)["type"] != "disabled" {
+		t.Fatalf("opus-5 disabled must be preserved, got %#v", opus["thinking"])
+	}
+}
+
 func TestNormalizeClaudePassThroughClampsXHighWhenThinkingDisabled(t *testing.T) {
 	// Regression: 2026-07-31 17:12:56 — Claude Code sent thinking:disabled +
 	// output_config.effort:xhigh → Anthropic 400 on Opus 5.
