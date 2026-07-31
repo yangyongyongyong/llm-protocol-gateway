@@ -1746,7 +1746,9 @@ function buildApiKeyOpenCodeConfig(key: APIKey, route: Route | undefined, endpoi
 function openCodeModelLimit(modelID: string, provider?: Provider, aliases?: Record<string, string>) {
   const target = ((aliases?.[modelID] || aliases?.[modelID.trim()] || modelID) || '').trim() || modelID;
   const listed = provider?.models?.find((item) => item.id === target || item.id === modelID);
-  const context = listed?.contextLength && listed.contextLength > 0 ? listed.contextLength : 128000;
+  // 目录未显式给出上下文长度时，默认按 1M 处理（与 Claude [1m] 保持一致，
+  // 避免 Codex/OpenCode 回落到 128k 触发过早压缩）。目录若有真实值则以真实值为准。
+  const context = listed?.contextLength && listed.contextLength > 0 ? listed.contextLength : 1_000_000;
   const output = context >= 1_000_000
     ? 128000
     : context >= 200000
