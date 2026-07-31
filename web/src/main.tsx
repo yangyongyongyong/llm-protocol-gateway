@@ -1856,8 +1856,17 @@ ${keepOfficialLogin ? 'supports_websockets = true\n' : ''}experimental_bearer_to
 `;
 }
 
+/** 给 Claude 模型名补上 [1m] 后缀，让客户端请求 100 万上下文窗口（避免默认 200k 频繁压缩）。
+ *  已带后缀 / 空值不重复加；后缀触发 anthropic-beta: context-1m-2025-08-07 头。 */
+function withClaude1MContext(model: string) {
+  const trimmed = model.trim();
+  if (!trimmed || trimmed === 'your-model') return trimmed;
+  if (/\[[^\]]*\]\s*$/.test(trimmed)) return trimmed;
+  return `${trimmed}[1m]`;
+}
+
 function buildApiKeyClaudeConfig(key: APIKey, route: Route | undefined, endpoints: OutputEndpoint[], publicBase: string, provider?: Provider) {
-  const model = resolveApiKeyModel(key, provider);
+  const model = withClaude1MContext(resolveApiKeyModel(key, provider));
   const baseURL = `${apiKeyGatewayRoot(endpoints, publicBase)}/anthropic`;
   const config = {
     env: {
@@ -1866,6 +1875,7 @@ function buildApiKeyClaudeConfig(key: APIKey, route: Route | undefined, endpoint
       ANTHROPIC_API_KEY: key.key,
       ANTHROPIC_MODEL: model,
     },
+    model,
   };
   return `${JSON.stringify(config, null, 2)}\n`;
 }
