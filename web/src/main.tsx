@@ -1870,22 +1870,52 @@ function clientConfigScriptNoun(_client: 'opencode' | 'codex' | 'claude') {
   return '修改脚本';
 }
 
-// awk 片段：删除 BEGIN_MARK..END_MARK（含首尾）之间的内容，并顺带吃掉紧跟在
-// END_MARK 后面的空行，避免每次重复执行都多攒一行空行。找不到分界线时原样透传。
-const CODEX_PROVIDER_BLOCK_STRIP_AWK = [
-  "awk -v begin=\"$BEGIN_MARK\" -v end=\"$END_MARK\" '",
-  '  $0 == begin { skip=1; next }',
-  '  skip == 1 { if ($0 == end) skip=2; next }',
-  '  skip == 2 { if ($0 == "") next; skip=0 }',
-  '  { print }',
-  "'",
-].join('\n');
+/** UTF-8 → base64，供粘贴型 Python 脚本安全内嵌配置正文（避免引号/heredoc 坑）。 */
+function utf8ToBase64(text: string) {
+  const bytes = new TextEncoder().encode(text);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+/** macOS 终端可直接粘贴执行：外层仅一行 python3 heredoc，逻辑全在 Python。 */
+function wrapMacPythonScript(pyBody: string, headerComment: string) {
+  const marker = `LPG_PY_${Date.now().toString(36)}`;
+  return [
+    `# ${headerComment}`,
+    '# macOS：粘贴到终端执行（依赖系统自带 python3；不依赖 bash/awk）',
+    `python3 <<'${marker}'`,
+    pyBody.replace(/\n$/, ''),
+    marker,
+    '',
+  ].join('\n');
+}
+
+const PY_HELPERS = `
+import base64, datetime, pathlib, shutil, subprocess, sys
+
+def _b64(s: str) -> str:
+    return base64.b64decode(s.encode("ascii")).decode("utf-8")
+
+def _backup(path: pathlib.Path) -> None:
+    if not path.exists():
+        return
+    bak = path.with_name(path.name + ".bak." + datetime.datetime.now().strftime("%Y%m%d%H%M%S"))
+    shutil.copy2(path, bak)
+    print(f"已备份: {bak}")
+
+def _write_text(path: pathlib.Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not text.endswith("\\n"):
+        text += "\\n"
+    path.write_text(text, encoding="utf-8")
+`.trim();
 
 /**
  * 生成 Codex 专用的“修改脚本”：增量合并进 ~/.codex/config.toml。
  * - 没有配置文件：直接新建，只包含我们这段。
  * - 已有配置文件：先摘掉此前由本工具写入的分界线区块（如果存在），再把新的一段
- *   插到文件最顶部，最后拼回文件原本剩余的全部内容——[features]/[memories]/
+ *   插到文件最顶部，最后拼回文件原本剩余的全部内容——[features]/[memories]、
  *   sandbox_mode/approval_policy/personality 等用户自己的配置一个字符都不会被
  *   改动，也不会被换位置。
  * model catalog 附加文件仍是本工具独占的一个文件，按原方式整份覆盖，不受影响。
@@ -1894,78 +1924,73 @@ function buildApiKeyCodexConfigPatchScript(
   configText: string,
   extraFiles: Array<{ rel: string; display: string; content: string }> = [],
 ) {
-  const stamp = Date.now().toString(36);
-  const blockMarker = `LPG_CFG_CODEX_BLOCK_${stamp}`;
-  const body = configText.endsWith('\n') ? configText : `${configText}\n`;
-  const lines = [
-    '# 修改脚本（增量合并进 config.toml；只替换本工具管理的一段，不动你其他配置；粘贴到终端执行即可）',
-    'set -euo pipefail',
-    'FILE="$HOME/.codex/config.toml"',
-    'mkdir -p "$(dirname "$FILE")"',
-    `BEGIN_MARK='${CODEX_PROVIDER_BLOCK_BEGIN}'`,
-    `END_MARK='${CODEX_PROVIDER_BLOCK_END}'`,
-    'if [ -f "$FILE" ]; then',
-    '  BAK="${FILE}.bak.$(date +%Y%m%d%H%M%S)"',
-    '  cp "$FILE" "$BAK"',
-    '  echo "已备份: $BAK"',
-    'fi',
-    'REST="$(mktemp)"',
-    'if [ -f "$FILE" ]; then',
-    `  ${CODEX_PROVIDER_BLOCK_STRIP_AWK} "$FILE" > "$REST"`,
-    'else',
-    '  : > "$REST"',
-    'fi',
-    'NEWFILE="$(mktemp)"',
-    '{',
-    '  echo "$BEGIN_MARK"',
-    `  cat <<'${blockMarker}'`,
-    body.replace(/\n$/, ''),
-    blockMarker,
-    '  echo "$END_MARK"',
-    '  echo ""',
-    '  cat "$REST"',
-    '} > "$NEWFILE"',
-    'mv "$NEWFILE" "$FILE"',
-    'rm -f "$REST"',
-    'echo "已合并写入（仅替换本工具管理的 provider 段，其余配置保持不变）: ~/.codex/config.toml"',
-  ];
-  extraFiles.forEach((file, index) => {
-    const fileMarker = `LPG_EXTRA_CODEX_${index}_${stamp}`;
-    const fileBody = file.content.endsWith('\n') ? file.content : `${file.content}\n`;
-    lines.push(
-      `EXTRA="$HOME/${file.rel}"`,
-      'mkdir -p "$(dirname "$EXTRA")"',
-      'if [ -f "$EXTRA" ]; then',
-      '  BAK="${EXTRA}.bak.$(date +%Y%m%d%H%M%S)"',
-      '  cp "$EXTRA" "$BAK"',
-      '  echo "已备份: $BAK"',
-      'fi',
-      `cat > "$EXTRA" <<'${fileMarker}'`,
-      fileBody.replace(/\n$/, ''),
-      fileMarker,
-      `echo "已写入: ${file.display}"`,
-    );
-  });
-  // 第三方/自定义 provider 下 Codex 的 remote compaction（长会话自动压缩）
-  // 常报 "expected exactly one compaction output item"——社区已确认这是所有
-  // 非官方 provider 的通用缺陷（cc-switch #4030/#4725 等），网关这边无法保证
-  // 模型每次都吐出 Codex 期望的那种单一输出项形状，唯一可靠的绕过方式是关掉
-  // 该特性、让 Codex 走本地压缩。用官方 codex CLI 完成（不手写 TOML，避免和
-  // 用户已有的 [features] 表冲突）；找不到 codex 命令或执行失败都只是提示，
-  // 不影响本脚本其余部分（provider 配置已经写完）。
-  lines.push(
-    'if command -v codex >/dev/null 2>&1; then',
-    '  if codex features disable remote_compaction_v2 >/dev/null 2>&1; then',
-    '    echo "已关闭 Codex remote compaction（第三方 provider 下长会话自动压缩常报 compaction 相关错误，改走本地压缩）"',
-    '  else',
-    '    echo "提示：codex features disable remote_compaction_v2 执行失败，可手动运行一次"',
-    '  fi',
-    'else',
-    '  echo "提示：未找到 codex 命令，建议手动执行一次: codex features disable remote_compaction_v2 （第三方 provider 下长会话自动压缩可能报错）"',
-    'fi',
-  );
-  lines.push('echo "完成。如客户端已在运行，请重启后再试。"', '');
-  return lines.join('\n');
+  const blockB64 = utf8ToBase64(configText.endsWith('\n') ? configText : `${configText}\n`);
+  const extrasPy = extraFiles.map((file) => {
+    const body = file.content.endsWith('\n') ? file.content : `${file.content}\n`;
+    return `    (${JSON.stringify(file.rel)}, ${JSON.stringify(file.display)}, ${JSON.stringify(utf8ToBase64(body))}),`;
+  }).join('\n');
+  const py = [
+    PY_HELPERS,
+    `BEGIN = ${JSON.stringify(CODEX_PROVIDER_BLOCK_BEGIN)}`,
+    `END = ${JSON.stringify(CODEX_PROVIDER_BLOCK_END)}`,
+    'HOME = pathlib.Path.home()',
+    'FILE = HOME / ".codex" / "config.toml"',
+    `NEW_BLOCK = _b64(${JSON.stringify(blockB64)})`,
+    'EXTRAS = [',
+    extrasPy,
+    ']',
+    '',
+    'def strip_provider_block(text: str) -> str:',
+    '    out = []',
+    '    skip = 0  # 0=normal 1=inside block 2=just after END',
+    '    for line in text.splitlines(keepends=True):',
+    '        raw = line.rstrip("\\r\\n")',
+    '        if skip == 0:',
+    '            if raw == BEGIN:',
+    '                skip = 1',
+    '                continue',
+    '            out.append(line)',
+    '            continue',
+    '        if skip == 1:',
+    '            if raw == END:',
+    '                skip = 2',
+    '            continue',
+    '        if raw == "":',
+    '            skip = 0',
+    '            continue',
+    '        skip = 0',
+    '        out.append(line)',
+    '    return "".join(out)',
+    '',
+    'FILE.parent.mkdir(parents=True, exist_ok=True)',
+    'rest = ""',
+    'if FILE.exists():',
+    '    _backup(FILE)',
+    '    rest = strip_provider_block(FILE.read_text(encoding="utf-8"))',
+    'block = NEW_BLOCK if NEW_BLOCK.endswith("\\n") else NEW_BLOCK + "\\n"',
+    'merged = f"{BEGIN}\\n{block}{END}\\n\\n{rest}"',
+    '_write_text(FILE, merged)',
+    'print("已合并写入（仅替换本工具管理的 provider 段，其余配置保持不变）: ~/.codex/config.toml")',
+    '',
+    'for rel, display, payload in EXTRAS:',
+    '    path = HOME / rel',
+    '    _backup(path)',
+    '    _write_text(path, _b64(payload))',
+    '    print(f"已写入: {display}")',
+    '',
+    '# 第三方 provider 下 remote compaction 常报错；用官方 CLI 关掉（不手改 [features]）',
+    'codex = shutil.which("codex")',
+    'if codex:',
+    '    try:',
+    '        subprocess.run([codex, "features", "disable", "remote_compaction_v2"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)',
+    '        print("已关闭 Codex remote compaction（第三方 provider 下长会话自动压缩常报 compaction 相关错误，改走本地压缩）")',
+    '    except Exception:',
+    '        print("提示：codex features disable remote_compaction_v2 执行失败，可手动运行一次")',
+    'else:',
+    '    print("提示：未找到 codex 命令，建议手动执行一次: codex features disable remote_compaction_v2 （第三方 provider 下长会话自动压缩可能报错）")',
+    'print("完成。如客户端已在运行，请重启后再试。")',
+  ].join('\n');
+  return wrapMacPythonScript(py, '修改脚本（增量合并进 config.toml；只替换本工具管理的一段，不动你其他配置）');
 }
 
 /**
@@ -1973,42 +1998,55 @@ function buildApiKeyCodexConfigPatchScript(
  * 任何配置都不会被触碰；没有该区块时是无害的空操作（不会报错、不会误删）。
  */
 function buildApiKeyCodexRestoreOfficialScript() {
-  const lines = [
-    '# 还原为官方 provider（只移除本工具管理的那一段，不动你其他配置；粘贴到终端执行即可）',
-    'set -euo pipefail',
-    'FILE="$HOME/.codex/config.toml"',
-    `BEGIN_MARK='${CODEX_PROVIDER_BLOCK_BEGIN}'`,
-    `END_MARK='${CODEX_PROVIDER_BLOCK_END}'`,
-    'if [ ! -f "$FILE" ]; then',
-    '  echo "未发现 $FILE，无需还原"',
-    '  exit 0',
-    'fi',
-    'BAK="${FILE}.bak.$(date +%Y%m%d%H%M%S)"',
-    'cp "$FILE" "$BAK"',
-    'echo "已备份: $BAK"',
-    'TMP="$(mktemp)"',
-    `${CODEX_PROVIDER_BLOCK_STRIP_AWK} "$FILE" > "$TMP"`,
-    'mv "$TMP" "$FILE"',
-    'echo "已移除本工具管理的 provider 配置，Codex 将回退到官方 provider（其他设置保持不变）: $FILE"',
-    // 官方 provider 走官方链路，remote compaction 通常没问题；对称地把我们
-    // 关掉的这个特性开回去，不残留我们的footprint。同样通过官方 CLI 完成，
-    // 找不到命令或执行失败都只是提示，不影响还原本身（provider 配置已经移除）。
-    'if command -v codex >/dev/null 2>&1; then',
-    '  if codex features enable remote_compaction_v2 >/dev/null 2>&1; then',
-    '    echo "已恢复 Codex remote compaction（官方 provider 下通常没有兼容性问题）"',
-    '  else',
-    '    echo "提示：codex features enable remote_compaction_v2 执行失败，可忽略或手动运行"',
-    '  fi',
-    'else',
-    '  echo "提示：未找到 codex 命令，如需恢复 remote compaction 可手动执行: codex features enable remote_compaction_v2"',
-    'fi',
-  ];
-  return lines.join('\n');
+  const py = [
+    PY_HELPERS,
+    `BEGIN = ${JSON.stringify(CODEX_PROVIDER_BLOCK_BEGIN)}`,
+    `END = ${JSON.stringify(CODEX_PROVIDER_BLOCK_END)}`,
+    'FILE = pathlib.Path.home() / ".codex" / "config.toml"',
+    '',
+    'def strip_provider_block(text: str) -> str:',
+    '    out = []',
+    '    skip = 0',
+    '    for line in text.splitlines(keepends=True):',
+    '        raw = line.rstrip("\\r\\n")',
+    '        if skip == 0:',
+    '            if raw == BEGIN:',
+    '                skip = 1',
+    '                continue',
+    '            out.append(line)',
+    '            continue',
+    '        if skip == 1:',
+    '            if raw == END:',
+    '                skip = 2',
+    '            continue',
+    '        if raw == "":',
+    '            skip = 0',
+    '            continue',
+    '        skip = 0',
+    '        out.append(line)',
+    '    return "".join(out)',
+    '',
+    'if not FILE.exists():',
+    '    print(f"未发现 {FILE}，无需还原")',
+    '    sys.exit(0)',
+    '_backup(FILE)',
+    '_write_text(FILE, strip_provider_block(FILE.read_text(encoding="utf-8")))',
+    'print(f"已移除本工具管理的 provider 配置，Codex 将回退到官方 provider（其他设置保持不变）: {FILE}")',
+    'codex = shutil.which("codex")',
+    'if codex:',
+    '    try:',
+    '        subprocess.run([codex, "features", "enable", "remote_compaction_v2"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)',
+    '        print("已恢复 Codex remote compaction（官方 provider 下通常没有兼容性问题）")',
+    '    except Exception:',
+    '        print("提示：codex features enable remote_compaction_v2 执行失败，可忽略或手动运行")',
+    'else:',
+    '    print("提示：未找到 codex 命令，如需恢复 remote compaction 可手动执行: codex features enable remote_compaction_v2")',
+  ].join('\n');
+  return wrapMacPythonScript(py, '还原为官方 provider（只移除本工具管理的那一段，不动你其他配置）');
 }
 
-/** 生成可粘贴到终端执行的覆盖脚本：备份旧文件后写入完整配置（Codex 另写 model catalog）。
- *  Codex 会走上面的增量“修改脚本”；这里只服务 opencode / claude —— 它们的配置文件
- *  由本工具独占管理，整份覆盖不存在“误删用户其他配置”的问题。 */
+/** 生成可粘贴到终端执行的修改脚本（Python）：Codex 走 TOML 分界线增量替换；
+ *  OpenCode / Claude 走 JSON 键级深合并。 */
 function buildApiKeyClientConfigInstallScript(
   client: 'opencode' | 'codex' | 'claude',
   configText: string,
@@ -2017,47 +2055,24 @@ function buildApiKeyClientConfigInstallScript(
   if (client === 'codex') {
     return buildApiKeyCodexConfigPatchScript(configText, extraFiles);
   }
-  // OpenCode / Claude 的配置文件是 JSON，且并非本工具独占（用户自己的 provider/
-  // 主题/keybinds/mcp、permissions/hooks/model/statusLine 等都在同一文件里）。因此
-  // 改为“增量合并”：用 python3 做键级深合并，只更新本工具管理的键（Claude 的
-  // env.ANTHROPIC_*，OpenCode 的 provider.<key> 与顶层 model），其余用户配置一律保留。
+  // OpenCode / Claude：JSON 键级深合并，只更新本工具管理的键。
   const rel = clientConfigHomeRelativePath(client);
   const display = clientConfigFilePath(client);
-  const stamp = Date.now().toString(36);
-  const jsonMarker = `LPG_CFG_JSON_${client.toUpperCase()}_${stamp}`;
-  const pyMarker = `LPG_CFG_PY_${client.toUpperCase()}_${stamp}`;
-  const body = configText.endsWith('\n') ? configText : `${configText}\n`;
-  const lines = [
-    '# 修改脚本（增量合并进 JSON 配置；只更新本工具管理的键，保留你其它配置；粘贴到终端执行即可）',
-    'set -euo pipefail',
-    `FILE="$HOME/${rel}"`,
-    'mkdir -p "$(dirname "$FILE")"',
-    'if ! command -v python3 >/dev/null 2>&1; then',
-    '  echo "未找到 python3，无法安全增量合并 JSON。请改用弹窗里的「仅复制配置内容」手动合并。" >&2',
-    '  exit 1',
-    'fi',
-    'if [ -f "$FILE" ]; then',
-    '  BAK="${FILE}.bak.$(date +%Y%m%d%H%M%S)"',
-    '  cp "$FILE" "$BAK"',
-    '  echo "已备份: $BAK"',
-    'fi',
-    `LPG_NEW=$(cat <<'${jsonMarker}'`,
-    body.replace(/\n$/, ''),
-    jsonMarker,
-    ')',
-    `LPG_NEW="$LPG_NEW" python3 - "$FILE" <<'${pyMarker}'`,
-    'import json, os, sys',
-    'path = sys.argv[1]',
-    'new = json.loads(os.environ["LPG_NEW"])',
-    'data = {}',
-    'if os.path.exists(path):',
-    '    try:',
-    '        with open(path, "r", encoding="utf-8") as f:',
-    '            data = json.load(f) or {}',
-    '    except Exception:',
-    '        data = {}',
-    'if not isinstance(data, dict):',
-    '    data = {}',
+  const jsonB64 = utf8ToBase64(configText.endsWith('\n') ? configText : `${configText}\n`);
+  const extrasPy = extraFiles.map((file) => {
+    const body = file.content.endsWith('\n') ? file.content : `${file.content}\n`;
+    return `    (${JSON.stringify(file.rel)}, ${JSON.stringify(file.display)}, ${JSON.stringify(utf8ToBase64(body))}),`;
+  }).join('\n');
+  const py = [
+    PY_HELPERS,
+    'import json',
+    'HOME = pathlib.Path.home()',
+    `FILE = HOME / ${JSON.stringify(rel)}`,
+    `NEW = json.loads(_b64(${JSON.stringify(jsonB64)}))`,
+    'EXTRAS = [',
+    extrasPy,
+    ']',
+    '',
     'def merge(dst, src):',
     '    for k, v in src.items():',
     '        if isinstance(v, dict) and isinstance(dst.get(k), dict):',
@@ -2065,33 +2080,28 @@ function buildApiKeyClientConfigInstallScript(
     '        else:',
     '            dst[k] = v',
     '    return dst',
-    'merge(data, new)',
-    'with open(path, "w", encoding="utf-8") as f:',
-    '    json.dump(data, f, ensure_ascii=False, indent=2)',
-    '    f.write("\\n")',
-    pyMarker,
-    `echo "已合并写入（仅更新本工具管理的键，保留你其它配置）: ${display}"`,
-  ];
-  // opencode / claude 目前没有附加文件；保留循环以兼容将来扩展（附加文件仍整份写入）。
-  extraFiles.forEach((file, index) => {
-    const fileMarker = `LPG_EXTRA_${client.toUpperCase()}_${index}_${stamp}`;
-    const fileBody = file.content.endsWith('\n') ? file.content : `${file.content}\n`;
-    lines.push(
-      `EXTRA="$HOME/${file.rel}"`,
-      'mkdir -p "$(dirname "$EXTRA")"',
-      'if [ -f "$EXTRA" ]; then',
-      '  BAK="${EXTRA}.bak.$(date +%Y%m%d%H%M%S)"',
-      '  cp "$EXTRA" "$BAK"',
-      '  echo "已备份: $BAK"',
-      'fi',
-      `cat > "$EXTRA" <<'${fileMarker}'`,
-      fileBody.replace(/\n$/, ''),
-      fileMarker,
-      `echo "已写入: ${file.display}"`,
-    );
-  });
-  lines.push('echo "完成。如客户端已在运行，请重启后再试。"', '');
-  return lines.join('\n');
+    '',
+    'FILE.parent.mkdir(parents=True, exist_ok=True)',
+    'data = {}',
+    'if FILE.exists():',
+    '    _backup(FILE)',
+    '    try:',
+    '        loaded = json.loads(FILE.read_text(encoding="utf-8") or "{}")',
+    '        if isinstance(loaded, dict):',
+    '            data = loaded',
+    '    except Exception:',
+    '        data = {}',
+    'merge(data, NEW if isinstance(NEW, dict) else {})',
+    'FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")',
+    `print(${JSON.stringify(`已合并写入（仅更新本工具管理的键，保留你其它配置）: ${display}`)})`,
+    'for rel, display, payload in EXTRAS:',
+    '    path = HOME / rel',
+    '    _backup(path)',
+    '    _write_text(path, _b64(payload))',
+    '    print(f"已写入: {display}")',
+    'print("完成。如客户端已在运行，请重启后再试。")',
+  ].join('\n');
+  return wrapMacPythonScript(py, '修改脚本（增量合并进 JSON 配置；只更新本工具管理的键，保留你其它配置）');
 }
 
 function buildApiKeyClientConfigExtras(
@@ -2795,8 +2805,19 @@ function formatEnCompact(value: number) {
   return String(value);
 }
 
-/** 最近 7 天组合图：柱状 = 每日总 Token（左轴），折线 = 请求次数（右轴）。 */
-function UsageMonthlyTokenBars({ points, onPickDay }: {
+/** 按点数稀疏选取 X 轴刻度，避免 30 天全标挤在一起。 */
+function pickUsageXTickIndexes(count: number) {
+  if (count <= 0) return [] as number[];
+  if (count <= 10) return Array.from({ length: count }, (_, i) => i);
+  const step = Math.max(1, Math.ceil(count / 8));
+  const indexes = new Set<number>([0, count - 1]);
+  for (let i = 0; i < count; i += step) indexes.add(i);
+  return [...indexes].sort((a, b) => a - b);
+}
+
+/** 每日 Token（柱 / 左轴）+ 请求次数（折线 / 右轴）组合图。 */
+function UsageMonthlyTokenBars({ title = '最近 7 天 · 每日用量', points, onPickDay }: {
+  title?: string;
   points: DailyRequestPoint[];
   onPickDay?: (date: string) => void;
 }) {
@@ -2812,12 +2833,11 @@ function UsageMonthlyTokenBars({ points, onPickDay }: {
   }).join(' ');
   // 数值标注：非 0 的每天都标
   const barX = (i: number) => (points.length === 1 ? 50 : ((i + 0.5) / points.length) * 100);
-  // X 轴刻度：仅 7 天，每天都显示
-  const xTickIndexes = points.map((_, i) => i);
+  const xTickIndexes = pickUsageXTickIndexes(points.length);
   return (
-    <div className="usage-month-bars" role="img" aria-label="最近 7 天每日 Token 与请求次数组合图">
+    <div className="usage-month-bars" role="img" aria-label={title}>
       <div className="usage-month-bars-head">
-        <div className="usage-month-bars-title">最近 7 天 · 每日用量</div>
+        <div className="usage-month-bars-title">{title}</div>
         <div className="usage-month-bars-legend">
           <span className="usage-month-legend-item"><i className="legend-bar" />Token（左轴）</span>
           <span className="usage-month-legend-item"><i className="legend-line" />请求次数（右轴）</span>
@@ -2828,7 +2848,7 @@ function UsageMonthlyTokenBars({ points, onPickDay }: {
       ) : (
         <>
           <div className="usage-month-bars-plot">
-            <div className="usage-month-bars-yaxis">
+            <div className="usage-month-bars-yaxis" aria-label="Token">
               <span>{formatTokenCount(tokenMax)}</span>
               <span>{formatTokenCount(Math.round(tokenMax / 2))}</span>
               <span>0</span>
@@ -2893,7 +2913,7 @@ function UsageMonthlyTokenBars({ points, onPickDay }: {
                 );
               })}
             </div>
-            <div className="usage-month-bars-yaxis right">
+            <div className="usage-month-bars-yaxis right" aria-label="请求次数">
               <span>{requestMax}</span>
               <span>{Math.round(requestMax / 2)}</span>
               <span>0</span>
@@ -6995,8 +7015,25 @@ function App() {
                 <Metric label="本月总 Token" value={formatTokenCount((usageMonth?.total.inputTokens ?? 0) + (usageMonth?.total.outputTokens ?? 0))} note={usageMonth?.total ? formatTokenSummary(usageMonth.total) : '暂无数据'} />
               </div>
 
+              {usageFrom !== usageTo ? (
+                <div className="usage-charts-full">
+                  <UsageMonthlyTokenBars
+                    title={`按日请求量 · ${usageFrom} ~ ${usageTo}`}
+                    points={requestStats?.daily || []}
+                    onPickDay={(date) => {
+                      usageFollowTodayRef.current = isFollowingTodayRange(date, date);
+                      setUsageFrom(date);
+                      setUsageTo(date);
+                      void refreshRequestStats(date, date);
+                    }}
+                  />
+                </div>
+              ) : null}
+
               <div className="usage-charts">
-                <UsageLineChart title="按日请求量" points={requestStats?.daily || []} />
+                {usageFrom === usageTo ? (
+                  <UsageLineChart title="按日请求量" points={requestStats?.daily || []} />
+                ) : null}
                 <UsageBarChart
                   title="按 API Key 请求"
                   items={(requestStats?.range?.byApiKey || usageToday?.byApiKey || []).slice(0, 8).map((item) => ({
@@ -8113,6 +8150,7 @@ function App() {
                     />
                   </label>
                 </div>
+                <div className="hint-line">仅影响请求明细（流量日志正文等）。用量统计的每日 Token / 请求次数汇总会永久保留。</div>
                 <div className="app-log-list">
                   {appLogs.length === 0 ? <div className="empty-state">暂无应用日志。</div> : appLogs.map((log, index) => (
                     <div className="app-log-row" key={`${log.time}-${index}`}>
@@ -10157,8 +10195,8 @@ function ApiKeyClientConfigModal({
       title={clientConfigTitle(client)}
       description={
         client === 'codex'
-          ? '已复制修改脚本到剪贴板。在终端粘贴执行即可增量合并进 config.toml（只替换本工具管理的一段，不动你其他配置；会先备份旧文件）。'
-          : '已复制修改脚本到剪贴板。在终端粘贴执行即可增量合并进 JSON 配置（只更新本工具管理的键，保留你其它配置；会先备份旧文件；依赖 python3）。'
+          ? '已复制 Python 修改脚本到剪贴板。粘贴到终端执行即可增量合并进 config.toml（只替换本工具管理的一段，不动你其他配置；会先备份；依赖 macOS 自带 python3）。'
+          : '已复制 Python 修改脚本到剪贴板。粘贴到终端执行即可增量合并进 JSON 配置（只更新本工具管理的键，保留你其它配置；会先备份；依赖 macOS 自带 python3）。'
       }
       onClose={onClose}
       size="wide"
@@ -10241,22 +10279,23 @@ function ApiKeyClientConfigModal({
         {protocolHint ? <div className="hint-line error">{protocolHint}</div> : null}
 
         <div className="field">
-          <label>{client === 'codex' ? '配置修改脚本' : '配置覆盖脚本'}</label>
+          <label>配置修改脚本（Python）</label>
           <div className="hint-line">
             {client === 'codex' ? (
               <>
-                终端执行后会增量合并进 {filePath}：只替换本工具用一对多个 # 号分界线包起来的那一段
-                （provider 相关配置），文件里其他任何区块（比如 [features]/[memories]、
+                终端粘贴执行后会增量合并进 {filePath}：只替换本工具用一对多个 # 号分界线包起来的那一段
+                （provider 相关配置），文件里其他任何区块（比如 [features]、[memories]、
                 sandbox_mode、approval_policy、personality 等你自己的配置）原样保留、不会被改动或
                 挪动位置——对 Codex App 做最小改动。
                 {configExtras.length > 0 ? ` 同时整份覆盖 ${configExtras.map((item) => item.display).join('、')}（本工具独占的模型元数据文件，不影响其他配置）。` : ''}
-                {' '}执行前会先备份为同目录 <code>.bak.时间戳</code>。
+                {' '}执行前会先备份为同目录 <code>.bak.时间戳</code>。脚本为 Python（macOS 自带 python3），不再依赖 bash/awk。
               </>
             ) : (
               <>
-                终端执行后会覆盖 {filePath}
-                {configExtras.length > 0 ? ` 与 ${configExtras.map((item) => item.display).join('、')}` : ''}
-                ；若文件已存在，会先备份为同目录 <code>.bak.时间戳</code>。
+                终端粘贴执行后会增量合并进 {filePath}
+                {configExtras.length > 0 ? `，并写入 ${configExtras.map((item) => item.display).join('、')}` : ''}
+                ：只更新本工具管理的键，保留你其它配置；若文件已存在，会先备份为同目录 <code>.bak.时间戳</code>。
+                脚本为 Python（macOS 自带 python3）。
               </>
             )}
           </div>
