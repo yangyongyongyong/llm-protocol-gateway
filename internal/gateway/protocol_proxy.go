@@ -545,6 +545,14 @@ func (s *Server) executeProtocolFlow(
 	if err != nil {
 		return 0, TokenUsage{}, nil, err
 	}
+	// Single chokepoint for the Qoder job-token refresh: every pass-through path
+	// and every protocol conversion below flows through here.
+	if provider.AuthType == domain.AuthTypeQoderPAT {
+		provider, err = s.ensureFreshQoderToken(provider)
+		if err != nil {
+			return 0, TokenUsage{}, nil, err
+		}
+	}
 
 	if decision.Action == "pass_through" {
 		body, err := json.Marshal(req)

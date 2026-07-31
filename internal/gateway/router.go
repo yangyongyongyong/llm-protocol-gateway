@@ -288,7 +288,8 @@ func (r *Router) AddProvider(provider domain.Provider) (domain.Provider, error) 
 	if provider.BaseURL == "" &&
 		provider.AuthType != domain.AuthTypeClaudeOAuth &&
 		provider.AuthType != domain.AuthTypeCursorOAuth &&
-		provider.AuthType != domain.AuthTypeChatGPTOAuth {
+		provider.AuthType != domain.AuthTypeChatGPTOAuth &&
+		provider.AuthType != domain.AuthTypeQoderPAT {
 		return domain.Provider{}, fmt.Errorf("provider baseUrl is required")
 	}
 	if provider.ID == "" {
@@ -374,6 +375,19 @@ func normalizeProvider(provider *domain.Provider) {
 		// ChatGPT OAuth providers call Codex CLI upstream (chatgpt.com/backend-api).
 		provider.Protocol = domain.ProtocolOpenAIResponses
 		provider.BaseURL = chatgptCodexResponsesURL
+	}
+	if provider.AuthType == domain.AuthTypeQoderPAT {
+		// Qoder's direct endpoint is natively OpenAI-Chat compatible. Unlike the
+		// clauses above, the base URL is only defaulted, not pinned:
+		// api2-v2.qoder.sh is an internal endpoint that may move, and leaving a
+		// manual override means an endpoint change is a config edit rather than a
+		// rebuild. The create form's example.com placeholder is treated as unset,
+		// otherwise a provider created before the user picks Qoder keeps sending
+		// requests to example.com.
+		provider.Protocol = domain.ProtocolOpenAIChat
+		if isPlaceholderBaseURL(provider.BaseURL) {
+			provider.BaseURL = qoderDirectBaseURL
+		}
 	}
 	if provider.HealthStatus == "" {
 		provider.HealthStatus = "unchecked"
@@ -1204,6 +1218,47 @@ func (r *Router) ClearProviderCursorOAuth(providerID string) (domain.Provider, e
 		}
 		updated := r.state.Providers[index]
 		updated.CursorOAuth = nil
+		normalizeProvider(&updated)
+		r.state.Providers[index] = updated
+		return updated, nil
+	}
+	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+}
+
+// SetProviderQoderPAT stores (or replaces) the Qoder credential pair for a
+// provider and forces it into qoder_pat auth mode.
+func (r *Router) SetProviderQoderPAT(providerID string, credential domain.QoderPATCredential) (domain.Provider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID != providerID {
+			continue
+		}
+		updated := r.state.Providers[index]
+		updated.AuthType = domain.AuthTypeQoderPAT
+		credentialCopy := credential
+		updated.QoderPAT = &credentialCopy
+		normalizeProvider(&updated)
+		r.state.Providers[index] = updated
+		return updated, nil
+	}
+	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+}
+
+// ClearProviderQoderPAT removes the stored Qoder credential (logout) while
+// leaving the provider in qoder_pat auth mode so the user can paste a new
+// personal access token without re-configuring the provider.
+func (r *Router) ClearProviderQoderPAT(providerID string) (domain.Provider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID != providerID {
+			continue
+		}
+		updated := r.state.Providers[index]
+		updated.QoderPAT = nil
 		normalizeProvider(&updated)
 		r.state.Providers[index] = updated
 		return updated, nil

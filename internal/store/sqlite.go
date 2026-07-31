@@ -447,6 +447,13 @@ func (s *Store) Save(state domain.GatewayState) error {
 				scope = provider.ChatGPTOAuth.ChatGPTAccountID
 				accountLabel = provider.ChatGPTOAuth.AccountLabel
 			}
+		case domain.AuthTypeQoderPAT:
+			if provider.QoderPAT != nil {
+				accessToken = provider.QoderPAT.AccessToken
+				refreshToken = provider.QoderPAT.RefreshToken
+				expiresAt = provider.QoderPAT.ExpiresAt
+				accountLabel = provider.QoderPAT.AccountLabel
+			}
 		}
 		disabled := 0
 		if provider.Disabled {
@@ -630,6 +637,15 @@ func (s *Store) loadProviders() ([]domain.Provider, error) {
 					ExpiresAt:        expiresAt,
 					ChatGPTAccountID: scope,
 					AccountLabel:     accountLabel,
+				}
+			}
+		case domain.AuthTypeQoderPAT:
+			if accessToken != "" || refreshToken != "" {
+				p.QoderPAT = &domain.QoderPATCredential{
+					AccessToken:  accessToken,
+					RefreshToken: refreshToken,
+					ExpiresAt:    expiresAt,
+					AccountLabel: accountLabel,
 				}
 			}
 		default:

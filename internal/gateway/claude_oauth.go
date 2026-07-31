@@ -490,7 +490,7 @@ func (s *Server) ensureFreshClaudeToken(provider domain.Provider) (domain.Provid
 	if err != nil {
 		return current, err
 	}
-	if err := s.persistProviderOAuth(updated.ID, updated.ClaudeOAuth, nil, nil); err != nil {
+	if err := s.persistProviderOAuth(updated.ID, updated.ClaudeOAuth, nil, nil, nil); err != nil {
 		// Memory has the new token; DB does not. A restart would then load the
 		// old refresh token and hit invalid_grant — surface loudly.
 		s.logs.AddApp("error", "failed to persist refreshed claude oauth token", err.Error())
@@ -554,7 +554,7 @@ func (s *Server) BackfillClaudeOAuthAccountLabels() {
 			credential := *provider.ClaudeOAuth
 			credential.AccountLabel = label
 			if updated, err := s.router.SetProviderClaudeOAuth(provider.ID, credential); err == nil {
-				if err := s.persistProviderOAuth(updated.ID, updated.ClaudeOAuth, nil, nil); err != nil {
+				if err := s.persistProviderOAuth(updated.ID, updated.ClaudeOAuth, nil, nil, nil); err != nil {
 					s.logs.AddApp("warn", "failed to persist claude oauth account label", err.Error())
 				}
 				s.logs.AddApp("info", "claude oauth account label backfilled", fmt.Sprintf("provider=%s label=%s", provider.ID, label))

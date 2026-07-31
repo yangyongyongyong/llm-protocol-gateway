@@ -253,6 +253,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /__providers/{id}/chatgpt-oauth/complete", s.handleChatGPTOAuthComplete)
 	mux.HandleFunc("POST /__providers/{id}/chatgpt-oauth/disconnect", s.handleChatGPTOAuthDisconnect)
 	mux.HandleFunc("GET /__providers/{id}/chatgpt-oauth/usage", s.handleChatGPTOAuthUsage)
+	mux.HandleFunc("POST /__providers/{id}/qoder-pat/complete", s.handleQoderPATComplete)
+	mux.HandleFunc("GET /__providers/{id}/qoder-pat/status", s.handleQoderPATStatus)
+	mux.HandleFunc("POST /__providers/{id}/qoder-pat/disconnect", s.handleQoderPATDisconnect)
 	mux.HandleFunc("GET /__providers/{id}/zhipu/usage", s.handleZhipuUsage)
 	mux.HandleFunc("DELETE /__providers/{id}", s.handleDeleteProvider)
 	mux.HandleFunc("GET /__providers/deleted", s.handleListDeletedProviders)
@@ -404,6 +407,16 @@ func redactProviderForClient(provider domain.Provider) domain.Provider {
 			ExpiresAt:    original.ExpiresAt,
 			AccountLabel: original.AccountLabel,
 			Connected:    strings.TrimSpace(original.AccessToken) != "" && strings.TrimSpace(original.RefreshToken) != "",
+		}
+	}
+	if provider.QoderPAT != nil {
+		original := provider.QoderPAT
+		provider.QoderPAT = &domain.QoderPATCredential{
+			ExpiresAt:    original.ExpiresAt,
+			AccountLabel: original.AccountLabel,
+			// Derived from the PAT, not the job token: the job token expires and
+			// is re-exchanged on demand, but the connection itself persists.
+			Connected: strings.TrimSpace(original.RefreshToken) != "",
 		}
 	}
 	// Regenerate curl against the real BaseURL for UI display.
@@ -2769,7 +2782,7 @@ func (s *Server) saveState() error {
 // full-state Save (which DELETEs + re-INSERTs all providers/models/routes on
 // the single shared SQLite connection and blocks request-hot-path writes).
 // Falls back to saveState when the incremental saver is unavailable.
-func (s *Server) persistProviderOAuth(providerID string, claude *domain.ClaudeOAuthCredential, cursor *domain.CursorOAuthCredential, chatgpt *domain.ChatGPTOAuthCredential) error {
+func (s *Server) persistProviderOAuth(providerID string, claude *domain.ClaudeOAuthCredential, cursor *domain.CursorOAuthCredential, chatgpt *domain.ChatGPTOAuthCredential, qoder *domain.QoderPATCredential) error {
 	if s.providerOAuthSaver != nil {
 		var accessToken, refreshToken, expiresAt, scope, accountLabel string
 		switch {
@@ -2790,6 +2803,11 @@ func (s *Server) persistProviderOAuth(providerID string, claude *domain.ClaudeOA
 			expiresAt = chatgpt.ExpiresAt
 			scope = chatgpt.ChatGPTAccountID
 			accountLabel = chatgpt.AccountLabel
+		case qoder != nil:
+			accessToken = qoder.AccessToken
+			refreshToken = qoder.RefreshToken
+			expiresAt = qoder.ExpiresAt
+			accountLabel = qoder.AccountLabel
 		default:
 			return nil
 		}
@@ -3404,7 +3422,12 @@ func (s *Server) resolveClaudeConsumerRoute(r *http.Request) (domain.Route, doma
 func (s *Server) proxyClaudeCountTokens(r *http.Request, provider domain.Provider, body []byte) (int, []byte, error) {
 	// Cursor OAuth (and other empty-baseURL OpenAI-chat providers) have no Anthropic
 	// count_tokens upstream. Return a lightweight stub so Claude Code startup checks pass.
-	if provider.AuthType == domain.AuthTypeCursorOAuth || (provider.Protocol == domain.ProtocolOpenAIChat && strings.TrimSpace(provider.BaseURL) == "") {
+	// Qoder needs the same stub but must be named explicitly: it is openai_chat with a
+	// real (non-empty) base URL, so it would otherwise fall through to a genuine
+	// Anthropic count_tokens call against api2-v2.qoder.sh and fail.
+	if provider.AuthType == domain.AuthTypeCursorOAuth ||
+		provider.AuthType == domain.AuthTypeQoderPAT ||
+		(provider.Protocol == domain.ProtocolOpenAIChat && strings.TrimSpace(provider.BaseURL) == "") {
 		stub, _ := json.Marshal(map[string]any{"input_tokens": 1})
 		return http.StatusOK, stub, nil
 	}
@@ -3503,6 +3526,23 @@ func (s *Server) fetchProviderModels(r *http.Request, provider domain.Provider, 
 			return providerTestResult{Success: false, Provider: provider.ID, ModelsURL: modelsURL, Status: response.StatusCode, LatencyMs: time.Since(started).Milliseconds(), Error: parseErr.Error(), Preview: preview, Models: []domain.Model{}}
 		}
 		return providerTestResult{Success: true, Provider: provider.ID, ModelsURL: modelsURL, Status: response.StatusCode, LatencyMs: time.Since(started).Milliseconds(), Models: models, Preview: preview}
+	}
+
+	if provider.AuthType == domain.AuthTypeQoderPAT {
+		refreshed, err := s.ensureFreshQoderToken(provider)
+		if err != nil {
+			return providerTestResult{Success: false, Provider: provider.ID, LatencyMs: time.Since(started).Milliseconds(), Error: err.Error(), Models: []domain.Model{}}
+		}
+		provider = refreshed
+		// Qoder's direct endpoint serves no /models route (it 404s), so report the
+		// probed alias list rather than attempting a fetch that always fails.
+		return providerTestResult{
+			Success:   true,
+			Provider:  provider.ID,
+			LatencyMs: time.Since(started).Milliseconds(),
+			Models:    defaultQoderModels(provider.ID),
+			Preview:   "qoder direct endpoint exposes no /models route; using the known alias list",
+		}
 	}
 
 	if provider.AuthType == domain.AuthTypeChatGPTOAuth {
@@ -4408,6 +4448,15 @@ func applyProviderAuth(request *http.Request, provider domain.Provider, incoming
 }
 
 func resolveProviderAuth(provider domain.Provider) string {
+	// Qoder carries its bearer in the credential rather than APIKeySource. This
+	// is a pure lookup: the exchange itself happens in ensureFreshQoderToken,
+	// since this function has no context to make a network call with.
+	if provider.AuthType == domain.AuthTypeQoderPAT {
+		if provider.QoderPAT != nil {
+			return strings.TrimSpace(provider.QoderPAT.AccessToken)
+		}
+		return ""
+	}
 	source := strings.TrimSpace(provider.APIKeySource)
 	if source == "" {
 		return ""

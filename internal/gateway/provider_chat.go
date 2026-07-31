@@ -228,7 +228,7 @@ func thinkingOptionsForProvider(provider domain.Provider) map[string]any {
 			"protocol":     provider.Protocol,
 			"defaultField": "reasoning_effort",
 			"fields": []map[string]any{
-				{"key": "reasoning_effort", "label": "reasoning_effort", "presets": []string{"low", "medium", "high"}, "custom": true},
+				{"key": "reasoning_effort", "label": "reasoning_effort", "presets": []string{"low", "medium", "high", "xhigh", "max"}, "custom": true},
 				{"key": "thinking.type", "label": "thinking.type", "presets": []string{"enabled", "disabled"}, "custom": true},
 			},
 		}
@@ -338,6 +338,15 @@ func (s *Server) testProviderChat(r *http.Request, providerID string, req provid
 	}
 	if provider.AuthType == domain.AuthTypeChatGPTOAuth {
 		return s.testChatGPTOAuthProviderChat(r, provider, req, started)
+	}
+	// The transport below (executeProviderChatHTTP) bypasses executeProtocolFlow,
+	// so the Qoder job token has to be refreshed here explicitly.
+	if provider.AuthType == domain.AuthTypeQoderPAT {
+		refreshed, err := s.ensureFreshQoderToken(provider)
+		if err != nil {
+			return map[string]any{"success": false, "error": err.Error(), "latencyMs": time.Since(started).Milliseconds()}, http.StatusBadGateway
+		}
+		provider = refreshed
 	}
 
 	model := strings.TrimSpace(req.Model)
@@ -496,12 +505,16 @@ func (s *Server) testProviderCacheChat(r *http.Request, providerID string, req p
 	if provider.Protocol == domain.ProtocolClaude {
 		return s.testClaudeProviderCacheChat(r, provider, req, started)
 	}
-	if provider.AuthType == domain.AuthTypeChatGPTOAuth || provider.Protocol == domain.ProtocolOpenAIResponses {
+	// Qoder silently drops array-form message content: the cache test's
+	// cache_control system block yields prompt_tokens=8 where the same text as a
+	// plain string yields 810. The request would succeed while measuring nothing,
+	// so skip rather than report a misleading result.
+	if provider.AuthType == domain.AuthTypeChatGPTOAuth || provider.AuthType == domain.AuthTypeQoderPAT || provider.Protocol == domain.ProtocolOpenAIResponses {
 		return map[string]any{
 			"success":    true,
 			"skipped":    true,
 			"providerId": provider.ID,
-			"summary":    "ChatGPT OAuth / Responses provider skips Cache test",
+			"summary":    "ChatGPT OAuth / Qoder / Responses provider skips Cache test",
 			"latencyMs":  time.Since(started).Milliseconds(),
 		}, http.StatusOK
 	}
@@ -615,6 +628,15 @@ func (s *Server) testProviderThinkingChat(r *http.Request, providerID string, re
 	provider, err := s.router.ProviderByID(providerID)
 	if err != nil {
 		return map[string]any{"success": false, "error": err.Error(), "latencyMs": time.Since(started).Milliseconds()}, http.StatusNotFound
+	}
+	// executeProviderChatHTTP below bypasses executeProtocolFlow, so the Qoder
+	// job token has to be refreshed here explicitly.
+	if provider.AuthType == domain.AuthTypeQoderPAT {
+		refreshed, refreshErr := s.ensureFreshQoderToken(provider)
+		if refreshErr != nil {
+			return map[string]any{"success": false, "error": refreshErr.Error(), "latencyMs": time.Since(started).Milliseconds()}, http.StatusBadGateway
+		}
+		provider = refreshed
 	}
 
 	model := strings.TrimSpace(req.Model)

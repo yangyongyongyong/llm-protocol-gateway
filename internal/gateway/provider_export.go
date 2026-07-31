@@ -129,7 +129,7 @@ func prepareProviderForImport(provider domain.Provider) (domain.Provider, error)
 		provider.AuthType = domain.AuthTypeAPIKey
 	}
 	switch provider.AuthType {
-	case domain.AuthTypeAPIKey, domain.AuthTypeClaudeOAuth, domain.AuthTypeCursorOAuth, domain.AuthTypeChatGPTOAuth:
+	case domain.AuthTypeAPIKey, domain.AuthTypeClaudeOAuth, domain.AuthTypeCursorOAuth, domain.AuthTypeChatGPTOAuth, domain.AuthTypeQoderPAT:
 	default:
 		return domain.Provider{}, fmt.Errorf("unsupported authType %q", provider.AuthType)
 	}
@@ -143,13 +143,15 @@ func prepareProviderForImport(provider domain.Provider) (domain.Provider, error)
 	if provider.BaseURL == "" &&
 		provider.AuthType != domain.AuthTypeClaudeOAuth &&
 		provider.AuthType != domain.AuthTypeCursorOAuth &&
-		provider.AuthType != domain.AuthTypeChatGPTOAuth {
+		provider.AuthType != domain.AuthTypeChatGPTOAuth &&
+		provider.AuthType != domain.AuthTypeQoderPAT {
 		return domain.Provider{}, fmt.Errorf("provider baseUrl is required")
 	}
 
 	provider.ClaudeOAuth = sanitizeImportedClaudeOAuth(provider.ClaudeOAuth)
 	provider.CursorOAuth = sanitizeImportedCursorOAuth(provider.CursorOAuth)
 	provider.ChatGPTOAuth = sanitizeImportedChatGPTOAuth(provider.ChatGPTOAuth)
+	provider.QoderPAT = sanitizeImportedQoderPAT(provider.QoderPAT)
 	if provider.RequestAdapter != nil {
 		// Drop generated display-only curl; it is rebuilt on read.
 		adapter := *provider.RequestAdapter
@@ -208,6 +210,32 @@ func sanitizeImportedCursorOAuth(cred *domain.CursorOAuthCredential) *domain.Cur
 		}
 	}
 	return &domain.CursorOAuthCredential{
+		AccessToken:  access,
+		RefreshToken: refresh,
+		ExpiresAt:    expires,
+		AccountLabel: label,
+	}
+}
+
+func sanitizeImportedQoderPAT(cred *domain.QoderPATCredential) *domain.QoderPATCredential {
+	if cred == nil {
+		return nil
+	}
+	access := strings.TrimSpace(cred.AccessToken)
+	refresh := strings.TrimSpace(cred.RefreshToken)
+	expires := strings.TrimSpace(cred.ExpiresAt)
+	label := strings.TrimSpace(cred.AccountLabel)
+	if access == "" && refresh == "" {
+		if expires == "" && label == "" && !cred.Connected {
+			return nil
+		}
+		return &domain.QoderPATCredential{
+			ExpiresAt:    expires,
+			AccountLabel: label,
+			Connected:    false,
+		}
+	}
+	return &domain.QoderPATCredential{
 		AccessToken:  access,
 		RefreshToken: refresh,
 		ExpiresAt:    expires,
@@ -322,7 +350,28 @@ func mergeProviderImport(existing, incoming domain.Provider) domain.Provider {
 	updated.RequestAdapter = cloneRequestAdapter(incoming.RequestAdapter)
 	updated.ClaudeOAuth = mergeClaudeOAuthImport(existing.ClaudeOAuth, incoming.ClaudeOAuth)
 	updated.CursorOAuth = mergeCursorOAuthImport(existing.CursorOAuth, incoming.CursorOAuth)
+	updated.QoderPAT = mergeQoderPATImport(existing.QoderPAT, incoming.QoderPAT)
 	return updated
+}
+
+func mergeQoderPATImport(existing, incoming *domain.QoderPATCredential) *domain.QoderPATCredential {
+	if incoming == nil {
+		return cloneQoderPAT(existing)
+	}
+	if strings.TrimSpace(incoming.AccessToken) != "" || strings.TrimSpace(incoming.RefreshToken) != "" {
+		return cloneQoderPAT(incoming)
+	}
+	if existing == nil {
+		return nil
+	}
+	merged := *existing
+	if incoming.ExpiresAt != "" {
+		merged.ExpiresAt = incoming.ExpiresAt
+	}
+	if incoming.AccountLabel != "" {
+		merged.AccountLabel = incoming.AccountLabel
+	}
+	return &merged
 }
 
 func mergeClaudeOAuthImport(existing, incoming *domain.ClaudeOAuthCredential) *domain.ClaudeOAuthCredential {
@@ -375,6 +424,7 @@ func cloneProviderForExport(provider domain.Provider) domain.Provider {
 	cloned.RequestAdapter = cloneRequestAdapter(provider.RequestAdapter)
 	cloned.ClaudeOAuth = cloneClaudeOAuth(provider.ClaudeOAuth)
 	cloned.CursorOAuth = cloneCursorOAuth(provider.CursorOAuth)
+	cloned.QoderPAT = cloneQoderPAT(provider.QoderPAT)
 	if cloned.RequestAdapter != nil {
 		cloned.RequestAdapter.CurlExample = ""
 	}
@@ -419,6 +469,14 @@ func cloneClaudeOAuth(cred *domain.ClaudeOAuthCredential) *domain.ClaudeOAuthCre
 }
 
 func cloneCursorOAuth(cred *domain.CursorOAuthCredential) *domain.CursorOAuthCredential {
+	if cred == nil {
+		return nil
+	}
+	cloned := *cred
+	return &cloned
+}
+
+func cloneQoderPAT(cred *domain.QoderPATCredential) *domain.QoderPATCredential {
 	if cred == nil {
 		return nil
 	}

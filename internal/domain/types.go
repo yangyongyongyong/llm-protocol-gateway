@@ -134,6 +134,9 @@ type Provider struct {
 	// ChatGPTOAuth holds the ChatGPT/Codex CLI OAuth token pair for
 	// AuthType == "chatgpt_oauth" providers (sub2api prior art).
 	ChatGPTOAuth *ChatGPTOAuthCredential `json:"chatgptOAuth,omitempty"`
+	// QoderPAT holds the Qoder personal access token plus the job token
+	// exchanged from it, for AuthType == "qoder_pat" providers.
+	QoderPAT *QoderPATCredential `json:"qoderPat,omitempty"`
 	// RequestAdapter is an optional provider-level request rewrite template
 	// (URL/headers/body/model mapping). Nil means use built-in protocol logic.
 	RequestAdapter *RequestAdapter `json:"requestAdapter,omitempty"`
@@ -206,6 +209,23 @@ type CursorOAuthCredential struct {
 	Connected    bool   `json:"connected,omitempty"`
 }
 
+// QoderPATCredential holds the two-tier Qoder credentials. Field names mirror
+// CursorOAuthCredential so the existing sqlite oauth_* columns are reused with
+// no migration:
+//
+//	RefreshToken = the long-lived personal access token ("pt-…") the user pastes
+//	AccessToken  = the short-lived job token exchanged from it (~24h)
+//
+// Both are secrets and must never reach the frontend (see
+// gateway.redactProviderForClient).
+type QoderPATCredential struct {
+	AccessToken  string `json:"accessToken,omitempty"`
+	RefreshToken string `json:"refreshToken,omitempty"`
+	ExpiresAt    string `json:"expiresAt,omitempty"` // RFC3339
+	AccountLabel string `json:"accountLabel,omitempty"`
+	Connected    bool   `json:"connected,omitempty"`
+}
+
 // ChatGPTOAuthCredential holds a ChatGPT (Codex CLI) OAuth token pair used to
 // call chatgpt.com/backend-api/codex/responses. Secrets must never reach the
 // frontend (see gateway.redactProviderForClient).
@@ -223,6 +243,7 @@ const (
 	AuthTypeClaudeOAuth  = "claude_oauth"
 	AuthTypeCursorOAuth  = "cursor_oauth"
 	AuthTypeChatGPTOAuth = "chatgpt_oauth"
+	AuthTypeQoderPAT     = "qoder_pat"
 )
 
 type Model struct {

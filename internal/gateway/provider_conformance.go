@@ -107,7 +107,8 @@ func (s *Server) runProviderConformance(r *http.Request, providerID string, star
 	}
 	if provider.AuthType == domain.AuthTypeClaudeOAuth ||
 		provider.AuthType == domain.AuthTypeCursorOAuth ||
-		provider.AuthType == domain.AuthTypeChatGPTOAuth {
+		provider.AuthType == domain.AuthTypeChatGPTOAuth ||
+		provider.AuthType == domain.AuthTypeQoderPAT {
 		return conformanceReport{
 			Success:    false,
 			ProviderID: provider.ID,

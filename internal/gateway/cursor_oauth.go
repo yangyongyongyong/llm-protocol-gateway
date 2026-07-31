@@ -312,7 +312,7 @@ func (s *Server) ensureFreshCursorToken(provider domain.Provider) (domain.Provid
 	if err != nil {
 		return provider, err
 	}
-	_ = s.persistProviderOAuth(updated.ID, nil, updated.CursorOAuth, nil)
+	_ = s.persistProviderOAuth(updated.ID, nil, updated.CursorOAuth, nil, nil)
 	return updated, nil
 }
 

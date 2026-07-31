@@ -557,9 +557,23 @@ func streamOpenAIChatToResponsesEventsWithOptions(w http.ResponseWriter, reader 
 
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	// Some upstreams (Qoder) signal failures as an `event: error` frame whose
+	// data payload is a bare error object with no "error" wrapper key. Track the
+	// current event name so that payload is recognized instead of being skipped
+	// as an ordinary chunk, which would surface as "stream ended without any
+	// chunks" and hide the real message.
+	eventName := ""
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, ":") || !strings.HasPrefix(line, "data:") {
+		if line == "" || strings.HasPrefix(line, ":") {
+			eventName = ""
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
+		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
@@ -571,7 +585,12 @@ func streamOpenAIChatToResponsesEventsWithOptions(w http.ResponseWriter, reader 
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 			continue
 		}
-		if errorValue, ok := chunk["error"]; ok {
+		errorValue, hasError := chunk["error"]
+		if !hasError && strings.EqualFold(eventName, "error") {
+			errorValue = chunk
+			hasError = true
+		}
+		if hasError {
 			respBody, _, convErr := chatErrorValueToResponses(errorValue, state.model)
 			if convErr == nil && len(respBody) > 0 {
 				var errPayload map[string]any

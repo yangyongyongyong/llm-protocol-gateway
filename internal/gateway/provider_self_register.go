@@ -129,7 +129,7 @@ func (s *Server) handleProviderSelfRegister(w http.ResponseWriter, r *http.Reque
 	// baseUrl there. Reject explicitly instead of returning a false "ok".
 	if provider, err := s.router.ProviderByID(providerID); err == nil {
 		switch provider.AuthType {
-		case domain.AuthTypeClaudeOAuth, domain.AuthTypeCursorOAuth, domain.AuthTypeChatGPTOAuth:
+		case domain.AuthTypeClaudeOAuth, domain.AuthTypeCursorOAuth, domain.AuthTypeChatGPTOAuth, domain.AuthTypeQoderPAT:
 			writeOpenAIError(w, http.StatusBadRequest, "self-registration is only supported for api_key providers, not OAuth-connected providers")
 			return
 		}

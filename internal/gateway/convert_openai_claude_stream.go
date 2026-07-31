@@ -74,9 +74,18 @@ func streamOpenAIChatToClaudeEvents(w http.ResponseWriter, reader io.Reader, mod
 
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	// Some upstreams (Qoder) report failures as an `event: error` frame whose data
+	// payload is a bare error object with no "error" wrapper key. Track the event
+	// name so it is recognized rather than skipped as an ordinary chunk.
+	eventName := ""
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, ":") {
+			eventName = ""
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
 			continue
 		}
 		if !strings.HasPrefix(line, "data:") {
@@ -91,7 +100,12 @@ func streamOpenAIChatToClaudeEvents(w http.ResponseWriter, reader io.Reader, mod
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 			continue
 		}
-		if errorValue, ok := chunk["error"]; ok {
+		errorValue, hasError := chunk["error"]
+		if !hasError && strings.EqualFold(eventName, "error") {
+			errorValue = chunk
+			hasError = true
+		}
+		if hasError {
 			claudeBody, _, convErr := openAIErrorValueToClaude(errorValue, resolvedModel)
 			if convErr == nil && len(claudeBody) > 0 {
 				var payload map[string]any
