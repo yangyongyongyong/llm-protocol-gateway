@@ -2238,6 +2238,11 @@ func resolveProviderChatURL(provider domain.Provider, model string) string {
 	if provider.Protocol == domain.ProtocolOpenAIChat && !strings.Contains(lowerURL, "/chat/completions") && !strings.Contains(provider.BaseURL, "{model}") {
 		upstreamURL = strings.TrimRight(upstreamURL, "/") + "/chat/completions"
 	}
+	// Responses providers need the same path completion as the forwarding path
+	// (resolveProviderResponsesURL); without it a bare base URL 404s.
+	if provider.Protocol == domain.ProtocolOpenAIResponses && !strings.Contains(lowerURL, "/responses") && !strings.Contains(provider.BaseURL, "{model}") {
+		upstreamURL = strings.TrimRight(upstreamURL, "/") + "/responses"
+	}
 	return upstreamURL
 }
 

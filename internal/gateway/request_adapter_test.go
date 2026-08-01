@@ -23,6 +23,39 @@ func TestResolveProviderChatURLWithAdapter(t *testing.T) {
 	}
 }
 
+func TestResolveProviderChatURLAppendsResponsesPath(t *testing.T) {
+	// Regression: the chat-test/conformance path only appended /chat/completions,
+	// so Responses providers (e.g. DeepSeek) hit the bare base URL and 404'd.
+	cases := []struct {
+		name     string
+		provider domain.Provider
+		want     string
+	}{
+		{
+			name:     "responses base url gets /responses",
+			provider: domain.Provider{BaseURL: "https://api.deepseek.com", Protocol: domain.ProtocolOpenAIResponses},
+			want:     "https://api.deepseek.com/responses",
+		},
+		{
+			name:     "existing /responses is not duplicated",
+			provider: domain.Provider{BaseURL: "https://api.deepseek.com/v1/responses", Protocol: domain.ProtocolOpenAIResponses},
+			want:     "https://api.deepseek.com/v1/responses",
+		},
+		{
+			name:     "chat protocol still gets /chat/completions",
+			provider: domain.Provider{BaseURL: "https://api.deepseek.com", Protocol: domain.ProtocolOpenAIChat},
+			want:     "https://api.deepseek.com/chat/completions",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveProviderChatURL(tc.provider, "deepseek-v4-flash"); got != tc.want {
+				t.Fatalf("got %q want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestApplyRequestAdapterBodyRewritesModel(t *testing.T) {
 	provider := domain.Provider{
 		BaseURL: "http://ocean-dev.tuya-in.net/openai/deployments/{model}/chat/completions?api-version=2024-02-01",
