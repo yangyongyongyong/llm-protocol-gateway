@@ -44,6 +44,11 @@ Provider 不止支持 API Key，还支持 **OAuth 账号**直连：
 - **Claude 账号**（Claude.ai 订阅，OAuth）
 - **OpenAI / ChatGPT 账号**（Codex CLI OAuth）
 - **Cursor 账号**（Cursor 订阅）
+- **Qoder 账号**（PAT，粘贴个人访问令牌）
+
+Qoder 走两级令牌：在 [qoder.com/account/integrations](https://qoder.com/account/integrations)
+生成长期 PAT（`pt-` 开头）粘贴到控制台，网关自动用它兑换短期 job token 并在过期前续期，
+无需浏览器往返。上游原生 OpenAI Chat 兼容，三种入站协议都能转发。
 
 令牌刷新由网关托管，密钥/令牌永不下发到前端。
 
@@ -74,7 +79,7 @@ Provider、备选 Provider、模型映射、思考深度等，页面底部可一
 
 ### Provider 管理
 
-支持 Claude / OpenAI / Cursor 账号与 API Key，展示订阅额度、协议、绑定用户。
+支持 Claude / OpenAI / Cursor / Qoder 账号与 API Key，展示订阅额度、协议、绑定用户。
 
 ![Provider 管理](docs/images/providers.png)
 
