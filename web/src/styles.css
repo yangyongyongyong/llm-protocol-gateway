@@ -228,11 +228,30 @@ html[data-theme="dark"] .usage-month-bars-yaxis.right { color: #fbbf24; }
 .usage-month-bar span { display: block; width: 100%; border-radius: 4px 4px 2px 2px; background: linear-gradient(180deg, #3b82f6, #2563eb); transition: 0.12s ease; }
 .usage-month-bar:hover span { background: linear-gradient(180deg, #60a5fa, #3b82f6); }
 .usage-month-bar.zero span { background: var(--slate-soft); }
-/* 按日流量双折线图：图例用短线段而非色块，与折线呼应；图表整行全宽。 */
-.usage-traffic-card { width: 100%; }
+/* 按日流量双折线图：图例用短线段而非色块，与折线呼应；图表整行全宽。
+   轴/网格/刻度用 currentColor + 各自不透明度，深色主题只需改一处基色。 */
+.usage-traffic-card { width: 100%; color: var(--text); }
 .usage-traffic-card .usage-chart-svg { width: 100%; height: auto; }
+.usage-traffic-card .tl-grid { opacity: 0.09; }
+.usage-traffic-card .tl-axis { opacity: 0.28; }
+.usage-traffic-card .tl-tick { opacity: 0.6; }
+.usage-traffic-card .tl-axis-title { opacity: 0.75; }
 .usage-month-legend-item .legend-line.traffic-rx { display: inline-block; width: 14px; height: 3px; border-radius: 2px; background: #059669; }
 .usage-month-legend-item .legend-line.traffic-tx { display: inline-block; width: 14px; height: 3px; border-radius: 2px; background: #7c3aed; }
+html[data-theme="dark"] .usage-traffic-card .tl-grid { opacity: 0.16; }
+/* 折线 / 数据点 / 数值标注：接收绿、发送紫，深色主题下提亮以保证对比度。 */
+.usage-traffic-card .tl-line.rx, .usage-traffic-card .tl-dot.rx { color: #059669; }
+.usage-traffic-card .tl-line.tx, .usage-traffic-card .tl-dot.tx { color: #7c3aed; }
+.usage-traffic-card .tl-val.rx { color: #047857; }
+.usage-traffic-card .tl-val.tx { color: #6d28d9; }
+html[data-theme="dark"] .usage-traffic-card .tl-line.rx,
+html[data-theme="dark"] .usage-traffic-card .tl-dot.rx,
+html[data-theme="dark"] .usage-traffic-card .tl-val.rx { color: #34d399; }
+html[data-theme="dark"] .usage-traffic-card .tl-line.tx,
+html[data-theme="dark"] .usage-traffic-card .tl-dot.tx,
+html[data-theme="dark"] .usage-traffic-card .tl-val.tx { color: #a78bfa; }
+html[data-theme="dark"] .usage-month-legend-item .legend-line.traffic-rx { background: #34d399; }
+html[data-theme="dark"] .usage-month-legend-item .legend-line.traffic-tx { background: #a78bfa; }
 .usage-month-line { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; color: #f59e0b; z-index: 2; }
 html[data-theme="dark"] .usage-month-line { color: #fbbf24; }
 /* 组合图数值标注：Token 在柱底内侧，请求次数在折线上方，互不重叠 */

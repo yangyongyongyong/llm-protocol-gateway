@@ -3064,11 +3064,11 @@ function UsageDailyTrafficLines({ title = '按日流量', points, onPickDay }: {
   onPickDay?: (date: string) => void;
 }) {
   const width = 960;
-  const height = 240;
-  const padLeft = 62;
-  const padRight = 16;
-  const padTop = 18;
-  const padBottom = 30;
+  const height = 260;
+  const padLeft = 70;
+  const padRight = 20;
+  const padTop = 26;
+  const padBottom = 46;
   const plotWidth = width - padLeft - padRight;
   const plotHeight = height - padTop - padBottom;
 
@@ -3085,6 +3085,10 @@ function UsageDailyTrafficLines({ title = '按日流量', points, onPickDay }: {
   const polyline = (values: number[]) => values.map((v, i) => `${xAt(i).toFixed(1)},${yAt(v).toFixed(1)}`).join(' ');
 
   const hasTraffic = rxValues.some((v) => v > 0) || txValues.some((v) => v > 0);
+  // 点太密时标注会糊成一片，只在刻度日标注；天数少时每天都标。
+  const labelIndexes = points.length <= 14
+    ? points.map((_, i) => i)
+    : xTickIndexes;
 
   return (
     <div className="usage-chart-card usage-traffic-card">
@@ -3105,17 +3109,22 @@ function UsageDailyTrafficLines({ title = '按日流量', points, onPickDay }: {
             const y = height - padBottom - ratio * plotHeight;
             return (
               <g key={`grid-${ratio}`}>
-                <line x1={padLeft} y1={y} x2={width - padRight} y2={y} stroke="rgba(15,23,42,0.07)" strokeWidth="1" />
-                <text x={padLeft - 8} y={y + 3} textAnchor="end" fontSize="10" fill="rgba(15,23,42,0.45)">
+                <line className="tl-grid" x1={padLeft} y1={y} x2={width - padRight} y2={y} stroke="currentColor" strokeWidth="1" />
+                <text className="tl-tick" x={padLeft - 8} y={y + 3} textAnchor="end" fontSize="10" fill="currentColor">
                   {formatBytes(Math.round(max * ratio), 0)}
                 </text>
               </g>
             );
           })}
-          <line x1={padLeft} y1={padTop} x2={padLeft} y2={height - padBottom} stroke="rgba(15,23,42,0.12)" strokeWidth="1" />
+          {/* 坐标轴 */}
+          <line className="tl-axis" x1={padLeft} y1={padTop} x2={padLeft} y2={height - padBottom} stroke="currentColor" strokeWidth="1" />
+          <line className="tl-axis" x1={padLeft} y1={height - padBottom} x2={width - padRight} y2={height - padBottom} stroke="currentColor" strokeWidth="1" />
+          {/* 轴标题 */}
+          <text className="tl-axis-title" x={padLeft - 8} y={padTop - 10} textAnchor="end" fontSize="10" fontWeight="700" fill="currentColor">流量</text>
+          <text className="tl-axis-title" x={width - padRight} y={height - 8} textAnchor="end" fontSize="10" fontWeight="700" fill="currentColor">日期</text>
 
-          <polyline points={polyline(rxValues)} fill="none" stroke="#059669" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
-          <polyline points={polyline(txValues)} fill="none" stroke="#7c3aed" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+          <polyline points={polyline(rxValues)} fill="none" className="tl-line rx" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+          <polyline points={polyline(txValues)} fill="none" className="tl-line tx" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
 
           {points.map((p, i) => (
             <g key={`pt-${p.date}`}>
@@ -3131,23 +3140,53 @@ function UsageDailyTrafficLines({ title = '按日流量', points, onPickDay }: {
               >
                 <title>{`${p.date} · 接收 ${formatBytes(rxValues[i])} · 发送 ${formatBytes(txValues[i])}`}</title>
               </rect>
-              {rxValues[i] > 0 ? <circle cx={xAt(i)} cy={yAt(rxValues[i])} r="2.6" fill="#059669" /> : null}
-              {txValues[i] > 0 ? <circle cx={xAt(i)} cy={yAt(txValues[i])} r="2.6" fill="#7c3aed" /> : null}
+              {rxValues[i] > 0 ? <circle cx={xAt(i)} cy={yAt(rxValues[i])} r="3" className="tl-dot rx" fill="currentColor" /> : null}
+              {txValues[i] > 0 ? <circle cx={xAt(i)} cy={yAt(txValues[i])} r="3" className="tl-dot tx" fill="currentColor" /> : null}
             </g>
           ))}
 
+          {/* 散点数值标注。两条线的标注可能撞在一起：谁高谁标上方，另一条标下方。 */}
+          {points.map((p, i) => {
+            if (!labelIndexes.includes(i)) return null;
+            const rx = rxValues[i];
+            const tx = txValues[i];
+            const rxAbove = rx >= tx;
+            // 峰值点的上方标注会顶到轴标题，钳进绘图区内；贴底时同理往上让。
+            const nudge = (v: number, above: boolean) => {
+              const y = yAt(v) + (above ? -9 : 15);
+              return Math.min(Math.max(y, padTop + 8), height - padBottom - 3);
+            };
+            return (
+              <g key={`lbl-${p.date}`} pointerEvents="none">
+                {rx > 0 ? (
+                  <text x={xAt(i)} y={nudge(rx, rxAbove)} textAnchor="middle" fontSize="9.5" fontWeight="700" className="tl-val rx" fill="currentColor">
+                    {formatBytes(rx, 0)}
+                  </text>
+                ) : null}
+                {tx > 0 ? (
+                  <text x={xAt(i)} y={nudge(tx, !rxAbove)} textAnchor="middle" fontSize="9.5" fontWeight="700" className="tl-val tx" fill="currentColor">
+                    {formatBytes(tx, 0)}
+                  </text>
+                ) : null}
+              </g>
+            );
+          })}
+
           {points.map((p, i) => (
             xTickIndexes.includes(i) ? (
-              <text
-                key={`x-${p.date}`}
-                x={xAt(i)}
-                y={height - padBottom + 16}
-                textAnchor="middle"
-                fontSize="10"
-                fill="rgba(15,23,42,0.5)"
-              >
-                {p.date.slice(5)}
-              </text>
+              <g key={`x-${p.date}`}>
+                <line className="tl-axis" x1={xAt(i)} y1={height - padBottom} x2={xAt(i)} y2={height - padBottom + 4} stroke="currentColor" strokeWidth="1" />
+                <text
+                  x={xAt(i)}
+                  y={height - padBottom + 17}
+                  textAnchor="middle"
+                  fontSize="10"
+                  fill="currentColor"
+                  className="tl-tick"
+                >
+                  {p.date.slice(5)}
+                </text>
+              </g>
             ) : null
           ))}
         </svg>
