@@ -68,9 +68,12 @@ type Alert struct {
 	IPCount       int      `json:"ipCount"`
 	WindowMinutes int      `json:"windowMinutes"`
 	RequestCount  int      `json:"requestCount"`
-	Status        string   `json:"status"`
-	PushStatus    string   `json:"pushStatus,omitempty"`
-	PushError     string   `json:"pushError,omitempty"`
+	// ConcurrentAt is the instant peak concurrency was observed. Set only by the
+	// overlap rule; zero for window-based rules.
+	ConcurrentAt time.Time `json:"concurrentAt,omitempty"`
+	Status       string    `json:"status"`
+	PushStatus   string    `json:"pushStatus,omitempty"`
+	PushError    string    `json:"pushError,omitempty"`
 }
 
 // MultiIPHit is one detection result: an API key seen from IPCount distinct
@@ -78,6 +81,17 @@ type Alert struct {
 type MultiIPHit struct {
 	APIKeyID     string
 	APIKeyName   string
+	IPs          []string
+	IPCount      int
+	RequestCount int
+}
+
+// ConcurrentIPHit is one detection result for the overlap rule: at instant At
+// the key had IPCount distinct client IPs with in-flight requests at once.
+type ConcurrentIPHit struct {
+	APIKeyID     string
+	APIKeyName   string
+	At           time.Time
 	IPs          []string
 	IPCount      int
 	RequestCount int

@@ -595,6 +595,8 @@ type AlertRecord = {
   ipCount: number;
   windowMinutes: number;
   requestCount: number;
+  /** 仅并发重叠规则有值：观测到峰值并发的那一刻。 */
+  concurrentAt?: string;
   status: 'unread' | 'read' | 'ignored';
   pushStatus?: string;
   pushError?: string;
@@ -620,6 +622,9 @@ type AlertSettingsView = {
   multiIpEnabled: boolean;
   multiIpWindowMinutes: number;
   multiIpThreshold: number;
+  concurrentIpEnabled: boolean;
+  concurrentIpWindowMinutes: number;
+  concurrentIpThreshold: number;
   cooldownMinutes: number;
   telegram: {
     enabled: boolean;
@@ -4150,6 +4155,9 @@ function App() {
           multiIpEnabled: merged.multiIpEnabled,
           multiIpWindowMinutes: merged.multiIpWindowMinutes,
           multiIpThreshold: merged.multiIpThreshold,
+          concurrentIpEnabled: merged.concurrentIpEnabled,
+          concurrentIpWindowMinutes: merged.concurrentIpWindowMinutes,
+          concurrentIpThreshold: merged.concurrentIpThreshold,
           cooldownMinutes: merged.cooldownMinutes,
           telegram: {
             enabled: merged.telegram.enabled,
@@ -8005,7 +8013,8 @@ function App() {
                 <div>
                   <h2 className="panel-title">告警</h2>
                   <p className="panel-desc">
-                    检测 API 密钥是否被多个 IP 同时使用（疑似泄露）。仅告警，不会禁用密钥或限流，不影响下游正常使用。
+                    检测 API 密钥是否被多方同时使用（疑似泄露）：窗口内独立 IP 数超阈值，或同一时刻多个 IP 的请求真实重叠。
+                    仅告警，不会禁用密钥或限流，不影响下游正常使用。
                     检测基于请求日志（默认保留 {requestLogRetentionDays} 天），每 2 分钟扫描一次。
                   </p>
                 </div>
@@ -8034,15 +8043,17 @@ function App() {
                   <div className="empty-state">加载告警中…</div>
                 ) : !alertPage || alertPage.items.length === 0 ? (
                   <div className="empty-state">
-                    暂无告警。当同一密钥在 {alertSettings?.multiIpWindowMinutes ?? 10} 分钟内被
-                    {alertSettings?.multiIpThreshold ?? 5} 个及以上不同 IP 使用时，这里会出现记录。
+                    暂无告警。触发条件：同一密钥在 {alertSettings?.multiIpWindowMinutes ?? 10} 分钟内被
+                    {alertSettings?.multiIpThreshold ?? 5} 个及以上不同 IP 使用，或同一时刻有
+                    {alertSettings?.concurrentIpThreshold ?? 4} 个及以上不同 IP 的请求同时在飞行中。
                   </div>
                 ) : (
                   <>
                     <div className="log-header alert-log-header">
                       <span>时间</span>
+                      <span>规则</span>
                       <span>密钥</span>
-                      <span>独立 IP</span>
+                      <span>IP</span>
                       <span>状态</span>
                       <span>操作</span>
                     </div>
@@ -8050,8 +8061,17 @@ function App() {
                       <div className={`log-row${alert.status === 'unread' ? ' error' : ''}`} key={alert.id}>
                         <div className="log-row-main alert-log-row">
                           <span>{new Date(alert.time).toLocaleString()}</span>
+                          <span>
+                            <Badge tone={alert.rule === 'apikey_concurrent_ip' ? 'red' : 'amber'}>
+                              {alert.rule === 'apikey_concurrent_ip' ? '并发重叠' : '多 IP'}
+                            </Badge>
+                          </span>
                           <span>{alert.apiKeyName || alert.apiKeyId}</span>
-                          <span>{alert.ipCount} 个 / {alert.windowMinutes} 分钟</span>
+                          <span>
+                            {alert.rule === 'apikey_concurrent_ip'
+                              ? `同时 ${alert.ipCount} 个`
+                              : `${alert.ipCount} 个 / ${alert.windowMinutes} 分钟`}
+                          </span>
                           <span>
                             <Badge tone={alert.status === 'unread' ? 'red' : alert.status === 'ignored' ? 'slate' : 'green'}>
                               {alert.status === 'unread' ? '未读' : alert.status === 'ignored' ? '已忽略' : '已读'}
@@ -8074,6 +8094,7 @@ function App() {
                         </div>
                         <div className="log-row-sub" style={{ display: 'flex', gap: 14, flexWrap: 'wrap', whiteSpace: 'normal' }}>
                           <span>请求数 {alert.requestCount}</span>
+                          {alert.concurrentAt ? <span>并发时刻 {new Date(alert.concurrentAt).toLocaleString()}</span> : null}
                           <span>IP：{alert.ips.join(', ')}</span>
                           {alert.pushError ? <span>推送失败原因：{alert.pushError}</span> : null}
                         </div>
@@ -8107,16 +8128,16 @@ function App() {
                     desc: `窗口内同一密钥的独立 IP 数达到阈值即告警。当前：${alertSettings?.multiIpWindowMinutes ?? 10} 分钟 / ${alertSettings?.multiIpThreshold ?? 5} 个 IP。`,
                   },
                   {
+                    name: '并发时间重叠',
+                    enabled: alertSettings?.concurrentIpEnabled ?? false,
+                    planned: false,
+                    desc: `同一时刻有多个不同 IP 的请求同时在飞行中即告警（当前阈值 ${alertSettings?.concurrentIpThreshold ?? 4} 个）。请求区间真实重叠，本人切换网络只会产生先后请求，故几乎无误报。`,
+                  },
+                  {
                     name: '地理 / ASN 跳变',
                     enabled: false,
                     planned: true,
                     desc: '相邻请求的 IP 归属地或运营商在物理上不可能的时间内发生跳变。需接入 IP 归属库。',
-                  },
-                  {
-                    name: '并发时间重叠',
-                    enabled: false,
-                    planned: true,
-                    desc: '两个不同 IP 的请求在时间上重叠，可证明确实是两个实体同时使用，几乎无误报。',
                   },
                   {
                     name: '用量突增',
@@ -8186,8 +8207,48 @@ function App() {
                         onBlur={() => void saveAlertSettings({})}
                       />
                     </label>
+                  </div>
+
+                  <label className="toggle-row" style={{ display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer', margin: '16px 0 12px' }}>
+                    <input
+                      type="checkbox"
+                      checked={alertSettings.concurrentIpEnabled}
+                      disabled={saving}
+                      onChange={(event) => void saveAlertSettings({ concurrentIpEnabled: event.target.checked })}
+                    />
+                    <span>启用「并发时间重叠」检测</span>
+                  </label>
+                  <div className="form-grid compact">
                     <label className="field">
-                      <span>冷却期（分钟）</span>
+                      <span>回溯窗口（分钟）</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={1440}
+                        value={alertSettings.concurrentIpWindowMinutes}
+                        onChange={(event) => setAlertSettings({ ...alertSettings, concurrentIpWindowMinutes: Number(event.target.value) || 10 })}
+                        onBlur={() => void saveAlertSettings({})}
+                      />
+                    </label>
+                    <label className="field">
+                      <span>同时并发 IP 阈值（≥2）</span>
+                      <input
+                        type="number"
+                        min={2}
+                        value={alertSettings.concurrentIpThreshold}
+                        onChange={(event) => setAlertSettings({ ...alertSettings, concurrentIpThreshold: Number(event.target.value) || 4 })}
+                        onBlur={() => void saveAlertSettings({})}
+                      />
+                    </label>
+                  </div>
+                  <p className="hint-line">
+                    判定依据是请求的真实时间区间 [开始, 开始+耗时) 是否重叠，只统计回溯窗口内的记录。
+                    同一 IP 的并发（客户端并行工具调用）不计入。
+                  </p>
+
+                  <div className="form-grid compact">
+                    <label className="field">
+                      <span>冷却期（分钟，两条规则共用）</span>
                       <input
                         type="number"
                         min={1}
@@ -8198,7 +8259,8 @@ function App() {
                     </label>
                   </div>
                   <p className="hint-line">
-                    冷却期内同一密钥只告警一次，避免同一次泄露反复推送；但若窗口内出现全新 IP，会立即再告一次。
+                    冷却期按「规则 + 密钥」独立计算：同一密钥在冷却期内每条规则各只告警一次，
+                    避免同一次泄露反复推送；但若出现全新 IP，会立即再告一次。
                   </p>
 
                   <label className="toggle-row" style={{ display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer', margin: '16px 0 12px' }}>

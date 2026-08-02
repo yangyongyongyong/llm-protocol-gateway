@@ -76,6 +76,12 @@ type PublicAccessSettings struct {
 // distinct client IPs inside a sliding window" — the key-leak signal.
 const AlertRuleAPIKeyMultiIP = "apikey_multi_ip"
 
+// AlertRuleAPIKeyConcurrentIP is the rule id for "one API key had requests from
+// several distinct IPs in flight at the same instant". Stronger than the
+// multi-IP rule: switching networks yields sequential requests, never
+// overlapping ones, so this has almost no false positives.
+const AlertRuleAPIKeyConcurrentIP = "apikey_concurrent_ip"
+
 // Alert status values. Alerts start unread; the console can mark them read or
 // ignored (ignored means "reviewed, not a leak" — it is never auto-set).
 const (
@@ -96,11 +102,17 @@ const (
 // value under the "alerts" settings key rather than on GatewayState, so the
 // Telegram bot token can never ride along with GET /__state.
 type AlertSettings struct {
-	MultiIPEnabled       bool             `json:"multiIpEnabled"`
-	MultiIPWindowMinutes int              `json:"multiIpWindowMinutes"`
-	MultiIPThreshold     int              `json:"multiIpThreshold"`
-	CooldownMinutes      int              `json:"cooldownMinutes"`
-	Telegram             TelegramSettings `json:"telegram"`
+	MultiIPEnabled       bool `json:"multiIpEnabled"`
+	MultiIPWindowMinutes int  `json:"multiIpWindowMinutes"`
+	MultiIPThreshold     int  `json:"multiIpThreshold"`
+	// ConcurrentIP* configures the overlap rule: distinct IPs with requests in
+	// flight simultaneously. Its window only bounds how far back to look for
+	// overlaps; the detection itself is instant-based, not window-based.
+	ConcurrentIPEnabled       bool             `json:"concurrentIpEnabled"`
+	ConcurrentIPWindowMinutes int              `json:"concurrentIpWindowMinutes"`
+	ConcurrentIPThreshold     int              `json:"concurrentIpThreshold"`
+	CooldownMinutes           int              `json:"cooldownMinutes"`
+	Telegram                  TelegramSettings `json:"telegram"`
 }
 
 // TelegramSettings configures the Telegram bot used for alert push.
@@ -123,16 +135,27 @@ const (
 	// window, which would false-positive at a lower threshold.
 	alertMultiIPThresholdDefault = 5
 	alertMultiIPThresholdMin     = 2
-	alertCooldownMinutesDefault  = 60
-	alertCooldownMinutesMin      = 1
+	// The overlap rule looks back far enough to catch a recent burst; the
+	// detection itself is instant-based so this only bounds the scan range.
+	alertConcurrentIPWindowMinutesDefault = 10
+	// "同一时刻超过三个 IP" → more than 3, i.e. 4. Real traffic confirms the
+	// boundary: Cursor's AWS egress pool genuinely runs 3 IPs concurrently
+	// (~13-15s per request), so a threshold of 3 would false-positive.
+	alertConcurrentIPThresholdDefault = 4
+	alertConcurrentIPThresholdMin     = 2
+	alertCooldownMinutesDefault       = 60
+	alertCooldownMinutesMin           = 1
 )
 
 func DefaultAlertSettings() AlertSettings {
 	return AlertSettings{
-		MultiIPEnabled:       true,
-		MultiIPWindowMinutes: alertMultiIPWindowMinutesDefault,
-		MultiIPThreshold:     alertMultiIPThresholdDefault,
-		CooldownMinutes:      alertCooldownMinutesDefault,
+		MultiIPEnabled:            true,
+		MultiIPWindowMinutes:      alertMultiIPWindowMinutesDefault,
+		MultiIPThreshold:          alertMultiIPThresholdDefault,
+		ConcurrentIPEnabled:       true,
+		ConcurrentIPWindowMinutes: alertConcurrentIPWindowMinutesDefault,
+		ConcurrentIPThreshold:     alertConcurrentIPThresholdDefault,
+		CooldownMinutes:           alertCooldownMinutesDefault,
 	}
 }
 
@@ -152,6 +175,21 @@ func (s *AlertSettings) Normalize() {
 	}
 	if s.MultiIPThreshold < alertMultiIPThresholdMin {
 		s.MultiIPThreshold = alertMultiIPThresholdMin
+	}
+	if s.ConcurrentIPWindowMinutes <= 0 {
+		s.ConcurrentIPWindowMinutes = alertConcurrentIPWindowMinutesDefault
+	}
+	if s.ConcurrentIPWindowMinutes < alertMultiIPWindowMinutesMin {
+		s.ConcurrentIPWindowMinutes = alertMultiIPWindowMinutesMin
+	}
+	if s.ConcurrentIPWindowMinutes > alertMultiIPWindowMinutesMax {
+		s.ConcurrentIPWindowMinutes = alertMultiIPWindowMinutesMax
+	}
+	if s.ConcurrentIPThreshold <= 0 {
+		s.ConcurrentIPThreshold = alertConcurrentIPThresholdDefault
+	}
+	if s.ConcurrentIPThreshold < alertConcurrentIPThresholdMin {
+		s.ConcurrentIPThreshold = alertConcurrentIPThresholdMin
 	}
 	if s.CooldownMinutes <= 0 {
 		s.CooldownMinutes = alertCooldownMinutesDefault

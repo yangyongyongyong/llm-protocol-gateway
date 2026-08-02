@@ -610,8 +610,8 @@ html[data-theme="dark"] .api-key-client-config-actions .client-config-btn {
    密钥名由用户自定义，容易比其余列长，故给它最大的弹性份额；用户名（管理员/
    用户名）与 IP 相对固定，让出空间。 */
 .traffic-log-header, .traffic-log-row { grid-template-columns: 120px 64px 56px minmax(140px, 1.3fr) minmax(0, 0.45fr) minmax(0, 0.7fr) minmax(0, 0.7fr) minmax(0, 0.85fr) 60px 60px 52px; }
-/* 告警表：时间/密钥/独立 IP/状态/操作。状态与操作列放多个徽标与按钮，给足弹性。 */
-.alert-log-header, .alert-log-row { grid-template-columns: 150px minmax(120px, 1fr) 130px minmax(160px, 1fr) minmax(180px, 1fr); }
+/* 告警表：时间/规则/密钥/IP/状态/操作。状态与操作列放多个徽标与按钮，给足弹性。 */
+.alert-log-header, .alert-log-row { grid-template-columns: 150px 96px minmax(110px, 1fr) 110px minmax(150px, 1fr) minmax(180px, 1fr); }
 .log-ip { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 11px; color: var(--muted); }
 .log-provider { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font-size: 12px; font-weight: 700; }
 .log-header { padding: 0 12px 2px; color: var(--subtle); font-size: 11px; font-weight: 780; letter-spacing: 0.03em; }

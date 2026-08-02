@@ -236,3 +236,121 @@ func TestAlertIPsSerializeAsArrayWhenEmpty(t *testing.T) {
 		t.Fatalf("expected empty ips array in %s", raw)
 	}
 }
+
+func appendLogWithLatency(t *testing.T, s *Store, when time.Time, keyID, ip string, latencyMS int64) {
+	t.Helper()
+	if err := s.AppendRequestLog(monitor.RequestLog{
+		Time: when, APIKeyID: keyID, APIKeyName: keyID,
+		ClientIP: ip, Status: 200, LatencyMillis: latencyMS,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Three IPs whose requests all overlap the same instant must be detected.
+func TestDetectConcurrentIPKeysOverlapping(t *testing.T) {
+	t.Parallel()
+	s := newAlertTestStore(t)
+	base := time.Now().Add(-time.Minute).Truncate(time.Millisecond)
+	// All three are in flight for 10s starting within 1s of each other.
+	appendLogWithLatency(t, s, base, "k1", "1.1.1.1", 10000)
+	appendLogWithLatency(t, s, base.Add(300*time.Millisecond), "k1", "2.2.2.2", 10000)
+	appendLogWithLatency(t, s, base.Add(600*time.Millisecond), "k1", "3.3.3.3", 10000)
+
+	hits, err := s.DetectConcurrentIPKeys(base.Add(-time.Minute), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("expected 1 hit, got %d: %+v", len(hits), hits)
+	}
+	if hits[0].IPCount != 3 {
+		t.Fatalf("expected peak concurrency 3, got %d", hits[0].IPCount)
+	}
+	if hits[0].At.IsZero() {
+		t.Fatal("expected the overlap instant to be recorded")
+	}
+}
+
+// Sequential requests from different IPs (one person switching networks) must
+// NOT trip the overlap rule — this is the whole point of the rule.
+func TestDetectConcurrentIPKeysSequentialNotFlagged(t *testing.T) {
+	t.Parallel()
+	s := newAlertTestStore(t)
+	base := time.Now().Add(-10 * time.Minute).Truncate(time.Millisecond)
+	// Each finishes (100ms) long before the next begins (1 minute apart).
+	appendLogWithLatency(t, s, base, "k1", "1.1.1.1", 100)
+	appendLogWithLatency(t, s, base.Add(time.Minute), "k1", "2.2.2.2", 100)
+	appendLogWithLatency(t, s, base.Add(2*time.Minute), "k1", "3.3.3.3", 100)
+
+	hits, err := s.DetectConcurrentIPKeys(base.Add(-time.Minute), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("sequential requests must not be flagged, got %+v", hits)
+	}
+}
+
+// Only two of three overlap at any instant: below a threshold of 3.
+func TestDetectConcurrentIPKeysBelowThreshold(t *testing.T) {
+	t.Parallel()
+	s := newAlertTestStore(t)
+	base := time.Now().Add(-time.Minute).Truncate(time.Millisecond)
+	appendLogWithLatency(t, s, base, "k1", "1.1.1.1", 1000)
+	appendLogWithLatency(t, s, base.Add(500*time.Millisecond), "k1", "2.2.2.2", 1000)
+	// Starts after the first two have finished.
+	appendLogWithLatency(t, s, base.Add(5*time.Second), "k1", "3.3.3.3", 1000)
+
+	hits, err := s.DetectConcurrentIPKeys(base.Add(-time.Minute), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("peak concurrency is 2, expected no hits, got %+v", hits)
+	}
+	// Lowering the threshold to 2 should surface it.
+	hits, err = s.DetectConcurrentIPKeys(base.Add(-time.Minute), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].IPCount != 2 {
+		t.Fatalf("expected one hit with 2 concurrent IPs, got %+v", hits)
+	}
+}
+
+// Many concurrent requests from a SINGLE IP are normal parallel tool calls.
+func TestDetectConcurrentIPKeysSameIPNotFlagged(t *testing.T) {
+	t.Parallel()
+	s := newAlertTestStore(t)
+	base := time.Now().Add(-time.Minute).Truncate(time.Millisecond)
+	for i := 0; i < 6; i++ {
+		appendLogWithLatency(t, s, base.Add(time.Duration(i)*10*time.Millisecond), "k1", "1.1.1.1", 10000)
+	}
+	hits, err := s.DetectConcurrentIPKeys(base.Add(-time.Minute), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("single-IP concurrency must not be flagged, got %+v", hits)
+	}
+}
+
+func TestDetectConcurrentIPKeysExcludesEmptyKeyAndIP(t *testing.T) {
+	t.Parallel()
+	s := newAlertTestStore(t)
+	base := time.Now().Add(-time.Minute).Truncate(time.Millisecond)
+	for i, ip := range []string{"1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4"} {
+		appendLogWithLatency(t, s, base.Add(time.Duration(i)*time.Millisecond), "", ip, 10000)
+	}
+	for i := 0; i < 4; i++ {
+		appendLogWithLatency(t, s, base.Add(time.Duration(i)*time.Millisecond), "noip", "", 10000)
+	}
+	hits, err := s.DetectConcurrentIPKeys(base.Add(-time.Minute), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("expected no hits, got %+v", hits)
+	}
+}

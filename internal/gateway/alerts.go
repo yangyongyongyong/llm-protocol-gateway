@@ -34,6 +34,7 @@ const (
 // a Server without alert persistence.
 type AlertStore interface {
 	DetectMultiIPKeys(time.Time, int) ([]monitor.MultiIPHit, error)
+	DetectConcurrentIPKeys(time.Time, int) ([]monitor.ConcurrentIPHit, error)
 	InsertAlert(monitor.Alert) (int64, error)
 	QueryAlerts(monitor.AlertQuery) (store.AlertPage, error)
 	AlertByID(int64) (monitor.Alert, bool, error)
@@ -87,11 +88,14 @@ func (s *Server) UpdateAlertSettings(incoming domain.AlertSettings) (domain.Aler
 // same "rebuild the struct, don't copy the secret" rule as
 // redactProviderForClient.
 type alertSettingsView struct {
-	MultiIPEnabled       bool                `json:"multiIpEnabled"`
-	MultiIPWindowMinutes int                 `json:"multiIpWindowMinutes"`
-	MultiIPThreshold     int                 `json:"multiIpThreshold"`
-	CooldownMinutes      int                 `json:"cooldownMinutes"`
-	Telegram             telegramSettingsView `json:"telegram"`
+	MultiIPEnabled            bool                 `json:"multiIpEnabled"`
+	MultiIPWindowMinutes      int                  `json:"multiIpWindowMinutes"`
+	MultiIPThreshold          int                  `json:"multiIpThreshold"`
+	ConcurrentIPEnabled       bool                 `json:"concurrentIpEnabled"`
+	ConcurrentIPWindowMinutes int                  `json:"concurrentIpWindowMinutes"`
+	ConcurrentIPThreshold     int                  `json:"concurrentIpThreshold"`
+	CooldownMinutes           int                  `json:"cooldownMinutes"`
+	Telegram                  telegramSettingsView `json:"telegram"`
 }
 
 type telegramSettingsView struct {
@@ -108,10 +112,13 @@ func redactAlertSettingsForClient(settings domain.AlertSettings) alertSettingsVi
 		preview = token[len(token)-4:]
 	}
 	return alertSettingsView{
-		MultiIPEnabled:       settings.MultiIPEnabled,
-		MultiIPWindowMinutes: settings.MultiIPWindowMinutes,
-		MultiIPThreshold:     settings.MultiIPThreshold,
-		CooldownMinutes:      settings.CooldownMinutes,
+		MultiIPEnabled:            settings.MultiIPEnabled,
+		MultiIPWindowMinutes:      settings.MultiIPWindowMinutes,
+		MultiIPThreshold:          settings.MultiIPThreshold,
+		ConcurrentIPEnabled:       settings.ConcurrentIPEnabled,
+		ConcurrentIPWindowMinutes: settings.ConcurrentIPWindowMinutes,
+		ConcurrentIPThreshold:     settings.ConcurrentIPThreshold,
+		CooldownMinutes:           settings.CooldownMinutes,
 		Telegram: telegramSettingsView{
 			Enabled:            settings.Telegram.Enabled,
 			ChatID:             settings.Telegram.ChatID,
@@ -141,37 +148,60 @@ func (s *Server) StartAlertScan(ctx context.Context) {
 	}()
 }
 
-// runAlertScan performs one detection pass: find keys used from too many IPs,
-// drop the ones still inside their cooldown, persist the rest, and push.
+// runAlertScan performs one detection pass per enabled rule: find offending
+// keys, drop the ones still inside their cooldown, persist the rest, and push.
 func (s *Server) runAlertScan() {
 	if s.alertStore == nil {
 		return
 	}
 	settings := s.AlertSettings()
+	s.scanMultiIP(settings)
+	s.scanConcurrentIP(settings)
+}
+
+func (s *Server) scanMultiIP(settings domain.AlertSettings) {
 	if !settings.MultiIPEnabled {
 		return
 	}
 	since := time.Now().Add(-time.Duration(settings.MultiIPWindowMinutes) * time.Minute)
 	hits, err := s.alertStore.DetectMultiIPKeys(since, settings.MultiIPThreshold)
 	if err != nil {
-		slog.Warn("alert scan failed", "error", err)
+		slog.Warn("alert scan failed", "rule", domain.AlertRuleAPIKeyMultiIP, "error", err)
 		return
 	}
 	for _, hit := range hits {
-		if !s.shouldRaiseMultiIPAlert(hit, settings) {
+		if !s.shouldRaiseAlert(domain.AlertRuleAPIKeyMultiIP, hit.APIKeyID, hit.IPs, settings) {
 			continue
 		}
 		s.raiseMultiIPAlert(hit, settings)
 	}
 }
 
-// shouldRaiseMultiIPAlert applies cooldown suppression. Inside the cooldown an
+func (s *Server) scanConcurrentIP(settings domain.AlertSettings) {
+	if !settings.ConcurrentIPEnabled {
+		return
+	}
+	since := time.Now().Add(-time.Duration(settings.ConcurrentIPWindowMinutes) * time.Minute)
+	hits, err := s.alertStore.DetectConcurrentIPKeys(since, settings.ConcurrentIPThreshold)
+	if err != nil {
+		slog.Warn("alert scan failed", "rule", domain.AlertRuleAPIKeyConcurrentIP, "error", err)
+		return
+	}
+	for _, hit := range hits {
+		if !s.shouldRaiseAlert(domain.AlertRuleAPIKeyConcurrentIP, hit.APIKeyID, hit.IPs, settings) {
+			continue
+		}
+		s.raiseConcurrentIPAlert(hit, settings)
+	}
+}
+
+// shouldRaiseAlert applies per-rule cooldown suppression. Inside the cooldown an
 // alert repeats only when a brand-new IP shows up, which is a genuinely new
 // event rather than the same one still in progress.
-func (s *Server) shouldRaiseMultiIPAlert(hit monitor.MultiIPHit, settings domain.AlertSettings) bool {
-	previous, ok, err := s.alertStore.LatestAlertForKey(domain.AlertRuleAPIKeyMultiIP, hit.APIKeyID)
+func (s *Server) shouldRaiseAlert(rule, apiKeyID string, ips []string, settings domain.AlertSettings) bool {
+	previous, ok, err := s.alertStore.LatestAlertForKey(rule, apiKeyID)
 	if err != nil {
-		slog.Warn("alert cooldown lookup failed", "error", err, "apiKeyId", hit.APIKeyID)
+		slog.Warn("alert cooldown lookup failed", "error", err, "rule", rule, "apiKeyId", apiKeyID)
 		return false
 	}
 	if !ok {
@@ -180,7 +210,7 @@ func (s *Server) shouldRaiseMultiIPAlert(hit monitor.MultiIPHit, settings domain
 	if time.Since(previous.Time) >= time.Duration(settings.CooldownMinutes)*time.Minute {
 		return true
 	}
-	return hasNewIP(previous.IPs, hit.IPs)
+	return hasNewIP(previous.IPs, ips)
 }
 
 // hasNewIP reports whether current contains an IP absent from previous.
@@ -223,6 +253,31 @@ func (s *Server) raiseMultiIPAlert(hit monitor.MultiIPHit, settings domain.Alert
 	s.pushAlert(alert, settings.Telegram)
 }
 
+func (s *Server) raiseConcurrentIPAlert(hit monitor.ConcurrentIPHit, settings domain.AlertSettings) {
+	ips := append([]string{}, hit.IPs...)
+	sort.Strings(ips)
+	alert := monitor.Alert{
+		Time:     time.Now(),
+		Rule:     domain.AlertRuleAPIKeyConcurrentIP,
+		Severity: "error",
+		APIKeyID: hit.APIKeyID, APIKeyName: hit.APIKeyName,
+		IPs: ips, IPCount: hit.IPCount,
+		WindowMinutes: settings.ConcurrentIPWindowMinutes,
+		RequestCount:  hit.RequestCount,
+		ConcurrentAt:  hit.At,
+		Status:        domain.AlertStatusUnread,
+	}
+	id, err := s.alertStore.InsertAlert(alert)
+	if err != nil {
+		slog.Warn("persist alert failed", "error", err, "apiKeyId", hit.APIKeyID)
+		return
+	}
+	alert.ID = id
+	s.logs.AddApp("warn", "api key used concurrently from multiple IPs",
+		fmt.Sprintf("key=%s concurrentIPs=%d at=%s", hit.APIKeyName, hit.IPCount, beijingTime(hit.At)))
+	s.pushAlert(alert, settings.Telegram)
+}
+
 // pushAlert delivers one alert to Telegram and records the outcome on the alert
 // row. Delivery is never retried automatically: a bad token would otherwise
 // hammer the API every scan. The console offers a manual retry instead.
@@ -262,6 +317,17 @@ func formatAlertMessage(alert monitor.Alert) string {
 		keyName = alert.APIKeyID
 	}
 	var builder strings.Builder
+	if alert.Rule == domain.AlertRuleAPIKeyConcurrentIP {
+		builder.WriteString("🚨 <b>API Key 几乎确定已泄露</b>\n\n")
+		fmt.Fprintf(&builder, "密钥: <b>%s</b>\n", escapeTelegramHTML(keyName))
+		fmt.Fprintf(&builder, "同一时刻并发 IP: <b>%d</b> 个\n", alert.IPCount)
+		fmt.Fprintf(&builder, "并发时刻: %s (UTC+8)\n", beijingTime(alert.ConcurrentAt))
+		fmt.Fprintf(&builder, "并发请求数: %d\n", alert.RequestCount)
+		fmt.Fprintf(&builder, "IP: %s%s\n", escapeTelegramHTML(strings.Join(ips, ", ")), suffix)
+		builder.WriteString("说明: 请求在时间上重叠，说明确有多方同时在用，非本人切换网络。\n")
+		fmt.Fprintf(&builder, "发现时间: %s (UTC+8)", beijingTime(alert.Time))
+		return builder.String()
+	}
 	builder.WriteString("⚠️ <b>API Key 可能泄露</b>\n\n")
 	fmt.Fprintf(&builder, "密钥: <b>%s</b>\n", escapeTelegramHTML(keyName))
 	fmt.Fprintf(&builder, "独立 IP: <b>%d</b> 个（%d 分钟内）\n", alert.IPCount, alert.WindowMinutes)

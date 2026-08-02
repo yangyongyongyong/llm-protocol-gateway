@@ -239,22 +239,26 @@ func TestShouldRaiseMultiIPAlertCooldown(t *testing.T) {
 	}
 
 	// Never alerted before → must raise.
-	if !server.shouldRaiseMultiIPAlert(hit, settings) {
+	if !server.shouldRaiseAlert(domain.AlertRuleAPIKeyMultiIP, hit.APIKeyID, hit.IPs, settings) {
 		t.Fatal("first detection must raise an alert")
 	}
 	server.raiseMultiIPAlert(hit, settings)
 
 	// Same IP set, still inside cooldown → suppressed.
-	if server.shouldRaiseMultiIPAlert(hit, settings) {
+	if server.shouldRaiseAlert(domain.AlertRuleAPIKeyMultiIP, hit.APIKeyID, hit.IPs, settings) {
 		t.Fatal("identical IP set inside cooldown must be suppressed")
 	}
 
 	// A brand-new IP appears → new event, alert again despite cooldown.
-	grown := hit
-	grown.IPs = append(append([]string{}, hit.IPs...), "9.9.9.9")
-	grown.IPCount = 4
-	if !server.shouldRaiseMultiIPAlert(grown, settings) {
+	grown := append(append([]string{}, hit.IPs...), "9.9.9.9")
+	if !server.shouldRaiseAlert(domain.AlertRuleAPIKeyMultiIP, hit.APIKeyID, grown, settings) {
 		t.Fatal("a brand-new IP must re-alert even inside cooldown")
+	}
+
+	// Cooldown is per-rule: the overlap rule has its own history, so it must not
+	// be suppressed by the multi-IP alert we just raised.
+	if !server.shouldRaiseAlert(domain.AlertRuleAPIKeyConcurrentIP, hit.APIKeyID, hit.IPs, settings) {
+		t.Fatal("cooldown must be tracked per rule, not per key")
 	}
 
 	// The suppressed and re-alert checks above are pure predicate calls, so only
@@ -304,5 +308,83 @@ func TestFormatAlertMessageEscapesAndTruncates(t *testing.T) {
 	}
 	if !strings.Contains(message, "等 20 个") {
 		t.Fatalf("expected truncation notice for long IP lists: %s", message)
+	}
+}
+
+func TestConcurrentIPDefaultsAndClamp(t *testing.T) {
+	settings := domain.DefaultAlertSettings()
+	if !settings.ConcurrentIPEnabled {
+		t.Fatal("overlap rule should be enabled by default")
+	}
+	if settings.ConcurrentIPThreshold != 4 {
+		t.Fatalf("expected default concurrent threshold 4, got %d", settings.ConcurrentIPThreshold)
+	}
+	if settings.ConcurrentIPWindowMinutes != 10 {
+		t.Fatalf("expected default concurrent window 10, got %d", settings.ConcurrentIPWindowMinutes)
+	}
+
+	clamped := domain.AlertSettings{ConcurrentIPThreshold: 1, ConcurrentIPWindowMinutes: 99999}
+	clamped.Normalize()
+	if clamped.ConcurrentIPThreshold != 2 {
+		t.Fatalf("threshold must clamp to >=2, got %d", clamped.ConcurrentIPThreshold)
+	}
+	if clamped.ConcurrentIPWindowMinutes != 1440 {
+		t.Fatalf("window must clamp to 1440, got %d", clamped.ConcurrentIPWindowMinutes)
+	}
+}
+
+// The two rules must produce visibly different pushes so the operator can tell
+// a "possible" leak from a near-certain one.
+func TestFormatAlertMessageDistinguishesRules(t *testing.T) {
+	concurrent := monitorAlertFixture("main", []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"})
+	concurrent.Rule = domain.AlertRuleAPIKeyConcurrentIP
+	concurrent.ConcurrentAt = time.Date(2026, 8, 3, 4, 5, 6, 0, time.UTC)
+	message := formatAlertMessage(concurrent)
+	if !strings.Contains(message, "同一时刻并发 IP") {
+		t.Fatalf("overlap message missing concurrency wording: %s", message)
+	}
+	// 04:05:06 UTC is 12:05:06 in UTC+8.
+	if !strings.Contains(message, "12:05:06") {
+		t.Fatalf("overlap instant should render in UTC+8: %s", message)
+	}
+
+	multi := monitorAlertFixture("main", []string{"1.1.1.1"})
+	if strings.Contains(formatAlertMessage(multi), "同一时刻并发 IP") {
+		t.Fatal("multi-IP message must not use overlap wording")
+	}
+}
+
+// concurrent_at must survive the DB round trip, since the console and the push
+// text both display it.
+func TestConcurrentAtPersists(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	server := &Server{logs: monitor.NewStore(), alertStore: db}
+	at := time.Now().Add(-time.Minute).UTC().Truncate(time.Millisecond)
+
+	server.raiseConcurrentIPAlert(monitor.ConcurrentIPHit{
+		APIKeyID: "k1", APIKeyName: "main", At: at,
+		IPs: []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"}, IPCount: 3, RequestCount: 3,
+	}, domain.DefaultAlertSettings())
+
+	page, err := db.QueryAlerts(monitor.AlertQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 1 {
+		t.Fatalf("expected 1 alert, got %d", page.Total)
+	}
+	got := page.Items[0]
+	if got.Rule != domain.AlertRuleAPIKeyConcurrentIP {
+		t.Fatalf("unexpected rule %q", got.Rule)
+	}
+	if !got.ConcurrentAt.Equal(at) {
+		t.Fatalf("concurrentAt did not persist: want %s got %s", at, got.ConcurrentAt)
+	}
+	if got.Severity != "error" {
+		t.Fatalf("overlap alerts should be severity error, got %q", got.Severity)
 	}
 }
