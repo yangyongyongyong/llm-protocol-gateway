@@ -52,7 +52,56 @@ func (s *Server) refreshAllOAuthUsage(ctx context.Context) {
 			if isZhipuBaseURL(provider.BaseURL) && strings.TrimSpace(resolveProviderAuth(provider)) != "" {
 				s.refreshZhipuUsage(provider.ID)
 			}
+			// DeepSeek exposes an account-balance endpoint on the same terms.
+			if isDeepSeekBaseURL(provider.BaseURL) && strings.TrimSpace(resolveProviderAuth(provider)) != "" {
+				s.refreshDeepSeekBalance(provider.ID)
+			}
 		}
+	}
+}
+
+func (s *Server) refreshDeepSeekBalance(providerID string) {
+	cacheKey := "deepseek:" + providerID
+	unlock := s.lockOAuthUsageFetch(cacheKey)
+	defer unlock()
+	s.refreshDeepSeekBalanceHoldingLock(providerID)
+}
+
+func (s *Server) maybeRefreshDeepSeekBalanceAsync(providerID string) {
+	cacheKey := "deepseek:" + providerID
+	if !s.oauthUsageCache.needsRefresh(cacheKey) {
+		return
+	}
+	if !s.tryLockOAuthUsageFetch(cacheKey) {
+		return
+	}
+	go func() {
+		defer s.unlockOAuthUsageFetch(cacheKey)
+		s.refreshDeepSeekBalanceHoldingLock(providerID)
+	}()
+}
+
+func (s *Server) refreshDeepSeekBalanceHoldingLock(providerID string) {
+	provider, err := s.router.ProviderByID(providerID)
+	if err != nil || provider.Disabled {
+		return
+	}
+	if !isDeepSeekBaseURL(provider.BaseURL) {
+		return
+	}
+	apiKey := resolveProviderAuth(provider)
+	if strings.TrimSpace(apiKey) == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	report, err := fetchDeepSeekBalance(ctx, provider.BaseURL, apiKey)
+	if err != nil {
+		return
+	}
+	// Cache both success and "unsupported" so relays are not hammered.
+	if report.Available || report.Unsupported {
+		s.oauthUsageCache.set("deepseek:"+providerID, report)
 	}
 }
 

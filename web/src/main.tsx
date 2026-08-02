@@ -215,6 +215,24 @@ type ZhipuUsageReport = {
   weekly?: ZhipuUsageBucket;
 };
 
+/** DeepSeek 余额：金额为十进制字符串，保持原样不转 number 以免丢精度。 */
+type DeepSeekBalanceInfo = {
+  currency: string;
+  total_balance: string;
+  granted_balance?: string;
+  topped_up_balance?: string;
+};
+
+type DeepSeekBalanceReport = {
+  available: boolean;
+  unsupported?: boolean;
+  error?: string;
+  fetchedAt?: string;
+  /** 上游 is_available：false 表示账户已无法继续调用（余额耗尽）。 */
+  isAvailable: boolean;
+  balance_infos?: DeepSeekBalanceInfo[];
+};
+
 type CursorOAuthUsageBucket = {
   label: string;
   utilization: number;
@@ -9075,6 +9093,12 @@ function App() {
               <ZhipuUsagePanel providerId={editingProviderID} />
             </div>
           )}
+          {editingProviderID && providerDraft.authType === 'api_key' && /deepseek\.com/i.test(providerDraft.baseUrl) && (
+            <div className="claude-oauth-panel">
+              <div className="hint-line">DeepSeek 账户余额（来自官方 /user/balance 接口）</div>
+              <DeepSeekBalancePanel providerId={editingProviderID} />
+            </div>
+          )}
           {providerDraft.protocol === 'claude' && providerDraft.authType === 'claude_oauth' && (
             <div className="claude-oauth-panel">
               {!editingProviderID ? (
@@ -9999,6 +10023,83 @@ function ZhipuUsagePanel({ providerId, compact }: { providerId: string; compact?
   );
 }
 
+/** DeepSeek 账户余额面板。与 Zhipu 同为 api_key provider，复用同一套额度面板样式；
+ *  但展示的是金额而非百分比进度条，故不渲染 usage-track。 */
+function DeepSeekBalancePanel({ providerId, compact }: { providerId: string; compact?: boolean }) {
+  const { report, loading, refresh } = useOAuthUsageReport<DeepSeekBalanceReport>(
+    true,
+    `/__providers/${encodeURIComponent(providerId)}/deepseek/usage`,
+  );
+
+  // 卡片上的紧凑版：拉取失败/不支持时不占位。
+  if (compact) {
+    if (!report?.available) return null;
+  } else if (report?.unsupported) {
+    return (
+      <div className="claude-usage-panel" onClick={(event) => event.stopPropagation()}>
+        <div className="hint-line">{report.error || '该地址不支持余额查询（可能是第三方中转），转发不受影响。'}</div>
+      </div>
+    );
+  }
+
+  const infos = report?.balance_infos || [];
+
+  return (
+    <div className={`claude-usage-panel${compact ? ' compact' : ''}`} onClick={(event) => event.stopPropagation()}>
+      <div className="claude-usage-title">
+        <span>DeepSeek 账户余额</span>
+        <span className="claude-usage-actions">
+          {loading ? <span className="claude-usage-status">刷新中…</span> : report?.fetchedAt ? <span className="claude-usage-status">更新于 {formatClaudeUsageResetAt(report.fetchedAt)}</span> : null}
+          <button
+            type="button"
+            className="btn btn-tiny"
+            disabled={loading}
+            onClick={(event) => {
+              event.stopPropagation();
+              void refresh();
+            }}
+          >
+            刷新
+          </button>
+        </span>
+      </div>
+      {!report ? (
+        <div className="claude-usage-empty">{loading ? '正在拉取余额…' : '暂无余额数据'}</div>
+      ) : !report.available ? (
+        <div className="claude-usage-empty error">{report.error || '余额不可用'}</div>
+      ) : infos.length === 0 ? (
+        <div className="claude-usage-empty">未返回余额数据</div>
+      ) : (
+        <div className="claude-usage-grid">
+          {infos.map((info) => (
+            <div className="claude-usage-row" key={info.currency}>
+              <div className="claude-usage-head">
+                <span>可用余额（{info.currency}）</span>
+                <span>{formatDeepSeekAmount(info.currency, info.total_balance)}</span>
+              </div>
+              <div className="claude-usage-reset">
+                充值 {formatDeepSeekAmount(info.currency, info.topped_up_balance)}
+                {' · '}赠送 {formatDeepSeekAmount(info.currency, info.granted_balance)}
+              </div>
+            </div>
+          ))}
+          {!report.isAvailable ? (
+            <div className="claude-usage-empty error">账户余额已不足，上游将拒绝新请求。</div>
+          ) : null}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** 金额按原始字符串展示（不转 number，避免精度问题），仅补货币符号。 */
+function formatDeepSeekAmount(currency: string, amount?: string) {
+  const value = (amount || '').trim();
+  if (!value) return '—';
+  const symbol = currency === 'CNY' ? '¥' : currency === 'USD' ? '$' : '';
+  return `${symbol}${value}`;
+}
+
 function CursorOAuthUsagePanel({ providerId, connected, compact }: { providerId: string; connected?: boolean; compact?: boolean }) {
   const { report, loading, refresh } = useOAuthUsageReport<CursorOAuthUsageReport>(
     Boolean(connected),
@@ -10177,6 +10278,7 @@ function ProviderCard({ active, selected, name, providerId, protocol, tone, url,
       {isCursorOAuth && cursorOAuthConnected && !providerDisabled ? <CursorOAuthUsagePanel providerId={providerId} connected={cursorOAuthConnected} compact /> : null}
       {isChatGPTOAuth && chatgptOAuthConnected && !providerDisabled ? <ChatGPTOAuthUsagePanel providerId={providerId} connected={chatgptOAuthConnected} compact /> : null}
       {!providerDisabled && !isClaudeOAuth && !isCursorOAuth && !isChatGPTOAuth && !isQoderPAT && /(?:bigmodel\.cn|z\.ai)/i.test(url) ? <ZhipuUsagePanel providerId={providerId} compact /> : null}
+      {!providerDisabled && !isClaudeOAuth && !isCursorOAuth && !isChatGPTOAuth && !isQoderPAT && /deepseek\.com/i.test(url) ? <DeepSeekBalancePanel providerId={providerId} compact /> : null}
       {!readOnly ? (
         <div className="provider-actions">
           <button className="icon-btn" disabled={testing} onClick={(event) => { event.stopPropagation(); onTest(); }} title="从 Provider 接口获取可用模型">{testing ? '获取中' : '获取模型'}</button>

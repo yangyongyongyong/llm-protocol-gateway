@@ -269,6 +269,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /__providers/{id}/qoder-pat/status", s.handleQoderPATStatus)
 	mux.HandleFunc("POST /__providers/{id}/qoder-pat/disconnect", s.handleQoderPATDisconnect)
 	mux.HandleFunc("GET /__providers/{id}/zhipu/usage", s.handleZhipuUsage)
+	mux.HandleFunc("GET /__providers/{id}/deepseek/usage", s.handleDeepSeekBalance)
 	mux.HandleFunc("DELETE /__providers/{id}", s.handleDeleteProvider)
 	mux.HandleFunc("GET /__providers/deleted", s.handleListDeletedProviders)
 	mux.HandleFunc("POST /__providers/{id}/restore", s.handleRestoreProvider)
@@ -2153,6 +2154,65 @@ func (s *Server) handleZhipuUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Cache success + unsupported (非编程套餐) so card polling stays quiet.
+	if report.Available || report.Unsupported {
+		s.oauthUsageCache.set(cacheKey, report)
+	}
+	writeJSON(w, http.StatusOK, report)
+}
+
+func (s *Server) handleDeepSeekBalance(w http.ResponseWriter, r *http.Request) {
+	providerID := r.PathValue("id")
+	if !s.requireProviderAccessForUser(w, r, providerID) {
+		return
+	}
+	provider, err := s.router.ProviderByID(providerID)
+	if err != nil {
+		writeOpenAIError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if !isDeepSeekBaseURL(provider.BaseURL) {
+		writeJSON(w, http.StatusOK, DeepSeekBalanceReport{Available: false, Error: "provider is not a DeepSeek provider"})
+		return
+	}
+	if provider.Disabled {
+		writeJSON(w, http.StatusOK, DeepSeekBalanceReport{Available: false, Error: "provider disabled"})
+		return
+	}
+	apiKey := resolveProviderAuth(provider)
+	if strings.TrimSpace(apiKey) == "" {
+		writeJSON(w, http.StatusOK, DeepSeekBalanceReport{Available: false, Error: "provider has no API key configured (apiKeySource is empty)"})
+		return
+	}
+
+	cacheKey := "deepseek:" + providerID
+	forceRefresh := strings.EqualFold(r.URL.Query().Get("refresh"), "1") || strings.EqualFold(r.URL.Query().Get("refresh"), "true")
+	if forceRefresh {
+		s.oauthUsageCache.invalidate(cacheKey)
+	} else if cached, ok := s.oauthUsageCache.getAllowStale(cacheKey); ok {
+		if report, ok := cached.(DeepSeekBalanceReport); ok {
+			s.maybeRefreshDeepSeekBalanceAsync(providerID)
+			writeJSON(w, http.StatusOK, report)
+			return
+		}
+	}
+
+	unlock := s.lockOAuthUsageFetch(cacheKey)
+	defer unlock()
+	if !forceRefresh {
+		if cached, ok := s.oauthUsageCache.get(cacheKey); ok {
+			if report, ok := cached.(DeepSeekBalanceReport); ok {
+				writeJSON(w, http.StatusOK, report)
+				return
+			}
+		}
+	}
+
+	report, err := fetchDeepSeekBalance(r.Context(), provider.BaseURL, apiKey)
+	if err != nil {
+		writeJSON(w, http.StatusOK, DeepSeekBalanceReport{Available: false, Error: err.Error()})
+		return
+	}
+	// Cache success + unsupported (第三方中转无此端点) so card polling stays quiet.
 	if report.Available || report.Unsupported {
 		s.oauthUsageCache.set(cacheKey, report)
 	}
