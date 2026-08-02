@@ -1,5 +1,7 @@
 package domain
 
+import "strings"
+
 type Protocol string
 
 const (
@@ -68,6 +70,94 @@ type PublicAccessSettings struct {
 	StatusMessage   string `json:"statusMessage"`
 	// Tunnel is the live cloudflared process state; runtime-only, not persisted.
 	Tunnel *TunnelRuntime `json:"tunnel,omitempty"`
+}
+
+// AlertRuleAPIKeyMultiIP is the rule id for "one API key used from too many
+// distinct client IPs inside a sliding window" — the key-leak signal.
+const AlertRuleAPIKeyMultiIP = "apikey_multi_ip"
+
+// Alert status values. Alerts start unread; the console can mark them read or
+// ignored (ignored means "reviewed, not a leak" — it is never auto-set).
+const (
+	AlertStatusUnread  = "unread"
+	AlertStatusRead    = "read"
+	AlertStatusIgnored = "ignored"
+)
+
+// Alert push states. Disabled means Telegram was off when the alert fired, so
+// it is not a delivery failure and must not be surfaced as one.
+const (
+	AlertPushSent     = "sent"
+	AlertPushFailed   = "failed"
+	AlertPushDisabled = "disabled"
+)
+
+// AlertSettings holds alerting configuration. It is persisted as a single JSON
+// value under the "alerts" settings key rather than on GatewayState, so the
+// Telegram bot token can never ride along with GET /__state.
+type AlertSettings struct {
+	MultiIPEnabled       bool             `json:"multiIpEnabled"`
+	MultiIPWindowMinutes int              `json:"multiIpWindowMinutes"`
+	MultiIPThreshold     int              `json:"multiIpThreshold"`
+	CooldownMinutes      int              `json:"cooldownMinutes"`
+	Telegram             TelegramSettings `json:"telegram"`
+}
+
+// TelegramSettings configures the Telegram bot used for alert push.
+type TelegramSettings struct {
+	Enabled bool `json:"enabled"`
+	// BotToken is a credential: never return it to the browser. See
+	// redactAlertSettingsForClient in internal/gateway/alerts.go.
+	BotToken string `json:"botToken,omitempty"`
+	ChatID   string `json:"chatId,omitempty"`
+}
+
+// Alert-setting bounds. A zero or out-of-range value would otherwise degrade
+// the scan into alerting on every pass, so Normalize clamps into these.
+const (
+	alertMultiIPWindowMinutesDefault = 10
+	alertMultiIPWindowMinutesMin     = 1
+	alertMultiIPWindowMinutesMax     = 1440
+	alertMultiIPThresholdDefault     = 3
+	alertMultiIPThresholdMin         = 2
+	alertCooldownMinutesDefault      = 60
+	alertCooldownMinutesMin          = 1
+)
+
+func DefaultAlertSettings() AlertSettings {
+	return AlertSettings{
+		MultiIPEnabled:       true,
+		MultiIPWindowMinutes: alertMultiIPWindowMinutesDefault,
+		MultiIPThreshold:     alertMultiIPThresholdDefault,
+		CooldownMinutes:      alertCooldownMinutesDefault,
+	}
+}
+
+// Normalize fills zero values with defaults and clamps out-of-range numbers.
+func (s *AlertSettings) Normalize() {
+	if s.MultiIPWindowMinutes <= 0 {
+		s.MultiIPWindowMinutes = alertMultiIPWindowMinutesDefault
+	}
+	if s.MultiIPWindowMinutes < alertMultiIPWindowMinutesMin {
+		s.MultiIPWindowMinutes = alertMultiIPWindowMinutesMin
+	}
+	if s.MultiIPWindowMinutes > alertMultiIPWindowMinutesMax {
+		s.MultiIPWindowMinutes = alertMultiIPWindowMinutesMax
+	}
+	if s.MultiIPThreshold <= 0 {
+		s.MultiIPThreshold = alertMultiIPThresholdDefault
+	}
+	if s.MultiIPThreshold < alertMultiIPThresholdMin {
+		s.MultiIPThreshold = alertMultiIPThresholdMin
+	}
+	if s.CooldownMinutes <= 0 {
+		s.CooldownMinutes = alertCooldownMinutesDefault
+	}
+	if s.CooldownMinutes < alertCooldownMinutesMin {
+		s.CooldownMinutes = alertCooldownMinutesMin
+	}
+	s.Telegram.BotToken = strings.TrimSpace(s.Telegram.BotToken)
+	s.Telegram.ChatID = strings.TrimSpace(s.Telegram.ChatID)
 }
 
 // TunnelRuntime mirrors the tunnel manager's live state for status responses.

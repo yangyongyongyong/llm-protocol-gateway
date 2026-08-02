@@ -300,6 +300,7 @@ func (rt *Runtime) Start(cfg Config) error {
 		server.StartUserActivityFlush(context.Background())
 		server.BackfillClaudeOAuthAccountLabels()
 		server.StartCursorModelBackgroundRefresh(context.Background())
+		server.StartAlertScan(context.Background())
 		rt.startStorageMaintenance(db, retentionDays)
 	}()
 

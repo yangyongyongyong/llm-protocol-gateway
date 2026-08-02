@@ -210,6 +210,9 @@ func (s *Store) migrate() error {
 	if err := ensureUsageDailyTables(tx); err != nil {
 		return fmt.Errorf("migrate usage_daily: %w", err)
 	}
+	if err := ensureAlertsTable(tx); err != nil {
+		return fmt.Errorf("migrate alerts: %w", err)
+	}
 	if err := addColumnIfMissing(tx, "api_keys", "model_aliases", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}

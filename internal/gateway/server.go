@@ -67,6 +67,7 @@ type Server struct {
 	providerOAuthSaver      ProviderOAuthSaver
 	requestLogStore         RequestLogStore
 	usageDailyStore         UsageDailyStore
+	alertStore              AlertStore
 	tunnels                 *tunnel.Manager
 	pendingClaudeOAuth      *claudeOAuthPendingStore
 	pendingCursorOAuth      *cursorOAuthPendingStore
@@ -140,6 +141,9 @@ func NewServer(router *Router, logs *monitor.Store, stateSaver ...StateSaver) *S
 			server.usageDailyStore = uds
 			logs.SetUsageDailyStore(uds)
 		}
+		if as, ok := stateSaver[0].(AlertStore); ok {
+			server.alertStore = as
+		}
 		if auth, ok := stateSaver[0].(AdminAuthStore); ok {
 			server.adminAuth = auth
 		}
@@ -207,6 +211,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /__app/logs", s.handleAppLogs)
 	mux.HandleFunc("PATCH /__app/log-level", s.handleSetLogLevel)
 	mux.HandleFunc("PATCH /__settings/request-log-retention", s.handleSetRequestLogRetention)
+	// Alerting (API key leak detection). Admin-only: these paths are absent from
+	// isUserAllowedPath, and each handler also calls requireAdmin.
+	mux.HandleFunc("GET /__alerts", s.handleListAlerts)
+	mux.HandleFunc("PATCH /__alerts/{id}", s.handleUpdateAlertStatus)
+	mux.HandleFunc("POST /__alerts/{id}/push", s.handleRetryAlertPush)
+	mux.HandleFunc("GET /__alerts/settings", s.handleAlertSettings)
+	mux.HandleFunc("PATCH /__alerts/settings", s.handleUpdateAlertSettings)
+	mux.HandleFunc("POST /__alerts/telegram/test", s.handleTelegramTest)
 	mux.HandleFunc("PATCH /__settings/web-exposed", s.handleSetWebExposed)
 	mux.HandleFunc("PATCH /__public-access", s.handleUpdatePublicAccess)
 	mux.HandleFunc("PATCH /__endpoints/{id}", s.handleUpdateEndpoint)

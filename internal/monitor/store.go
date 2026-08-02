@@ -52,6 +52,44 @@ const (
 	AccessSourceLocal  = "local"
 )
 
+// Alert is one raised alert record. Unlike AppLog (in-memory, capped, lost on
+// restart) alerts are persisted to SQLite so a leak signal survives a restart.
+type Alert struct {
+	ID       int64     `json:"id"`
+	Time     time.Time `json:"time"`
+	Rule     string    `json:"rule"`
+	Severity string    `json:"severity"`
+	// APIKeyID is the stable key id; APIKeyName is a mutable display label.
+	APIKeyID   string `json:"apiKeyId"`
+	APIKeyName string `json:"apiKeyName"`
+	// IPs is the distinct client-IP set observed in the window. Cooldown
+	// suppression compares against this set: a brand-new IP means a new event.
+	IPs           []string `json:"ips"`
+	IPCount       int      `json:"ipCount"`
+	WindowMinutes int      `json:"windowMinutes"`
+	RequestCount  int      `json:"requestCount"`
+	Status        string   `json:"status"`
+	PushStatus    string   `json:"pushStatus,omitempty"`
+	PushError     string   `json:"pushError,omitempty"`
+}
+
+// MultiIPHit is one detection result: an API key seen from IPCount distinct
+// client IPs inside the scan window.
+type MultiIPHit struct {
+	APIKeyID     string
+	APIKeyName   string
+	IPs          []string
+	IPCount      int
+	RequestCount int
+}
+
+// AlertQuery filters and pages persisted alerts.
+type AlertQuery struct {
+	Status   string // "" / all | unread | read | ignored
+	Page     int
+	PageSize int
+}
+
 // RequestLogQuery filters and pages request logs.
 type RequestLogQuery struct {
 	From       time.Time

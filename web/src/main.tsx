@@ -584,6 +584,51 @@ type LogPage = {
   page: number;
 };
 
+type AlertRecord = {
+  id: number;
+  time: string;
+  rule: string;
+  severity: string;
+  apiKeyId: string;
+  apiKeyName: string;
+  ips: string[];
+  ipCount: number;
+  windowMinutes: number;
+  requestCount: number;
+  status: 'unread' | 'read' | 'ignored';
+  pushStatus?: string;
+  pushError?: string;
+};
+
+type AlertCounts = {
+  all: number;
+  unread: number;
+  read: number;
+  ignored: number;
+};
+
+type AlertPage = {
+  items: AlertRecord[];
+  total: number;
+  page: number;
+  pageSize: number;
+  counts: AlertCounts;
+};
+
+/** 后端已脱敏：只有 botTokenConfigured + 末 4 位,永远没有 botToken 本体。 */
+type AlertSettingsView = {
+  multiIpEnabled: boolean;
+  multiIpWindowMinutes: number;
+  multiIpThreshold: number;
+  cooldownMinutes: number;
+  telegram: {
+    enabled: boolean;
+    chatId: string;
+    botTokenConfigured: boolean;
+    botTokenPreview?: string;
+  };
+};
+
 type APIKeyDayStats = {
   apiKeyId: string;
   apiKeyName: string;
@@ -876,12 +921,13 @@ const navItems = [
   { id: 'usage-stats', label: '用量统计' },
   { id: 'public-access', label: '公网访问' },
   { id: 'traffic-tokens', label: 'API 日志' },
+  { id: 'alerts', label: '告警' },
   { id: 'users', label: '用户管理' },
   { id: 'self-check', label: '自检' },
   { id: 'machine', label: '机器状态' },
   { id: 'settings', label: '设置' },
 ] as const;
-const navIcons = ['◉', '☰', '🔑', '⌘', '▣', '↗', '≡', '👥', '✓', '🖥', '⚙'];
+const navIcons = ['◉', '☰', '🔑', '⌘', '▣', '↗', '≡', '🔔', '👥', '✓', '🖥', '⚙'];
 type NavItemID = typeof navItems[number]['id'];
 
 // 核心配置项：新用户只需依次配好这两个即可使用，侧边栏置顶并加底色区分。
@@ -3167,6 +3213,15 @@ function App() {
   const [authPasswordConfirm, setAuthPasswordConfirm] = useState('');
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState('');
+  // 告警页（仅 admin）
+  const [alertPage, setAlertPage] = useState<AlertPage | null>(null);
+  const [alertsLoading, setAlertsLoading] = useState(false);
+  const [alertStatusFilter, setAlertStatusFilter] = useState<'all' | 'unread' | 'read' | 'ignored'>('all');
+  const [alertsPageNum, setAlertsPageNum] = useState(1);
+  const [alertSettings, setAlertSettings] = useState<AlertSettingsView | null>(null);
+  // 密码框留空 = 不修改已配置的 bot token(后端约定)。
+  const [telegramTokenInput, setTelegramTokenInput] = useState('');
+
   // 用户管理页（仅 admin）
   const [consoleUsers, setConsoleUsers] = useState<ConsoleUser[]>([]);
   const [usersLoading, setUsersLoading] = useState(false);
@@ -3819,6 +3874,13 @@ function App() {
     return () => window.clearInterval(timer);
   }, [activeNav, logsPage, logsStatusFilter, logsFrom, logsTo, logsApiKeyName, logsProviderFilter, logsOwnerFilter]);
 
+  // 进入告警页：拉一次列表 + 配置。筛选切换时回到第 1 页重新拉。
+  useEffect(() => {
+    if (activeNav !== 'alerts') return;
+    void refreshAlerts(1, alertStatusFilter);
+    void refreshAlertSettings();
+  }, [activeNav, alertStatusFilter]);
+
   // 管理员打开 API 日志页时加载用户列表，用于「用户」筛选下拉；普通用户看不到这个
   // 筛选项（后端也只对 admin 生效），不需要拉取。
   useEffect(() => {
@@ -4045,6 +4107,111 @@ function App() {
       showToast(`更新管理密码失败：${String(error)}`);
     } finally {
       setAdminPasswordBusy(false);
+    }
+  }
+
+  async function refreshAlerts(page = alertsPageNum, status = alertStatusFilter) {
+    setAlertsLoading(true);
+    try {
+      const params = new URLSearchParams({ page: String(page) });
+      if (status !== 'all') params.set('status', status);
+      const response = await fetch(`${API_BASE}/__alerts?${params.toString()}`, { credentials: 'same-origin' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      setAlertPage(await response.json() as AlertPage);
+      setAlertsPageNum(page);
+    } catch {
+      // 非管理员或后端异常时静默
+    } finally {
+      setAlertsLoading(false);
+    }
+  }
+
+  async function refreshAlertSettings() {
+    try {
+      const response = await fetch(`${API_BASE}/__alerts/settings`, { credentials: 'same-origin' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      setAlertSettings(await response.json() as AlertSettingsView);
+    } catch {
+      // 非管理员或后端异常时静默
+    }
+  }
+
+  /** 保存告警配置。token 传空串表示保持后端已存的值不变。 */
+  async function saveAlertSettings(patch: Partial<AlertSettingsView> & { botToken?: string }) {
+    if (!alertSettings) return;
+    setSaving(true);
+    try {
+      const merged = { ...alertSettings, ...patch };
+      const response = await fetch(`${API_BASE}/__alerts/settings`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({
+          multiIpEnabled: merged.multiIpEnabled,
+          multiIpWindowMinutes: merged.multiIpWindowMinutes,
+          multiIpThreshold: merged.multiIpThreshold,
+          cooldownMinutes: merged.cooldownMinutes,
+          telegram: {
+            enabled: merged.telegram.enabled,
+            chatId: merged.telegram.chatId,
+            botToken: patch.botToken ?? '',
+          },
+        }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      setAlertSettings(await response.json() as AlertSettingsView);
+      setTelegramTokenInput('');
+      showToast('告警配置已保存');
+    } catch (error) {
+      showToast(`保存告警配置失败：${String(error)}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function updateAlertStatus(id: number, status: 'unread' | 'read' | 'ignored') {
+    try {
+      const response = await fetch(`${API_BASE}/__alerts/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ status }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      await refreshAlerts();
+    } catch (error) {
+      showToast(`更新告警状态失败：${String(error)}`);
+    }
+  }
+
+  async function retryAlertPush(id: number) {
+    try {
+      const response = await fetch(`${API_BASE}/__alerts/${id}/push`, {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const updated = await response.json() as AlertRecord;
+      showToast(updated.pushStatus === 'sent' ? '已重新推送到 Telegram' : `重推未成功：${updated.pushError || '未知原因'}`);
+      await refreshAlerts();
+    } catch (error) {
+      showToast(`重推失败：${String(error)}`);
+    }
+  }
+
+  async function sendTelegramTest() {
+    setSaving(true);
+    try {
+      const response = await fetch(`${API_BASE}/__alerts/telegram/test`, {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
+      if (!response.ok) throw new Error(await response.text());
+      showToast('测试消息已发送，请查看 Telegram');
+    } catch (error) {
+      showToast(`测试消息发送失败：${String(error)}`);
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -7827,6 +7994,267 @@ function App() {
                   </>
                 )}
               </div>
+            </div>
+          </section>
+          )}
+
+          {activeNav === 'alerts' && !isNormalUser && (
+          <section className="section-full">
+            <div className="card panel">
+              <div className="panel-header">
+                <div>
+                  <h2 className="panel-title">告警</h2>
+                  <p className="panel-desc">
+                    检测 API 密钥是否被多个 IP 同时使用（疑似泄露）。仅告警，不会禁用密钥或限流，不影响下游正常使用。
+                    检测基于请求日志（默认保留 {requestLogRetentionDays} 天），每 2 分钟扫描一次。
+                  </p>
+                </div>
+              </div>
+
+              <div className="models-filter-group" style={{ marginBottom: 12 }}>
+                {([
+                  { key: 'all', label: '全部', count: alertPage?.counts.all ?? 0 },
+                  { key: 'unread', label: '未读', count: alertPage?.counts.unread ?? 0 },
+                  { key: 'read', label: '已读', count: alertPage?.counts.read ?? 0 },
+                  { key: 'ignored', label: '已忽略', count: alertPage?.counts.ignored ?? 0 },
+                ] as const).map((chip) => (
+                  <button
+                    key={chip.key}
+                    type="button"
+                    className={`models-filter-chip${alertStatusFilter === chip.key ? ' active' : ''}`}
+                    onClick={() => setAlertStatusFilter(chip.key)}
+                  >
+                    {chip.label} {chip.count}
+                  </button>
+                ))}
+              </div>
+
+              <div className="log-table">
+                {alertsLoading && !alertPage ? (
+                  <div className="empty-state">加载告警中…</div>
+                ) : !alertPage || alertPage.items.length === 0 ? (
+                  <div className="empty-state">
+                    暂无告警。当同一密钥在 {alertSettings?.multiIpWindowMinutes ?? 10} 分钟内被
+                    {alertSettings?.multiIpThreshold ?? 3} 个及以上不同 IP 使用时，这里会出现记录。
+                  </div>
+                ) : (
+                  <>
+                    <div className="log-header alert-log-header">
+                      <span>时间</span>
+                      <span>密钥</span>
+                      <span>独立 IP</span>
+                      <span>状态</span>
+                      <span>操作</span>
+                    </div>
+                    {alertPage.items.map((alert) => (
+                      <div className={`log-row${alert.status === 'unread' ? ' error' : ''}`} key={alert.id}>
+                        <div className="log-row-main alert-log-row">
+                          <span>{new Date(alert.time).toLocaleString()}</span>
+                          <span>{alert.apiKeyName || alert.apiKeyId}</span>
+                          <span>{alert.ipCount} 个 / {alert.windowMinutes} 分钟</span>
+                          <span>
+                            <Badge tone={alert.status === 'unread' ? 'red' : alert.status === 'ignored' ? 'slate' : 'green'}>
+                              {alert.status === 'unread' ? '未读' : alert.status === 'ignored' ? '已忽略' : '已读'}
+                            </Badge>
+                            {alert.pushStatus === 'sent' ? <Badge tone="green">已推送</Badge> : null}
+                            {alert.pushStatus === 'failed' ? <Badge tone="red">推送失败</Badge> : null}
+                            {alert.pushStatus === 'disabled' ? <Badge tone="slate">未配置推送</Badge> : null}
+                          </span>
+                          <span style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                            {alert.status !== 'read' ? (
+                              <button className="mini-btn" type="button" onClick={() => void updateAlertStatus(alert.id, 'read')}>标记已读</button>
+                            ) : null}
+                            {alert.status !== 'ignored' ? (
+                              <button className="mini-btn" type="button" onClick={() => void updateAlertStatus(alert.id, 'ignored')}>忽略</button>
+                            ) : null}
+                            {alert.pushStatus === 'failed' ? (
+                              <button className="mini-btn" type="button" onClick={() => void retryAlertPush(alert.id)}>重推</button>
+                            ) : null}
+                          </span>
+                        </div>
+                        <div className="log-row-sub" style={{ display: 'flex', gap: 14, flexWrap: 'wrap', whiteSpace: 'normal' }}>
+                          <span>请求数 {alert.requestCount}</span>
+                          <span>IP：{alert.ips.join(', ')}</span>
+                          {alert.pushError ? <span>推送失败原因：{alert.pushError}</span> : null}
+                        </div>
+                      </div>
+                    ))}
+                    <div className="hint-line" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <span>共 {alertPage.total} 条 · 第 {alertPage.page} 页 · 每页 {alertPage.pageSize} 条</span>
+                      <span style={{ display: 'flex', gap: 8 }}>
+                        <button className="mini-btn" type="button" disabled={alertPage.page <= 1} onClick={() => void refreshAlerts(alertPage.page - 1)}>上一页</button>
+                        <button className="mini-btn" type="button" disabled={alertPage.page * alertPage.pageSize >= alertPage.total} onClick={() => void refreshAlerts(alertPage.page + 1)}>下一页</button>
+                      </span>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+
+            <div className="card panel">
+              <div className="panel-header">
+                <div>
+                  <h2 className="panel-title">监控覆盖</h2>
+                  <p className="panel-desc">当前已实现与规划中的检测规则。规划中的规则尚未生效，仅用于标记后续迭代方向。</p>
+                </div>
+              </div>
+              <div className="model-grid">
+                {[
+                  {
+                    name: '单密钥多 IP',
+                    enabled: alertSettings?.multiIpEnabled ?? false,
+                    planned: false,
+                    desc: `窗口内同一密钥的独立 IP 数达到阈值即告警。当前：${alertSettings?.multiIpWindowMinutes ?? 10} 分钟 / ${alertSettings?.multiIpThreshold ?? 3} 个 IP。`,
+                  },
+                  {
+                    name: '地理 / ASN 跳变',
+                    enabled: false,
+                    planned: true,
+                    desc: '相邻请求的 IP 归属地或运营商在物理上不可能的时间内发生跳变。需接入 IP 归属库。',
+                  },
+                  {
+                    name: '并发时间重叠',
+                    enabled: false,
+                    planned: true,
+                    desc: '两个不同 IP 的请求在时间上重叠，可证明确实是两个实体同时使用，几乎无误报。',
+                  },
+                  {
+                    name: '用量突增',
+                    enabled: false,
+                    planned: true,
+                    desc: 'token / 请求数相对历史基线暴涨。能覆盖泄露者走同一代理池出口、IP 数不超阈值的情况。',
+                  },
+                  {
+                    name: '首见新 IP 提醒',
+                    enabled: false,
+                    planned: true,
+                    desc: '学习历史 IP 基线，出现从未见过的 IP 时单独提醒一次。灵敏度更高但初期噪音较多。',
+                  },
+                ].map((rule) => (
+                  <div className="model-card compact" key={rule.name}>
+                    <div className="provider-top">
+                      <div className="provider-name">{rule.name}</div>
+                      <Badge tone={rule.planned ? 'slate' : rule.enabled ? 'green' : 'amber'}>
+                        {rule.planned ? '规划中' : rule.enabled ? '已启用' : '已关闭'}
+                      </Badge>
+                    </div>
+                    <div className="provider-meta">{rule.desc}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="card panel">
+              <div className="panel-header">
+                <div>
+                  <h2 className="panel-title">告警设置</h2>
+                  <p className="panel-desc">调整检测阈值与 Telegram 推送。Bot Token 保存后不会再下发到浏览器，只显示末 4 位。</p>
+                </div>
+              </div>
+              {!alertSettings ? (
+                <div className="empty-state">加载配置中…</div>
+              ) : (
+                <>
+                  <label className="toggle-row" style={{ display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer', marginBottom: 12 }}>
+                    <input
+                      type="checkbox"
+                      checked={alertSettings.multiIpEnabled}
+                      disabled={saving}
+                      onChange={(event) => void saveAlertSettings({ multiIpEnabled: event.target.checked })}
+                    />
+                    <span>启用「单密钥多 IP」检测</span>
+                  </label>
+                  <div className="form-grid compact">
+                    <label className="field">
+                      <span>检测窗口（分钟）</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={1440}
+                        value={alertSettings.multiIpWindowMinutes}
+                        onChange={(event) => setAlertSettings({ ...alertSettings, multiIpWindowMinutes: Number(event.target.value) || 10 })}
+                        onBlur={() => void saveAlertSettings({})}
+                      />
+                    </label>
+                    <label className="field">
+                      <span>独立 IP 阈值（≥2）</span>
+                      <input
+                        type="number"
+                        min={2}
+                        value={alertSettings.multiIpThreshold}
+                        onChange={(event) => setAlertSettings({ ...alertSettings, multiIpThreshold: Number(event.target.value) || 3 })}
+                        onBlur={() => void saveAlertSettings({})}
+                      />
+                    </label>
+                    <label className="field">
+                      <span>冷却期（分钟）</span>
+                      <input
+                        type="number"
+                        min={1}
+                        value={alertSettings.cooldownMinutes}
+                        onChange={(event) => setAlertSettings({ ...alertSettings, cooldownMinutes: Number(event.target.value) || 60 })}
+                        onBlur={() => void saveAlertSettings({})}
+                      />
+                    </label>
+                  </div>
+                  <p className="hint-line">
+                    冷却期内同一密钥只告警一次，避免同一次泄露反复推送；但若窗口内出现全新 IP，会立即再告一次。
+                  </p>
+
+                  <label className="toggle-row" style={{ display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer', margin: '16px 0 12px' }}>
+                    <input
+                      type="checkbox"
+                      checked={alertSettings.telegram.enabled}
+                      disabled={saving}
+                      onChange={(event) => void saveAlertSettings({ telegram: { ...alertSettings.telegram, enabled: event.target.checked } })}
+                    />
+                    <span>启用 Telegram 推送</span>
+                  </label>
+                  {alertSettings.telegram.botTokenConfigured ? (
+                    <p className="hint-line">已配置 Bot Token · 令牌尾号 ****{alertSettings.telegram.botTokenPreview || '----'}</p>
+                  ) : (
+                    <p className="hint-line">尚未配置 Bot Token。在 Telegram 里找 @BotFather 创建机器人获取 token，再向机器人发一条消息以取得 chat id。</p>
+                  )}
+                  <div className="form-grid compact">
+                    <label className="field">
+                      <span>Bot Token{alertSettings.telegram.botTokenConfigured ? '（留空表示不修改）' : ''}</span>
+                      <input
+                        type="password"
+                        placeholder="粘贴 BotFather 给出的 token"
+                        value={telegramTokenInput}
+                        onChange={(event) => setTelegramTokenInput(event.target.value)}
+                      />
+                    </label>
+                    <label className="field">
+                      <span>Chat ID</span>
+                      <input
+                        type="text"
+                        placeholder="例如 123456789 或 -1001234567890"
+                        value={alertSettings.telegram.chatId}
+                        onChange={(event) => setAlertSettings({ ...alertSettings, telegram: { ...alertSettings.telegram, chatId: event.target.value } })}
+                      />
+                    </label>
+                  </div>
+                  <div className="public-simple-actions" style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+                    <button
+                      className="btn primary"
+                      type="button"
+                      disabled={saving}
+                      onClick={() => void saveAlertSettings({ botToken: telegramTokenInput.trim() })}
+                    >
+                      保存 Telegram 配置
+                    </button>
+                    <button
+                      className="mini-btn"
+                      type="button"
+                      disabled={saving || !alertSettings.telegram.botTokenConfigured || !alertSettings.telegram.chatId.trim()}
+                      onClick={() => void sendTelegramTest()}
+                    >
+                      发送测试消息
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
           </section>
           )}
