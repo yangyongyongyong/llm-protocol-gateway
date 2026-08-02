@@ -7478,23 +7478,6 @@ function App() {
                 </div>
               ) : null}
 
-              <div className="usage-charts-full">
-                <UsageDailyTrafficLines
-                  title={usageFrom === usageTo ? '按日流量（网关转发）' : `按日流量（网关转发） · ${usageFrom} ~ ${usageTo}`}
-                  points={requestStats?.daily || []}
-                  onPickDay={(date) => {
-                    usageFollowTodayRef.current = isFollowingTodayRange(date, date);
-                    setUsageFrom(date);
-                    setUsageTo(date);
-                    void refreshRequestStats(date, date);
-                  }}
-                />
-                <p className="hint-line">
-                  统计网关实际转发的请求体 / 响应体字节数（业务流量），一天一条、永久保留。
-                  与「机器状态」页的整机网卡累计值不同：后者含本机所有流量且重启归零。
-                </p>
-              </div>
-
               <div className="usage-charts">
                 {usageFrom === usageTo ? (
                   <UsageLineChart title="按日请求量" points={requestStats?.daily || []} />
@@ -7546,6 +7529,23 @@ function App() {
                   cache={requestStats?.range?.total.cacheTokens ?? usageToday?.total.cacheTokens ?? 0}
                 />
                 <UsageStatusChart title="状态码分布" items={requestStats?.status || []} />
+              </div>
+
+              <div className="usage-charts-full">
+                <UsageDailyTrafficLines
+                  title={usageFrom === usageTo ? '按日流量（网关转发）' : `按日流量（网关转发） · ${usageFrom} ~ ${usageTo}`}
+                  points={requestStats?.daily || []}
+                  onPickDay={(date) => {
+                    usageFollowTodayRef.current = isFollowingTodayRange(date, date);
+                    setUsageFrom(date);
+                    setUsageTo(date);
+                    void refreshRequestStats(date, date);
+                  }}
+                />
+                <p className="hint-line">
+                  统计网关实际转发的请求体 / 响应体字节数（业务流量），一天一条、永久保留。
+                  与「机器状态」页的整机网卡累计值不同：后者含本机所有流量且重启归零。
+                </p>
               </div>
 
               {usageToday?.lastRequest ? (
