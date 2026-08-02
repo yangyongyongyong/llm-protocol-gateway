@@ -228,16 +228,11 @@ html[data-theme="dark"] .usage-month-bars-yaxis.right { color: #fbbf24; }
 .usage-month-bar span { display: block; width: 100%; border-radius: 4px 4px 2px 2px; background: linear-gradient(180deg, #3b82f6, #2563eb); transition: 0.12s ease; }
 .usage-month-bar:hover span { background: linear-gradient(180deg, #60a5fa, #3b82f6); }
 .usage-month-bar.zero span { background: var(--slate-soft); }
-/* 按日流量：接收/发送堆叠柱。外层 .traffic-stack 控制总高，内部两段按当日占比分配。 */
-.usage-month-legend-item .legend-bar.traffic-rx { background: linear-gradient(180deg, #34d399, #059669); }
-.usage-month-legend-item .legend-bar.traffic-tx { background: linear-gradient(180deg, #a78bfa, #7c3aed); }
-.usage-month-bar.traffic .traffic-stack { display: flex; flex-direction: column; justify-content: flex-end; width: 100%; border-radius: 4px 4px 2px 2px; overflow: hidden; background: transparent; }
-.usage-month-bar.traffic .traffic-seg { display: block; width: 100%; transition: 0.12s ease; }
-.usage-month-bar.traffic .traffic-seg.rx { background: linear-gradient(180deg, #34d399, #059669); }
-.usage-month-bar.traffic .traffic-seg.tx { background: linear-gradient(180deg, #a78bfa, #7c3aed); }
-.usage-month-bar.traffic:hover .traffic-seg.rx { background: linear-gradient(180deg, #6ee7b7, #10b981); }
-.usage-month-bar.traffic:hover .traffic-seg.tx { background: linear-gradient(180deg, #c4b5fd, #8b5cf6); }
-.usage-month-bar.traffic.zero .traffic-stack { background: var(--slate-soft); }
+/* 按日流量双折线图：图例用短线段而非色块，与折线呼应；图表整行全宽。 */
+.usage-traffic-card { width: 100%; }
+.usage-traffic-card .usage-chart-svg { width: 100%; height: auto; }
+.usage-month-legend-item .legend-line.traffic-rx { display: inline-block; width: 14px; height: 3px; border-radius: 2px; background: #059669; }
+.usage-month-legend-item .legend-line.traffic-tx { display: inline-block; width: 14px; height: 3px; border-radius: 2px; background: #7c3aed; }
 .usage-month-line { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; color: #f59e0b; z-index: 2; }
 html[data-theme="dark"] .usage-month-line { color: #fbbf24; }
 /* 组合图数值标注：Token 在柱底内侧，请求次数在折线上方，互不重叠 */

@@ -3055,86 +3055,102 @@ function UsageMonthlyTokenBars({ title = '最近 7 天 · 每日用量', points,
   );
 }
 
-/** 按日转发流量（接收/发送）。堆叠柱状，复用 usage-month-bars 的布局与样式。
- *  数据来自 usage_daily 汇总，与请求量同源、一天一条、永久保留。 */
-function UsageDailyTrafficBars({ title = '按日流量', points, onPickDay }: {
+/** 按日转发流量（接收/发送）双折线图。数据来自 usage_daily 汇总，与请求量同源、
+ *  一天一条、永久保留。用 SVG 折线而非柱状：天数多时柱子会挤在一起互相重叠，
+ *  折线在任意天数下都不会。 */
+function UsageDailyTrafficLines({ title = '按日流量', points, onPickDay }: {
   title?: string;
   points: DailyRequestPoint[];
   onPickDay?: (date: string) => void;
 }) {
+  const width = 960;
+  const height = 240;
+  const padLeft = 62;
+  const padRight = 16;
+  const padTop = 18;
+  const padBottom = 30;
+  const plotWidth = width - padLeft - padRight;
+  const plotHeight = height - padTop - padBottom;
+
   const rxValues = points.map((p) => p.rxBytes || 0);
   const txValues = points.map((p) => p.txBytes || 0);
-  const totals = points.map((_, i) => rxValues[i] + txValues[i]);
-  const maxTotal = Math.max(...totals, 1);
-  const xTickIndexes = pickUsageXTickIndexes(points.length);
+  const max = Math.max(1, ...rxValues, ...txValues);
   const sumRx = rxValues.reduce((acc, v) => acc + v, 0);
   const sumTx = txValues.reduce((acc, v) => acc + v, 0);
-  const barX = (i: number) => (points.length === 1 ? 50 : ((i + 0.5) / points.length) * 100);
+  const xTickIndexes = pickUsageXTickIndexes(points.length);
+
+  // 单点时居中，避免除零。
+  const xAt = (i: number) => (points.length <= 1 ? padLeft + plotWidth / 2 : padLeft + (i / (points.length - 1)) * plotWidth);
+  const yAt = (v: number) => height - padBottom - (v / max) * plotHeight;
+  const polyline = (values: number[]) => values.map((v, i) => `${xAt(i).toFixed(1)},${yAt(v).toFixed(1)}`).join(' ');
+
+  const hasTraffic = rxValues.some((v) => v > 0) || txValues.some((v) => v > 0);
 
   return (
-    <div className="usage-month-bars" role="img" aria-label={title}>
+    <div className="usage-chart-card usage-traffic-card">
       <div className="usage-month-bars-head">
         <div className="usage-month-bars-title">{title}</div>
         <div className="usage-month-bars-legend">
-          <span className="usage-month-legend-item"><i className="legend-bar traffic-rx" />接收 {formatBytes(sumRx)}</span>
-          <span className="usage-month-legend-item"><i className="legend-bar traffic-tx" />发送 {formatBytes(sumTx)}</span>
+          <span className="usage-month-legend-item"><i className="legend-line traffic-rx" />接收 {formatBytes(sumRx)}</span>
+          <span className="usage-month-legend-item"><i className="legend-line traffic-tx" />发送 {formatBytes(sumTx)}</span>
         </div>
       </div>
       {points.length === 0 ? (
-        <div className="usage-month-bars-empty">暂无数据</div>
-      ) : totals.every((v) => v === 0) ? (
-        <div className="usage-month-bars-empty">暂无流量数据（本功能上线后的请求才会计入）</div>
+        <div className="empty-state compact">暂无数据</div>
+      ) : !hasTraffic ? (
+        <div className="empty-state compact">暂无流量数据（本功能上线后的请求才会计入）</div>
       ) : (
-        <>
-          <div className="usage-month-bars-plot">
-            <div className="usage-month-bars-yaxis" aria-label="流量">
-              <span>{formatBytes(maxTotal)}</span>
-              <span>{formatBytes(Math.round(maxTotal / 2))}</span>
-              <span>0</span>
-            </div>
-            <div className="usage-month-bars-track">
-              {points.map((p, i) => {
-                const total = totals[i];
-                const h = total > 0 ? Math.max(4, Math.round((total / maxTotal) * 100)) : 2;
-                // 堆叠：接收在下、发送在上，占各自在当日总量中的比例。
-                const rxShare = total > 0 ? (rxValues[i] / total) * 100 : 0;
-                return (
-                  <button
-                    key={p.date}
-                    type="button"
-                    className={`usage-month-bar traffic${total === 0 ? ' zero' : ''}`}
-                    title={`${p.date} · 接收 ${formatBytes(rxValues[i])} · 发送 ${formatBytes(txValues[i])} · 合计 ${formatBytes(total)}`}
-                    onClick={() => onPickDay?.(p.date)}
-                  >
-                    <span className="traffic-stack" style={{ height: `${h}%` }}>
-                      <i className="traffic-seg tx" style={{ height: `${100 - rxShare}%` }} />
-                      <i className="traffic-seg rx" style={{ height: `${rxShare}%` }} />
-                    </span>
-                  </button>
-                );
-              })}
-              {points.map((p, i) => {
-                if (totals[i] <= 0) return null;
-                return (
-                  <span
-                    key={`tf-${p.date}`}
-                    className="usage-month-label token"
-                    style={{ left: `${barX(i)}%`, bottom: '3%' }}
-                  >
-                    {formatBytes(totals[i], 0)}
-                  </span>
-                );
-              })}
-            </div>
-          </div>
-          <div className="usage-month-bars-xaxis">
-            {points.map((p, i) => (
-              <span key={p.date} className="usage-month-bars-xtick">
-                {xTickIndexes.includes(i) ? p.date.slice(5) : ''}
-              </span>
-            ))}
-          </div>
-        </>
+        <svg viewBox={`0 0 ${width} ${height}`} className="usage-chart-svg" role="img" aria-label={title}>
+          {[0, 0.25, 0.5, 0.75, 1].map((ratio) => {
+            const y = height - padBottom - ratio * plotHeight;
+            return (
+              <g key={`grid-${ratio}`}>
+                <line x1={padLeft} y1={y} x2={width - padRight} y2={y} stroke="rgba(15,23,42,0.07)" strokeWidth="1" />
+                <text x={padLeft - 8} y={y + 3} textAnchor="end" fontSize="10" fill="rgba(15,23,42,0.45)">
+                  {formatBytes(Math.round(max * ratio), 0)}
+                </text>
+              </g>
+            );
+          })}
+          <line x1={padLeft} y1={padTop} x2={padLeft} y2={height - padBottom} stroke="rgba(15,23,42,0.12)" strokeWidth="1" />
+
+          <polyline points={polyline(rxValues)} fill="none" stroke="#059669" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+          <polyline points={polyline(txValues)} fill="none" stroke="#7c3aed" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+
+          {points.map((p, i) => (
+            <g key={`pt-${p.date}`}>
+              {/* 透明热区：整列可点/可悬浮，不必精准命中细小的点 */}
+              <rect
+                x={xAt(i) - Math.max(6, plotWidth / Math.max(points.length, 1) / 2)}
+                y={padTop}
+                width={Math.max(12, plotWidth / Math.max(points.length, 1))}
+                height={plotHeight}
+                fill="transparent"
+                style={{ cursor: onPickDay ? 'pointer' : 'default' }}
+                onClick={() => onPickDay?.(p.date)}
+              >
+                <title>{`${p.date} · 接收 ${formatBytes(rxValues[i])} · 发送 ${formatBytes(txValues[i])}`}</title>
+              </rect>
+              {rxValues[i] > 0 ? <circle cx={xAt(i)} cy={yAt(rxValues[i])} r="2.6" fill="#059669" /> : null}
+              {txValues[i] > 0 ? <circle cx={xAt(i)} cy={yAt(txValues[i])} r="2.6" fill="#7c3aed" /> : null}
+            </g>
+          ))}
+
+          {points.map((p, i) => (
+            xTickIndexes.includes(i) ? (
+              <text
+                key={`x-${p.date}`}
+                x={xAt(i)}
+                y={height - padBottom + 16}
+                textAnchor="middle"
+                fontSize="10"
+                fill="rgba(15,23,42,0.5)"
+              >
+                {p.date.slice(5)}
+              </text>
+            ) : null
+          ))}
+        </svg>
       )}
     </div>
   );
@@ -7424,7 +7440,7 @@ function App() {
               ) : null}
 
               <div className="usage-charts-full">
-                <UsageDailyTrafficBars
+                <UsageDailyTrafficLines
                   title={usageFrom === usageTo ? '按日流量（网关转发）' : `按日流量（网关转发） · ${usageFrom} ~ ${usageTo}`}
                   points={requestStats?.daily || []}
                   onPickDay={(date) => {
