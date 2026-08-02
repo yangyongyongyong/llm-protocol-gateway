@@ -3065,8 +3065,8 @@ function UsageDailyTrafficLines({ title = '按日流量', points, onPickDay }: {
 }) {
   const width = 960;
   const height = 260;
-  const padLeft = 70;
-  const padRight = 20;
+  const padLeft = 74;
+  const padRight = 74;
   const padTop = 26;
   const padBottom = 46;
   const plotWidth = width - padLeft - padRight;
@@ -3074,15 +3074,21 @@ function UsageDailyTrafficLines({ title = '按日流量', points, onPickDay }: {
 
   const rxValues = points.map((p) => p.rxBytes || 0);
   const txValues = points.map((p) => p.txBytes || 0);
-  const max = Math.max(1, ...rxValues, ...txValues);
-  const sumRx = rxValues.reduce((acc, v) => acc + v, 0);
-  const sumTx = txValues.reduce((acc, v) => acc + v, 0);
   const xTickIndexes = pickUsageXTickIndexes(points.length);
+
+  // 双纵轴：接收通常比发送大一两个数量级（实测 91 MB vs 1.3 MB），共用一根轴会
+  // 把发送线压在 0 刻度上、和它自己的标注值对不上。故左轴管接收、右轴管发送，
+  // 各按自身量级缩放；轴刻度用同色标注，明确哪条线读哪根轴。
+  const rxMax = Math.max(1, ...rxValues);
+  const txMax = Math.max(1, ...txValues);
 
   // 单点时居中，避免除零。
   const xAt = (i: number) => (points.length <= 1 ? padLeft + plotWidth / 2 : padLeft + (i / (points.length - 1)) * plotWidth);
-  const yAt = (v: number) => height - padBottom - (v / max) * plotHeight;
-  const polyline = (values: number[]) => values.map((v, i) => `${xAt(i).toFixed(1)},${yAt(v).toFixed(1)}`).join(' ');
+  const yOf = (v: number, scaleMax: number) => height - padBottom - (v / scaleMax) * plotHeight;
+  const yRx = (v: number) => yOf(v, rxMax);
+  const yTx = (v: number) => yOf(v, txMax);
+  const polyline = (values: number[], scaleMax: number) =>
+    values.map((v, i) => `${xAt(i).toFixed(1)},${yOf(v, scaleMax).toFixed(1)}`).join(' ');
 
   const hasTraffic = rxValues.some((v) => v > 0) || txValues.some((v) => v > 0);
   // 点太密时标注会糊成一片，只在刻度日标注；天数少时每天都标。
@@ -3094,9 +3100,11 @@ function UsageDailyTrafficLines({ title = '按日流量', points, onPickDay }: {
     <div className="usage-chart-card usage-traffic-card">
       <div className="usage-month-bars-head">
         <div className="usage-month-bars-title">{title}</div>
+        {/* 图例只做颜色与读轴说明。刻意不放合计数值：区间可能是几十天，
+            一个区间总量对逐日曲线没有解释力，具体数值看点标注与悬浮提示。 */}
         <div className="usage-month-bars-legend">
-          <span className="usage-month-legend-item"><i className="legend-line traffic-rx" />接收 {formatBytes(sumRx)}</span>
-          <span className="usage-month-legend-item"><i className="legend-line traffic-tx" />发送 {formatBytes(sumTx)}</span>
+          <span className="usage-month-legend-item"><i className="legend-line traffic-rx" />接收（左轴）</span>
+          <span className="usage-month-legend-item"><i className="legend-line traffic-tx" />发送（右轴）</span>
         </div>
       </div>
       {points.length === 0 ? (
@@ -3110,21 +3118,27 @@ function UsageDailyTrafficLines({ title = '按日流量', points, onPickDay }: {
             return (
               <g key={`grid-${ratio}`}>
                 <line className="tl-grid" x1={padLeft} y1={y} x2={width - padRight} y2={y} stroke="currentColor" strokeWidth="1" />
-                <text className="tl-tick" x={padLeft - 8} y={y + 3} textAnchor="end" fontSize="10" fill="currentColor">
-                  {formatBytes(Math.round(max * ratio), 0)}
+                {/* 左轴刻度＝接收量级，右轴刻度＝发送量级，各自用线色标注 */}
+                <text className="tl-val rx" x={padLeft - 8} y={y + 3} textAnchor="end" fontSize="10" fill="currentColor">
+                  {formatBytes(rxMax * ratio, 1)}
+                </text>
+                <text className="tl-val tx" x={width - padRight + 8} y={y + 3} textAnchor="start" fontSize="10" fill="currentColor">
+                  {formatBytes(txMax * ratio, 1)}
                 </text>
               </g>
             );
           })}
-          {/* 坐标轴 */}
+          {/* 坐标轴：左右各一根纵轴 + 一根横轴 */}
           <line className="tl-axis" x1={padLeft} y1={padTop} x2={padLeft} y2={height - padBottom} stroke="currentColor" strokeWidth="1" />
+          <line className="tl-axis" x1={width - padRight} y1={padTop} x2={width - padRight} y2={height - padBottom} stroke="currentColor" strokeWidth="1" />
           <line className="tl-axis" x1={padLeft} y1={height - padBottom} x2={width - padRight} y2={height - padBottom} stroke="currentColor" strokeWidth="1" />
           {/* 轴标题 */}
-          <text className="tl-axis-title" x={padLeft - 8} y={padTop - 10} textAnchor="end" fontSize="10" fontWeight="700" fill="currentColor">流量</text>
-          <text className="tl-axis-title" x={width - padRight} y={height - 8} textAnchor="end" fontSize="10" fontWeight="700" fill="currentColor">日期</text>
+          <text className="tl-val rx" x={padLeft - 8} y={padTop - 10} textAnchor="end" fontSize="10" fontWeight="700" fill="currentColor">接收</text>
+          <text className="tl-val tx" x={width - padRight + 8} y={padTop - 10} textAnchor="start" fontSize="10" fontWeight="700" fill="currentColor">发送</text>
+          <text className="tl-axis-title" x={width / 2} y={height - 6} textAnchor="middle" fontSize="10" fontWeight="700" fill="currentColor">日期</text>
 
-          <polyline points={polyline(rxValues)} fill="none" className="tl-line rx" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
-          <polyline points={polyline(txValues)} fill="none" className="tl-line tx" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+          <polyline points={polyline(rxValues, rxMax)} fill="none" className="tl-line rx" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+          <polyline points={polyline(txValues, txMax)} fill="none" className="tl-line tx" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
 
           {points.map((p, i) => (
             <g key={`pt-${p.date}`}>
@@ -3140,32 +3154,32 @@ function UsageDailyTrafficLines({ title = '按日流量', points, onPickDay }: {
               >
                 <title>{`${p.date} · 接收 ${formatBytes(rxValues[i])} · 发送 ${formatBytes(txValues[i])}`}</title>
               </rect>
-              {rxValues[i] > 0 ? <circle cx={xAt(i)} cy={yAt(rxValues[i])} r="3" className="tl-dot rx" fill="currentColor" /> : null}
-              {txValues[i] > 0 ? <circle cx={xAt(i)} cy={yAt(txValues[i])} r="3" className="tl-dot tx" fill="currentColor" /> : null}
+              {rxValues[i] > 0 ? <circle cx={xAt(i)} cy={yRx(rxValues[i])} r="3" className="tl-dot rx" fill="currentColor" /> : null}
+              {txValues[i] > 0 ? <circle cx={xAt(i)} cy={yTx(txValues[i])} r="3" className="tl-dot tx" fill="currentColor" /> : null}
             </g>
           ))}
 
-          {/* 散点数值标注。两条线的标注可能撞在一起：谁高谁标上方，另一条标下方。 */}
+          {/* 散点数值标注。两条线各读自己的轴，位置可能仍然撞上：按屏幕 y 判断
+              谁在上方，上者标上、下者标下；再钳进绘图区避免顶到轴标题。 */}
           {points.map((p, i) => {
             if (!labelIndexes.includes(i)) return null;
             const rx = rxValues[i];
             const tx = txValues[i];
-            const rxAbove = rx >= tx;
-            // 峰值点的上方标注会顶到轴标题，钳进绘图区内；贴底时同理往上让。
-            const nudge = (v: number, above: boolean) => {
-              const y = yAt(v) + (above ? -9 : 15);
-              return Math.min(Math.max(y, padTop + 8), height - padBottom - 3);
-            };
+            const rxScreenY = yRx(rx);
+            const txScreenY = yTx(tx);
+            const clamp = (y: number) => Math.min(Math.max(y, padTop + 8), height - padBottom - 3);
+            const collide = Math.abs(rxScreenY - txScreenY) < 14;
+            const rxAbove = !collide || rxScreenY <= txScreenY;
             return (
               <g key={`lbl-${p.date}`} pointerEvents="none">
                 {rx > 0 ? (
-                  <text x={xAt(i)} y={nudge(rx, rxAbove)} textAnchor="middle" fontSize="9.5" fontWeight="700" className="tl-val rx" fill="currentColor">
-                    {formatBytes(rx, 0)}
+                  <text x={xAt(i)} y={clamp(rxScreenY + (rxAbove ? -9 : 15))} textAnchor="middle" fontSize="9.5" fontWeight="700" className="tl-val rx" fill="currentColor">
+                    {formatBytes(rx, 1)}
                   </text>
                 ) : null}
                 {tx > 0 ? (
-                  <text x={xAt(i)} y={nudge(tx, !rxAbove)} textAnchor="middle" fontSize="9.5" fontWeight="700" className="tl-val tx" fill="currentColor">
-                    {formatBytes(tx, 0)}
+                  <text x={xAt(i)} y={clamp(txScreenY + (rxAbove ? 15 : -9))} textAnchor="middle" fontSize="9.5" fontWeight="700" className="tl-val tx" fill="currentColor">
+                    {formatBytes(tx, 1)}
                   </text>
                 ) : null}
               </g>
