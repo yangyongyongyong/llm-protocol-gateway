@@ -118,10 +118,13 @@ const (
 	alertMultiIPWindowMinutesDefault = 10
 	alertMultiIPWindowMinutesMin     = 1
 	alertMultiIPWindowMinutesMax     = 1440
-	alertMultiIPThresholdDefault     = 3
-	alertMultiIPThresholdMin         = 2
-	alertCooldownMinutesDefault      = 60
-	alertCooldownMinutesMin          = 1
+	// 5 rather than 3: real traffic shows legitimate clients (e.g. Cursor's
+	// server-side egress pool) reaching 3 distinct IPs inside a 10-minute
+	// window, which would false-positive at a lower threshold.
+	alertMultiIPThresholdDefault = 5
+	alertMultiIPThresholdMin     = 2
+	alertCooldownMinutesDefault  = 60
+	alertCooldownMinutesMin      = 1
 )
 
 func DefaultAlertSettings() AlertSettings {

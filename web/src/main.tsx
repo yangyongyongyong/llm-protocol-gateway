@@ -8035,7 +8035,7 @@ function App() {
                 ) : !alertPage || alertPage.items.length === 0 ? (
                   <div className="empty-state">
                     暂无告警。当同一密钥在 {alertSettings?.multiIpWindowMinutes ?? 10} 分钟内被
-                    {alertSettings?.multiIpThreshold ?? 3} 个及以上不同 IP 使用时，这里会出现记录。
+                    {alertSettings?.multiIpThreshold ?? 5} 个及以上不同 IP 使用时，这里会出现记录。
                   </div>
                 ) : (
                   <>
@@ -8104,7 +8104,7 @@ function App() {
                     name: '单密钥多 IP',
                     enabled: alertSettings?.multiIpEnabled ?? false,
                     planned: false,
-                    desc: `窗口内同一密钥的独立 IP 数达到阈值即告警。当前：${alertSettings?.multiIpWindowMinutes ?? 10} 分钟 / ${alertSettings?.multiIpThreshold ?? 3} 个 IP。`,
+                    desc: `窗口内同一密钥的独立 IP 数达到阈值即告警。当前：${alertSettings?.multiIpWindowMinutes ?? 10} 分钟 / ${alertSettings?.multiIpThreshold ?? 5} 个 IP。`,
                   },
                   {
                     name: '地理 / ASN 跳变',
@@ -8182,7 +8182,7 @@ function App() {
                         type="number"
                         min={2}
                         value={alertSettings.multiIpThreshold}
-                        onChange={(event) => setAlertSettings({ ...alertSettings, multiIpThreshold: Number(event.target.value) || 3 })}
+                        onChange={(event) => setAlertSettings({ ...alertSettings, multiIpThreshold: Number(event.target.value) || 5 })}
                         onBlur={() => void saveAlertSettings({})}
                       />
                     </label>

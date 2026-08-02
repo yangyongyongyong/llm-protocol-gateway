@@ -25,7 +25,7 @@ func TestStoreSatisfiesAlertStore(t *testing.T) {
 func TestAlertSettingsNormalizeFillsDefaults(t *testing.T) {
 	settings := domain.AlertSettings{}
 	settings.Normalize()
-	if settings.MultiIPWindowMinutes != 10 || settings.MultiIPThreshold != 3 || settings.CooldownMinutes != 60 {
+	if settings.MultiIPWindowMinutes != 10 || settings.MultiIPThreshold != 5 || settings.CooldownMinutes != 60 {
 		t.Fatalf("zero values not defaulted: %+v", settings)
 	}
 }
