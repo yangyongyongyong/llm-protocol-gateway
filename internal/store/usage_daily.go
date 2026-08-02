@@ -33,6 +33,13 @@ func ensureUsageDailyTables(tx *sql.Tx) error {
 	if err != nil {
 		return err
 	}
+	// rx_bytes / tx_bytes were added with the per-day traffic chart; existing
+	// installs get them via ALTER TABLE rather than a table rebuild.
+	for _, col := range []string{"rx_bytes", "tx_bytes"} {
+		if err := addColumnIfMissing(tx, "usage_daily_buckets", col, "INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return fmt.Errorf("usage_daily_buckets.%s: %w", col, err)
+		}
+	}
 	_, err = tx.Exec(`CREATE INDEX IF NOT EXISTS idx_usage_daily_buckets_day ON usage_daily_buckets(day)`)
 	return err
 }
@@ -104,8 +111,8 @@ func upsertUsageBucket(tx *sql.Tx, day, bucketType, bucketID, bucketName string,
 		day, bucket_type, bucket_id, bucket_name,
 		request_count, input_tokens, output_tokens, cache_tokens,
 		status_2xx, status_4xx, status_5xx, status_other,
-		latency_sum, ttft_sum, ttft_count
-	) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		latency_sum, ttft_sum, ttft_count, rx_bytes, tx_bytes
+	) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(day, bucket_type, bucket_id) DO UPDATE SET
 		bucket_name = CASE WHEN excluded.bucket_name != '' THEN excluded.bucket_name ELSE usage_daily_buckets.bucket_name END,
 		request_count = usage_daily_buckets.request_count + 1,
@@ -118,11 +125,13 @@ func upsertUsageBucket(tx *sql.Tx, day, bucketType, bucketID, bucketName string,
 		status_other = usage_daily_buckets.status_other + excluded.status_other,
 		latency_sum = usage_daily_buckets.latency_sum + excluded.latency_sum,
 		ttft_sum = usage_daily_buckets.ttft_sum + excluded.ttft_sum,
-		ttft_count = usage_daily_buckets.ttft_count + excluded.ttft_count`,
+		ttft_count = usage_daily_buckets.ttft_count + excluded.ttft_count,
+		rx_bytes = usage_daily_buckets.rx_bytes + excluded.rx_bytes,
+		tx_bytes = usage_daily_buckets.tx_bytes + excluded.tx_bytes`,
 		day, bucketType, bucketID, bucketName,
 		delta.InputTokens, delta.OutputTokens, delta.CacheTokens,
 		status2xx, status4xx, status5xx, statusOther,
-		latencySum, ttftSum, ttftCount,
+		latencySum, ttftSum, ttftCount, delta.RxBytes, delta.TxBytes,
 	)
 	return err
 }
@@ -136,14 +145,14 @@ func (s *Store) LoadUsageSince(since time.Time) (map[string]monitor.UsageDayBuck
 		rows, err = s.reader().Query(`SELECT day, bucket_type, bucket_id, bucket_name,
 			request_count, input_tokens, output_tokens, cache_tokens,
 			status_2xx, status_4xx, status_5xx, status_other,
-			latency_sum, ttft_sum, ttft_count
+			latency_sum, ttft_sum, ttft_count, rx_bytes, tx_bytes
 			FROM usage_daily_buckets ORDER BY day`)
 	} else {
 		sinceDay := since.Local().Format("2006-01-02")
 		rows, err = s.reader().Query(`SELECT day, bucket_type, bucket_id, bucket_name,
 			request_count, input_tokens, output_tokens, cache_tokens,
 			status_2xx, status_4xx, status_5xx, status_other,
-			latency_sum, ttft_sum, ttft_count
+			latency_sum, ttft_sum, ttft_count, rx_bytes, tx_bytes
 			FROM usage_daily_buckets WHERE day >= ? ORDER BY day`, sinceDay)
 	}
 	if err != nil {
@@ -158,9 +167,10 @@ func (s *Store) LoadUsageSince(since time.Time) (map[string]monitor.UsageDayBuck
 			reqCount, inTok, outTok, cacheTok     int64
 			s2xx, s4xx, s5xx, sOther              int64
 			latSum, ttftSum, ttftCount            int64
+			rxBytes, txBytes                      int64
 		)
 		if err := rows.Scan(&day, &bucketType, &bucketID, &bucketName, &reqCount, &inTok, &outTok, &cacheTok,
-			&s2xx, &s4xx, &s5xx, &sOther, &latSum, &ttftSum, &ttftCount); err != nil {
+			&s2xx, &s4xx, &s5xx, &sOther, &latSum, &ttftSum, &ttftCount, &rxBytes, &txBytes); err != nil {
 			return nil, nil, err
 		}
 		dayBuckets, ok := out[day]
@@ -178,6 +188,8 @@ func (s *Store) LoadUsageSince(since time.Time) (map[string]monitor.UsageDayBuck
 			InputTokens:  inTok,
 			OutputTokens: outTok,
 			CacheTokens:  cacheTok,
+			RxBytes:      rxBytes,
+			TxBytes:      txBytes,
 		}
 		switch bucketType {
 		case "total":

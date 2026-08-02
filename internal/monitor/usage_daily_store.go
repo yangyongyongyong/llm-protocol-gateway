@@ -15,6 +15,8 @@ type UsagePersistDelta struct {
 	InputTokens    int64
 	OutputTokens   int64
 	CacheTokens    int64
+	RxBytes        int64
+	TxBytes        int64
 	LatencyMs      int64
 	TTFTMs         int64
 	LastRequest    *RequestLog

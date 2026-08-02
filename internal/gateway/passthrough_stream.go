@@ -11,13 +11,16 @@ import (
 const passThroughLogBufferMax = 256 * 1024
 
 // limitedBuffer keeps up to max bytes for logging/usage parsing while the
-// remainder of a stream is still forwarded to the client.
+// remainder of a stream is still forwarded to the client. It also counts every
+// byte written so callers can report true forwarded size despite the cap.
 type limitedBuffer struct {
-	buf []byte
-	max int
+	buf   []byte
+	max   int
+	total int64
 }
 
 func (b *limitedBuffer) Write(p []byte) (int, error) {
+	b.total += int64(len(p))
 	if b.max <= 0 {
 		return len(p), nil
 	}
@@ -34,6 +37,11 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 
 func (b *limitedBuffer) Bytes() []byte {
 	return b.buf
+}
+
+// Total is the full number of bytes streamed, including any beyond the cap.
+func (b *limitedBuffer) Total() int64 {
+	return b.total
 }
 
 // flushWriter writes to the response and flushes after each Write so SSE
@@ -113,6 +121,12 @@ func writePassThroughResponse(w http.ResponseWriter, response *http.Response, st
 	hw.Flush()
 
 	tee := &limitedBuffer{max: passThroughLogBufferMax}
+	// The logged body is capped, so report the true streamed size separately for
+	// daily traffic accounting. response.Request carries the proxy request's
+	// context, which holds the requestTiming this rides on.
+	if response.Request != nil {
+		defer func() { requestTimingFrom(response.Request.Context()).recordStreamedTxBytes(tee.Total()) }()
+	}
 	// hw.Write already serializes; flush after each chunk via flushWriter so
 	// we do not re-enter hw.Flush while holding hw's write lock.
 	writer := io.MultiWriter(&flushWriter{w: hw, flusher: hw}, tee)

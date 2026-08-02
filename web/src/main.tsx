@@ -700,6 +700,10 @@ type DailyRequestPoint = {
   inputTokens: number;
   outputTokens: number;
   cacheTokens: number;
+  /** 网关当日转发的请求体字节数（下游发给我们的）。永久保留。 */
+  rxBytes?: number;
+  /** 网关当日返回给下游的字节数。永久保留。 */
+  txBytes?: number;
   avgLatencyMs?: number;
   avgTtftMs?: number;
 };
@@ -3036,6 +3040,91 @@ function UsageMonthlyTokenBars({ title = '最近 7 天 · 每日用量', points,
               <span>{requestMax}</span>
               <span>{Math.round(requestMax / 2)}</span>
               <span>0</span>
+            </div>
+          </div>
+          <div className="usage-month-bars-xaxis">
+            {points.map((p, i) => (
+              <span key={p.date} className="usage-month-bars-xtick">
+                {xTickIndexes.includes(i) ? p.date.slice(5) : ''}
+              </span>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** 按日转发流量（接收/发送）。堆叠柱状，复用 usage-month-bars 的布局与样式。
+ *  数据来自 usage_daily 汇总，与请求量同源、一天一条、永久保留。 */
+function UsageDailyTrafficBars({ title = '按日流量', points, onPickDay }: {
+  title?: string;
+  points: DailyRequestPoint[];
+  onPickDay?: (date: string) => void;
+}) {
+  const rxValues = points.map((p) => p.rxBytes || 0);
+  const txValues = points.map((p) => p.txBytes || 0);
+  const totals = points.map((_, i) => rxValues[i] + txValues[i]);
+  const maxTotal = Math.max(...totals, 1);
+  const xTickIndexes = pickUsageXTickIndexes(points.length);
+  const sumRx = rxValues.reduce((acc, v) => acc + v, 0);
+  const sumTx = txValues.reduce((acc, v) => acc + v, 0);
+  const barX = (i: number) => (points.length === 1 ? 50 : ((i + 0.5) / points.length) * 100);
+
+  return (
+    <div className="usage-month-bars" role="img" aria-label={title}>
+      <div className="usage-month-bars-head">
+        <div className="usage-month-bars-title">{title}</div>
+        <div className="usage-month-bars-legend">
+          <span className="usage-month-legend-item"><i className="legend-bar traffic-rx" />接收 {formatBytes(sumRx)}</span>
+          <span className="usage-month-legend-item"><i className="legend-bar traffic-tx" />发送 {formatBytes(sumTx)}</span>
+        </div>
+      </div>
+      {points.length === 0 ? (
+        <div className="usage-month-bars-empty">暂无数据</div>
+      ) : totals.every((v) => v === 0) ? (
+        <div className="usage-month-bars-empty">暂无流量数据（本功能上线后的请求才会计入）</div>
+      ) : (
+        <>
+          <div className="usage-month-bars-plot">
+            <div className="usage-month-bars-yaxis" aria-label="流量">
+              <span>{formatBytes(maxTotal)}</span>
+              <span>{formatBytes(Math.round(maxTotal / 2))}</span>
+              <span>0</span>
+            </div>
+            <div className="usage-month-bars-track">
+              {points.map((p, i) => {
+                const total = totals[i];
+                const h = total > 0 ? Math.max(4, Math.round((total / maxTotal) * 100)) : 2;
+                // 堆叠：接收在下、发送在上，占各自在当日总量中的比例。
+                const rxShare = total > 0 ? (rxValues[i] / total) * 100 : 0;
+                return (
+                  <button
+                    key={p.date}
+                    type="button"
+                    className={`usage-month-bar traffic${total === 0 ? ' zero' : ''}`}
+                    title={`${p.date} · 接收 ${formatBytes(rxValues[i])} · 发送 ${formatBytes(txValues[i])} · 合计 ${formatBytes(total)}`}
+                    onClick={() => onPickDay?.(p.date)}
+                  >
+                    <span className="traffic-stack" style={{ height: `${h}%` }}>
+                      <i className="traffic-seg tx" style={{ height: `${100 - rxShare}%` }} />
+                      <i className="traffic-seg rx" style={{ height: `${rxShare}%` }} />
+                    </span>
+                  </button>
+                );
+              })}
+              {points.map((p, i) => {
+                if (totals[i] <= 0) return null;
+                return (
+                  <span
+                    key={`tf-${p.date}`}
+                    className="usage-month-label token"
+                    style={{ left: `${barX(i)}%`, bottom: '3%' }}
+                  >
+                    {formatBytes(totals[i], 0)}
+                  </span>
+                );
+              })}
             </div>
           </div>
           <div className="usage-month-bars-xaxis">
@@ -7333,6 +7422,23 @@ function App() {
                   />
                 </div>
               ) : null}
+
+              <div className="usage-charts-full">
+                <UsageDailyTrafficBars
+                  title={usageFrom === usageTo ? '按日流量（网关转发）' : `按日流量（网关转发） · ${usageFrom} ~ ${usageTo}`}
+                  points={requestStats?.daily || []}
+                  onPickDay={(date) => {
+                    usageFollowTodayRef.current = isFollowingTodayRange(date, date);
+                    setUsageFrom(date);
+                    setUsageTo(date);
+                    void refreshRequestStats(date, date);
+                  }}
+                />
+                <p className="hint-line">
+                  统计网关实际转发的请求体 / 响应体字节数（业务流量），一天一条、永久保留。
+                  与「机器状态」页的整机网卡累计值不同：后者含本机所有流量且重启归零。
+                </p>
+              </div>
 
               <div className="usage-charts">
                 {usageFrom === usageTo ? (

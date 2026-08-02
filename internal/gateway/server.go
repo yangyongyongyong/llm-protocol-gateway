@@ -886,8 +886,13 @@ func (s *Server) recordRequestLogEx(started time.Time, matchedKey domain.APIKey,
 		InputTokens:    usage.InputTokens,
 		OutputTokens:   usage.OutputTokens,
 		CacheTokens:    usage.CacheTokens,
-		LatencyMs:      latency,
-		TTFTMs:         ttftMs,
+		// Forwarded payload sizes. For streaming responses the logged body is
+		// capped at passThroughLogBufferMax, so prefer the true streamed count
+		// recorded during the copy; fall back to the buffered length otherwise.
+		RxBytes:   int64(len(requestBody)),
+		TxBytes:   max(timing.streamedTx(), int64(len(responseBody))),
+		LatencyMs: latency,
+		TTFTMs:    ttftMs,
 	})
 	if s.requestLogStore != nil {
 		if err := s.requestLogStore.AppendRequestLogWithRetention(entry, s.RequestLogRetentionDays()); err != nil {
@@ -3014,7 +3019,11 @@ func (s *Server) modelsForRequest(r *http.Request) []domain.Model {
 
 func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
-	r, _ = attachRequestTiming(r, started)
+	var timingRef *requestTiming
+	r, timingRef = attachRequestTiming(r, started)
+	// Count client-bound bytes for daily traffic stats on every path (pass-through
+	// and all conversions). recordRequestLogEx reads the tally at log time.
+	w = timingRef.attachTxCounter(w)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "failed to read request body")
@@ -3117,7 +3126,11 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
-	r, _ = attachRequestTiming(r, started)
+	var timingRef *requestTiming
+	r, timingRef = attachRequestTiming(r, started)
+	// Count client-bound bytes for daily traffic stats on every path (pass-through
+	// and all conversions). recordRequestLogEx reads the tally at log time.
+	w = timingRef.attachTxCounter(w)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": "failed to read request body", "type": "invalid_request_error"}})
@@ -3305,7 +3318,11 @@ func (s *Server) handleOpenAIImagesGenerations(w http.ResponseWriter, r *http.Re
 // route-resolution pattern (test header or consumer API key -> router.Decide).
 func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
-	r, _ = attachRequestTiming(r, started)
+	var timingRef *requestTiming
+	r, timingRef = attachRequestTiming(r, started)
+	// Count client-bound bytes for daily traffic stats on every path (pass-through
+	// and all conversions). recordRequestLogEx reads the tally at log time.
+	w = timingRef.attachTxCounter(w)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "failed to read request body")

@@ -26,8 +26,11 @@ type UsageEvent struct {
 	InputTokens    int64
 	OutputTokens   int64
 	CacheTokens    int64
-	LatencyMs      int64
-	TTFTMs         int64
+	// RxBytes/TxBytes are the forwarded request/response payload sizes.
+	RxBytes   int64
+	TxBytes   int64
+	LatencyMs int64
+	TTFTMs    int64
 }
 
 type usageDayStats struct {
@@ -107,6 +110,8 @@ func (s *Store) applyUsageEventLocked(event UsageEvent) UsagePersistDelta {
 	day.total.InputTokens += inputTokens
 	day.total.OutputTokens += event.OutputTokens
 	day.total.CacheTokens += cacheTokens
+	day.total.RxBytes += event.RxBytes
+	day.total.TxBytes += event.TxBytes
 	day.latencySum += event.LatencyMs
 
 	keyStats, ok := day.byAPIKey[keyID]
@@ -118,6 +123,8 @@ func (s *Store) applyUsageEventLocked(event UsageEvent) UsagePersistDelta {
 	keyStats.InputTokens += inputTokens
 	keyStats.OutputTokens += event.OutputTokens
 	keyStats.CacheTokens += cacheTokens
+	keyStats.RxBytes += event.RxBytes
+	keyStats.TxBytes += event.TxBytes
 
 	providerStats, ok := day.byProvider[providerID]
 	if !ok {
@@ -217,6 +224,8 @@ func (s *Store) applyUsageEventLocked(event UsageEvent) UsagePersistDelta {
 		InputTokens:    inputTokens,
 		OutputTokens:   event.OutputTokens,
 		CacheTokens:    cacheTokens,
+		RxBytes:        event.RxBytes,
+		TxBytes:        event.TxBytes,
 		LatencyMs:      event.LatencyMs,
 		TTFTMs:         event.TTFTMs,
 		LastRequest:    lastCopy,
@@ -400,6 +409,8 @@ func (s *Store) dailyStatsInRangeLocked(from, to time.Time) []DailyRequestPoint 
 		point.InputTokens = dayStats.total.InputTokens
 		point.OutputTokens = dayStats.total.OutputTokens
 		point.CacheTokens = dayStats.total.CacheTokens
+		point.RxBytes = dayStats.total.RxBytes
+		point.TxBytes = dayStats.total.TxBytes
 		latencySum[dayKey] = dayStats.latencySum
 		ttftSum[dayKey] = dayStats.ttftSum
 		ttftCount[dayKey] = dayStats.ttftCount
@@ -646,6 +657,8 @@ func dailyStatsForKeysLocked(byDay map[string]*usageDayStats, from, to time.Time
 			point.InputTokens += stats.InputTokens
 			point.OutputTokens += stats.OutputTokens
 			point.CacheTokens += stats.CacheTokens
+			point.RxBytes += stats.RxBytes
+			point.TxBytes += stats.TxBytes
 		}
 	}
 	out := make([]DailyRequestPoint, 0, len(byDayOut))

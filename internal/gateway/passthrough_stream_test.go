@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestWritePassThroughResponseStreamsAndTees(t *testing.T) {
@@ -60,5 +61,55 @@ func TestRequestBodyWantsStream(t *testing.T) {
 	}
 	if requestBodyWantsStream([]byte(`{"stream":false}`)) {
 		t.Fatal("expected stream false")
+	}
+}
+
+// The logged body is capped at passThroughLogBufferMax, but daily traffic must
+// reflect the true streamed size, so limitedBuffer counts every byte written.
+func TestLimitedBufferCountsBeyondCap(t *testing.T) {
+	buf := &limitedBuffer{max: 16}
+	chunk := make([]byte, 10)
+	for i := 0; i < 5; i++ {
+		if _, err := buf.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(buf.Bytes()) != 16 {
+		t.Fatalf("buffered bytes should be capped at 16, got %d", len(buf.Bytes()))
+	}
+	if buf.Total() != 50 {
+		t.Fatalf("total should count every byte written, got %d", buf.Total())
+	}
+}
+
+func TestLimitedBufferTotalWithZeroCap(t *testing.T) {
+	buf := &limitedBuffer{max: 0}
+	if _, err := buf.Write(make([]byte, 32)); err != nil {
+		t.Fatal(err)
+	}
+	if len(buf.Bytes()) != 0 {
+		t.Fatalf("expected nothing buffered, got %d", len(buf.Bytes()))
+	}
+	if buf.Total() != 32 {
+		t.Fatalf("total must still count, got %d", buf.Total())
+	}
+}
+
+// recordStreamedTxBytes is called on paths where timing may be absent.
+func TestRequestTimingStreamedTxNilSafe(t *testing.T) {
+	var timing *requestTiming
+	timing.recordStreamedTxBytes(123) // must not panic
+	if got := timing.streamedTx(); got != 0 {
+		t.Fatalf("nil timing should report 0, got %d", got)
+	}
+	real := newRequestTiming(time.Now())
+	real.recordStreamedTxBytes(4096)
+	if got := real.streamedTx(); got != 4096 {
+		t.Fatalf("expected 4096, got %d", got)
+	}
+	// Zero/negative writes must not clobber a recorded value.
+	real.recordStreamedTxBytes(0)
+	if got := real.streamedTx(); got != 4096 {
+		t.Fatalf("zero must not overwrite, got %d", got)
 	}
 }

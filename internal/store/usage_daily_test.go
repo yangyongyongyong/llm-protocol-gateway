@@ -118,3 +118,69 @@ func TestUsageDailyClearSinceKeepsOlderDays(t *testing.T) {
 		t.Fatalf("expected only 2026-07-01 preserved, got %+v", days)
 	}
 }
+
+// Daily traffic bytes must accumulate across requests and survive a reload,
+// since this is the永久保留 series behind the traffic chart.
+func TestUsageDailyAccumulatesTrafficBytes(t *testing.T) {
+	t.Parallel()
+	s, err := Open(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	now := time.Date(2026, 8, 2, 9, 0, 0, 0, time.Local)
+	for i := 0; i < 3; i++ {
+		if err := s.ApplyUsageDelta(monitor.UsagePersistDelta{
+			Day: "2026-08-02", KeyID: "k1", KeyName: "main", ProviderID: "p1",
+			StatusClass: "2xx", InputTokens: 10, OutputTokens: 5,
+			RxBytes: 1000, TxBytes: 4000,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	days, _, err := s.LoadUsageSince(now.AddDate(0, 0, -1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	day, ok := days["2026-08-02"]
+	if !ok {
+		t.Fatalf("missing day, got %v", days)
+	}
+	if day.Total.RxBytes != 3000 || day.Total.TxBytes != 12000 {
+		t.Fatalf("traffic not accumulated: rx=%d tx=%d", day.Total.RxBytes, day.Total.TxBytes)
+	}
+	// Per-key buckets carry bytes too, so per-user filtered charts stay correct.
+	keyStats, ok := day.ByAPIKey["k1"]
+	if !ok {
+		t.Fatalf("missing api_key bucket: %+v", day.ByAPIKey)
+	}
+	if keyStats.RxBytes != 3000 || keyStats.TxBytes != 12000 {
+		t.Fatalf("per-key traffic wrong: rx=%d tx=%d", keyStats.RxBytes, keyStats.TxBytes)
+	}
+}
+
+// Rows written before this feature have no bytes; they must read back as 0
+// rather than failing the scan (ALTER TABLE default).
+func TestUsageDailyTrafficDefaultsToZero(t *testing.T) {
+	t.Parallel()
+	s, err := Open(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	if err := s.ApplyUsageDelta(monitor.UsagePersistDelta{
+		Day: "2026-08-01", KeyID: "k1", ProviderID: "p1", StatusClass: "2xx",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	days, _, err := s.LoadUsageSince(time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := days["2026-08-01"].Total.RxBytes; got != 0 {
+		t.Fatalf("expected zero rx bytes, got %d", got)
+	}
+}

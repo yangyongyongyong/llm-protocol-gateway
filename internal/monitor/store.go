@@ -145,6 +145,9 @@ type APIKeyDayStats struct {
 	InputTokens  int64  `json:"inputTokens"`
 	OutputTokens int64  `json:"outputTokens"`
 	CacheTokens  int64  `json:"cacheTokens"`
+	// Forwarded payload bytes: Rx from downstream clients, Tx back to them.
+	RxBytes int64 `json:"rxBytes,omitempty"`
+	TxBytes int64 `json:"txBytes,omitempty"`
 }
 
 type ProviderDayStats struct {
@@ -213,8 +216,13 @@ type DailyRequestPoint struct {
 	InputTokens  int64  `json:"inputTokens"`
 	OutputTokens int64  `json:"outputTokens"`
 	CacheTokens  int64  `json:"cacheTokens"`
-	AvgLatencyMs int64  `json:"avgLatencyMs,omitempty"`
-	AvgTTFTMs    int64  `json:"avgTtftMs,omitempty"`
+	// RxBytes/TxBytes are gateway-forwarded payload bytes for the day: Rx is what
+	// downstream clients sent us, Tx is what we returned. Unlike the host-metrics
+	// NIC counters these are business traffic only and are kept forever.
+	RxBytes      int64 `json:"rxBytes,omitempty"`
+	TxBytes      int64 `json:"txBytes,omitempty"`
+	AvgLatencyMs int64 `json:"avgLatencyMs,omitempty"`
+	AvgTTFTMs    int64 `json:"avgTtftMs,omitempty"`
 }
 
 type StatusBucketStats struct {

@@ -13,15 +13,15 @@ import (
 type timingFlag string
 
 const (
-	timingFlagOAuthRefresh       timingFlag = "oauth_refresh"
-	timingFlagSaveState          timingFlag = "save_state"
-	timingFlagCursorBridgeStart  timingFlag = "cursor_bridge_start"
-	timingFlagDualHopBuffer      timingFlag = "dual_hop_buffer"
-	timingFlagFailoverRetry      timingFlag = "failover_retry"
-	timingFlagEmptyStreamRetry   timingFlag = "empty_stream_retry"
-	timingFlagTouchDB            timingFlag = "touch_db"
-	timingFlagThinkingRectify    timingFlag = "thinking_rectify"
-	timingFlagThinkingOnlyRetry  timingFlag = "thinking_only_retry"
+	timingFlagOAuthRefresh      timingFlag = "oauth_refresh"
+	timingFlagSaveState         timingFlag = "save_state"
+	timingFlagCursorBridgeStart timingFlag = "cursor_bridge_start"
+	timingFlagDualHopBuffer     timingFlag = "dual_hop_buffer"
+	timingFlagFailoverRetry     timingFlag = "failover_retry"
+	timingFlagEmptyStreamRetry  timingFlag = "empty_stream_retry"
+	timingFlagTouchDB           timingFlag = "touch_db"
+	timingFlagThinkingRectify   timingFlag = "thinking_rectify"
+	timingFlagThinkingOnlyRetry timingFlag = "thinking_only_retry"
 )
 
 type timingContextKey struct{}
@@ -36,6 +36,14 @@ type requestTiming struct {
 	upstreamHeaderAt    atomic.Int64
 	upstreamFirstByteAt atomic.Int64
 	clientFirstWriteAt  atomic.Int64
+
+	// streamedTxBytes is the true byte count forwarded to the client on streaming
+	// paths, where the logged response body is capped at passThroughLogBufferMax
+	// and would otherwise understate daily traffic.
+	streamedTxBytes atomic.Int64
+	// txCounter wraps the client ResponseWriter to tally delivered bytes. It is
+	// set once at handler entry and read at log time, so it needs no lock.
+	txCounter *countingResponseWriter
 
 	flagsMu sync.Mutex
 	flags   map[timingFlag]struct{}
@@ -91,6 +99,39 @@ func (t *requestTiming) markPrepReady() {
 		return
 	}
 	t.prepReadyAt.CompareAndSwap(0, time.Now().UnixNano())
+}
+
+// recordStreamedTxBytes reports the true bytes streamed to the client. Nil-safe
+// like the other marks, so non-proxy paths can call it unconditionally.
+func (t *requestTiming) recordStreamedTxBytes(n int64) {
+	if t == nil || n <= 0 {
+		return
+	}
+	t.streamedTxBytes.Store(n)
+}
+
+// attachTxCounter wraps w so bytes delivered to the client are tallied, and
+// returns the wrapper to use in place of w. Nil-safe: without timing the
+// original writer is returned unchanged.
+func (t *requestTiming) attachTxCounter(w http.ResponseWriter) http.ResponseWriter {
+	if t == nil || w == nil {
+		return w
+	}
+	counter := newCountingResponseWriter(w)
+	t.txCounter = counter
+	return counter
+}
+
+// streamedTx returns the bytes delivered to the client. Prefers the writer tally
+// (covers every path); falls back to an explicitly recorded stream count.
+func (t *requestTiming) streamedTx() int64 {
+	if t == nil {
+		return 0
+	}
+	if n := t.txCounter.BytesWritten(); n > 0 {
+		return n
+	}
+	return t.streamedTxBytes.Load()
 }
 
 func (t *requestTiming) markUpstreamDoStart() {
