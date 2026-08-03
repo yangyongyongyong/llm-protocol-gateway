@@ -3877,6 +3877,13 @@ function App() {
     return consoleUsers.find((user) => user.id === ownerID)?.username || ownerID;
   }, [consoleUsers]);
 
+  // 解析 Provider 创建者显示名：空 = 管理员（旧 Provider/管理员自建）。
+  const providerOwnerName = React.useCallback((provider: Provider) => {
+    const ownerID = (provider.ownerUserId || '').trim();
+    if (!ownerID) return '管理员';
+    return consoleUsers.find((user) => user.id === ownerID)?.username || ownerID;
+  }, [consoleUsers]);
+
   const filteredApiKeys = useMemo(() => {
     let keys = state.apiKeys || [];
     const keyword = apiKeyKeyword.trim().toLowerCase();
@@ -4219,6 +4226,13 @@ function App() {
   // 筛选项（后端也只对 admin 生效），不需要拉取。
   useEffect(() => {
     if (activeNav !== 'traffic-tokens') return;
+    if (authStatus?.role === 'user') return;
+    void refreshConsoleUsers();
+  }, [activeNav, authStatus?.role]);
+
+  // 输入 Provider 页要给每个 Provider 标注创建者，同样需要用户列表解析用户名。
+  useEffect(() => {
+    if (activeNav !== 'input-providers') return;
     if (authStatus?.role === 'user') return;
     void refreshConsoleUsers();
   }, [activeNav, authStatus?.role]);
@@ -7586,6 +7600,7 @@ function App() {
                         isQoderPAT={provider.authType === 'qoder_pat'}
                         qoderPATConnected={provider.qoderPat?.connected}
                         cursorBridge={provider.authType === 'cursor_oauth' ? state.cursorBridge : undefined}
+                        ownerName={!isNormalUser ? providerOwnerName(provider) : undefined}
                         authorizedUserCount={!isNormalUser
                           ? consoleUsers.filter((user) => user.role !== 'admin' && (user.allowedProviderIds || []).includes(provider.id)).length
                           : undefined}
@@ -10649,7 +10664,7 @@ function ChatGPTOAuthUsagePanel({ providerId, connected, compact }: { providerId
   );
 }
 
-function ProviderCard({ active, selected, name, providerId, protocol, tone, url, usedCount, healthStatus, nextRetryAt, testing, chatTesting, readOnly, selectable, providerDisabled, onToggleEnabled, subtitle, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, isQoderPAT, qoderPATConnected, cursorBridge, authorizedUserCount, onShowUsers, onToggleSelect, onClick, onTest, onChatTest, onConformance, onEdit, onClone, onDelete }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; usedCount: number; healthStatus: string; nextRetryAt?: string; testing: boolean; chatTesting?: boolean; readOnly?: boolean; selectable?: boolean; providerDisabled?: boolean; onToggleEnabled?: () => void; subtitle?: string; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; isQoderPAT?: boolean; qoderPATConnected?: boolean; cursorBridge?: CursorBridgeRuntime; authorizedUserCount?: number; onShowUsers?: () => void; onToggleSelect: () => void; onClick: () => void; onTest: () => void; onChatTest: () => void; onConformance?: () => void; onEdit: () => void; onClone: () => void; onDelete: () => void }) {
+function ProviderCard({ active, selected, name, providerId, protocol, tone, url, usedCount, healthStatus, nextRetryAt, testing, chatTesting, readOnly, selectable, providerDisabled, onToggleEnabled, subtitle, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, isQoderPAT, qoderPATConnected, cursorBridge, ownerName, authorizedUserCount, onShowUsers, onToggleSelect, onClick, onTest, onChatTest, onConformance, onEdit, onClone, onDelete }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; usedCount: number; healthStatus: string; nextRetryAt?: string; testing: boolean; chatTesting?: boolean; readOnly?: boolean; selectable?: boolean; providerDisabled?: boolean; onToggleEnabled?: () => void; subtitle?: string; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; isQoderPAT?: boolean; qoderPATConnected?: boolean; cursorBridge?: CursorBridgeRuntime; ownerName?: string; authorizedUserCount?: number; onShowUsers?: () => void; onToggleSelect: () => void; onClick: () => void; onTest: () => void; onChatTest: () => void; onConformance?: () => void; onEdit: () => void; onClone: () => void; onDelete: () => void }) {
   const oauthConnected = isClaudeOAuth ? claudeOAuthConnected : isCursorOAuth ? cursorOAuthConnected : isChatGPTOAuth ? chatgptOAuthConnected : isQoderPAT ? qoderPATConnected : false;
   const showOAuthBadge = isClaudeOAuth || isCursorOAuth || isChatGPTOAuth || isQoderPAT;
   const isUnavailable = healthStatus === 'unavailable';
@@ -10689,6 +10704,7 @@ function ProviderCard({ active, selected, name, providerId, protocol, tone, url,
             </span>
           ) : null}
           <Badge tone={usedCount > 0 ? 'amber' : 'slate'}>{usedCount} 个 API Key</Badge>
+          {ownerName ? <Badge tone="slate">创建者：{ownerName}</Badge> : null}
           {onShowUsers && authorizedUserCount != null ? (
             <span
               className="provider-users-badge"
