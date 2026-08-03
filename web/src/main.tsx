@@ -936,6 +936,37 @@ type ProviderTestResult = {
 
 const API_BASE = '';
 
+// 后端连通性判定与轮询节奏。
+//
+// 背景：经公网自定义域名（Cloudflare 具名隧道）访问时，实测单次请求的 TLS 握手
+// 约 1.0s、首字节约 1.5s，而本地直连只要约 1.7ms——差三个数量级。原先「任何一次
+// fetch 抛异常就立刻标记未连接」在局域网下没问题，放到公网就会被偶发抖动、边缘
+// 节点切换、标签页休眠频繁误触发，表现为界面一直在「重连中…」。
+//
+// 对策：① 连续失败达到阈值才判定断线；② 公网访问时放慢轮询；③ 每个探测请求
+// 都带超时，避免慢请求堆积把后续轮询一起拖垮。
+const BACKEND_FAIL_STREAK_LIMIT = 3;
+const BACKEND_POLL_MS_LOCAL = 5000;
+const BACKEND_POLL_MS_REMOTE = 15000;
+const BACKEND_PROBE_TIMEOUT_MS = 8000;
+
+/** 判断当前页面是否经公网域名访问（非 localhost / 内网地址）。 */
+function isRemoteOrigin() {
+  if (typeof window === 'undefined') return false;
+  const host = window.location.hostname;
+  if (!host) return false;
+  if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host.endsWith('.local')) return false;
+  // 常见内网网段：10/8、192.168/16、172.16-31/12
+  if (/^10\./.test(host) || /^192\.168\./.test(host)) return false;
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) return false;
+  return true;
+}
+
+/** 带超时的 fetch。超时后抛 AbortError，调用方按普通失败处理。 */
+function fetchWithTimeout(input: string, init: RequestInit = {}, timeoutMs = BACKEND_PROBE_TIMEOUT_MS) {
+  return fetch(input, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+}
+
 // Qoder 直连端点。后端 normalizeProvider 只在 baseUrl 留空时兜这个默认值
 // （保留手动覆盖入口），所以切到 Qoder 时前端要主动把占位 URL 换掉，
 // 否则会残留创建表单的 example.com 预填值。
@@ -3380,6 +3411,10 @@ function App() {
   const [hostMetrics, setHostMetrics] = useState<HostMetrics | null>(null);
   // null = 尚未探测，避免刷新瞬间误闪「后端未连接」
   const [backendConnected, setBackendConnected] = useState<boolean | null>(null);
+  // 连续失败计数。公网走 Cloudflare 隧道时单次 TLS 握手实测约 1.5s，偶发抖动
+  // 在所难免；单次失败就翻红会让 UI 频繁误报「重连中」，故需连续失败若干次
+  // 才判定断线。ref 而非 state：只用于判定、不驱动渲染。
+  const backendFailStreakRef = useRef(0);
   const [backendReconnecting, setBackendReconnecting] = useState(false);
   const [authStatus, setAuthStatus] = useState<AdminAuthStatus | null>(() => bootSession.auth);
   useEffect(() => {
@@ -3876,7 +3911,11 @@ function App() {
         if (!isDocumentActive()) return;
         const [connected, auth] = await Promise.all([refreshBackendHealth(), refreshAuthStatus()]);
         if (!connected) {
-          await reconnectBackend(false);
+          // 只有累计失败到阈值（确认真断了）才走重连流程；单次抖动直接跳过本轮，
+          // 否则每次抖动都会额外打一串补偿请求，反而加重公网链路负担。
+          if (backendFailStreakRef.current >= BACKEND_FAIL_STREAK_LIMIT) {
+            await reconnectBackend(false);
+          }
           return;
         }
         if (auth && (!auth.requireAuth || auth.authenticated)) {
@@ -3885,7 +3924,8 @@ function App() {
         }
       })();
     };
-    const timer = window.setInterval(pollOnce, 5000);
+    // 公网经隧道访问时单次往返约 1.5s，5s 轮询会让多路请求互相叠加；放慢到 15s。
+    const timer = window.setInterval(pollOnce, isRemoteOrigin() ? BACKEND_POLL_MS_REMOTE : BACKEND_POLL_MS_LOCAL);
     // 重新回到前台（Chrome 变为最前台 / 标签页重新可见）时立即补一次刷新，
     // 让底部“数据更新于”不必等到下一个 5s 周期才追上。
     const onFocusResume = () => { if (isDocumentActive()) pollOnce(); };
@@ -3974,7 +4014,7 @@ function App() {
       if (!isDocumentActive()) return;
       void (async () => {
         try {
-          const response = await fetch(`${API_BASE}/__host-metrics`, { credentials: 'include' });
+          const response = await fetchWithTimeout(`${API_BASE}/__host-metrics`, { credentials: 'include' });
           if (!response.ok || cancelled) return;
           const data = await response.json() as HostMetrics;
           if (!cancelled) setHostMetrics(data);
@@ -3984,7 +4024,7 @@ function App() {
       })();
     };
     tick();
-    timer = window.setInterval(tick, 5000);
+    timer = window.setInterval(tick, isRemoteOrigin() ? BACKEND_POLL_MS_REMOTE : BACKEND_POLL_MS_LOCAL);
     const onResume = () => { if (isDocumentActive()) tick(); };
     window.addEventListener('focus', onResume);
     document.addEventListener('visibilitychange', onResume);
@@ -4051,7 +4091,7 @@ function App() {
       if (!isDocumentActive()) return;
       if (logsPageRef.current !== 1) return;
       void refreshLogs(1, undefined, undefined, { silent: true });
-    }, 5000);
+    }, isRemoteOrigin() ? BACKEND_POLL_MS_REMOTE : BACKEND_POLL_MS_LOCAL);
     return () => window.clearInterval(timer);
   }, [activeNav, logsPage, logsStatusFilter, logsFrom, logsTo, logsApiKeyName, logsProviderFilter, logsOwnerFilter]);
 
@@ -4154,7 +4194,7 @@ function App() {
 
   async function refreshAuthStatus(): Promise<AdminAuthStatus | null> {
     try {
-      const response = await fetch(`${API_BASE}/__auth/status`, { credentials: 'same-origin' });
+      const response = await fetchWithTimeout(`${API_BASE}/__auth/status`, { credentials: 'same-origin' });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json() as AdminAuthStatus;
       setAuthStatus(data);
@@ -4538,15 +4578,33 @@ function App() {
     }
   }
 
+  /** 探测成功：立即恢复「已连接」并清零失败计数。 */
+  function markBackendReachable() {
+    backendFailStreakRef.current = 0;
+    setBackendConnected(true);
+  }
+
+  /** 探测失败：累计连续失败，达到阈值才翻红，避免单次抖动误报。 */
+  function markBackendUnreachable() {
+    backendFailStreakRef.current += 1;
+    if (backendFailStreakRef.current >= BACKEND_FAIL_STREAK_LIMIT) {
+      setBackendConnected(false);
+    }
+  }
+
   async function refreshBackendHealth() {
     try {
-      const response = await fetch(`${API_BASE}/__health`);
+      const response = await fetchWithTimeout(`${API_BASE}/__health`);
       const body = await response.text();
       const connected = response.ok && body.includes('"status":"ok"');
-      setBackendConnected(connected);
+      if (connected) {
+        markBackendReachable();
+      } else {
+        markBackendUnreachable();
+      }
       return connected;
     } catch {
-      setBackendConnected(false);
+      markBackendUnreachable();
       return false;
     }
   }
@@ -4575,7 +4633,7 @@ function App() {
   async function refreshState(toast = true) {
     setLoading(true);
     try {
-      const response = await fetch(`${API_BASE}/__state`, { credentials: 'same-origin' });
+      const response = await fetchWithTimeout(`${API_BASE}/__state`, { credentials: 'same-origin' });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json() as GatewayState;
       const normalized = normalizeGatewayState(data);
@@ -4586,13 +4644,13 @@ function App() {
       if (data.requestLogRetentionDays && data.requestLogRetentionDays > 0) {
         setRequestLogRetentionDays(data.requestLogRetentionDays);
       }
-      setBackendConnected(true);
+      markBackendReachable();
       setDataFetchedAt(new Date());
       writeUICache(uiCacheScope(authStatusRef.current), 'state', normalized);
       if (toast) showToast('已刷新后端状态和模型列表');
       return true;
     } catch (error) {
-      setBackendConnected(false);
+      markBackendUnreachable();
       if (toast) showToast(`后端未连接：${String(error)}。请在项目根目录运行 cd web && npm run dev，或单独执行 npm run gateway。`);
       return false;
     } finally {
