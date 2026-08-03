@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/luca/llm-protocol-gateway/internal/domain"
+	"github.com/luca/llm-protocol-gateway/internal/monitor"
 )
 
 func TestQoderTokenExpiryPrefersExplicitLifetime(t *testing.T) {
@@ -277,5 +278,182 @@ func TestChatToClaudeStreamSurfacesBareErrorEvent(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "Unsupported model") {
 		t.Fatalf("error should carry the upstream message, got: %v", err)
+	}
+}
+
+// The console has no real Qoder username to show (no account endpoint, opaque
+// job token), so the label carries the PAT's last 4 chars to tell two connected
+// accounts apart. It must never expose more of the credential than that.
+func TestQoderAccountLabelShowsOnlyLastFour(t *testing.T) {
+	const pat = "pt-abcdefghijklmnop9xyz"
+	label := qoderAccountLabelFor(pat)
+	if !strings.HasSuffix(label, "****9xyz") {
+		t.Fatalf("expected the last 4 chars, got %q", label)
+	}
+	if strings.Contains(label, pat) {
+		t.Fatalf("label leaked the full PAT: %q", label)
+	}
+	// Nothing beyond the tail may appear: strip the tail and the rest of the
+	// PAT must not be present anywhere in the label.
+	if strings.Contains(label, pat[:len(pat)-4]) {
+		t.Fatalf("label leaked the PAT prefix: %q", label)
+	}
+}
+
+func TestQoderAccountLabelFallsBackWhenTooShort(t *testing.T) {
+	for _, short := range []string{"", "  ", "abc"} {
+		if got := qoderAccountLabelFor(short); got != qoderAccountLabel {
+			t.Fatalf("qoderAccountLabelFor(%q) = %q, want plain %q", short, got, qoderAccountLabel)
+		}
+	}
+}
+
+// The label is only written during a token exchange, and exchanges happen
+// lazily on the forward path — so an idle connected provider would keep the old
+// bare "Qoder" label forever. Startup backfill closes that gap.
+func TestBackfillQoderAccountLabels(t *testing.T) {
+	router := NewRouter(domain.GatewayState{Providers: []domain.Provider{
+		{
+			ID: "stale", AuthType: domain.AuthTypeQoderPAT, Protocol: domain.ProtocolOpenAIChat,
+			BaseURL:  qoderDirectBaseURL,
+			QoderPAT: &domain.QoderPATCredential{RefreshToken: "pt-abcdefghijkl7890", AccountLabel: "Qoder", Connected: true},
+		},
+		{
+			ID: "no-pat", AuthType: domain.AuthTypeQoderPAT, Protocol: domain.ProtocolOpenAIChat,
+			BaseURL:  qoderDirectBaseURL,
+			QoderPAT: &domain.QoderPATCredential{AccountLabel: "Qoder"},
+		},
+		{
+			ID: "other", AuthType: domain.AuthTypeAPIKey, Protocol: domain.ProtocolOpenAIChat,
+			BaseURL: "https://api.example.com", APIKeySource: "sk-x",
+		},
+	}})
+	server := NewServer(router, monitor.NewStore())
+
+	server.BackfillQoderAccountLabels()
+
+	stale, err := router.ProviderByID("stale")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale.QoderPAT.AccountLabel != "Qoder · ****7890" {
+		t.Fatalf("stale label not backfilled, got %q", stale.QoderPAT.AccountLabel)
+	}
+	// The PAT itself must never end up in the label.
+	if strings.Contains(stale.QoderPAT.AccountLabel, "pt-abcdefghijkl") {
+		t.Fatalf("label leaked the PAT: %q", stale.QoderPAT.AccountLabel)
+	}
+
+	// A connection without a stored PAT has nothing to derive from: leave it be.
+	noPAT, err := router.ProviderByID("no-pat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if noPAT.QoderPAT.AccountLabel != "Qoder" {
+		t.Fatalf("provider without a PAT should keep its label, got %q", noPAT.QoderPAT.AccountLabel)
+	}
+
+	// Non-Qoder providers must not be touched.
+	other, err := router.ProviderByID("other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.AuthType != domain.AuthTypeAPIKey || other.QoderPAT != nil {
+		t.Fatalf("unrelated provider was modified: %+v", other)
+	}
+}
+
+// Disconnect must not wipe the personal access token — only pause forwarding.
+// Losing the PAT forces a trip back to qoder.com/account/integrations just to
+// reconnect, which is the exact regression this guards.
+func TestDisconnectProviderQoderPATKeepsToken(t *testing.T) {
+	router := NewRouter(domain.GatewayState{Providers: []domain.Provider{{
+		ID: "p1", AuthType: domain.AuthTypeQoderPAT, Protocol: domain.ProtocolOpenAIChat,
+		BaseURL: qoderDirectBaseURL,
+		QoderPAT: &domain.QoderPATCredential{
+			AccessToken: "jt-live", RefreshToken: "pt-keepme1234", ExpiresAt: "2026-01-01T00:00:00Z",
+			AccountLabel: "Qoder · ****1234",
+		},
+	}}})
+
+	updated, err := router.DisconnectProviderQoderPAT("p1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.QoderPAT == nil {
+		t.Fatal("QoderPAT must not be nil after disconnect")
+	}
+	if updated.QoderPAT.RefreshToken != "pt-keepme1234" {
+		t.Fatalf("PAT must survive disconnect, got %q", updated.QoderPAT.RefreshToken)
+	}
+	if !updated.QoderPAT.Disconnected {
+		t.Fatal("expected Disconnected=true")
+	}
+	if updated.QoderPAT.AccessToken != "" {
+		t.Fatalf("job token should be cleared, got %q", updated.QoderPAT.AccessToken)
+	}
+	if updated.QoderPAT.AccountLabel != "Qoder · ****1234" {
+		t.Fatalf("account label must survive disconnect, got %q", updated.QoderPAT.AccountLabel)
+	}
+
+	// Redaction must reflect the paused state: not connected, but the console
+	// can still tell there is a saved token to reconnect with.
+	redacted := redactProviderForClient(updated)
+	if redacted.QoderPAT.Connected {
+		t.Error("disconnected provider must not read as Connected")
+	}
+	if !redacted.QoderPAT.HasStoredToken {
+		t.Error("expected HasStoredToken=true so the console can offer one-click reconnect")
+	}
+	if !redacted.QoderPAT.Disconnected {
+		t.Error("expected Disconnected=true in the redacted view")
+	}
+}
+
+// A provider that was never connected must not claim HasStoredToken, so the
+// console shows the paste box rather than a "reconnect" button with nothing
+// to reconnect.
+func TestRedactProviderQoderPATNeverConnected(t *testing.T) {
+	redacted := redactProviderForClient(domain.Provider{
+		ID: "p1", AuthType: domain.AuthTypeQoderPAT, Protocol: domain.ProtocolOpenAIChat,
+		QoderPAT: &domain.QoderPATCredential{},
+	})
+	if redacted.QoderPAT.Connected || redacted.QoderPAT.HasStoredToken {
+		t.Fatalf("expected no connection state without a PAT, got %+v", redacted.QoderPAT)
+	}
+}
+
+// A disconnected provider must not silently keep forwarding via the lazy
+// token-refresh path — otherwise "断开连接" would do nothing observable.
+func TestEnsureFreshQoderTokenRefusesWhenDisconnected(t *testing.T) {
+	provider := domain.Provider{
+		ID: "p1", AuthType: domain.AuthTypeQoderPAT, Protocol: domain.ProtocolOpenAIChat,
+		QoderPAT: &domain.QoderPATCredential{RefreshToken: "pt-x", Disconnected: true},
+	}
+	server := &Server{}
+	if _, err := server.ensureFreshQoderToken(provider); err == nil {
+		t.Fatal("expected an error for a disconnected provider")
+	} else if !strings.Contains(err.Error(), "disconnected") {
+		t.Fatalf("expected a disconnected-specific error, got %v", err)
+	}
+}
+
+// The catalog order should read priciest-first (docs.qoder.com's credit
+// multiplier, descending) so anything that iterates provider.Models without
+// its own sort — the model list page, dropdowns — shows it that way too.
+func TestDefaultQoderModelsOrderedByMultiplierDescending(t *testing.T) {
+	models := defaultQoderModels("qoder")
+	got := make([]string, len(models))
+	for i, m := range models {
+		got[i] = m.ID
+	}
+	want := []string{"ultimate", "performance", "auto", "efficient", "lite"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("order mismatch at %d: got %v, want %v", i, got, want)
+		}
 	}
 }

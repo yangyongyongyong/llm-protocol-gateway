@@ -287,10 +287,77 @@ func (m *Manager) defaultRun(ctx context.Context, args ...string) (*exec.Cmd, io
 		return nil, nil, err
 	}
 	// Merge stdout+stderr so URL parsing works regardless of stream.
+	merged := io.Reader(io.MultiReader(stderr, stdout))
+	closer := io.Closer(stderr)
+	// Persist a copy of cloudflared's own output. Its own process log is
+	// otherwise not captured anywhere in this app; when the public tunnel
+	// intermittently 502s while everything else looks healthy, this file is
+	// the only place with cloudflared's own account of what happened at that
+	// timestamp (edge disconnects, QUIC re-dials, connection resets) — the
+	// alternative is inferring purely from Cloudflare's generic HTML error page.
+	if logFile := openCloudflaredLogFile(); logFile != nil {
+		fmt.Fprintf(logFile, "\n=== cloudflared started %s (pid %d): %s %s ===\n",
+			time.Now().Format(time.RFC3339), cmd.Process.Pid, bin, strings.Join(args, " "))
+		merged = io.TeeReader(merged, logFile)
+		closer = teeCloser{Closer: stderr, extra: logFile}
+	}
 	return cmd, struct {
 		io.Reader
 		io.Closer
-	}{io.MultiReader(stderr, stdout), stderr}, nil
+	}{merged, closer}, nil
+}
+
+// cloudflaredLogMaxBytes caps the persisted cloudflared output file so it can
+// never grow unbounded across a long-running gateway session.
+const cloudflaredLogMaxBytes = 8 * 1024 * 1024
+
+// cloudflaredLogPath mirrors DefaultConfigPath's resolution order (see
+// internal/config/store.go) so the log sits next to the gateway's own data.
+func cloudflaredLogPath() string {
+	if configDir, err := os.UserConfigDir(); err == nil && strings.TrimSpace(configDir) != "" {
+		return filepath.Join(configDir, "llm-protocol-gateway", "cloudflared.log")
+	}
+	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		return filepath.Join(home, ".llm-protocol-gateway", "cloudflared.log")
+	}
+	return ""
+}
+
+// openCloudflaredLogFile appends to the log file, rotating out the previous
+// contents once it grows past cloudflaredLogMaxBytes. Logging is a diagnostic
+// nicety, never a startup dependency: any failure here just returns nil and
+// the tunnel starts without persisted logs, exactly as it always has.
+func openCloudflaredLogFile() *os.File {
+	path := cloudflaredLogPath()
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil
+	}
+	if info, err := os.Stat(path); err == nil && info.Size() > cloudflaredLogMaxBytes {
+		_ = os.Rename(path, path+".1")
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil
+	}
+	return file
+}
+
+// teeCloser closes both the original pipe and the log file it was being
+// copied into.
+type teeCloser struct {
+	io.Closer
+	extra *os.File
+}
+
+func (t teeCloser) Close() error {
+	err := t.Closer.Close()
+	if closeErr := t.extra.Close(); err == nil {
+		err = closeErr
+	}
+	return err
 }
 
 // scrubProxyEnv removes proxy-related variables so child processes (cloudflared)

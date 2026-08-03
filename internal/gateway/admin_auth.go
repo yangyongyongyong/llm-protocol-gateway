@@ -139,7 +139,7 @@ func (s *Server) withAdminAuth(next http.Handler) http.Handler {
 // Data-level isolation (own keys only) is enforced inside each handler.
 func isUserAllowedPath(method, path string) bool {
 	switch path {
-	case "/__state", "/__logs", "/__request-stats", "/__apikeys", "/__auth/password":
+	case "/__state", "/__logs", "/__request-stats", "/__apikeys", "/__auth/password", "/__ui-log":
 		return true
 	}
 	if strings.HasPrefix(path, "/__apikeys/") {
@@ -198,13 +198,18 @@ func isUserProviderManagementPath(method, path string) bool {
 		switch parts[1] {
 		case "claude-oauth", "cursor-oauth", "chatgpt-oauth", "qoder-pat":
 			// qoder-pat has no browser round-trip (the user pastes a PAT), so it
-			// only uses complete/status/disconnect — the same verbs as the OAuth
-			// families. Ownership itself is checked inside each handler.
+			// only uses complete/status/disconnect/reconnect — the OAuth
+			// families additionally share start/complete/disconnect/status but
+			// have no reconnect verb of their own (their PAT-equivalent is the
+			// OAuth token, refreshed transparently, not something to re-paste).
+			// Ownership itself is checked inside each handler.
 			switch parts[2] {
 			case "start", "complete", "disconnect":
 				return method == http.MethodPost
 			case "status":
 				return method == http.MethodGet
+			case "reconnect":
+				return method == http.MethodPost && parts[1] == "qoder-pat"
 			}
 			return false
 		case "self-register-token":

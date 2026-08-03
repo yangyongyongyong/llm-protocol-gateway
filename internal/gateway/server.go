@@ -209,6 +209,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /__logs", s.handleLogs)
 	mux.HandleFunc("GET /__request-stats", s.handleRequestStats)
 	mux.HandleFunc("GET /__app/logs", s.handleAppLogs)
+	// UI 诊断日志：浏览器端关键事件上报（见 ui_log.go 的背景说明）。
+	mux.HandleFunc("POST /__ui-log", s.handleUILog)
 	mux.HandleFunc("PATCH /__app/log-level", s.handleSetLogLevel)
 	mux.HandleFunc("PATCH /__settings/request-log-retention", s.handleSetRequestLogRetention)
 	// Alerting (API key leak detection). Admin-only: these paths are absent from
@@ -268,6 +270,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /__providers/{id}/qoder-pat/complete", s.handleQoderPATComplete)
 	mux.HandleFunc("GET /__providers/{id}/qoder-pat/status", s.handleQoderPATStatus)
 	mux.HandleFunc("POST /__providers/{id}/qoder-pat/disconnect", s.handleQoderPATDisconnect)
+	mux.HandleFunc("POST /__providers/{id}/qoder-pat/reconnect", s.handleQoderPATReconnect)
 	mux.HandleFunc("GET /__providers/{id}/zhipu/usage", s.handleZhipuUsage)
 	mux.HandleFunc("GET /__providers/{id}/deepseek/usage", s.handleDeepSeekBalance)
 	mux.HandleFunc("DELETE /__providers/{id}", s.handleDeleteProvider)
@@ -424,12 +427,16 @@ func redactProviderForClient(provider domain.Provider) domain.Provider {
 	}
 	if provider.QoderPAT != nil {
 		original := provider.QoderPAT
+		hasToken := strings.TrimSpace(original.RefreshToken) != ""
 		provider.QoderPAT = &domain.QoderPATCredential{
 			ExpiresAt:    original.ExpiresAt,
 			AccountLabel: original.AccountLabel,
-			// Derived from the PAT, not the job token: the job token expires and
-			// is re-exchanged on demand, but the connection itself persists.
-			Connected: strings.TrimSpace(original.RefreshToken) != "",
+			// Connected means "can forward right now": PAT present AND not
+			// paused by an explicit disconnect. The job token itself expiring
+			// does not affect this — it re-exchanges on demand.
+			Connected:      hasToken && !original.Disconnected,
+			Disconnected:   original.Disconnected,
+			HasStoredToken: hasToken,
 		}
 	}
 	// Regenerate curl against the real BaseURL for UI display.
@@ -2890,6 +2897,9 @@ func (s *Server) persistProviderOAuth(providerID string, claude *domain.ClaudeOA
 			refreshToken = qoder.RefreshToken
 			expiresAt = qoder.ExpiresAt
 			accountLabel = qoder.AccountLabel
+			if qoder.Disconnected {
+				scope = domain.QoderDisconnectedScopeMarker
+			}
 		default:
 			return nil
 		}

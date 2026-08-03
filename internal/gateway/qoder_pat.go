@@ -27,6 +27,20 @@ const (
 	qoderAccountLabel     = "Qoder"
 )
 
+// qoderAccountLabelFor builds the console-facing label for a Qoder connection.
+//
+// Qoder exposes no account/user endpoint, and the job token is an opaque string
+// (not a JWT), so the real username cannot be resolved. The PAT's last 4 chars
+// are the only stable, non-sensitive discriminator available — enough to tell
+// two connected accounts apart without revealing the credential.
+func qoderAccountLabelFor(pat string) string {
+	pat = strings.TrimSpace(pat)
+	if len(pat) < 4 {
+		return qoderAccountLabel
+	}
+	return qoderAccountLabel + " · ****" + pat[len(pat)-4:]
+}
+
 // isPlaceholderBaseURL reports whether a base URL carries no real routing
 // information: either empty, or still the create form's example.com prefill.
 func isPlaceholderBaseURL(baseURL string) bool {
@@ -49,10 +63,16 @@ func isPlaceholderBaseURL(baseURL string) bool {
 // the console dropdown that fail at request time. Users whose plan includes a
 // frontier model can add it as an extra model on the provider.
 func defaultQoderModels(providerID string) []domain.Model {
+	// Order matches docs.qoder.com/zh/user-guide/chat/model-tier-selector's
+	// credit-consumption multiplier, descending: ultimate 1.6x > performance
+	// 1.1x > auto 1.0x > efficient 0.3x > lite (free). Kept in this order (not
+	// alphabetical) so anything that just iterates provider.Models — the model
+	// list page, dropdowns — shows the priciest tier first without needing its
+	// own sort.
 	aliases := []string{
-		"auto", // Smart Routing
 		"ultimate",
 		"performance",
+		"auto", // Smart Routing
 		"efficient",
 		"lite",
 	}
@@ -199,7 +219,7 @@ func exchangeQoderJobTokenAt(exchangeURL, pat string) (domain.QoderPATCredential
 		// The exchange never rotates the PAT, so it is always carried forward.
 		RefreshToken: pat,
 		ExpiresAt:    qoderTokenExpiry(jobToken, expiresIn, expiresAt, time.Now()).UTC().Format(time.RFC3339),
-		AccountLabel: qoderAccountLabel,
+		AccountLabel: qoderAccountLabelFor(pat),
 		Connected:    true,
 	}, nil
 }
@@ -225,12 +245,54 @@ func qoderTokenNeedsRefresh(credential *domain.QoderPATCredential) bool {
 // ensureFreshQoderToken guarantees the provider holds a usable job token. It is
 // called on every proxied request, so the unexpired path performs no network
 // I/O at all.
+// BackfillQoderAccountLabels refreshes account labels for already connected
+// Qoder providers (one-shot at startup).
+//
+// The label is derived locally from the stored PAT, so unlike the Claude
+// backfill this needs no network call. It runs because the label is only
+// written during a token exchange, and exchanges happen lazily on the forward
+// path — a connected provider that is idle would otherwise keep showing the old
+// bare "Qoder" label indefinitely.
+func (s *Server) BackfillQoderAccountLabels() {
+	for _, provider := range s.router.State().Providers {
+		if provider.Deleted || provider.AuthType != domain.AuthTypeQoderPAT || provider.QoderPAT == nil {
+			continue
+		}
+		pat := strings.TrimSpace(provider.QoderPAT.RefreshToken)
+		if pat == "" {
+			continue
+		}
+		want := qoderAccountLabelFor(pat)
+		if provider.QoderPAT.AccountLabel == want {
+			continue
+		}
+		credential := *provider.QoderPAT
+		credential.AccountLabel = want
+		updated, err := s.router.SetProviderQoderPAT(provider.ID, credential)
+		if err != nil {
+			continue
+		}
+		if err := s.persistProviderOAuth(updated.ID, nil, nil, nil, updated.QoderPAT); err != nil {
+			s.logs.AddApp("warn", "failed to persist qoder account label", err.Error())
+			continue
+		}
+		s.logs.AddApp("info", "qoder account label backfilled",
+			fmt.Sprintf("provider=%s label=%s", provider.ID, want))
+	}
+}
+
 func (s *Server) ensureFreshQoderToken(provider domain.Provider) (domain.Provider, error) {
 	if provider.AuthType != domain.AuthTypeQoderPAT {
 		return provider, nil
 	}
 	if provider.QoderPAT == nil || strings.TrimSpace(provider.QoderPAT.RefreshToken) == "" {
 		return provider, fmt.Errorf("provider %q has no Qoder personal access token; paste one in provider settings", provider.ID)
+	}
+	if provider.QoderPAT.Disconnected {
+		// A user-initiated disconnect must actually stop forwarding, not just
+		// change a console label — otherwise "断开连接" would silently keep
+		// working via this lazy refresh, defeating the point of disconnecting.
+		return provider, fmt.Errorf("provider %q was disconnected from Qoder; reconnect in provider settings", provider.ID)
 	}
 	if !qoderTokenNeedsRefresh(provider.QoderPAT) {
 		return provider, nil

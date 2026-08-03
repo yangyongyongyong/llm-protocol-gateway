@@ -136,6 +136,17 @@ func shouldServeUIFallback(path string) bool {
 func newUIHandler(distDir string) http.Handler {
 	fileServer := http.FileServer(http.Dir(distDir))
 	indexPath := filepath.Join(distDir, "index.html")
+	// serveIndex sends the SPA entry page with revalidation forced.
+	//
+	// index.html references content-hashed bundles (index-<hash>.js). Without an
+	// explicit Cache-Control the browser applies heuristic caching to the entry
+	// page and keeps pointing at an old hash long after a rebuild — the console
+	// then runs stale JS while the server already serves the new bundle. Assets
+	// themselves stay immutable-cacheable because their name changes on rebuild.
+	serveIndex := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+		http.ServeFile(w, r, indexPath)
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			http.NotFound(w, r)
@@ -143,10 +154,13 @@ func newUIHandler(distDir string) http.Handler {
 		}
 		path := r.URL.Path
 		if path == "/" {
-			http.ServeFile(w, r, indexPath)
+			serveIndex(w, r)
 			return
 		}
 		if strings.HasPrefix(path, "/assets/") {
+			// Vite embeds a content hash in every asset filename, so a changed
+			// file always has a new URL; caching them hard is safe.
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 			fileServer.ServeHTTP(w, r)
 			return
 		}
@@ -155,7 +169,7 @@ func newUIHandler(distDir string) http.Handler {
 			return
 		}
 		if shouldServeUIFallback(path) {
-			http.ServeFile(w, r, indexPath)
+			serveIndex(w, r)
 			return
 		}
 		http.NotFound(w, r)

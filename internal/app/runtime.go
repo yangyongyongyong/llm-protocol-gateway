@@ -299,6 +299,7 @@ func (rt *Runtime) Start(cfg Config) error {
 		server.StartProviderFailoverRecovery(context.Background())
 		server.StartUserActivityFlush(context.Background())
 		server.BackfillClaudeOAuthAccountLabels()
+		server.BackfillQoderAccountLabels()
 		server.StartCursorModelBackgroundRefresh(context.Background())
 		server.StartAlertScan(context.Background())
 		rt.startStorageMaintenance(db, retentionDays)

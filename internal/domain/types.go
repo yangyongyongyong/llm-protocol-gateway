@@ -355,7 +355,23 @@ type QoderPATCredential struct {
 	ExpiresAt    string `json:"expiresAt,omitempty"` // RFC3339
 	AccountLabel string `json:"accountLabel,omitempty"`
 	Connected    bool   `json:"connected,omitempty"`
+	// Disconnected marks a user-initiated pause (the "断开连接" button): the
+	// personal access token itself is kept — unlike the old behavior, which
+	// wiped it — so reconnecting needs no trip back to
+	// qoder.com/account/integrations to fetch a fresh one. Forwarding must
+	// still refuse to use the credential while this is true.
+	Disconnected bool `json:"disconnected,omitempty"`
+	// HasStoredToken is computed at redaction time (RefreshToken != ""), never
+	// itself persisted. Lets the console tell "paused, PAT still known" apart
+	// from "never configured" without the PAT ever reaching the browser.
+	HasStoredToken bool `json:"hasStoredToken,omitempty"`
 }
+
+// QoderDisconnectedScopeMarker is stashed in the shared oauth_scope column
+// (otherwise unused by Qoder) to persist QoderPATCredential.Disconnected across
+// restarts without a schema migration. Referenced from both internal/gateway
+// (write) and internal/store (read/write), hence living in domain.
+const QoderDisconnectedScopeMarker = "disconnected"
 
 // ChatGPTOAuthCredential holds a ChatGPT (Codex CLI) OAuth token pair used to
 // call chatgpt.com/backend-api/codex/responses. Secrets must never reach the

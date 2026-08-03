@@ -456,6 +456,9 @@ func (s *Store) Save(state domain.GatewayState) error {
 				refreshToken = provider.QoderPAT.RefreshToken
 				expiresAt = provider.QoderPAT.ExpiresAt
 				accountLabel = provider.QoderPAT.AccountLabel
+				if provider.QoderPAT.Disconnected {
+					scope = domain.QoderDisconnectedScopeMarker
+				}
 			}
 		}
 		disabled := 0
@@ -649,6 +652,7 @@ func (s *Store) loadProviders() ([]domain.Provider, error) {
 					RefreshToken: refreshToken,
 					ExpiresAt:    expiresAt,
 					AccountLabel: accountLabel,
+					Disconnected: scope == domain.QoderDisconnectedScopeMarker,
 				}
 			}
 		default:

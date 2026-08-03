@@ -1246,10 +1246,16 @@ func (r *Router) SetProviderQoderPAT(providerID string, credential domain.QoderP
 	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
 }
 
-// ClearProviderQoderPAT removes the stored Qoder credential (logout) while
-// leaving the provider in qoder_pat auth mode so the user can paste a new
-// personal access token without re-configuring the provider.
-func (r *Router) ClearProviderQoderPAT(providerID string) (domain.Provider, error) {
+// DisconnectProviderQoderPAT pauses a Qoder connection without discarding the
+// stored personal access token: the short-lived job token is cleared and the
+// credential is marked Disconnected so forwarding stops and the console shows
+// it as disconnected, but the PAT itself survives so reconnecting is a single
+// click (no trip back to qoder.com/account/integrations for a fresh token).
+//
+// This replaces the previous behavior of wiping the whole credential on
+// disconnect, which forced a full re-paste to reconnect — see
+// handleQoderPATDisconnect / handleQoderPATReconnect.
+func (r *Router) DisconnectProviderQoderPAT(providerID string) (domain.Provider, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -1258,7 +1264,13 @@ func (r *Router) ClearProviderQoderPAT(providerID string) (domain.Provider, erro
 			continue
 		}
 		updated := r.state.Providers[index]
-		updated.QoderPAT = nil
+		if updated.QoderPAT != nil {
+			credential := *updated.QoderPAT
+			credential.AccessToken = ""
+			credential.ExpiresAt = ""
+			credential.Disconnected = true
+			updated.QoderPAT = &credential
+		}
 		normalizeProvider(&updated)
 		r.state.Providers[index] = updated
 		return updated, nil

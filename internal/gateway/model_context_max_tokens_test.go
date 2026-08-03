@@ -39,6 +39,24 @@ func TestEffectiveClaudeMaxTokensOverride(t *testing.T) {
 	}
 }
 
+// TestQoderTierMaxOutputTokens locks in the empirically-probed per-tier split
+// (2026-08-03, real requests against the connected upstream): ultimate
+// accepted max_tokens=200_000 with no rejection, while performance/auto/lite
+// hard-rejected anything above 65536 ("Range of max_tokens should be
+// [1, 65536]"); efficient wasn't conclusively above 65536 either, so it stays
+// on the generic catch-all along with the other three.
+func TestQoderTierMaxOutputTokens(t *testing.T) {
+	t.Parallel()
+	if got := resolveModelMaxOutputTokens("ultimate", contextLengthDefault); got != 200_000 {
+		t.Fatalf("ultimate tier: got %d, want 200000", got)
+	}
+	for _, tier := range []string{"performance", "auto", "efficient", "lite"} {
+		if got := resolveModelMaxOutputTokens(tier, contextLengthDefault); got != 65_536 {
+			t.Fatalf("%s tier: got %d, want 65536", tier, got)
+		}
+	}
+}
+
 func TestFillModelTokenBudgets(t *testing.T) {
 	t.Parallel()
 	model := domain.Model{ID: "claude-sonnet-4-5"}

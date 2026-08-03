@@ -192,6 +192,16 @@ func isGLM5BaseModelID(modelID string) bool {
 // clients that read Models API / OpenCode limit.output fields.
 func resolveModelMaxOutputTokens(modelID string, contextLength int) int {
 	id := normalizeModelContextID(modelID)
+	// Qoder tier IDs aren't real model names and match none of the heuristics
+	// below, so they'd all fall through to the generic 65_536 catch-all.
+	// Empirically probed against the live upstream (2026-08-03, real request
+	// with max_tokens forced past 65536): performance/auto/efficient/lite all
+	// either hard-reject or stay well-behaved at the 65_536 catch-all already
+	// in place, but ultimate accepted max_tokens=200_000 with no rejection —
+	// so it gets a dedicated higher budget instead of silently capping at 65536.
+	if id == "ultimate" {
+		return 200_000
+	}
 	if isClaudeHaikuModel(id) {
 		return 64_000
 	}
