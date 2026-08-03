@@ -196,7 +196,10 @@ func isUserProviderManagementPath(method, path string) bool {
 	}
 	if len(parts) == 3 {
 		switch parts[1] {
-		case "claude-oauth", "cursor-oauth", "chatgpt-oauth":
+		case "claude-oauth", "cursor-oauth", "chatgpt-oauth", "qoder-pat":
+			// qoder-pat has no browser round-trip (the user pastes a PAT), so it
+			// only uses complete/status/disconnect — the same verbs as the OAuth
+			// families. Ownership itself is checked inside each handler.
 			switch parts[2] {
 			case "start", "complete", "disconnect":
 				return method == http.MethodPost
