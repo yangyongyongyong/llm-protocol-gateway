@@ -4065,6 +4065,9 @@ func (s *Server) proxyOpenAIToClaudeMessages(w http.ResponseWriter, r *http.Requ
 	if err != nil {
 		return 0, TokenUsage{}, nil, err
 	}
+	if provider.AuthType == domain.AuthTypeQoderPAT {
+		qoderBackfillToolDescriptions(openAIReq)
+	}
 	stream, _ := openAIReq["stream"].(bool)
 	upstreamBody, err := json.Marshal(openAIReq)
 	if err != nil {

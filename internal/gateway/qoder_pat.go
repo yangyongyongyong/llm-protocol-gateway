@@ -309,6 +309,40 @@ func (s *Server) ensureFreshQoderToken(provider domain.Provider) (domain.Provide
 	return updated, nil
 }
 
+// qoderBackfillToolDescriptions fills in an empty function.description on every
+// tool in an outgoing OpenAI-chat request bound for Qoder.
+//
+// This is a Qoder-specific workaround, not a general protocol fix: the real
+// OpenAI Chat Completions spec documents tools[].function.description as
+// optional, and every other openai_chat provider in this gateway tolerates it
+// being absent. Whatever serves Qoder's "ultimate" tier validates it more
+// strictly than the spec requires and rejects a missing/null description with
+// a Pydantic-style "tools.0.custom.description: Input should be a valid
+// string" — observed in production when Claude Code's built-in web_search
+// tool (which carries no description at all) got routed there. Scoped to
+// AuthTypeQoderPAT call sites only; must not touch the shared
+// convert_claude_openai.go / convert_openai_responses_chat.go conversion paths
+// used by every other openai_chat provider.
+func qoderBackfillToolDescriptions(chatReq map[string]any) {
+	tools, ok := chatReq["tools"].([]any)
+	if !ok {
+		return
+	}
+	for _, item := range tools {
+		tool, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		function, ok := tool["function"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, hasKey := function["description"]; !hasKey {
+			function["description"] = ""
+		}
+	}
+}
+
 // syncQoderProviderModels installs the model catalog. Qoder's direct endpoint
 // serves no /models route, so this uses the probed alias list directly instead
 // of attempting a fetch that always 404s.

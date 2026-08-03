@@ -210,6 +210,9 @@ func (s *Server) proxyOpenAIChatToResponses(w http.ResponseWriter, r *http.Reque
 	if err != nil {
 		return 0, TokenUsage{}, nil, err
 	}
+	if provider.AuthType == domain.AuthTypeQoderPAT {
+		qoderBackfillToolDescriptions(chatReq)
+	}
 	// Cursor OAuth injects bridge quirks; other openai_chat providers stay standard
 	// so Claude→Responses (and generic Chat→Responses) are not coupled to Cursor fixes.
 	opts := StandardChatToResponsesStreamOptions()

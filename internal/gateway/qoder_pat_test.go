@@ -457,3 +457,64 @@ func TestDefaultQoderModelsOrderedByMultiplierDescending(t *testing.T) {
 		}
 	}
 }
+
+// Reproduces a production incident (2026-08-03): Claude Code's built-in
+// web_search_20250305 tool carries no description at all, and Qoder's
+// "ultimate" tier rejected the resulting request with a Pydantic-style
+// "tools.0.custom.description: Input should be a valid string" — the field
+// must be present, even as "", not omitted.
+func TestQoderBackfillToolDescriptionsFillsMissingField(t *testing.T) {
+	claudeReq := map[string]any{
+		"model": "ultimate",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "search"},
+		},
+		"tools": []any{
+			map[string]any{"type": "web_search_20250305", "name": "web_search", "max_uses": float64(8)},
+		},
+	}
+	openAIReq, err := claudeRequestToOpenAIChat(claudeReq, "ultimate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Before the backfill: description is absent, which is exactly what
+	// tripped Qoder's stricter-than-spec validation.
+	tools := openAIReq["tools"].([]any)
+	function := tools[0].(map[string]any)["function"].(map[string]any)
+	if _, exists := function["description"]; exists {
+		t.Fatalf("test setup assumption broken: description already present: %+v", function)
+	}
+
+	qoderBackfillToolDescriptions(openAIReq)
+
+	description, ok := function["description"]
+	if !ok {
+		t.Fatal("expected description key to be backfilled")
+	}
+	if _, isString := description.(string); !isString {
+		t.Fatalf("description must be a string, got %T: %v", description, description)
+	}
+}
+
+// The workaround must only touch Qoder-bound requests: every other
+// openai_chat provider's conversion tolerates an absent description just
+// fine (it is optional per OpenAI's own Chat Completions spec), so baking
+// this into the shared conversion path would be the wrong scope.
+func TestQoderBackfillToolDescriptionsNotAppliedToOtherProviders(t *testing.T) {
+	claudeReq := map[string]any{
+		"model":    "glm-5.2",
+		"messages": []any{map[string]any{"role": "user", "content": "search"}},
+		"tools": []any{
+			map[string]any{"type": "web_search_20250305", "name": "web_search", "max_uses": float64(8)},
+		},
+	}
+	openAIReq, err := claudeRequestToOpenAIChat(claudeReq, "glm-5.2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := openAIReq["tools"].([]any)
+	function := tools[0].(map[string]any)["function"].(map[string]any)
+	if _, exists := function["description"]; exists {
+		t.Fatalf("non-Qoder conversion should leave description untouched/absent: %+v", function)
+	}
+}
