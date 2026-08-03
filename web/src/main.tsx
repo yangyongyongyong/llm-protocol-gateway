@@ -180,6 +180,10 @@ type ChatGPTOAuthInfo = {
 
 type QoderPATInfo = {
   connected?: boolean;
+  /** 用户点了「断开连接」：令牌仍保留在后端，只是暂停转发。见 disconnected 分支 UI。 */
+  disconnected?: boolean;
+  /** 后端仍存有个人访问令牌（即使当前 disconnected），可一键重新连接、无需再粘贴。 */
+  hasStoredToken?: boolean;
   expiresAt?: string;
   accountLabel?: string;
 };
@@ -967,6 +971,91 @@ function fetchWithTimeout(input: string, init: RequestInit = {}, timeoutMs = BAC
   return fetch(input, { ...init, signal: AbortSignal.timeout(timeoutMs) });
 }
 
+/**
+ * 解析连接类接口的响应，返回可直接展示的错误。
+ *
+ * 两类失败必须区分开：
+ *
+ * 1. 链路层：网关重启期间 Cloudflare 隧道未就绪、反代超时、会话过期跳登录页——
+ *    响应体是 HTML，无条件 `response.json()` 会抛
+ *    `Unexpected token '<', "<!DOCTYPE "...`，把真实原因盖住。
+ * 2. 业务层：后端把上游失败也映射成 502（例如 PAT 格式错误时
+ *    "qoder job token exchange failed with HTTP 400: invalid personal token
+ *    format"），此时响应体是 JSON，必须原样透出后端消息——否则用户会被告知
+ *    "隧道不可达，请稍后重试"，而实际上重试一万次也没用。
+ *
+ * 因此只以 content-type 作为分流依据，绝不单看状态码。
+ */
+/** 上报一条 UI 诊断事件到后端应用日志（GET /__app/logs 可见）。fire-and-forget。 */
+function reportUIDiag(event: string, detail: string) {
+  try {
+    void fetch(`${API_BASE}/__ui-log`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ event, detail }),
+    }).catch(() => {});
+  } catch {
+    // 诊断通道自身绝不能影响业务
+  }
+}
+
+/**
+ * 挡住浏览器（尤其 Safari）顽固的账号自动填充。
+ *
+ * 实测（ui-diag 日志）：`autoComplete="one-time-code"` + `data-1p-ignore` 等属性
+ * 组合仍被绕过——浏览器原生派发了 trusted=true、inputType=(none) 的填充事件，
+ * 是自动填充的典型指纹，而非用户真实输入。
+ *
+ * 浏览器的自动填充扫描发生在页面加载 / DOM 变动那一刻；此时字段若是 `readOnly`
+ * 会被直接跳过。真正聚焦（用户主动点击/Tab 进来）时才摘掉 `readOnly`，扫描窗口
+ * 已经错过。这是绕过 autocomplete 属性失效时的可靠兜底。
+ */
+function antiAutofillProps() {
+  return {
+    readOnly: true,
+    onFocus: (event: React.FocusEvent<HTMLInputElement>) => {
+      event.target.removeAttribute('readonly');
+    },
+  } as const;
+}
+
+/** 供筛选框 onChange 里调用：识别并上报疑似自动填充的变更（诊断用，不拦截）。 */
+function reportIfLooksLikeAutofill(diagName: string, previous: string, next: string, event: React.ChangeEvent<HTMLInputElement>) {
+  if (previous === '' && next !== '' && event.nativeEvent instanceof InputEvent) {
+    const native = event.nativeEvent;
+    if (!native.inputType) {
+      reportUIDiag(diagName, `value=${next.slice(0, 24)} trusted=${native.isTrusted} inputType=(none)`);
+    }
+  }
+}
+
+async function readConnectResponse(response: Response, fallbackMessage: string) {
+  const contentType = (response.headers.get('content-type') || '').toLowerCase();
+  // 诊断:记录浏览器真实收到的状态/类型/体前缀,终结"到底是谁返回的 502"之争。
+  {
+    let preview = '';
+    try { preview = (await response.clone().text()).slice(0, 160); } catch { /* 诊断不阻塞业务 */ }
+    reportUIDiag('connect-response', `status=${response.status} ct=${contentType} body=${preview}`);
+  }
+  if (contentType.includes('json')) {
+    // 后端应答（含它用 4xx/5xx 表达的业务错误）：原样透出真实原因。
+    const data = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new Error(data?.error?.message || data?.error || `${fallbackMessage}（HTTP ${response.status}）`);
+    }
+    return data;
+  }
+  // 非 JSON：请求没到达后端，或到达前就被中间层截断。
+  if (response.status === 502 || response.status === 503 || response.status === 504 || response.status === 522) {
+    throw new Error(`网关暂时不可达（HTTP ${response.status}）。若刚重启过服务，公网隧道通常需要 30-60 秒重建，请稍后重试。`);
+  }
+  if (response.status === 401 || response.status === 403) {
+    throw new Error(`登录状态已失效（HTTP ${response.status}），请刷新页面重新登录后再试。`);
+  }
+  throw new Error(`服务返回了非预期内容（HTTP ${response.status}），请稍后重试。`);
+}
+
 // Qoder 直连端点。后端 normalizeProvider 只在 baseUrl 留空时兜这个默认值
 // （保留手动覆盖入口），所以切到 Qoder 时前端要主动把占位 URL 换掉，
 // 否则会残留创建表单的 example.com 预填值。
@@ -1409,6 +1498,11 @@ function maskApiKeySource(source?: string): string {
 // 「连接方式」下拉框里代表自助注册模式的选项文案；三种协议共用同一个选项
 // （不像 OAuth 选项那样绑定单一协议）。
 const SELF_REGISTER_CONNECT_LABEL = '内网穿透自助注册（Bearer 令牌）';
+
+// 「连接方式」下拉里 API Key 选项的文案。括号里点明适用范围：本网关只实现了
+// OpenAI Chat / OpenAI Responses / Claude 三种上游协议（见 domain.Protocol），
+// 填任意平台的 key 并不等于就能转发——上游必须原生兼容这三种之一。
+const API_KEY_CONNECT_LABEL = 'API Key（仅支持 OpenAI Chat / Responses / Claude 三种协议的上游）';
 
 // selfRegisterPlaceholderBaseURL 是创建时的占位 baseUrl：真实地址由用户自己的
 // 脚本在生成令牌后通过 self-register 接口写入，这里只是先满足"创建 Provider
@@ -3313,8 +3407,27 @@ function formatModelOutputBudget(n: number | undefined) {
   return String(n);
 }
 
+// Qoder 模型分级选择器（docs.qoder.com/zh/user-guide/chat/model-tier-selector）
+// 的 5 个档位及其 credit 消耗倍率，按倍率降序（与后端 defaultQoderModels 的
+// 目录顺序一致）。按模型 id 匹配而非按 provider 类型：这 5 个是高度独有的
+// 英文单词 id，和其他 provider 真实模型名（vendor-model-version 形式）撞车
+// 的概率可忽略，换来的是零改动地在所有下拉框（SearchableModelSelect 及其
+// 复用者）里生效，不必额外传 provider 上下文。
+const QODER_TIER_INFO: Record<string, { label: string; multiplier: string }> = {
+  ultimate: { label: '极致', multiplier: '1.6x' },
+  performance: { label: '性能', multiplier: '1.1x' },
+  auto: { label: '智能路由', multiplier: '1.0x' },
+  efficient: { label: '经济', multiplier: '0.3x' },
+  lite: { label: '轻量', multiplier: '免费' },
+};
+
 function modelSelectOptionLabel(model: Model) {
+  const tier = QODER_TIER_INFO[model.id];
   const out = formatModelOutputBudget(model.maxOutputTokens);
+  if (tier) {
+    const base = `${model.id}（${tier.label} ${tier.multiplier}）`;
+    return out ? `${base} · out ${out}` : base;
+  }
   return out ? `${model.id} · out ${out}` : model.id;
 }
 
@@ -5796,8 +5909,7 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ code, state }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data?.error?.message || data?.error || 'connect failed');
+      await readConnectResponse(response, 'Claude 账号连接失败');
       resetClaudeOAuthFlowState();
       showToast('Claude 账号连接成功');
       await refreshState(false);
@@ -5969,8 +6081,7 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ code: chatgptOAuthCode }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data?.error?.message || data?.error || 'connect failed');
+      await readConnectResponse(response, 'ChatGPT 账号连接失败');
       resetChatGPTOAuthFlowState();
       showToast('ChatGPT 账号连接成功');
       await refreshState(false);
@@ -5992,8 +6103,7 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token: qoderPatInput.trim() }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data?.error?.message || data?.error || 'connect failed');
+      await readConnectResponse(response, 'Qoder 账号连接失败');
       resetQoderPATFlowState();
       showToast('Qoder 账号连接成功');
       await refreshState(false);
@@ -6010,9 +6120,26 @@ function App() {
     setQoderPatError('');
     try {
       const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(editingProviderID)}/qoder-pat/disconnect`, { method: 'POST' });
-      if (!response.ok) throw new Error(await response.text());
+      await readConnectResponse(response, 'Qoder 断开连接失败');
+      showToast('已断开 Qoder 账号连接（令牌已保留，随时可一键重新连接）');
+      await refreshState(false);
+    } catch (error) {
+      setQoderPatError(String(error));
+    } finally {
+      setQoderPatBusy(false);
+    }
+  }
+
+  /** 用已保存的个人访问令牌重新连接，无需再粘贴。 */
+  async function reconnectQoderPAT() {
+    if (!editingProviderID) return;
+    setQoderPatBusy(true);
+    setQoderPatError('');
+    try {
+      const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(editingProviderID)}/qoder-pat/reconnect`, { method: 'POST' });
+      await readConnectResponse(response, 'Qoder 重新连接失败');
       resetQoderPATFlowState();
-      showToast('已断开 Qoder 账号连接');
+      showToast('已使用已保存的令牌重新连接');
       await refreshState(false);
     } catch (error) {
       setQoderPatError(String(error));
@@ -7117,9 +7244,17 @@ function App() {
                     <input
                       type="search"
                       className="api-keys-filter-search"
+                      autoComplete="one-time-code"
+                      data-1p-ignore
+                      data-lpignore="true"
+                      name="apiKeyFilterKeyword"
                       placeholder="名称 / 密钥"
                       value={apiKeyKeyword}
-                      onChange={(event) => setApiKeyKeyword(event.target.value)}
+                      {...antiAutofillProps()}
+                      onChange={(event) => {
+                        reportIfLooksLikeAutofill('apikey-filter-filled', apiKeyKeyword, event.target.value, event);
+                        setApiKeyKeyword(event.target.value);
+                      }}
                     />
                   </div>
                   {!isNormalUser ? (
@@ -7330,12 +7465,26 @@ function App() {
               </div>
               <div className="providers-filter-toolbar">
                 <div className="models-search-row">
+                  {/* Chrome 会无视 autoComplete="off"（尤其同页存在密码框时），把这类
+                      文本框当成登录表单的用户名字段，自动灌入保存的账号——实测按 ESC
+                      关弹窗后此框被填成 "admin"。给一个语义明确、与登录无关的值
+                      （one-time-code）Chrome 才会真正放弃填充；再叠加 data-1p/lpignore
+                      关掉 1Password / LastPass 的注入。 */}
                   <input
                     className="models-search-input"
                     type="search"
+                    autoComplete="one-time-code"
+                    data-1p-ignore
+                    data-lpignore="true"
+                    name="providerFilterKeyword"
                     value={providersSearchQuery}
                     placeholder="按名称 / ID / 地址检索，支持正则，如 tuya|claude"
-                    onChange={(event) => setProvidersSearchQuery(event.target.value)}
+                    {...antiAutofillProps()}
+                    onChange={(event) => {
+                      const next = event.target.value;
+                      reportIfLooksLikeAutofill('provider-filter-filled', providersSearchQuery, next, event);
+                      setProvidersSearchQuery(next);
+                    }}
                     aria-label="Provider 名称检索"
                   />
                   {providersSearchQuery.trim() ? (
@@ -8007,9 +8156,17 @@ function App() {
                   <input
                     className="models-search-input"
                     type="search"
+                    autoComplete="one-time-code"
+                    data-1p-ignore
+                    data-lpignore="true"
+                    name="modelFilterKeyword"
                     value={modelsSearchQuery}
                     placeholder="按名称检索，支持正则，如 gpt-5\\.6|sonnet"
-                    onChange={(event) => setModelsSearchQuery(event.target.value)}
+                    {...antiAutofillProps()}
+                    onChange={(event) => {
+                      reportIfLooksLikeAutofill('model-filter-filled', modelsSearchQuery, event.target.value, event);
+                      setModelsSearchQuery(event.target.value);
+                    }}
                     aria-label="模型名称检索"
                   />
                   {modelsSearchQuery.trim() ? (
@@ -8533,6 +8690,8 @@ function App() {
                       <span>Bot Token{alertSettings.telegram.botTokenConfigured ? '（留空表示不修改）' : ''}</span>
                       <input
                         type="password"
+                        autoComplete="off"
+                        name="telegramBotToken"
                         placeholder="粘贴 BotFather 给出的 token"
                         value={telegramTokenInput}
                         onChange={(event) => setTelegramTokenInput(event.target.value)}
@@ -9219,7 +9378,7 @@ function App() {
                 : providerDraft.authType === 'chatgpt_oauth' ? '登录 ChatGPT 账号 (OAuth)'
                 : providerDraft.authType === 'qoder_pat' ? '连接 Qoder 账号 (PAT)'
                 : providerDraft.authType === 'self_register' ? SELF_REGISTER_CONNECT_LABEL
-                : 'API Key';
+                : API_KEY_CONNECT_LABEL;
               // 自助注册类 Provider：协议只能由脚本通过 self-register 接口的
               // protocol 字段声明，控制台不提供选择/修改入口。
               // resolveProviderAuthType 已根据 selfRegistration 回填 self_register。
@@ -9232,7 +9391,7 @@ function App() {
                   <SelectField
                     fullWidth
                     label="连接方式"
-                    values={['API Key', '登录 Claude 账号 (OAuth)', '登录 Cursor 账号 (OAuth)', '登录 ChatGPT 账号 (OAuth)', '连接 Qoder 账号 (PAT)', SELF_REGISTER_CONNECT_LABEL]}
+                    values={[API_KEY_CONNECT_LABEL, '登录 Claude 账号 (OAuth)', '登录 Cursor 账号 (OAuth)', '登录 ChatGPT 账号 (OAuth)', '连接 Qoder 账号 (PAT)', SELF_REGISTER_CONNECT_LABEL]}
                     value={connectValue}
                     onChange={(value) => setProviderDraft((current) => {
                       const authType = value === '登录 Claude 账号 (OAuth)' ? 'claude_oauth'
@@ -9281,6 +9440,14 @@ function App() {
                 </>
               );
             })()}
+            {providerDraft.authType === 'api_key' && (
+              <div className="hint-line">
+                本网关只实现了 OpenAI Chat、OpenAI Responses、Claude 三种上游协议。
+                密钥所属平台不限，但该平台必须原生兼容上面选中的协议（例如 DeepSeek、
+                智谱、各类中转站多为 OpenAI Chat 兼容）。若上游是自定义或私有协议，
+                请改用「内网穿透自助注册」，由你的脚本自行适配后再接入。
+              </div>
+            )}
             {providerDraft.authType === 'cursor_oauth' && (
               <div className="hint-line">Cursor OAuth 上游固定为 OpenAI Chat（本地 bridge `/v1/chat/completions`）；客户端若要 Responses/Claude，请在路由输出协议里转换。</div>
             )}
@@ -9315,10 +9482,9 @@ function App() {
                 )}
               </>
             )}
-            <Field label="兜底模型（可选）" value={providerDraft.defaultModel} onChange={(value) => setProviderDraft((current) => ({ ...current, defaultModel: value }))} />
-            <div className="field"><label>默认思考深度（可选）</label><select value={providerDraft.defaultThinkingDepth} onChange={(event) => setProviderDraft((current) => ({ ...current, defaultThinkingDepth: event.target.value }))}>
-              {thinkingDepthSelectOptions({ value: '', label: '（不指定）' })}
-            </select></div>
+            {/* 兜底模型 / 默认思考深度不在这里配置：日常按需求在「API 密钥」里
+                指定即可。字段本身保留（后端仍用于模型别名兜底、{model} URL 模板
+                填充与控制台各项测试），编辑时原值原样带走，不会被这个表单清空。 */}
           </div>
           {editingProviderID && providerDraft.authType === 'api_key' && /(?:bigmodel\.cn|z\.ai)/i.test(providerDraft.baseUrl) && (
             <div className="claude-oauth-panel">
@@ -9438,6 +9604,7 @@ function App() {
               ) : (() => {
                 const editingProvider = state.providers.find((item) => item.id === editingProviderID);
                 const connected = editingProvider?.qoderPat?.connected;
+                const hasStoredToken = editingProvider?.qoderPat?.hasStoredToken;
                 if (connected) {
                   return (
                     <>
@@ -9450,11 +9617,29 @@ function App() {
                     </>
                   );
                 }
+                // 已断开，但令牌仍保存在后端：一键重新连接，不必再跑一趟
+                // qoder.com 重新复制令牌（disconnect 不再清空凭据）。
+                if (hasStoredToken) {
+                  return (
+                    <>
+                      <div className="hint-line">已断开{editingProvider?.qoderPat?.accountLabel ? ` · ${editingProvider.qoderPat.accountLabel}` : ''}（个人访问令牌仍保留，未在转发中使用）</div>
+                      <div className="actions" style={{ gap: 8 }}>
+                        <button className="btn primary" disabled={qoderPatBusy} onClick={() => void reconnectQoderPAT()}>{qoderPatBusy ? '连接中…' : '重新连接（使用已保存的令牌）'}</button>
+                      </div>
+                      {qoderPatError && <div className="hint-line error">{qoderPatError}</div>}
+                      <div className="hint-line" style={{ marginTop: 8 }}>要换成另一个账号？粘贴新的个人访问令牌即可覆盖：</div>
+                      <div className="field-inline" style={{ marginTop: 4 }}>
+                        <input type="text" placeholder="粘贴 pt- 开头的个人访问令牌" value={qoderPatInput} onChange={(event) => setQoderPatInput(event.target.value)} />
+                        <button className="mini-btn" disabled={qoderPatBusy || !qoderPatInput.trim()} onClick={() => void connectQoderPAT()}>{qoderPatBusy ? '连接中…' : '完成连接'}</button>
+                      </div>
+                    </>
+                  );
+                }
                 return (
                   <>
                     <div className="hint-line">在 qoder.com/account/integrations 生成个人访问令牌（pt- 开头）后粘贴到这里。令牌只用来兑换短期作业令牌，不会回传到浏览器。</div>
                     <div className="field-inline" style={{ marginTop: 8 }}>
-                      <input type="password" placeholder="粘贴 pt- 开头的个人访问令牌" value={qoderPatInput} onChange={(event) => setQoderPatInput(event.target.value)} />
+                      <input type="text" placeholder="粘贴 pt- 开头的个人访问令牌" value={qoderPatInput} onChange={(event) => setQoderPatInput(event.target.value)} />
                       <button className="mini-btn" disabled={qoderPatBusy || !qoderPatInput.trim()} onClick={() => void connectQoderPAT()}>{qoderPatBusy ? '连接中…' : '完成连接'}</button>
                     </div>
                     {qoderPatError && <div className="hint-line error">{qoderPatError}</div>}
@@ -11695,11 +11880,28 @@ function MultiSelectFilter({ label, options, selected, onChange, allLabel, field
           role="combobox"
           aria-expanded={open}
           aria-autocomplete="list"
+          // 该输入框会出现在「用户名 + 密码」正下方（用户管理弹窗），整体形状
+          // 与登录表单一致，Chrome 会把保存的账号（实测 "admin"）灌进来且无视
+          // autoComplete="off"。one-time-code 是 Chrome 真正尊重的非登录语义；
+          // data-1p/lpignore 关掉 1Password / LastPass 注入。
+          autoComplete="one-time-code"
+          data-1p-ignore
+          data-lpignore="true"
+          name="multiSelectFilterQuery"
           value={open ? query : displayLabel}
           placeholder={open ? '输入关键字过滤…' : (allLabel || '全部')}
-          onFocus={() => { setOpen(true); setQuery(''); }}
+          readOnly={!open}
+          onFocus={(event) => {
+            event.target.removeAttribute('readonly');
+            setOpen(true);
+            setQuery('');
+          }}
           onClick={() => { setOpen(true); }}
-          onChange={(event) => { setOpen(true); setQuery(event.target.value); }}
+          onChange={(event) => {
+            reportIfLooksLikeAutofill('multiselect-filter-filled', query, event.target.value, event);
+            setOpen(true);
+            setQuery(event.target.value);
+          }}
           onKeyDown={onKeyDown}
         />
         {open ? (
