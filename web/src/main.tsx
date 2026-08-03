@@ -8786,8 +8786,19 @@ function App() {
                     if (va !== vb) return (va - vb) * dir;
                     return a.user.username.localeCompare(b.user.username, 'zh-CN');
                   }).map(({ user, ownedKeys, lastActive, lastUsedMs }) => {
-                    const providerNames = (user.allowedProviderIds || [])
-                      .map((id) => state.providers.find((provider) => provider.id === id)?.name || id);
+                    // 「Provider」列此前只读 allowedProviderIds（管理员手动授权的白名单），
+                    // 漏掉了用户自己创建的 Provider——后端权限判定
+                    // （allowedProviderIDsForUser，见 user_isolation.go）本身是"白名单 ∪ 自建"，
+                    // 用户能正常用自建 Provider，只是这一列没显示出来，看起来像"没权限"。
+                    const allowedIds = user.allowedProviderIds || [];
+                    const ownedProviderIds = state.providers
+                      .filter((provider) => provider.ownerUserId === user.id)
+                      .map((provider) => provider.id);
+                    const providerIds = Array.from(new Set([...allowedIds, ...ownedProviderIds]));
+                    const providerNames = providerIds.map((id) => {
+                      const name = state.providers.find((provider) => provider.id === id)?.name || id;
+                      return ownedProviderIds.includes(id) && !allowedIds.includes(id) ? `${name}（自建）` : name;
+                    });
                     return (
                       <div className="log-row" key={user.id}>
                         <div className="log-row-main" style={{ gridTemplateColumns: USERS_TABLE_GRID }}>
@@ -10552,9 +10563,10 @@ function CursorOAuthUsagePanel({ providerId, connected, compact }: { providerId:
       ) : !report.available ? (
         <div className="claude-usage-empty error">{report.error || '额度不可用'}</div>
       ) : buckets.length === 0 ? (
-        <div className="claude-usage-empty">未返回额度桶数据</div>
+        <div className="claude-usage-empty">{report.message || '未返回额度桶数据'}</div>
       ) : (
         <div className="claude-usage-grid">
+          {report.message ? <div className="claude-usage-reset">{report.message}</div> : null}
           {buckets.map((bucket, index) => {
             const percent = Math.min(100, Math.max(0, bucket.utilization ?? 0));
             return (
