@@ -306,6 +306,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/images/generations", s.handleOpenAIImagesGenerations)
 	mux.HandleFunc("POST /openai/v1/images/generations", s.handleOpenAIImagesGenerations)
 	mux.HandleFunc("POST /openai/v1/responses", s.handleOpenAIResponses)
+	// Real OpenAI Responses API endpoint Codex CLI calls for "remote
+	// compaction" on long sessions (see responses_compact.go for why this
+	// exists — without it, Codex 404s and the session breaks mid-task).
+	mux.HandleFunc("POST /openai/v1/responses/compact", s.handleOpenAIResponsesCompact)
 	mux.HandleFunc("POST /anthropic/v1/messages", s.handleClaudeMessages)
 	mux.HandleFunc("POST /anthropic/v1/messages/count_tokens", s.handleClaudeCountTokens)
 	api := withCORS(mux)
@@ -3155,6 +3159,13 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		req = map[string]any{}
+	}
+	// A client may carry a compaction token (minted by our own
+	// handleOpenAIResponsesCompact) back into a normal request's input array;
+	// expand it into a plain message before anything downstream sees it — see
+	// responses_compact.go for why this must run first and unconditionally.
+	if items, ok := req["input"].([]any); ok {
+		req["input"] = expandCompactionItems(items)
 	}
 
 	var route domain.Route
