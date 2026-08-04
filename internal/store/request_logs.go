@@ -64,10 +64,12 @@ func (s *Store) AppendRequestLogWithRetention(log monitor.RequestLog, retentionD
 		log.RequestBody,
 		log.ResponseBody,
 	)
-	if err != nil {
-		return err
-	}
-	return s.PruneRequestLogs(retentionDays)
+	// retentionDays 不在这里立即生效——保留窗口按天计，靠网关启动时和每 6 小时
+	// 的维护 ticker（internal/app/runtime.go）跑 PruneRequestLogs 就足够及时，
+	// 没必要每条请求都额外跑 2 条 DELETE（稳态下几乎总是 0 行命中，纯粹的
+	// 写锁占用和语句开销，见磨损排查记录）。retentionDays 参数保留只是为了不
+	// 破坏调用方签名；真正生效的地方是上面提到的两处周期性调用。
+	return err
 }
 
 func (s *Store) PruneRequestLogs(retentionDays int) error {

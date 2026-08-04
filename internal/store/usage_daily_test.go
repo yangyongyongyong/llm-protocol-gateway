@@ -184,3 +184,55 @@ func TestUsageDailyTrafficDefaultsToZero(t *testing.T) {
 		t.Fatalf("expected zero rx bytes, got %d", got)
 	}
 }
+
+// ApplyUsageDeltas must commit an entire batch atomically and aggregate the
+// same as N sequential ApplyUsageDelta calls would — this is what the async
+// usage worker relies on to collapse many requests into one WAL commit.
+func TestUsageDailyApplyDeltasBatch(t *testing.T) {
+	t.Parallel()
+	s, err := Open(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	older := &monitor.RequestLog{Time: time.Date(2026, 8, 2, 9, 0, 0, 0, time.Local), APIKeyID: "k1"}
+	newer := &monitor.RequestLog{Time: time.Date(2026, 8, 2, 9, 5, 0, 0, time.Local), APIKeyID: "k2"}
+	deltas := []monitor.UsagePersistDelta{
+		{Day: "2026-08-02", KeyID: "k1", KeyName: "main", ProviderID: "p1", Model: "m1",
+			StatusClass: "2xx", InputTokens: 10, OutputTokens: 5, LastRequest: older},
+		{Day: "2026-08-02", KeyID: "k1", KeyName: "main", ProviderID: "p1", Model: "m1",
+			StatusClass: "2xx", InputTokens: 20, OutputTokens: 7, LastRequest: newer},
+		{Day: "2026-08-03", KeyID: "k2", KeyName: "second", ProviderID: "p2", Model: "m2",
+			StatusClass: "5xx", InputTokens: 1, OutputTokens: 1},
+	}
+	if err := s.ApplyUsageDeltas(deltas); err != nil {
+		t.Fatal(err)
+	}
+
+	days, last, err := s.LoadUsageSince(time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := days["2026-08-02"].ByAPIKey["k1"].RequestCount; got != 2 {
+		t.Fatalf("k1 request count = %d, want 2", got)
+	}
+	if got := days["2026-08-02"].Total.InputTokens; got != 30 {
+		t.Fatalf("2026-08-02 total input tokens = %d, want 30", got)
+	}
+	if got := days["2026-08-03"].Status5xx; got != 1 {
+		t.Fatalf("2026-08-03 status5xx = %d, want 1", got)
+	}
+	// Settings row must reflect the last delta in the batch that carried a
+	// LastRequest, not the first — matches "last write wins" semantics of
+	// calling ApplyUsageDelta once per event in order.
+	if last == nil || last.APIKeyID != "k2" {
+		t.Fatalf("last request = %+v, want k2 (the last delta with a LastRequest)", last)
+	}
+
+	// Empty batch must be a no-op, not an error (worker calls this on every
+	// timer tick even when nothing accumulated).
+	if err := s.ApplyUsageDeltas(nil); err != nil {
+		t.Fatalf("empty batch should be a no-op: %v", err)
+	}
+}

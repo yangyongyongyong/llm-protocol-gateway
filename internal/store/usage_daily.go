@@ -45,12 +45,48 @@ func ensureUsageDailyTables(tx *sql.Tx) error {
 }
 
 func (s *Store) ApplyUsageDelta(delta monitor.UsagePersistDelta) error {
+	return s.ApplyUsageDeltas([]monitor.UsagePersistDelta{delta})
+}
+
+// ApplyUsageDeltas persists several deltas in a single transaction/commit.
+// The async usage worker (internal/monitor/usage_accumulator.go) batches the
+// deltas it accumulates within a short window onto one call here instead of
+// calling ApplyUsageDelta per request, so sustained traffic produces one WAL
+// commit (and fsync) per batch rather than one per request.
+func (s *Store) ApplyUsageDeltas(deltas []monitor.UsagePersistDelta) error {
+	if len(deltas) == 0 {
+		return nil
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	var lastRequest *monitor.RequestLog
+	for _, delta := range deltas {
+		if err := applyUsageDeltaTx(tx, delta); err != nil {
+			return err
+		}
+		if delta.LastRequest != nil {
+			lastRequest = delta.LastRequest
+		}
+	}
+
+	if lastRequest != nil {
+		payload, err := json.Marshal(lastRequest)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO settings (key, value) VALUES (?, ?)
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value`, usageLastRequestSettingKey, string(payload)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func applyUsageDeltaTx(tx *sql.Tx, delta monitor.UsagePersistDelta) error {
 	if err := upsertUsageBucket(tx, delta.Day, "total", "", "", delta, true); err != nil {
 		return err
 	}
@@ -73,18 +109,7 @@ func (s *Store) ApplyUsageDelta(delta monitor.UsagePersistDelta) error {
 			return err
 		}
 	}
-
-	if delta.LastRequest != nil {
-		payload, err := json.Marshal(delta.LastRequest)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec(`INSERT INTO settings (key, value) VALUES (?, ?)
-			ON CONFLICT(key) DO UPDATE SET value = excluded.value`, usageLastRequestSettingKey, string(payload)); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
+	return nil
 }
 
 func upsertUsageBucket(tx *sql.Tx, day, bucketType, bucketID, bucketName string, delta monitor.UsagePersistDelta, withStatus bool) error {

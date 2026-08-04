@@ -8,6 +8,18 @@ import (
 
 const usageEventBuffer = 4096
 
+// usageBatchMaxSize/usageBatchMaxWait bound the async usage worker's batching:
+// it commits one usage_daily_buckets transaction per batch instead of one per
+// request, cutting WAL fsyncs under sustained load. usageBatchMaxWait also
+// bounds the worst-case data-loss window on an ungraceful shutdown (a killed
+// process loses at most this much unpersisted usage-stat delta — the request
+// itself already completed and returned to the client either way, so this
+// only affects the daily usage dashboard, never the proxied response).
+const (
+	usageBatchMaxSize = 50
+	usageBatchMaxWait = 300 * time.Millisecond
+)
+
 // UsageEvent is a lightweight usage record queued after each request completes.
 //
 // InputTokens is the normalized prompt total (PromptTotal): full prompt tokens
@@ -68,9 +80,34 @@ func (s *Store) startUsageWorker() {
 }
 
 func (s *Store) usageWorker() {
-	for event := range s.usageEvents {
-		delta := s.applyUsageEventLocked(event)
-		s.persistUsageDelta(delta)
+	batch := make([]UsagePersistDelta, 0, usageBatchMaxSize)
+	timer := time.NewTimer(usageBatchMaxWait)
+	defer timer.Stop()
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		s.persistUsageDeltas(batch)
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case event, ok := <-s.usageEvents:
+			if !ok {
+				flush()
+				return
+			}
+			batch = append(batch, s.applyUsageEventLocked(event))
+			if len(batch) >= usageBatchMaxSize {
+				flush()
+				timer.Reset(usageBatchMaxWait)
+			}
+		case <-timer.C:
+			flush()
+			timer.Reset(usageBatchMaxWait)
+		}
 	}
 }
 
@@ -241,6 +278,23 @@ func (s *Store) persistUsageDelta(delta UsagePersistDelta) {
 	}
 	if err := store.ApplyUsageDelta(delta); err != nil {
 		s.AddApp("warn", "failed to persist usage daily aggregate", err.Error())
+	}
+}
+
+// persistUsageDeltas is the batched counterpart used by usageWorker: one
+// transaction/commit for the whole batch instead of one per delta.
+func (s *Store) persistUsageDeltas(deltas []UsagePersistDelta) {
+	if len(deltas) == 0 {
+		return
+	}
+	s.mu.RLock()
+	store := s.usageDailyStore
+	s.mu.RUnlock()
+	if store == nil {
+		return
+	}
+	if err := store.ApplyUsageDeltas(deltas); err != nil {
+		s.AddApp("warn", "failed to persist usage daily aggregate batch", err.Error())
 	}
 }
 

@@ -40,7 +40,12 @@ func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_pragma=auto_vacuum(INCREMENTAL)")
+	// synchronous=NORMAL is the standard WAL pairing: still fsyncs at WAL
+	// checkpoints, but skips the fsync-per-commit that the default FULL does,
+	// cutting per-request disk wear without weakening WAL's own crash-safety
+	// guarantee (a crash can only lose the last few uncommitted transactions,
+	// never corrupt the DB).
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=auto_vacuum(INCREMENTAL)")
 	if err != nil {
 		return nil, err
 	}

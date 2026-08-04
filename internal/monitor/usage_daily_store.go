@@ -43,6 +43,10 @@ type UsageDayBuckets struct {
 // Daily aggregates are retained permanently; request log retention must not prune them.
 type UsageDailyStore interface {
 	ApplyUsageDelta(delta UsagePersistDelta) error
+	// ApplyUsageDeltas persists several deltas in one transaction/commit — the
+	// async usage worker batches same-tick events onto this instead of calling
+	// ApplyUsageDelta once per request, cutting WAL fsyncs under sustained load.
+	ApplyUsageDeltas(deltas []UsagePersistDelta) error
 	// LoadUsageSince loads aggregates for day >= since. Zero since loads all history.
 	LoadUsageSince(since time.Time) (map[string]UsageDayBuckets, *RequestLog, error)
 	// ClearUsageSince deletes aggregates for day >= since (used when replaying
