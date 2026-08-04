@@ -128,6 +128,12 @@ func (r *Router) SetRequestLogRetentionDays(days int) {
 	r.state.RequestLogRetentionDays = days
 }
 
+func (r *Router) SetLog2xxBodies(enabled bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.Log2xxBodies = enabled
+}
+
 func (r *Router) SetWebExposed(enabled bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

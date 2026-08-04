@@ -397,6 +397,10 @@ func (s *Store) Load(defaultState domain.GatewayState) (domain.GatewayState, err
 	if state.RequestLogRetentionDays <= 0 {
 		state.RequestLogRetentionDays = 7
 	}
+	// 默认 false（成功请求不记正文）：老库没有这个键时也走默认，不需要迁移。
+	if raw := strings.TrimSpace(s.setting("log2xxBodies")); raw != "" {
+		state.Log2xxBodies = raw == "1" || strings.EqualFold(raw, "true")
+	}
 	if raw := strings.TrimSpace(s.setting("webExposed")); raw != "" {
 		state.WebExposed = raw == "1" || strings.EqualFold(raw, "true")
 	}
@@ -551,6 +555,13 @@ func (s *Store) Save(state domain.GatewayState) error {
 		retentionDays = 7
 	}
 	if err := setSetting(tx, "requestLogRetentionDays", strconv.Itoa(retentionDays)); err != nil {
+		return err
+	}
+	log2xxBodiesValue := "false"
+	if state.Log2xxBodies {
+		log2xxBodiesValue = "true"
+	}
+	if err := setSetting(tx, "log2xxBodies", log2xxBodiesValue); err != nil {
 		return err
 	}
 	webExposedValue := "false"

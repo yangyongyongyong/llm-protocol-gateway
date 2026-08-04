@@ -75,10 +75,14 @@ type Server struct {
 	cursorBridge            *cursor.Bridge
 	listenAddr              string
 	requestLogRetentionDays int
-	adminAuth               AdminAuthStore
-	userStore               UserStore
-	oauthUsageCache         *oauthUsageCache
-	requestStatsCache       *requestStatsCache
+	// log2xxBodies mirrors GatewayState.Log2xxBodies; guarded by log2xxBodiesMu
+	// because it is read on every request-log write and toggled from a handler.
+	log2xxBodies      bool
+	log2xxBodiesMu    sync.RWMutex
+	adminAuth         AdminAuthStore
+	userStore         UserStore
+	oauthUsageCache   *oauthUsageCache
+	requestStatsCache *requestStatsCache
 	// oauthUsageFetchMu serializes upstream usage fetches per provider so
 	// concurrent UI polls share one in-flight request after cache miss.
 	oauthUsageFetchMu sync.Map
@@ -124,6 +128,7 @@ func NewServer(router *Router, logs *monitor.Store, stateSaver ...StateSaver) *S
 	if days := router.State().RequestLogRetentionDays; days > 0 {
 		server.requestLogRetentionDays = days
 	}
+	server.log2xxBodies = router.State().Log2xxBodies
 	if len(stateSaver) > 0 {
 		server.stateSaver = stateSaver[0]
 		if store, ok := stateSaver[0].(APIKeyStore); ok {
@@ -172,6 +177,20 @@ func (s *Server) SetRequestLogRetentionDays(days int) int {
 	return days
 }
 
+// Log2xxBodies reports whether successful requests persist their bodies.
+func (s *Server) Log2xxBodies() bool {
+	s.log2xxBodiesMu.RLock()
+	defer s.log2xxBodiesMu.RUnlock()
+	return s.log2xxBodies
+}
+
+// SetLog2xxBodies toggles body logging for successful requests.
+func (s *Server) SetLog2xxBodies(enabled bool) {
+	s.log2xxBodiesMu.Lock()
+	s.log2xxBodies = enabled
+	s.log2xxBodiesMu.Unlock()
+}
+
 // SetTunnelManager attaches the cloudflared lifecycle manager used by the
 // /__public endpoints. It is optional so tests can construct a Server without one.
 func (s *Server) SetTunnelManager(manager *tunnel.Manager) {
@@ -213,6 +232,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /__ui-log", s.handleUILog)
 	mux.HandleFunc("PATCH /__app/log-level", s.handleSetLogLevel)
 	mux.HandleFunc("PATCH /__settings/request-log-retention", s.handleSetRequestLogRetention)
+	mux.HandleFunc("PATCH /__settings/log-2xx-bodies", s.handleSetLog2xxBodies)
 	// Alerting (API key leak detection). Admin-only: these paths are absent from
 	// isUserAllowedPath, and each handler also calls requireAdmin.
 	mux.HandleFunc("GET /__alerts", s.handleListAlerts)
@@ -373,6 +393,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	state.RequestLogRetentionDays = s.RequestLogRetentionDays()
+	state.Log2xxBodies = s.Log2xxBodies()
 	state.WebExposed = s.router.WebExposed()
 	paths := ResolveDataPaths()
 	state.DataPaths = &paths
@@ -842,10 +863,20 @@ func (s *Server) recordRequestLogEx(started time.Time, matchedKey domain.APIKey,
 		ttftMs = latency
 	}
 	prepMs, preUpstreamMs, upstreamTtfbMs, gatewayOverheadMs, convertOutMs, postMs, timingFlags := timing.snapshot(ttftMs, latency)
-	// 非 2xx 错误：保留更完整的请求体，方便排查；2xx 正常请求只留精简体。
-	requestBodyCap := logBodyCapOK
-	if status < 200 || status >= 300 {
+	// 正文（请求体 / 响应体）默认只在失败时记录：这是每请求写盘量的绝对主要来源，
+	// 而成功请求的正文几乎用不到。「失败」除了 status 非 2xx，也包含「status 是
+	// 2xx 但响应体里带 error 负载」——那本质是伪装成成功的失败，恰恰最需要正文
+	// 才能排查。需要连正常成功请求的正文一起留时，在设置里打开「记录成功请求
+	// 正文」，按 logBodyCapOK 截断记录。
+	responseErrorMessage := extractResponseErrorMessage(responseBody)
+	treatAsFailure := status < 200 || status >= 300 || responseErrorMessage != ""
+	logSuccessBodies := s.Log2xxBodies()
+	requestBodyCap := 0
+	switch {
+	case treatAsFailure:
 		requestBodyCap = logBodyCapError
+	case logSuccessBodies:
+		requestBodyCap = logBodyCapOK
 	}
 	entry := monitor.RequestLog{
 		Time:                  started,
@@ -879,12 +910,14 @@ func (s *Server) recordRequestLogEx(started time.Time, matchedKey domain.APIKey,
 	} else if strings.HasPrefix(action, "test_") {
 		entry.APIKeyName = "Route Test"
 	}
-	if status >= 400 || extractResponseErrorMessage(responseBody) != "" {
+	if status >= 400 || responseErrorMessage != "" {
 		entry.ResponseBody = truncateForLog(responseBody, logBodyCapError)
-		entry.ErrorDescription = extractResponseErrorMessage(responseBody)
+		entry.ErrorDescription = responseErrorMessage
 		if entry.ErrorDescription == "" && status >= 400 {
 			entry.ErrorDescription = summarizeUpstreamHTTPError(status, responseBody)
 		}
+	} else if logSuccessBodies {
+		entry.ResponseBody = truncateForLog(responseBody, logBodyCapOK)
 	}
 	s.logs.Add(entry)
 	usageUserID := ""
@@ -920,6 +953,11 @@ func (s *Server) recordRequestLogEx(started time.Time, matchedKey domain.APIKey,
 
 func truncateForLog(data []byte, limit int) string {
 	if len(data) == 0 {
+		return ""
+	}
+	// limit<=0 表示「这类请求不记正文」（见 recordRequestLogEx 里的 2xx 分支），
+	// 必须返回空串而不是只剩一个截断标记的字符串。
+	if limit <= 0 {
 		return ""
 	}
 	if len(data) <= limit {
@@ -975,6 +1013,31 @@ func (s *Server) handleSetRequestLogRetention(w http.ResponseWriter, r *http.Req
 	// 每日用量汇总永久保留，不随请求明细保留天数一起裁剪。
 	s.logs.AddApp("info", "request log retention updated", fmt.Sprintf("days=%d", days))
 	writeJSON(w, http.StatusOK, map[string]any{"requestLogRetentionDays": days})
+}
+
+// handleSetLog2xxBodies toggles whether successful requests persist their
+// request/response bodies into request_logs. Off by default because those
+// bodies dominate per-request disk writes; failures always keep theirs.
+func (s *Server) handleSetLog2xxBodies(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid log2xxBodies json: "+err.Error())
+		return
+	}
+	if payload.Enabled == nil {
+		writeOpenAIError(w, http.StatusBadRequest, "enabled is required")
+		return
+	}
+	s.SetLog2xxBodies(*payload.Enabled)
+	s.router.SetLog2xxBodies(*payload.Enabled)
+	if err := s.saveState(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+		return
+	}
+	s.logs.AddApp("info", "2xx body logging updated", fmt.Sprintf("log2xxBodies=%v", *payload.Enabled))
+	writeJSON(w, http.StatusOK, map[string]any{"log2xxBodies": s.Log2xxBodies()})
 }
 
 func (s *Server) handleSetWebExposed(w http.ResponseWriter, r *http.Request) {
@@ -2872,6 +2935,7 @@ func (s *Server) saveState() error {
 	state := s.router.State()
 	state.LogLevel = s.logs.Level()
 	state.RequestLogRetentionDays = s.RequestLogRetentionDays()
+	state.Log2xxBodies = s.Log2xxBodies()
 	state.WebExposed = s.router.WebExposed()
 	return s.stateSaver.Save(state)
 }

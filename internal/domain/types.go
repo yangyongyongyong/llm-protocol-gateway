@@ -554,6 +554,12 @@ type GatewayState struct {
 	LogLevel     string               `json:"logLevel,omitempty"`
 	// RequestLogRetentionDays controls how long request_logs are kept (default 7).
 	RequestLogRetentionDays int `json:"requestLogRetentionDays,omitempty"`
+	// Log2xxBodies controls whether successful (2xx) requests store their request
+	// and response bodies in request_logs. Off by default: those bodies dominate
+	// the per-request disk write volume, while for a successful request they are
+	// rarely needed. Failed requests always store bodies regardless of this flag,
+	// and so does a 2xx whose response body carries an error payload.
+	Log2xxBodies bool `json:"log2xxBodies"`
 	// WebExposed controls whether the HTTP server binds all interfaces (0.0.0.0)
 	// so LAN / tunnel clients can reach the management UI and APIs. When false,
 	// the server listens on 127.0.0.1 only (local App / loopback).
