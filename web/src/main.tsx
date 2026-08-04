@@ -2029,12 +2029,12 @@ function buildApiKeyCodexConfig(key: APIKey, route: Route | undefined, endpoints
     ? '# 注意：当前密钥输出协议不是 OpenAI Responses，请先改为「OpenAI Responses」\n'
     : '';
   // 保持账号登录：让该 provider 表在 Codex 眼里“长得像官方 openai” provider
-  // （name / supports_websockets 对齐官方形状），使 Codex 官方特性门控（插件市场、
-  // 移动端远程控制等）继续命中；不改 base_url / experimental_bearer_token，
-  // 实际模型流量仍打到本网关。全程不写 ~/.codex/auth.json（本工具从未写过该文件）。
+  // （name 对齐官方形状），使 Codex 官方特性门控（插件市场、移动端远程控制等）
+  // 继续命中；不改 base_url / experimental_bearer_token，实际模型流量仍打到
+  // 本网关。全程不写 ~/.codex/auth.json（本工具从未写过该文件）。
   const providerName = keepOfficialLogin ? 'OpenAI' : (key.name || providerID);
   const keepOfficialComment = keepOfficialLogin
-    ? '# 保持账号登录已开启：name/supports_websockets 已对齐官方 provider 形状\n'
+    ? '# 保持账号登录已开启：name 已对齐官方 provider 形状\n'
     : '';
   return `# ~/.codex/config.toml （用户级；项目内 .codex/config.toml 不会生效 provider）
 # Codex 使用 Responses：base_url 指向网关 /openai/v1，wire_api = "responses"
@@ -2053,7 +2053,14 @@ name = "${providerName}"
 base_url = "${baseURL}"
 wire_api = "responses"
 requires_openai_auth = true
-${keepOfficialLogin ? 'supports_websockets = true\n' : ''}experimental_bearer_token = "${key.key}"
+# Codex 0.118+ 默认会先尝试 WebSocket 连 /v1/responses，这是 OpenAI 内部专用、
+# 没有公开文档的传输协议，第三方网关根本接不住，只会 405 之后重试几轮才退回
+# HTTPS（社区已知问题，如 github.com/openai/codex/issues/13103、#28503）。
+# 显式关闭（即使不是 100% 生效，这是社区公认的缓解办法）。之前"保持账号登录"
+# 会把这里设成 true 让 provider 更像官方，但这恰恰会让 Codex 更倾向于真的去
+# 试 WebSocket，反而更容易触发这个问题——所以这里不再跟随 keepOfficialLogin。
+supports_websockets = false
+experimental_bearer_token = "${key.key}"
 `;
 }
 
@@ -11503,9 +11510,9 @@ function ApiKeyClientConfigModal({
                   void onUpdateField?.(keyItem, 'codexKeepOfficialLogin', next);
                 }}
               />
-              开启后 provider 表会对齐 Codex 官方 provider 形状（name = "OpenAI"、supports_websockets = true），
+              开启后 provider 表会对齐 Codex 官方 provider 形状（name = "OpenAI"），
               尽量保留 Codex 官方插件市场 / 移动端远程控制；不写入也不影响 ~/.codex/auth.json，实际模型流量仍走本网关。
-              默认关闭；若不需要这些官方能力可保持关闭。
+              默认关闭；若不需要这些官方能力可保持关闭。（`supports_websockets` 固定为 false，不受此开关影响——见下方生成脚本注释。）
             </label>
           </div>
         ) : null}
