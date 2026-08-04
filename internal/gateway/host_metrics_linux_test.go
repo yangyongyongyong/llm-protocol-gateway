@@ -10,9 +10,19 @@ func TestParseProcMeminfo(t *testing.T) {
 	if !ok || total != 16384000*1024 || used != (16384000-8192000)*1024 {
 		t.Fatalf("total=%d used=%d ok=%v", total, used, ok)
 	}
-	st, su := parseProcSwap(in)
-	if st != 2048000*1024 || su != 1024000*1024 {
-		t.Fatalf("swap total=%d used=%d", st, su)
+	st, su, sok := parseProcSwap(in)
+	if !sok || st != 2048000*1024 || su != 1024000*1024 {
+		t.Fatalf("swap total=%d used=%d ok=%v", st, su, sok)
+	}
+
+	noSwap := "MemTotal:       16384000 kB\nMemFree:         1000000 kB\nMemAvailable:    8192000 kB\nSwapTotal:              0 kB\nSwapFree:               0 kB\n"
+	st2, su2, sok2 := parseProcSwap(noSwap)
+	if !sok2 || st2 != 0 || su2 != 0 {
+		t.Fatalf("no-swap total=%d used=%d ok=%v", st2, su2, sok2)
+	}
+
+	if _, _, sok3 := parseProcSwap(""); sok3 {
+		t.Fatalf("expected ok=false when /proc/meminfo is unreadable")
 	}
 }
 

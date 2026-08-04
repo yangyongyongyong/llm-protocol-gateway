@@ -61,7 +61,7 @@ func collectHostMetrics(prev any) hostMetricsCollectResult {
 	if total, used, ok := parseProcMeminfo(readFileQuiet("/proc/meminfo")); ok {
 		m.applyMem(total, used)
 	}
-	m.SwapTotal, m.SwapUsed = parseProcSwap(readFileQuiet("/proc/meminfo"))
+	m.SwapTotal, m.SwapUsed, m.SwapAvailable = parseProcSwap(readFileQuiet("/proc/meminfo"))
 	m.applyDiskRoot()
 	applyDiskTemps(&m)
 	applyFanSpeeds(&m)
@@ -129,24 +129,33 @@ func parseProcMeminfo(content string) (total, used uint64, ok bool) {
 	return totalKB * 1024, (totalKB - free) * 1024, true
 }
 
-func parseProcSwap(content string) (total, used uint64) {
+// parseProcSwap returns total/used swap bytes. ok reports whether
+// /proc/meminfo actually contained a SwapTotal line — a real 0 there (no
+// swap configured on this host) is a genuine "not enabled" state, unlike on
+// macOS, so this only reports ok=false when the file couldn't be read/parsed.
+func parseProcSwap(content string) (total, used uint64, ok bool) {
 	var totalKB, freeKB uint64
+	haveTotal := false
 	for _, line := range strings.Split(content, "\n") {
-		key, valKB, ok := parseMeminfoLine(line)
-		if !ok {
+		key, valKB, lineOK := parseMeminfoLine(line)
+		if !lineOK {
 			continue
 		}
 		switch key {
 		case "SwapTotal":
 			totalKB = valKB
+			haveTotal = true
 		case "SwapFree":
 			freeKB = valKB
 		}
 	}
-	if totalKB == 0 || freeKB > totalKB {
-		return totalKB * 1024, 0
+	if !haveTotal {
+		return 0, 0, false
 	}
-	return totalKB * 1024, (totalKB - freeKB) * 1024
+	if totalKB == 0 || freeKB > totalKB {
+		return totalKB * 1024, 0, true
+	}
+	return totalKB * 1024, (totalKB - freeKB) * 1024, true
 }
 
 func parseMeminfoLine(line string) (key string, valueKB uint64, ok bool) {

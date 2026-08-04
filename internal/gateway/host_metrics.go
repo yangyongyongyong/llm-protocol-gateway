@@ -39,12 +39,13 @@ type HostMetrics struct {
 	ThermalPressureSource    string  `json:"thermalPressureSource,omitempty"`
 
 	// Memory (bytes). MemAvailable=false when the platform has no cheap probe.
-	MemTotal     uint64  `json:"memTotal,omitempty"`
-	MemUsed      uint64  `json:"memUsed,omitempty"`
-	MemPercent   float64 `json:"memPercent,omitempty"`
-	MemAvailable bool    `json:"memAvailable"`
-	SwapTotal    uint64  `json:"swapTotal,omitempty"`
-	SwapUsed     uint64  `json:"swapUsed,omitempty"`
+	MemTotal      uint64  `json:"memTotal,omitempty"`
+	MemUsed       uint64  `json:"memUsed,omitempty"`
+	MemPercent    float64 `json:"memPercent,omitempty"`
+	MemAvailable  bool    `json:"memAvailable"`
+	SwapTotal     uint64  `json:"swapTotal,omitempty"`
+	SwapUsed      uint64  `json:"swapUsed,omitempty"`
+	SwapAvailable bool    `json:"swapAvailable"`
 
 	// Root filesystem (bytes).
 	DiskTotal     uint64  `json:"diskTotal,omitempty"`

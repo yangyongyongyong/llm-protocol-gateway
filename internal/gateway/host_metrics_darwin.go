@@ -70,7 +70,7 @@ func collectHostMetrics(prev any) hostMetricsCollectResult {
 		// Without cgo we can still report capacity; usage stays unknown.
 		m.MemTotal = total
 	}
-	m.SwapTotal, m.SwapUsed = darwinSwapUsage()
+	m.SwapTotal, m.SwapUsed, m.SwapAvailable = darwinSwapUsage()
 	m.applyDiskRoot()
 	applyDiskTemps(&m)
 	applyFanSpeeds(&m)
@@ -92,18 +92,23 @@ func collectHostMetrics(prev any) hostMetricsCollectResult {
 	return hostMetricsCollectResult{metrics: m, prev: nextPrev}
 }
 
-// darwinSwapUsage reads vm.swapusage (struct xsw_usage).
-func darwinSwapUsage() (total, used uint64) {
+// darwinSwapUsage reads vm.swapusage (struct xsw_usage). macOS backs swap with
+// dynamically-created files under /private/var/vm/, so total legitimately
+// reads 0 whenever no swap file is currently allocated (e.g. low memory
+// pressure right after boot) — that is NOT the same as swap being disabled.
+// ok reports whether the sysctl read itself succeeded, so callers/UI can tell
+// "known to be 0 right now" apart from "couldn't read this at all".
+func darwinSwapUsage() (total, used uint64, ok bool) {
 	raw, err := unix.SysctlRaw("vm.swapusage")
 	if err != nil || len(raw) < 24 {
-		return 0, 0
+		return 0, 0, false
 	}
 	total = binary.LittleEndian.Uint64(raw[0:8])
 	used = binary.LittleEndian.Uint64(raw[16:24])
 	if used > total {
 		used = total
 	}
-	return total, used
+	return total, used, true
 }
 
 // darwinUptimeSeconds derives host uptime from kern.boottime.
