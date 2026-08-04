@@ -119,6 +119,7 @@ type HostMetrics = {
   memAvailable?: boolean;
   swapTotal?: number;
   swapUsed?: number;
+  swapAvailable?: boolean;
   diskTotal?: number;
   diskUsed?: number;
   diskPercent?: number;
@@ -2204,11 +2205,48 @@ function buildApiKeyCodexConfigPatchScript(
     '        out.append(line)',
     '    return "".join(out)',
     '',
+    '# 迁移防呆：这个"标记包裹整段替换"的设计是后加的——早期版本直接裸写',
+    '# model_provider/model/... 等顶层键和 [model_providers.<id>] 表，不带',
+    '# BEGIN/END。老用户第一次用新版脚本时，strip_provider_block 只认标记，',
+    '# 找不到那段裸内容，于是新内容插到顶部，旧的裸内容原样留在文件后面——',
+    '# provider id 由 key 名派生、不会变，两边表名/顶层键撞在一起，TOML 解析报',
+    '# duplicate key。这里额外扫一遍 rest：摘掉不在任何 [section] 内、且恰好是',
+    '# 本工具管理的那 4 个顶层键的裸赋值，以及表名等于本次要写 id 的裸表——只自愈',
+    '# 这一种已知冲突，不触碰其余任何用户自定义内容（含同名 [section] 之后的字段）。',
+    'import re',
+    'def strip_bare_legacy_content(text: str, provider_id: str) -> str:',
+    '    header = "[model_providers." + provider_id + "]"',
+    '    managed_keys = {"model_provider", "model", "model_reasoning_effort", "model_catalog_json"}',
+    '    out = []',
+    '    seen_table = False',
+    '    skip_table = False',
+    '    for line in text.splitlines(keepends=True):',
+    '        raw = line.rstrip("\\r\\n")',
+    '        if skip_table:',
+    '            if raw.startswith("["):',
+    '                skip_table = False',
+    '            else:',
+    '                continue',
+    '        if raw.startswith("["):',
+    '            seen_table = True',
+    '            if raw == header:',
+    '                skip_table = True',
+    '                continue',
+    '            out.append(line)',
+    '            continue',
+    '        if not seen_table and raw.split("=", 1)[0].strip() in managed_keys:',
+    '            continue',
+    '        out.append(line)',
+    '    return "".join(out)',
+    '',
     'FILE.parent.mkdir(parents=True, exist_ok=True)',
     'rest = ""',
     'if FILE.exists():',
     '    _backup(FILE)',
     '    rest = strip_provider_block(FILE.read_text(encoding="utf-8"))',
+    '    _match = re.search(r"^\\[model_providers\\.(.+)\\]$", NEW_BLOCK, re.MULTILINE)',
+    '    if _match:',
+    '        rest = strip_bare_legacy_content(rest, _match.group(1))',
     'block = NEW_BLOCK if NEW_BLOCK.endswith("\\n") else NEW_BLOCK + "\\n"',
     'merged = f"{BEGIN}\\n{block}{END}\\n\\n{rest}"',
     '_write_text(FILE, merged)',
@@ -9150,7 +9188,7 @@ function App() {
                 <div className="machine-fact"><span>热力等级</span><b>{hostMetrics?.thermalPressureAvailable ? thermalPressureLabel(hostMetrics.thermalPressure) : '—'}</b></div>
                 <div className="machine-fact"><span>Goroutine</span><b>{hostMetrics?.goroutines ?? '—'}</b></div>
                 <div className="machine-fact"><span>网关堆内存</span><b>{hostMetrics?.processHeapMiB != null ? `${hostMetrics.processHeapMiB.toFixed(1)} MiB` : '—'}</b></div>
-                <div className="machine-fact"><span>交换分区</span><b>{hostMetrics?.swapTotal ? `${formatBytes(hostMetrics.swapUsed)} / ${formatBytes(hostMetrics.swapTotal)}` : '未启用'}</b></div>
+                <div className="machine-fact"><span>交换分区</span><b>{hostMetrics?.swapAvailable ? `${formatBytes(hostMetrics.swapUsed ?? 0)} / ${formatBytes(hostMetrics.swapTotal ?? 0)}` : '未启用'}</b></div>
               </div>
             </div>
           </section>
