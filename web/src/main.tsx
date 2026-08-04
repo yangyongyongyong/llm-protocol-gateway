@@ -2047,6 +2047,10 @@ ${warning}${keepOfficialComment}model_provider = "${providerID}"
 model = "${model}"
 model_reasoning_effort = "${effort}"
 model_catalog_json = "${CODEX_MODEL_CATALOG_DISPLAY}"
+# 关闭沙箱、跳过审批确认（等价于 codex --dangerously-bypass-approvals-and-sandbox）：
+# 每个操作都要手动确认太打断节奏，这里直接给最高权限、不做沙箱隔离。
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
 
 [model_providers.${providerID}]
 name = "${providerName}"
@@ -2108,8 +2112,10 @@ function clientConfigTitle(client: 'opencode' | 'codex' | 'claude') {
 
 // Codex config.toml 里，本工具管理的 provider 段的分界线（一对，多个 # 号）。
 // 只有落在这两行之间的内容会被本工具增量替换；文件里其余任何区块
-// （[features]、[memories]、sandbox_mode、approval_policy、personality 等用户
-// 自定义配置）永远原样保留、不会被这份脚本触碰或挪动位置。
+// （[features]、[memories]、personality 等用户自定义配置）永远原样保留、
+// 不会被这份脚本触碰或挪动位置。注意 approval_policy / sandbox_mode 这两个
+// 顶层键现在也由本工具写入这一段（关闭沙箱、跳过审批确认），不再算“用户自己
+// 的配置”——见 buildApiKeyCodexConfig 里的注释。
 const CODEX_PROVIDER_BLOCK_BEGIN = '################ LPG-CODEX-PROVIDER-BEGIN ################';
 const CODEX_PROVIDER_BLOCK_END = '################ LPG-CODEX-PROVIDER-END ################';
 
@@ -2166,8 +2172,9 @@ def _write_text(path: pathlib.Path, text: str) -> None:
  * - 没有配置文件：直接新建，只包含我们这段。
  * - 已有配置文件：先摘掉此前由本工具写入的分界线区块（如果存在），再把新的一段
  *   插到文件最顶部，最后拼回文件原本剩余的全部内容——[features]/[memories]、
- *   sandbox_mode/approval_policy/personality 等用户自己的配置一个字符都不会被
- *   改动，也不会被换位置。
+ *   personality 等用户自己的配置一个字符都不会被改动，也不会被换位置。
+ *   approval_policy / sandbox_mode 现在由本工具管理（关闭沙箱、跳过审批），
+ *   见 strip_bare_legacy_content 的 managed_keys。
  * model catalog 附加文件仍是本工具独占的一个文件，按原方式整份覆盖，不受影响。
  */
 function buildApiKeyCodexConfigPatchScript(
@@ -2218,12 +2225,14 @@ function buildApiKeyCodexConfigPatchScript(
     '# 找不到那段裸内容，于是新内容插到顶部，旧的裸内容原样留在文件后面——',
     '# provider id 由 key 名派生、不会变，两边表名/顶层键撞在一起，TOML 解析报',
     '# duplicate key。这里额外扫一遍 rest：摘掉不在任何 [section] 内、且恰好是',
-    '# 本工具管理的那 4 个顶层键的裸赋值，以及表名等于本次要写 id 的裸表——只自愈',
+    '# 本工具管理的那些顶层键的裸赋值，以及表名等于本次要写 id 的裸表——只自愈',
     '# 这一种已知冲突，不触碰其余任何用户自定义内容（含同名 [section] 之后的字段）。',
+    '# approval_policy/sandbox_mode 很多用户自己也会手动设置成裸顶层键，纳入',
+    '# managed_keys 避免和本工具这次写入的新值撞成 duplicate key。',
     'import re',
     'def strip_bare_legacy_content(text: str, provider_id: str) -> str:',
     '    header = "[model_providers." + provider_id + "]"',
-    '    managed_keys = {"model_provider", "model", "model_reasoning_effort", "model_catalog_json"}',
+    '    managed_keys = {"model_provider", "model", "model_reasoning_effort", "model_catalog_json", "approval_policy", "sandbox_mode"}',
     '    out = []',
     '    seen_table = False',
     '    skip_table = False',
@@ -11525,8 +11534,9 @@ function ApiKeyClientConfigModal({
             {client === 'codex' ? (
               <>
                 终端粘贴执行后会增量合并进 {filePath}：只替换本工具用一对多个 # 号分界线包起来的那一段
-                （provider 相关配置），文件里其他任何区块（比如 [features]、[memories]、
-                sandbox_mode、approval_policy、personality 等你自己的配置）原样保留、不会被改动或
+                （provider 相关配置，其中包含 approval_policy = "never" / sandbox_mode =
+                "danger-full-access"，即关闭沙箱、跳过审批确认）；文件里其他任何区块（比如
+                [features]、[memories]、personality 等你自己的配置）原样保留、不会被改动或
                 挪动位置——对 Codex App 做最小改动。
                 {configExtras.length > 0 ? ` 同时整份覆盖 ${configExtras.map((item) => item.display).join('、')}（本工具独占的模型元数据文件，不影响其他配置）。` : ''}
                 {' '}执行前会先备份为同目录 <code>.bak.时间戳</code>。脚本为 Python（macOS 自带 python3），不再依赖 bash/awk。
