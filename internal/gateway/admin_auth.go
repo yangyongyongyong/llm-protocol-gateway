@@ -25,6 +25,12 @@ const (
 	adminPasswordMinLen    = 8
 	settingAdminPassword   = "adminPasswordHash"
 	settingAdminSession    = "adminSessionSecret"
+	// Public-access control token (see public_access_control.go): a
+	// machine-facing bearer secret whose only capability is flipping public
+	// access on/off, stored like the admin secrets above (settings table,
+	// hash only — never the raw token).
+	settingPublicAccessControlTokenHash    = "publicAccessControlTokenHash"
+	settingPublicAccessControlTokenPreview = "publicAccessControlTokenPreview"
 )
 
 // AdminAuthStore persists the admin password hash and session signing secret.
@@ -102,6 +108,14 @@ func (s *Server) withAdminAuth(next http.Handler) http.Handler {
 		// model as self-register, also bypasses console session/cookie auth
 		// entirely — see authenticateSelfRegistrationRequest.
 		if isSelfCheckPath(r.Method, r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// Public-access on/off toggle: same bearer-token-only trust model, so a
+		// script / LLM agent with the dedicated control token can flip public
+		// access without a console session — see
+		// authenticatePublicAccessControlRequest.
+		if isPublicAccessControlPath(r.Method, r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}

@@ -231,6 +231,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /__public/cloudflare/login/status", s.handleCloudflareLoginStatus)
 	mux.HandleFunc("GET /__public/cloudflare/zones", s.handleCloudflareZones)
 	mux.HandleFunc("POST /__public/cloudflare/bind", s.handleCloudflareBind)
+	// Machine-facing public-access toggle (bearer token, no console session) plus
+	// the admin-only endpoints that mint/inspect/revoke that token.
+	mux.HandleFunc("POST /__public/control", s.handlePublicAccessControl)
+	mux.HandleFunc("GET /__public/control-token", s.handlePublicAccessControlTokenStatus)
+	mux.HandleFunc("POST /__public/control-token", s.handleGeneratePublicAccessControlToken)
+	mux.HandleFunc("POST /__public/control-token/revoke", s.handleRevokePublicAccessControlToken)
 	mux.HandleFunc("POST /__providers", s.handleCreateProvider)
 	mux.HandleFunc("PATCH /__providers/{id}", s.handleUpdateProvider)
 	mux.HandleFunc("GET /__providers/export", s.handleExportProviders)

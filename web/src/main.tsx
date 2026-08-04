@@ -3570,6 +3570,12 @@ function App() {
   const [cloudflareAuthorized, setCloudflareAuthorized] = useState(false);
   const [cloudflareAuthPending, setCloudflareAuthPending] = useState(false);
   const [showManualToken, setShowManualToken] = useState(false);
+  // 公网开关的机器控制令牌（bearer）：只能开/关公网访问，供脚本或 LLM 调用。
+  // rawToken 只在生成那一刻有值，刷新页面后只剩掩码预览。
+  const [publicControlTokenConfigured, setPublicControlTokenConfigured] = useState(false);
+  const [publicControlTokenPreview, setPublicControlTokenPreview] = useState('');
+  const [publicControlRawToken, setPublicControlRawToken] = useState('');
+  const [publicControlTokenBusy, setPublicControlTokenBusy] = useState(false);
   const cloudflarePollRef = useRef<number | null>(null);
   // 5s __state 轮询会不断换新 publicAccess 对象（含 tunnel 状态）。用指纹跳过
   // 「仅运行时变化」的同步，避免正在编辑的子域名前缀被已保存域名盖回去。
@@ -4172,6 +4178,9 @@ function App() {
     if (activeNav === 'public-access' || activeNav === 'settings') {
       void refreshCloudflareAuthStatus();
       void refreshState(false);
+    }
+    if (activeNav === 'public-access') {
+      void refreshPublicControlTokenStatus();
     }
   }, [activeNav]);
 
@@ -5323,6 +5332,61 @@ function App() {
       showToast(`停止公网隧道失败：${String(error)}`);
     } finally {
       setTunnelBusy(false);
+    }
+  }
+
+  async function refreshPublicControlTokenStatus() {
+    try {
+      const response = await fetch(`${API_BASE}/__public/control-token`, { credentials: 'same-origin' });
+      if (!response.ok) return;
+      const data = await response.json() as { configured?: boolean; preview?: string };
+      setPublicControlTokenConfigured(!!data.configured);
+      setPublicControlTokenPreview(data.preview || '');
+    } catch {
+      // 忽略瞬时错误：该面板不是关键路径，下次进页面会重试。
+    }
+  }
+
+  // 生成/重置公网开关控制令牌；原始令牌只在这次响应里出现一次。
+  async function generatePublicControlToken() {
+    setPublicControlTokenBusy(true);
+    try {
+      const response = await fetch(`${API_BASE}/__public/control-token`, {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const data = await response.json() as { token: string; preview?: string };
+      setPublicControlRawToken(data.token);
+      setPublicControlTokenConfigured(true);
+      setPublicControlTokenPreview(data.preview || '');
+      await refreshAppLogs();
+      showToast('已生成公网控制令牌，请立即复制（刷新页面后不再显示）');
+    } catch (error) {
+      showToast(`生成公网控制令牌失败：${String(error)}`);
+    } finally {
+      setPublicControlTokenBusy(false);
+    }
+  }
+
+  async function revokePublicControlToken() {
+    if (!window.confirm('确定撤销公网控制令牌？已发出的令牌会立即失效，脚本 / LLM 将无法再远程开关公网访问。')) return;
+    setPublicControlTokenBusy(true);
+    try {
+      const response = await fetch(`${API_BASE}/__public/control-token/revoke`, {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
+      if (!response.ok) throw new Error(await response.text());
+      setPublicControlRawToken('');
+      setPublicControlTokenConfigured(false);
+      setPublicControlTokenPreview('');
+      await refreshAppLogs();
+      showToast('已撤销公网控制令牌');
+    } catch (error) {
+      showToast(`撤销失败：${String(error)}`);
+    } finally {
+      setPublicControlTokenBusy(false);
     }
   }
 
@@ -7092,6 +7156,30 @@ function App() {
   const lanAccessURL = webExposed
     ? `http://${lanHostHint || '<局域网IP>'}:${portHint}`
     : '已关闭（仅本机可访问）';
+  // 远程开关示例里的 base 地址：该接口拒绝公网调用，所以给的是局域网地址
+  // （没探测到局域网 IP 时退回本机地址），不要给公网域名。
+  const publicControlBaseURL = webExposed && lanHostHint
+    ? `http://${lanHostHint}:${portHint}`
+    : `http://127.0.0.1:${portHint}`;
+  const publicControlCurlExamples = [
+    '# 开启「购买域名」公网访问',
+    `curl -X POST ${publicControlBaseURL}/__public/control \\`,
+    '  -H "Authorization: Bearer <令牌>" \\',
+    '  -H "Content-Type: application/json" \\',
+    `  -d '{"mode":"custom_domain","enabled":true}'`,
+    '',
+    '# 关闭「购买域名」公网访问',
+    `curl -X POST ${publicControlBaseURL}/__public/control \\`,
+    '  -H "Authorization: Bearer <令牌>" \\',
+    '  -H "Content-Type: application/json" \\',
+    `  -d '{"mode":"custom_domain","enabled":false}'`,
+    '',
+    '# 开启 / 关闭「免费随机域名」公网访问（把 enabled 换成 false 即为关闭）',
+    `curl -X POST ${publicControlBaseURL}/__public/control \\`,
+    '  -H "Authorization: Bearer <令牌>" \\',
+    '  -H "Content-Type: application/json" \\',
+    `  -d '{"mode":"random_tunnel","enabled":true}'`,
+  ].join('\n');
   const activeProviderRouteCount = selectedProvider ? (state.apiKeys || []).filter((key) => (
     apiKeyReferencesProvider(key, state.routes, selectedProvider.id)
   )).length : 0;
@@ -8201,6 +8289,77 @@ function App() {
                     {tunnel?.status === 'error' && publicAccess.mode === 'random_tunnel' ? <div className="hint-line error">{tunnel.message}</div> : null}
                   </div>
                 </details>
+              </div>
+            </div>
+
+            <div className="card panel" style={{ gridColumn: '1 / -1' }}>
+              <div className="panel-header">
+                <div>
+                  <h2 className="panel-title">远程开关令牌（脚本 / LLM）</h2>
+                  <p className="panel-desc">
+                    生成一个专用令牌后,脚本或 LLM 可以直接调接口开关公网访问,无需登录控制台。
+                    令牌只能做这一件事,碰不到任何其它管理接口;且该接口<strong>只接受本机 / 局域网调用</strong>,
+                    从公网域名调用会被拒绝。
+                  </p>
+                </div>
+                <Badge tone={publicControlTokenConfigured ? 'green' : 'slate'}>
+                  {publicControlTokenConfigured ? '已启用' : '未启用'}
+                </Badge>
+              </div>
+              <div className="public-simple-card">
+                <div className="hint-line">
+                  {publicControlTokenConfigured
+                    ? `已启用 · 令牌尾号 ****${publicControlTokenPreview || '----'}`
+                    : '尚未生成令牌，生成后才能远程开关。'}
+                </div>
+                {publicControlRawToken ? (
+                  <div className="field field-full">
+                    <label>新令牌（只显示这一次，请立即复制保存）</label>
+                    <div className="field-inline">
+                      <input readOnly value={publicControlRawToken} onFocus={(event) => event.currentTarget.select()} />
+                      <CopyButton value={publicControlRawToken} label="复制令牌" />
+                    </div>
+                  </div>
+                ) : null}
+                <div className="hint-line">
+                  四种操作分别是：购买域名（custom_domain）开 / 关，免费随机域名（random_tunnel）开 / 关。
+                  底层只有一条隧道，开启某一种即切换到该模式；关闭未在运行的那一种是无副作用的空操作。
+                </div>
+                <div className="hint-line">
+                  安全限制：该接口只在本机 / 局域网可用，公网域名调用一律 403 —— 令牌泄露也不会让外网有人替你开关公网。
+                  代价是关掉公网后要重新打开，必须回到本机或局域网操作。
+                </div>
+                <div className="field field-full">
+                  <label>调用示例（把 {'<令牌>'} 换成上面复制到的值）</label>
+                  <pre className="curl-preview">{publicControlCurlExamples}</pre>
+                  <div className="field-inline">
+                    <CopyButton
+                      value={publicControlCurlExamples}
+                      label="复制调用示例"
+                      toastContent="已复制调用示例，可直接贴给 LLM 使用"
+                    />
+                  </div>
+                </div>
+                <div className="public-simple-actions">
+                  <button
+                    className={publicControlTokenConfigured ? 'btn' : 'btn primary'}
+                    type="button"
+                    disabled={publicControlTokenBusy}
+                    onClick={() => void generatePublicControlToken()}
+                  >
+                    {publicControlTokenBusy ? '处理中…' : publicControlTokenConfigured ? '重置令牌' : '生成令牌'}
+                  </button>
+                  {publicControlTokenConfigured ? (
+                    <button
+                      className="btn danger"
+                      type="button"
+                      disabled={publicControlTokenBusy}
+                      onClick={() => void revokePublicControlToken()}
+                    >
+                      {publicControlTokenBusy ? '处理中…' : '撤销令牌'}
+                    </button>
+                  ) : null}
+                </div>
               </div>
             </div>
           </section>
