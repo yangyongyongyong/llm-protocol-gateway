@@ -109,7 +109,16 @@ html[data-theme="dark"] .amber { color: #fcd34d; }
 html[data-theme="dark"] .red { color: #fca5a5; }
 html[data-theme="dark"] .purple { color: #c4b5fd; }
 html[data-theme="dark"] .slate { color: #cbd5e1; }
-.nav { display: grid; gap: 8px; }
+/* 菜单区自身滚动：侧栏是固定高度的 sticky 元素，菜单项多／屏幕矮时以前会溢出
+   且滚不动。让 .nav 吃掉剩余空间并独立滚动，顶部品牌与底部账号区保持常驻。
+   min-height: 0 是必须的：flex 子项默认 min-height:auto 会拒绝收缩，overflow
+   就永远不生效。 */
+.nav { display: grid; gap: 8px; flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
+/* 滚动条只在悬停/滚动时明显，避免常驻占位影响观感。 */
+.nav::-webkit-scrollbar { width: 8px; }
+.nav::-webkit-scrollbar-track { background: transparent; }
+.nav::-webkit-scrollbar-thumb { background: transparent; border-radius: 999px; }
+.nav:hover::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--nav) 28%, transparent); }
 .nav-item { border: 0; width: 100%; cursor: pointer; display: flex; align-items: center; gap: 10px; padding: 10px 11px; border-radius: 14px; color: var(--nav); background: transparent; text-align: left; transition: 0.2s ease; font-size: 13px; text-decoration: none; }
 .nav-item:hover, .nav-item.active { color: var(--text); background: var(--hover); }
 /* 核心配置项（输入 Provider / API 密钥）：置顶 + 淡蓝底色与其他菜单区分。 */
@@ -762,6 +771,9 @@ html[data-theme="dark"] .mini-btn { color: #93c5fd; }
 @media (max-width: 1240px) {
   .shell { grid-template-columns: 1fr; }
   .sidebar { position: relative; top: auto; height: auto; }
+  /* 窄屏下侧栏不再固定高度、改为堆叠在内容上方，菜单区就不该再自己滚动，
+     否则会出现一个矮小的内嵌滚动框。 */
+  .nav { flex: 0 0 auto; min-height: auto; overflow-y: visible; }
   .grid-4 { grid-template-columns: 1fr 1fr; }
   .section-grid, .logs-grid { grid-template-columns: 1fr; }
   .provider-card-grid { grid-template-columns: 1fr; }
