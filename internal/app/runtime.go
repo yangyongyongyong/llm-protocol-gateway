@@ -167,6 +167,9 @@ func (rt *Runtime) Start(cfg Config) error {
 	if state.LogLevel != "" {
 		logs.SetLevel(state.LogLevel)
 	}
+	// Must be set before any request enqueues usage: the worker reads these
+	// thresholds once when it starts.
+	logs.SetUsageBatchConfig(state.UsageBatchMaxSize, time.Duration(state.UsageBatchMaxWaitSeconds)*time.Second)
 	retentionDays := state.RequestLogRetentionDays
 	if retentionDays <= 0 {
 		retentionDays = 7
@@ -428,6 +431,9 @@ func (rt *Runtime) Stop(ctx context.Context) error {
 	}
 	if rt.server != nil {
 		rt.server.StopCursorBridge()
+		// Deferred/batched writers hold data in memory to save disk wear; land
+		// it all before the DB closes so a restart loses nothing.
+		rt.server.FlushDeferredWrites()
 	}
 	var shutdownErr error
 	if rt.httpServer != nil {

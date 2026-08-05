@@ -401,6 +401,17 @@ func (s *Store) Load(defaultState domain.GatewayState) (domain.GatewayState, err
 	if raw := strings.TrimSpace(s.setting("log2xxBodies")); raw != "" {
 		state.Log2xxBodies = raw == "1" || strings.EqualFold(raw, "true")
 	}
+	// 用量统计攒批阈值（0 = 用默认值，由 monitor 侧钳制）。
+	if raw := strings.TrimSpace(s.setting("usageBatchMaxSize")); raw != "" {
+		if size, err := strconv.Atoi(raw); err == nil && size > 0 {
+			state.UsageBatchMaxSize = size
+		}
+	}
+	if raw := strings.TrimSpace(s.setting("usageBatchMaxWaitSeconds")); raw != "" {
+		if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+			state.UsageBatchMaxWaitSeconds = seconds
+		}
+	}
 	if raw := strings.TrimSpace(s.setting("webExposed")); raw != "" {
 		state.WebExposed = raw == "1" || strings.EqualFold(raw, "true")
 	}
@@ -562,6 +573,12 @@ func (s *Store) Save(state domain.GatewayState) error {
 		log2xxBodiesValue = "true"
 	}
 	if err := setSetting(tx, "log2xxBodies", log2xxBodiesValue); err != nil {
+		return err
+	}
+	if err := setSetting(tx, "usageBatchMaxSize", strconv.Itoa(state.UsageBatchMaxSize)); err != nil {
+		return err
+	}
+	if err := setSetting(tx, "usageBatchMaxWaitSeconds", strconv.Itoa(state.UsageBatchMaxWaitSeconds)); err != nil {
 		return err
 	}
 	webExposedValue := "false"

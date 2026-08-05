@@ -8,17 +8,60 @@ import (
 
 const usageEventBuffer = 4096
 
-// usageBatchMaxSize/usageBatchMaxWait bound the async usage worker's batching:
-// it commits one usage_daily_buckets transaction per batch instead of one per
-// request, cutting WAL fsyncs under sustained load. usageBatchMaxWait also
-// bounds the worst-case data-loss window on an ungraceful shutdown (a killed
-// process loses at most this much unpersisted usage-stat delta — the request
-// itself already completed and returned to the client either way, so this
-// only affects the daily usage dashboard, never the proxied response).
+// Defaults for the async usage worker's batching. It commits one
+// usage_daily_buckets transaction per batch instead of one per request, cutting
+// WAL fsyncs (and page-alignment waste) under sustained load.
+//
+// The wait window also bounds the worst-case data-loss window on an ungraceful
+// kill: the request itself already completed and returned to the client, so only
+// the usage dashboard's numbers are at stake, never a proxied response. Graceful
+// shutdown drains the queue (see Store.CloseUsageWorker).
+//
+// Both are configurable — see GatewayState.UsageBatchMaxSize / UsageBatchMaxWaitSeconds.
 const (
-	usageBatchMaxSize = 50
-	usageBatchMaxWait = 300 * time.Millisecond
+	defaultUsageBatchMaxSize = 500
+	defaultUsageBatchMaxWait = time.Minute
+	// usageBatchMaxWaitCap keeps a misconfigured value from parking usage
+	// numbers in memory for hours.
+	usageBatchMaxWaitCap = time.Hour
+	usageBatchMaxSizeCap = 10000
 )
+
+// NormalizeUsageBatchConfig clamps configured values, falling back to the
+// defaults for zero/negative input. Exported so the HTTP handler stores exactly
+// what the worker will run with.
+func NormalizeUsageBatchConfig(maxSize int, maxWait time.Duration) (int, time.Duration) {
+	if maxSize <= 0 {
+		maxSize = defaultUsageBatchMaxSize
+	}
+	if maxSize > usageBatchMaxSizeCap {
+		maxSize = usageBatchMaxSizeCap
+	}
+	if maxWait <= 0 {
+		maxWait = defaultUsageBatchMaxWait
+	}
+	if maxWait > usageBatchMaxWaitCap {
+		maxWait = usageBatchMaxWaitCap
+	}
+	return maxSize, maxWait
+}
+
+// SetUsageBatchConfig overrides the batching thresholds. Must be called before
+// the worker starts (i.e. before the first EnqueueUsage) — the worker reads
+// these once at startup, so a later change would race with it.
+func (s *Store) SetUsageBatchConfig(maxSize int, maxWait time.Duration) {
+	maxSize, maxWait = NormalizeUsageBatchConfig(maxSize, maxWait)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.usageBatchMaxSize = maxSize
+	s.usageBatchMaxWait = maxWait
+}
+
+func (s *Store) usageBatchConfig() (int, time.Duration) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return NormalizeUsageBatchConfig(s.usageBatchMaxSize, s.usageBatchMaxWait)
+}
 
 // UsageEvent is a lightweight usage record queued after each request completes.
 //
@@ -75,13 +118,37 @@ func newUsageDayStats() *usageDayStats {
 func (s *Store) startUsageWorker() {
 	s.usageOnce.Do(func() {
 		s.usageEvents = make(chan UsageEvent, usageEventBuffer)
+		s.usageStop = make(chan struct{})
+		s.usageStopped = make(chan struct{})
 		go s.usageWorker()
 	})
 }
 
+// CloseUsageWorker persists whatever the worker has queued and waits for it to
+// finish. Called on graceful shutdown so a restart does not discard the current
+// batch. Safe to call when the worker never started, and safe to call twice.
+//
+// Deliberately signals via a stop channel rather than closing usageEvents:
+// EnqueueUsage runs on request goroutines, and a send on a closed channel would
+// panic if a request landed mid-shutdown.
+func (s *Store) CloseUsageWorker() {
+	s.mu.RLock()
+	stop := s.usageStop
+	stopped := s.usageStopped
+	s.mu.RUnlock()
+	if stop == nil || stopped == nil {
+		return
+	}
+	s.usageCloseOnce.Do(func() { close(stop) })
+	<-stopped
+}
+
 func (s *Store) usageWorker() {
-	batch := make([]UsagePersistDelta, 0, usageBatchMaxSize)
-	timer := time.NewTimer(usageBatchMaxWait)
+	defer close(s.usageStopped)
+
+	maxSize, maxWait := s.usageBatchConfig()
+	batch := make([]UsagePersistDelta, 0, maxSize)
+	timer := time.NewTimer(maxWait)
 	defer timer.Stop()
 
 	flush := func() {
@@ -94,19 +161,26 @@ func (s *Store) usageWorker() {
 
 	for {
 		select {
-		case event, ok := <-s.usageEvents:
-			if !ok {
-				flush()
-				return
-			}
+		case event := <-s.usageEvents:
 			batch = append(batch, s.applyUsageEventLocked(event))
-			if len(batch) >= usageBatchMaxSize {
+			if len(batch) >= maxSize {
 				flush()
-				timer.Reset(usageBatchMaxWait)
+				timer.Reset(maxWait)
 			}
 		case <-timer.C:
 			flush()
-			timer.Reset(usageBatchMaxWait)
+			timer.Reset(maxWait)
+		case <-s.usageStop:
+			// Drain what producers already queued, then persist and exit.
+			for {
+				select {
+				case event := <-s.usageEvents:
+					batch = append(batch, s.applyUsageEventLocked(event))
+				default:
+					flush()
+					return
+				}
+			}
 		}
 	}
 }

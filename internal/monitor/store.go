@@ -257,6 +257,12 @@ type Store struct {
 	usageEvents      chan UsageEvent
 	usageOnce        sync.Once
 	usageDailyStore  UsageDailyStore
+	// Usage batching thresholds (0 = use defaults) and shutdown plumbing.
+	usageBatchMaxSize int
+	usageBatchMaxWait time.Duration
+	usageStop         chan struct{}
+	usageStopped      chan struct{}
+	usageCloseOnce    sync.Once
 }
 
 func NewStore() *Store {

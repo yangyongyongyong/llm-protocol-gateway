@@ -134,6 +134,13 @@ func (r *Router) SetLog2xxBodies(enabled bool) {
 	r.state.Log2xxBodies = enabled
 }
 
+func (r *Router) SetUsageBatchConfig(maxSize, maxWaitSeconds int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.UsageBatchMaxSize = maxSize
+	r.state.UsageBatchMaxWaitSeconds = maxWaitSeconds
+}
+
 func (r *Router) SetWebExposed(enabled bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

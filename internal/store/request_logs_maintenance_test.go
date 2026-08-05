@@ -156,3 +156,51 @@ func openWithAutoVacuum(path, mode string) (*Store, error) {
 	}
 	return s, nil
 }
+
+// AppendRequestLogs must write every row in one transaction and be a no-op on
+// an empty batch (the gateway's flusher calls it on every timer tick).
+func TestAppendRequestLogsBatch(t *testing.T) {
+	t.Parallel()
+	s, err := Open(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	if err := s.AppendRequestLogs(nil); err != nil {
+		t.Fatalf("empty batch should be a no-op: %v", err)
+	}
+
+	base := time.Now().UTC()
+	batch := make([]monitor.RequestLog, 0, 3)
+	for i := 0; i < 3; i++ {
+		batch = append(batch, monitor.RequestLog{
+			Time:       base.Add(time.Duration(i) * time.Second),
+			Status:     200,
+			APIKeyID:   "k1",
+			APIKeyName: "main",
+			Model:      "m1",
+		})
+	}
+	// A zero Time must be filled in rather than persisted as an empty string.
+	batch = append(batch, monitor.RequestLog{Status: 200, APIKeyID: "k1", Model: "m1"})
+
+	if err := s.AppendRequestLogs(batch); err != nil {
+		t.Fatalf("AppendRequestLogs: %v", err)
+	}
+	page, err := s.QueryRequestLogs(monitor.RequestLogQuery{Page: 1, PageSize: 50, Status: "all"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != len(batch) {
+		t.Fatalf("persisted %d rows, want %d", page.Total, len(batch))
+	}
+	for _, item := range page.Items {
+		if item.Time.IsZero() {
+			t.Fatalf("row persisted without a timestamp: %+v", item)
+		}
+		if item.Model != "m1" || item.APIKeyID != "k1" {
+			t.Fatalf("row fields lost: %+v", item)
+		}
+	}
+}

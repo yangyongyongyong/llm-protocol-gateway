@@ -99,9 +99,21 @@ func (b *Bridge) tokenFilePathLocked() string {
 	return path
 }
 
+// writeToken persists the access token, skipping the write when the file
+// already holds exactly this value.
+//
+// EnsureRunning is called on every Cursor-routed request, so an unconditional
+// write here meant one full file rewrite per request even in the steady state
+// where the token has not changed. Reading first is cheap (the file is a few
+// hundred bytes and stays in the page cache) and turns the common case into
+// zero disk writes.
 func (b *Bridge) writeToken(token string) error {
 	path := b.TokenFilePath()
-	return os.WriteFile(path, []byte(strings.TrimSpace(token)), 0o600)
+	token = strings.TrimSpace(token)
+	if existing, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(existing)) == token {
+		return nil
+	}
+	return os.WriteFile(path, []byte(token), 0o600)
 }
 
 func (b *Bridge) bridgeDir() string {

@@ -49,6 +49,8 @@ type ProviderOAuthSaver interface {
 type RequestLogStore interface {
 	AppendRequestLog(monitor.RequestLog) error
 	AppendRequestLogWithRetention(monitor.RequestLog, int) error
+	// AppendRequestLogs writes many rows in one transaction (batched successes).
+	AppendRequestLogs([]monitor.RequestLog) error
 	ListRequestLogs(int) ([]monitor.RequestLog, error)
 	QueryRequestLogs(monitor.RequestLogQuery) (monitor.RequestLogPage, error)
 	PruneRequestLogs(int) error
@@ -66,6 +68,7 @@ type Server struct {
 	apiKeyToucher           *apiKeyToucher
 	providerOAuthSaver      ProviderOAuthSaver
 	requestLogStore         RequestLogStore
+	requestLogBatcher       *requestLogBatcher
 	usageDailyStore         UsageDailyStore
 	alertStore              AlertStore
 	tunnels                 *tunnel.Manager
@@ -141,6 +144,11 @@ func NewServer(router *Router, logs *monitor.Store, stateSaver ...StateSaver) *S
 		}
 		if rls, ok := stateSaver[0].(RequestLogStore); ok {
 			server.requestLogStore = rls
+			// Successful requests batch into one commit per minute; failures are
+			// written through immediately (see requestLogBatcher).
+			server.requestLogBatcher = newRequestLogBatcher(rls, server.RequestLogRetentionDays, func(message, context string) {
+				logs.AddApp("warn", message, context)
+			}, requestLogBatchInterval, requestLogBatchMax)
 		}
 		if uds, ok := stateSaver[0].(UsageDailyStore); ok {
 			server.usageDailyStore = uds
@@ -233,6 +241,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /__app/log-level", s.handleSetLogLevel)
 	mux.HandleFunc("PATCH /__settings/request-log-retention", s.handleSetRequestLogRetention)
 	mux.HandleFunc("PATCH /__settings/log-2xx-bodies", s.handleSetLog2xxBodies)
+	mux.HandleFunc("PATCH /__settings/usage-batch", s.handleSetUsageBatch)
 	// Alerting (API key leak detection). Admin-only: these paths are absent from
 	// isUserAllowedPath, and each handler also calls requireAdmin.
 	mux.HandleFunc("GET /__alerts", s.handleListAlerts)
@@ -394,6 +403,15 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	}
 	state.RequestLogRetentionDays = s.RequestLogRetentionDays()
 	state.Log2xxBodies = s.Log2xxBodies()
+	// Send the effective values, not the raw 0-means-default ones: both fields
+	// are omitempty, so a stored 0 would vanish from the payload and the console
+	// would show its hardcoded placeholders instead of what the worker runs with.
+	effectiveBatchSize, effectiveBatchWait := monitor.NormalizeUsageBatchConfig(
+		state.UsageBatchMaxSize,
+		time.Duration(state.UsageBatchMaxWaitSeconds)*time.Second,
+	)
+	state.UsageBatchMaxSize = effectiveBatchSize
+	state.UsageBatchMaxWaitSeconds = int(effectiveBatchWait / time.Second)
 	state.WebExposed = s.router.WebExposed()
 	paths := ResolveDataPaths()
 	state.DataPaths = &paths
@@ -522,6 +540,8 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	// 密钥改名后，历史日志仍存着旧名字：按不变的 ID 过滤，才能筛出改名前的记录。
 	query = resolveLogKeyNameFilter(s.router.State().APIKeys, query)
+	// 成功请求是攒批落库的；先落盘再查，控制台才不会漏掉刚刚发生的请求。
+	s.FlushRequestLogs()
 	if s.requestLogStore != nil {
 		page, err := s.requestLogStore.QueryRequestLogs(query)
 		if err == nil {
@@ -643,6 +663,8 @@ func (s *Server) loadRequestLogsForStats(from, to time.Time, limit int) []monito
 	if s.requestLogStore == nil {
 		return nil
 	}
+	// 与 handleLogs 同理：先把攒批中的成功请求落库，统计才不会少算刚发生的请求。
+	s.FlushRequestLogs()
 	if limit <= 0 {
 		limit = 5000
 	}
@@ -945,10 +967,42 @@ func (s *Server) recordRequestLogEx(started time.Time, matchedKey domain.APIKey,
 		TTFTMs:    ttftMs,
 	})
 	if s.requestLogStore != nil {
-		if err := s.requestLogStore.AppendRequestLogWithRetention(entry, s.RequestLogRetentionDays()); err != nil {
+		if s.requestLogBatcher != nil {
+			s.requestLogBatcher.Append(entry, treatAsFailure)
+		} else if err := s.requestLogStore.AppendRequestLogWithRetention(entry, s.RequestLogRetentionDays()); err != nil {
 			s.logs.AddApp("warn", "failed to persist request log", err.Error())
 		}
 	}
+}
+
+// FlushRequestLogs persists any batched successful request logs immediately.
+// Called before reading the log page (so the console never misses a recent
+// request) and on graceful shutdown.
+func (s *Server) FlushRequestLogs() {
+	s.requestLogBatcher.Flush()
+}
+
+// CloseRequestLogBatcher flushes and stops the background batcher.
+func (s *Server) CloseRequestLogBatcher() {
+	s.requestLogBatcher.Close()
+}
+
+// FlushDeferredWrites lands everything the gateway persists lazily, then stops
+// the background flushers. Call on graceful shutdown, before closing the DB.
+//
+// Every deferred writer must be represented here — each one buys lower disk
+// wear by holding data in memory, and that trade is only sound if a clean
+// shutdown still writes it out.
+func (s *Server) FlushDeferredWrites() {
+	// Batched success rows (up to requestLogBatchInterval of them).
+	s.requestLogBatcher.Close()
+	// Queued usage deltas (up to one batch window).
+	s.logs.CloseUsageWorker()
+	// last_used_at values skipped by the 5-min-per-key throttle.
+	s.apiKeyToucher.Close()
+	// last_active_at values skipped by the 5-min-per-user throttle. The flush
+	// goroutine's ctx is never cancelled, so force a flush directly here.
+	s.flushUserActivity(true)
 }
 
 func truncateForLog(data []byte, limit int) string {
@@ -1038,6 +1092,49 @@ func (s *Server) handleSetLog2xxBodies(w http.ResponseWriter, r *http.Request) {
 	}
 	s.logs.AddApp("info", "2xx body logging updated", fmt.Sprintf("log2xxBodies=%v", *payload.Enabled))
 	writeJSON(w, http.StatusOK, map[string]any{"log2xxBodies": s.Log2xxBodies()})
+}
+
+// handleSetUsageBatch tunes how the async usage worker batches its commits.
+// Takes effect on the next gateway start: the worker reads the thresholds once
+// when it launches, so changing them live would race with it.
+func (s *Server) handleSetUsageBatch(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		MaxSize        *int `json:"maxSize"`
+		MaxWaitSeconds *int `json:"maxWaitSeconds"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid usage batch json: "+err.Error())
+		return
+	}
+	if payload.MaxSize == nil && payload.MaxWaitSeconds == nil {
+		writeOpenAIError(w, http.StatusBadRequest, "at least one of maxSize/maxWaitSeconds is required")
+		return
+	}
+	state := s.router.State()
+	maxSize := state.UsageBatchMaxSize
+	maxWaitSeconds := state.UsageBatchMaxWaitSeconds
+	if payload.MaxSize != nil {
+		maxSize = *payload.MaxSize
+	}
+	if payload.MaxWaitSeconds != nil {
+		maxWaitSeconds = *payload.MaxWaitSeconds
+	}
+	// Reuse monitor's clamping so the stored value matches what the worker will
+	// actually run with (and 0 keeps meaning "use the default").
+	normalizedSize, normalizedWait := monitor.NormalizeUsageBatchConfig(maxSize, time.Duration(maxWaitSeconds)*time.Second)
+	maxSize = normalizedSize
+	maxWaitSeconds = int(normalizedWait / time.Second)
+
+	s.router.SetUsageBatchConfig(maxSize, maxWaitSeconds)
+	if err := s.saveState(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+		return
+	}
+	s.logs.AddApp("info", "usage batch config updated", fmt.Sprintf("maxSize=%d maxWaitSeconds=%d (restart to apply)", maxSize, maxWaitSeconds))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"usageBatchMaxSize":        maxSize,
+		"usageBatchMaxWaitSeconds": maxWaitSeconds,
+	})
 }
 
 func (s *Server) handleSetWebExposed(w http.ResponseWriter, r *http.Request) {

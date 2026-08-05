@@ -335,6 +335,20 @@ func (s *Server) finishCursorOAuthExchange(providerID string, cred domain.Cursor
 	return updated, nil
 }
 
+// sameModelCatalog reports whether two model lists are identical. domain.Model
+// is a flat comparable struct, so element-wise == is exact.
+func sameModelCatalog(a, b []domain.Model) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Server) syncCursorProviderModels(providerID string) (domain.Provider, error) {
 	provider, err := s.router.ProviderByID(providerID)
 	if err != nil {
@@ -354,10 +368,22 @@ func (s *Server) syncCursorProviderModels(providerID string) (domain.Provider, e
 		s.logs.AddApp("warn", "cursor oauth model sync returned empty list", providerID)
 		return provider, fmt.Errorf("cursor model list is empty")
 	}
+	// Snapshot before the update: UpdateProviderModels assigns a fresh slice
+	// rather than mutating in place, so this stays valid afterwards.
+	before := provider.Models
+	beforeHealth := provider.HealthStatus
 	updated, err := s.router.UpdateProviderModels(providerID, result.Models, "healthy")
 	if err != nil {
 		s.logs.AddApp("warn", "cursor oauth model sync save failed", err.Error())
 		return provider, err
+	}
+	// The periodic refresh (every 30 min) almost always fetches an unchanged
+	// catalog, and saveState() is a full DELETE+re-INSERT of
+	// providers/models/routes — skip it when nothing actually changed. Health
+	// status is checked too: UpdateProviderModels also marks the provider
+	// healthy, and a recovery from an error state must still be persisted.
+	if sameModelCatalog(before, updated.Models) && beforeHealth == updated.HealthStatus {
+		return updated, nil
 	}
 	if err := s.saveState(); err != nil {
 		return updated, err

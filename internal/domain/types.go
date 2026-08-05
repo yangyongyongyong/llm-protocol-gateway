@@ -560,6 +560,13 @@ type GatewayState struct {
 	// rarely needed. Failed requests always store bodies regardless of this flag,
 	// and so does a 2xx whose response body carries an error payload.
 	Log2xxBodies bool `json:"log2xxBodies"`
+	// UsageBatchMaxSize / UsageBatchMaxWaitSeconds tune how the async usage
+	// worker batches usage_daily_buckets commits. Larger values mean fewer,
+	// bigger commits (less disk wear) at the cost of a longer window whose
+	// stats an ungraceful kill would lose. Zero means use the defaults
+	// (500 events / 60s).
+	UsageBatchMaxSize        int `json:"usageBatchMaxSize,omitempty"`
+	UsageBatchMaxWaitSeconds int `json:"usageBatchMaxWaitSeconds,omitempty"`
 	// WebExposed controls whether the HTTP server binds all interfaces (0.0.0.0)
 	// so LAN / tunnel clients can reach the management UI and APIs. When false,
 	// the server listens on 127.0.0.1 only (local App / loopback).

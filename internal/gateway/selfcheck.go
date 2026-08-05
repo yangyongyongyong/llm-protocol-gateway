@@ -7,10 +7,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -48,9 +50,9 @@ const (
 const selfcheckCasesPerProvider = 6
 
 type selfcheckStartRequest struct {
-	ProviderIDs []string          `json:"providerIds"`
-	TimeoutMs   int               `json:"timeoutMs"`
-	Prompt      string            `json:"prompt"`
+	ProviderIDs []string `json:"providerIds"`
+	TimeoutMs   int      `json:"timeoutMs"`
+	Prompt      string   `json:"prompt"`
 	// Models maps providerID → model id used for that provider's cases.
 	Models map[string]string `json:"models,omitempty"`
 }
@@ -119,11 +121,11 @@ func selfcheckCaseID(providerID string, client selfcheckClientCase, kind selfche
 }
 
 type selfcheckToolInfo struct {
-	ID      string `json:"id"`
-	Label   string `json:"label"`
-	Path    string `json:"path"`
-	Found   bool   `json:"found"`
-	Client  string `json:"client"`
+	ID       string `json:"id"`
+	Label    string `json:"label"`
+	Path     string `json:"path"`
+	Found    bool   `json:"found"`
+	Client   string `json:"client"`
 	Protocol string `json:"protocol"`
 }
 
@@ -137,7 +139,7 @@ func (s *Server) ensureSelfcheckStore() {
 
 func (s *Server) handleSelfcheckTools(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"tools": resolveSelfcheckTools(),
+		"tools":   resolveSelfcheckTools(),
 		"lanRoot": selfcheckLANRoot(s.router.State()),
 	})
 }
@@ -295,6 +297,12 @@ func (s *Server) handleSelfcheckRetry(w http.ResponseWriter, r *http.Request) {
 				item.apiKey = key.Key
 				item.model = model
 				item.routeCreated = created
+				// ensureSelfcheckRouteAndKey leaves persistence to its caller.
+				if created {
+					if err := s.saveState(); err != nil {
+						s.logs.AddApp("warn", "selfcheck retry route save failed", err.Error())
+					}
+				}
 			} else {
 				item.setupErr = err.Error()
 			}
@@ -350,6 +358,12 @@ func (s *Server) runSelfcheckJob(job *selfcheckJob, providerIDs []string) {
 		}
 		// 无论成功、失败、panic 或进程即将退出前跑完本函数，都扫掉 selfcheck-* 密钥。
 		s.cleanupSelfcheckArtifacts(routeIDs)
+		// 每个 job 目录里是一整套 per-case 客户端 home（动辄上百 MiB），只保留
+		// 最近几次；当前这次不删，结果页可能还要看它的产物。
+		if removed, freed := pruneSelfcheckJobDirs(job.ID); removed > 0 {
+			s.logs.AddApp("info", "selfcheck cache pruned",
+				fmt.Sprintf("dirs=%d freedMiB=%d kept=%d", removed, freed/(1024*1024), selfcheckJobDirsKept))
+		}
 	}()
 
 	cases := make([]preparedCase, 0, len(providerIDs)*selfcheckCasesPerProvider)
@@ -406,6 +420,15 @@ func (s *Server) runSelfcheckJob(job *selfcheckJob, providerIDs []string) {
 					setupErr:     setupErr,
 				})
 			}
+		}
+	}
+
+	// One full-state write for every route this run created, instead of one per
+	// route inside ensureSelfcheckRouteAndKey (saveState rewrites
+	// providers/models/routes wholesale).
+	if len(routeIDs) > 0 {
+		if err := s.saveState(); err != nil {
+			s.logs.AddApp("warn", "selfcheck route save failed", err.Error())
 		}
 	}
 
@@ -482,9 +505,14 @@ func (s *Server) cleanupSelfcheckArtifacts(routeIDs map[string]struct{}) {
 }
 
 // SweepSelfcheckLeftovers removes any leftover selfcheck-* API keys (and orphan
-// routes created solely for them) after a crash/restart interrupted a prior run.
+// routes created solely for them) after a crash/restart interrupted a prior run,
+// and prunes stale job directories out of the cache.
 func (s *Server) SweepSelfcheckLeftovers() {
 	s.cleanupSelfcheckArtifacts(nil)
+	if removed, freed := pruneSelfcheckJobDirs(""); removed > 0 {
+		s.logs.AddApp("info", "selfcheck cache pruned",
+			fmt.Sprintf("dirs=%d freedMiB=%d kept=%d", removed, freed/(1024*1024), selfcheckJobDirsKept))
+	}
 }
 
 func (s *Server) runPreparedSelfcheckCase(
@@ -609,6 +637,14 @@ func normalizeSelfcheckModels(raw map[string]string, providerIDs []string) map[s
 	return out
 }
 
+// ensureSelfcheckRouteAndKey prepares the route/key a case needs.
+//
+// It never calls saveState itself: a run prepares providers × 3 protocols
+// serially, and saveState is a full DELETE+re-INSERT of
+// providers/models/routes, so saving per route would issue one full rewrite per
+// created route. Callers persist once instead — see the routeCreated return
+// value. (API keys are unaffected: they go through apiKeyStore's incremental
+// single-row CRUD, not saveState.)
 func (s *Server) ensureSelfcheckRouteAndKey(provider domain.Provider, protocol domain.Protocol, preferredModel string) (domain.Route, domain.APIKey, string, bool, error) {
 	preferredModel = strings.TrimSpace(preferredModel)
 	state := s.router.State()
@@ -624,9 +660,6 @@ func (s *Server) ensureSelfcheckRouteAndKey(provider domain.Provider, protocol d
 		})
 		if err != nil {
 			return domain.Route{}, domain.APIKey{}, "", false, fmt.Errorf("create route: %w", err)
-		}
-		if err := s.saveState(); err != nil {
-			return domain.Route{}, domain.APIKey{}, "", false, fmt.Errorf("save route: %w", err)
 		}
 		route = created
 		routeCreated = true
@@ -763,6 +796,81 @@ func selfcheckCacheRoot() string {
 	return filepath.Join(os.TempDir(), "llm-gateway-selfcheck")
 }
 
+// selfcheckJobDirsKept is how many past job directories survive a sweep.
+//
+// Each job dir holds a full per-case client home (codex-home, opencode config,
+// auth files) and routinely reaches 100+ MiB; keeping every run indefinitely is
+// what let this cache grow to ~800 MiB. The most recent runs are the only ones
+// with diagnostic value, so keep a couple and drop the rest.
+const selfcheckJobDirsKept = 2
+
+// pruneSelfcheckJobDirs deletes all but the newest selfcheckJobDirsKept job
+// directories under the selfcheck cache root, plus any directory whose job is
+// currently running (identified by keepJobID) regardless of age.
+func pruneSelfcheckJobDirs(keepJobID string) (removed int, freedBytes int64) {
+	return pruneSelfcheckJobDirsIn(selfcheckCacheRoot(), keepJobID)
+}
+
+// pruneSelfcheckJobDirsIn is pruneSelfcheckJobDirs with an explicit root, so
+// tests need not chdir the whole process to reach a temp cache.
+func pruneSelfcheckJobDirsIn(root, keepJobID string) (removed int, freedBytes int64) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return 0, 0
+	}
+	type jobDir struct {
+		name    string
+		modTime time.Time
+	}
+	dirs := make([]jobDir, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "sc-") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		dirs = append(dirs, jobDir{name: entry.Name(), modTime: info.ModTime()})
+	}
+	// Newest first; keep the head of the list.
+	sort.Slice(dirs, func(i, j int) bool { return dirs[i].modTime.After(dirs[j].modTime) })
+
+	kept := 0
+	for _, dir := range dirs {
+		if dir.name == keepJobID {
+			continue
+		}
+		if kept < selfcheckJobDirsKept {
+			kept++
+			continue
+		}
+		path := filepath.Join(root, dir.name)
+		size := dirSizeBytes(path)
+		if err := os.RemoveAll(path); err != nil {
+			continue
+		}
+		removed++
+		freedBytes += size
+	}
+	return removed, freedBytes
+}
+
+// dirSizeBytes best-effort sums a directory's file sizes (for the log line).
+func dirSizeBytes(path string) int64 {
+	var total int64
+	_ = filepath.WalkDir(path, func(_ string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return nil
+		}
+		if info, err := entry.Info(); err == nil {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
+
 func newSelfcheckJobID() (string, error) {
 	buf := make([]byte, 8)
 	if _, err := rand.Read(buf); err != nil {
@@ -827,8 +935,8 @@ func contentLooksOK(text, prompt string) bool {
 // proves the model actually invoked a shell/file tool end-to-end through the
 // gateway's protocol conversion (not just produced text).
 type selfcheckToolProbe struct {
-	path  string
-	token string
+	path   string
+	token  string
 	prompt string
 }
 

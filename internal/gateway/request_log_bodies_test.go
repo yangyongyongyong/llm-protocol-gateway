@@ -146,3 +146,50 @@ func TestLog2xxBodiesEndpointRoundTrip(t *testing.T) {
 		t.Fatalf("missing enabled: status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+// GatewayState's usage-batch fields are omitempty, so a stored 0 ("use the
+// defaults") would disappear from /__state and the console would fall back to
+// its hardcoded placeholders. The handler must send the effective values.
+func TestStateExposesEffectiveUsageBatchConfig(t *testing.T) {
+	fetchState := func(t *testing.T, state domain.GatewayState) map[string]any {
+		t.Helper()
+		server := NewServer(NewRouter(state), monitor.NewStore())
+		server.SetAdminAuthStore(newMemoryAdminAuthStore())
+		req := httptest.NewRequest(http.MethodGet, "/__state", nil)
+		req.Host = "127.0.0.1:18093"
+		req.RemoteAddr = "127.0.0.1:4321"
+		rec := httptest.NewRecorder()
+		server.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		return payload
+	}
+
+	// Unset (0) must report the defaults rather than being omitted.
+	payload := fetchState(t, domain.GatewayState{})
+	size, ok := payload["usageBatchMaxSize"]
+	if !ok {
+		t.Fatal("usageBatchMaxSize missing from /__state when unset")
+	}
+	wait, ok := payload["usageBatchMaxWaitSeconds"]
+	if !ok {
+		t.Fatal("usageBatchMaxWaitSeconds missing from /__state when unset")
+	}
+	if size.(float64) <= 0 || wait.(float64) <= 0 {
+		t.Fatalf("expected positive defaults, got size=%v wait=%v", size, wait)
+	}
+
+	// An explicit configuration must round-trip unchanged.
+	payload = fetchState(t, domain.GatewayState{UsageBatchMaxSize: 250, UsageBatchMaxWaitSeconds: 30})
+	if got := payload["usageBatchMaxSize"].(float64); got != 250 {
+		t.Fatalf("usageBatchMaxSize = %v, want 250", got)
+	}
+	if got := payload["usageBatchMaxWaitSeconds"].(float64); got != 30 {
+		t.Fatalf("usageBatchMaxWaitSeconds = %v, want 30", got)
+	}
+}

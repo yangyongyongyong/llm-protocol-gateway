@@ -564,6 +564,9 @@ type GatewayState = {
   requestLogRetentionDays?: number;
   /** When true, successful (2xx) requests also persist their bodies. */
   log2xxBodies?: boolean;
+  /** Async usage-stat batching thresholds (0 = backend defaults). */
+  usageBatchMaxSize?: number;
+  usageBatchMaxWaitSeconds?: number;
   /** When true, HTTP binds 0.0.0.0 (LAN / tunnel). When false, loopback only. */
   webExposed?: boolean;
   dataPaths?: DataPaths;
@@ -3542,6 +3545,9 @@ function App() {
   const [requestLogRetentionDays, setRequestLogRetentionDays] = useState(7);
   // 成功请求是否落正文：默认关（正文是每请求写盘量的主要来源）。
   const [log2xxBodies, setLog2xxBodies] = useState(false);
+  // 用量统计攒批阈值:改动需重启网关才生效(worker 启动时读一次)。
+  const [usageBatchMaxSize, setUsageBatchMaxSize] = useState(500);
+  const [usageBatchMaxWaitSeconds, setUsageBatchMaxWaitSeconds] = useState(60);
   const [usageFrom, setUsageFrom] = useState(() => formatLocalISODate(new Date()));
   const [usageTo, setUsageTo] = useState(() => formatLocalISODate(new Date()));
   // 背景轮询拿到的是首次渲染的闭包，必须经 ref 读取最新区间，
@@ -4839,6 +4845,8 @@ function App() {
         setRequestLogRetentionDays(data.requestLogRetentionDays);
       }
       setLog2xxBodies(data.log2xxBodies === true);
+      if (data.usageBatchMaxSize && data.usageBatchMaxSize > 0) setUsageBatchMaxSize(data.usageBatchMaxSize);
+      if (data.usageBatchMaxWaitSeconds && data.usageBatchMaxWaitSeconds > 0) setUsageBatchMaxWaitSeconds(data.usageBatchMaxWaitSeconds);
       markBackendReachable();
       setDataFetchedAt(new Date());
       writeUICache(uiCacheScope(authStatusRef.current), 'state', normalized);
@@ -4988,6 +4996,26 @@ function App() {
       const data = await response.json() as { log2xxBodies: boolean };
       setLog2xxBodies(data.log2xxBodies);
       showToast(data.log2xxBodies ? '已开启记录成功请求正文（写盘量会显著上升）' : '已关闭记录成功请求正文');
+    } catch (error) {
+      showToast(`更新失败：${String(error)}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function updateUsageBatch(maxSize: number, maxWaitSeconds: number) {
+    setSaving(true);
+    try {
+      const response = await fetch(`${API_BASE}/__settings/usage-batch`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ maxSize, maxWaitSeconds }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const data = await response.json() as { usageBatchMaxSize: number; usageBatchMaxWaitSeconds: number };
+      setUsageBatchMaxSize(data.usageBatchMaxSize);
+      setUsageBatchMaxWaitSeconds(data.usageBatchMaxWaitSeconds);
+      showToast(`用量统计攒批已设为 ${data.usageBatchMaxSize} 条 / ${data.usageBatchMaxWaitSeconds} 秒（重启网关后生效）`);
     } catch (error) {
       showToast(`更新失败：${String(error)}`);
     } finally {
@@ -9437,6 +9465,31 @@ function App() {
                   <span>记录成功请求正文</span>
                 </label>
                 <div className="hint-line">默认关闭：成功请求只记元数据、不落正文（省磁盘）；失败请求始终保留正文。</div>
+                <div className="form-grid compact single-line" style={{ marginTop: 8 }}>
+                  <label className="field">
+                    <span>用量统计攒批条数</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={10000}
+                      value={usageBatchMaxSize}
+                      onChange={(e) => setUsageBatchMaxSize(Number(e.target.value) || 500)}
+                      onBlur={() => void updateUsageBatch(usageBatchMaxSize, usageBatchMaxWaitSeconds)}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>用量统计攒批秒数</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={3600}
+                      value={usageBatchMaxWaitSeconds}
+                      onChange={(e) => setUsageBatchMaxWaitSeconds(Number(e.target.value) || 60)}
+                      onBlur={() => void updateUsageBatch(usageBatchMaxSize, usageBatchMaxWaitSeconds)}
+                    />
+                  </label>
+                </div>
+                <div className="hint-line">攒够条数或到时间就落库一次（默认 500 条 / 60 秒），值越大写盘越少。修改后需重启网关生效；正常关闭会先落盘，不丢数据。</div>
                 <div className="app-log-list">
                   {appLogs.length === 0 ? <div className="empty-state">暂无应用日志。</div> : appLogs.map((log, index) => (
                     <div className="app-log-row" key={`${log.time}-${index}`}>

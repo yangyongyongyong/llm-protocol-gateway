@@ -24,17 +24,52 @@ func (s *Store) AppendRequestLog(log monitor.RequestLog) error {
 	return s.AppendRequestLogWithRetention(log, defaultRequestLogDays)
 }
 
-func (s *Store) AppendRequestLogWithRetention(log monitor.RequestLog, retentionDays int) error {
-	if log.Time.IsZero() {
-		log.Time = time.Now()
+// AppendRequestLogs inserts many rows in a single transaction/commit.
+//
+// A bodiless success row is only a few hundred bytes while every commit dirties
+// at least one page, so committing per request wastes most of each page. The
+// gateway's request-log batcher funnels successful requests here; failures still
+// go through AppendRequestLogWithRetention one at a time so they land
+// immediately.
+func (s *Store) AppendRequestLogs(logs []monitor.RequestLog) error {
+	if len(logs) == 0 {
+		return nil
 	}
-	_, err := s.db.Exec(`INSERT INTO request_logs (
-		time, api_key_id, api_key_name, route_id, provider_id, model, action, protocol_flow, path,
-		status, input_tokens, output_tokens, cache_tokens, latency_ms, ttft_ms,
-		prep_ms, pre_upstream_ms, upstream_ttfb_ms, gateway_overhead_ms, convert_out_ms, post_ms, timing_flags,
-		client_host, client_ip, access_source,
-		error_description, request_body, response_body
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stmt, err := tx.Prepare(requestLogInsertSQL)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = stmt.Close() }()
+
+	for _, log := range logs {
+		if log.Time.IsZero() {
+			log.Time = time.Now()
+		}
+		if _, err := stmt.Exec(requestLogInsertArgs(log)...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// requestLogInsertSQL / requestLogInsertArgs are shared by the single-row and
+// batched insert paths so the column list can only ever drift in one place.
+const requestLogInsertSQL = `INSERT INTO request_logs (
+	time, api_key_id, api_key_name, route_id, provider_id, model, action, protocol_flow, path,
+	status, input_tokens, output_tokens, cache_tokens, latency_ms, ttft_ms,
+	prep_ms, pre_upstream_ms, upstream_ttfb_ms, gateway_overhead_ms, convert_out_ms, post_ms, timing_flags,
+	client_host, client_ip, access_source,
+	error_description, request_body, response_body
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+func requestLogInsertArgs(log monitor.RequestLog) []any {
+	return []any{
 		log.Time.UTC().Format(time.RFC3339Nano),
 		log.APIKeyID,
 		log.APIKeyName,
@@ -63,7 +98,14 @@ func (s *Store) AppendRequestLogWithRetention(log monitor.RequestLog, retentionD
 		log.ErrorDescription,
 		log.RequestBody,
 		log.ResponseBody,
-	)
+	}
+}
+
+func (s *Store) AppendRequestLogWithRetention(log monitor.RequestLog, retentionDays int) error {
+	if log.Time.IsZero() {
+		log.Time = time.Now()
+	}
+	_, err := s.db.Exec(requestLogInsertSQL, requestLogInsertArgs(log)...)
 	// retentionDays 不在这里立即生效——保留窗口按天计，靠网关启动时和每 6 小时
 	// 的维护 ticker（internal/app/runtime.go）跑 PruneRequestLogs 就足够及时，
 	// 没必要每条请求都额外跑 2 条 DELETE（稳态下几乎总是 0 行命中，纯粹的
