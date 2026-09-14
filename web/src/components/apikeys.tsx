@@ -4,6 +4,52 @@ import { apiKeyClientBaseURL, apiKeyGatewayRoot, buildApiKeyClientConfig, buildA
 import { SearchableModelSelect } from './selects';
 import { APIKey, ConsoleUser, KeyProfile, Model, OutputEndpoint, Protocol, Provider, Route } from '../types';
 import { Badge, CopyButton, Modal } from './ui';
+/** 方案命名弹窗：替代 window.prompt——嵌入式浏览器/被浏览器拦截时 prompt 会静默
+ *  返回 null，表现为按钮点了没反应；应用内弹窗不依赖原生对话框。 */
+export function ProfileNameDialog({ mode, initial, busy, onSubmit, onClose }: { mode: 'create' | 'rename'; initial: string; busy: boolean; onSubmit: (name: string) => void; onClose: () => void }) {
+  const [value, setValue] = React.useState(initial);
+  const inputRef = React.useRef<HTMLInputElement | null>(null);
+  React.useEffect(() => {
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  }, []);
+  const trimmed = value.trim();
+  return (
+    <Modal
+      title={mode === 'create' ? '新建转发方案' : '重命名转发方案'}
+      description={mode === 'create'
+        ? '将完整复制当前生效方案的转发配置（Provider / 备选 / 模型映射等），创建后立即生效。'
+        : '仅修改方案名称，Key 的 token 与转发配置不受影响。'}
+      onClose={onClose}
+    >
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (busy || !trimmed) return;
+          onSubmit(trimmed);
+        }}
+      >
+        <div className="form-grid modal-form">
+          <div className="field field-full">
+            <label>方案名称</label>
+            <input
+              ref={inputRef}
+              value={value}
+              disabled={busy}
+              placeholder={mode === 'create' ? '例如：GPT-5.6 高质量' : ''}
+              onChange={(event) => setValue(event.target.value)}
+            />
+          </div>
+        </div>
+        <div className="actions modal-actions">
+          <button type="button" className="btn" onClick={onClose}>取消</button>
+          <button type="submit" className="btn primary" disabled={busy || !trimmed}>{busy ? '保存中…' : mode === 'create' ? '创建方案' : '保存'}</button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
 export function ApiKeyDetailPanel({
   keyItem,
   providers,
@@ -93,24 +139,22 @@ export function ApiKeyDetailPanel({
     };
   }
 
-  async function handleCreateProfile() {
-    const name = window.prompt('新方案名称（将完整复制当前转发配置）', '');
-    if (name == null) return;
-    const trimmed = name.trim();
-    if (!trimmed) {
-      onToast?.('请填写方案名称');
-      return;
-    }
-    await onCreateProfile(keyItem, snapshotCurrentProfile(trimmed), true);
-  }
+  // 方案创建/重命名走应用内弹窗：window.prompt 在部分嵌入式浏览器会被静默拦截，
+  // 表现为按钮点击毫无反应（“假按钮”）。
+  const [profileDialog, setProfileDialog] = React.useState<'create' | 'rename' | null>(null);
 
-  async function handleRenameProfile() {
-    if (!activeProfile) return;
-    const name = window.prompt('重命名当前方案', activeProfile.name);
-    if (name == null) return;
-    const trimmed = name.trim();
-    if (!trimmed || trimmed === activeProfile.name) return;
-    await onUpdateProfile(keyItem, activeProfile.id, { ...activeProfile, name: trimmed });
+  async function submitProfileName(name: string) {
+    if (!profileDialog) return;
+    try {
+      if (profileDialog === 'create') {
+        await onCreateProfile(keyItem, snapshotCurrentProfile(name), true);
+      } else if (activeProfile) {
+        await onUpdateProfile(keyItem, activeProfile.id, { ...activeProfile, name });
+      }
+      setProfileDialog(null);
+    } catch {
+      // 失败时保留弹窗供修改重试；错误提示由数据层的 toast 负责
+    }
   }
 
   async function handleDeleteProfile() {
@@ -138,15 +182,25 @@ export function ApiKeyDetailPanel({
         </div>
       </div>
 
+      {profileDialog ? (
+        <ProfileNameDialog
+          mode={profileDialog}
+          initial={profileDialog === 'rename' ? activeProfile?.name || '' : ''}
+          busy={saving}
+          onSubmit={(name) => void submitProfileName(name)}
+          onClose={() => setProfileDialog(null)}
+        />
+      ) : null}
+
       <div className="api-key-profile-selector">
         <div className="field-label-row">
           <label>转发方案</label>
           <div className="api-key-profile-toolbar">
-            <button className="btn" type="button" disabled={saving} onClick={() => void handleCreateProfile()}>
+            <button className="btn" type="button" disabled={saving} onClick={() => setProfileDialog('create')}>
               新建方案
             </button>
             {activeProfile ? (
-              <button className="btn" type="button" disabled={saving} onClick={() => void handleRenameProfile()}>
+              <button className="btn" type="button" disabled={saving} onClick={() => setProfileDialog('rename')}>
                 重命名
               </button>
             ) : null}

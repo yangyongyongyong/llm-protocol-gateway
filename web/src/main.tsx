@@ -6,7 +6,7 @@ import './styles.css';
 import { ApiKeyDetailPanel, ApiKeyFixedModelField, ApiKeyModelMappingControl } from './components/apikeys';
 import { MachineMetric, Metric, UsageBarChart, UsageCacheHitRate, UsageDailyTrafficLines, UsageLineChart, UsageMonthlyTokenBars, UsageRangeCalendar, UsageStatusChart } from './components/charts';
 import { API_BASE, API_KEYS_PAGE_SIZE, API_KEY_CONNECT_LABEL, BACKEND_FAIL_STREAK_LIMIT, BACKEND_POLL_MS_LOCAL, BACKEND_POLL_MS_REMOTE, LOGS_PAGE_SIZE, LOG_OWNER_FILTER_ADMIN, PROVIDER_CONNECT_FILTERS, QODER_DEFAULT_BASE_URL, REQUEST_ADAPTER_PRESETS, SELF_REGISTER_CONNECT_LABEL, USERS_TABLE_GRID, actionLabel, activePublicBaseURL, activeUIPublicBaseURL, antiAutofillProps, apiKeyReferencesProvider, buildApiKeyPatchBody, buildProviderChatCurl, buildRouteTestCurl, buildSelfRegistrationPrompt, clearUICache, compactRequestAdapterJSON, composeCustomDomain, coreNavIDs, defaultProviderChatTestOptions, defaultPublicAccess, defaultSelfcheckModelForProvider, defaultThinkingValueForField, deriveUIDomainFromAPI, diskTempLabel, diskTempNote, endpointURL, fallbackState, fanSpeedLabel, fanSpeedNote, fetchWithTimeout, findRouteForBinding, fixedOutputLabels, formatBytes, formatChatTestResponse, formatCompactCount, formatDuration, formatLocalISODate, formatProviderCacheTestDetail, formatProviderThinkingTestDetail, formatRate, formatSelfcheckCaseDetail, formatTokenCount, formatTokenSummary, formatTokenSummaryCompact, formatTrafficLogDetail, getApiKeyBinding, hostTempMetric, httpStatusLabel, isFollowingTodayRange, isRemoteOrigin, isTrafficLogError, loadBootSession, localGatewayRoot, logLevelValues, mapFromTrafficRanks, maskApiKeySource, modelsForSelfcheckProvider, navGroups, navIDFromPath, navItems, navPathForID, normalizeGatewayState, normalizeRequestStats, pickCustomDomainRoot, previewRequestAdapterCurl, protocolFromLabel, protocolLabel, protocolTone, providerConnectKind, providerConnectLabel, providerOptionLabel, providerUsageLabel, publicAccessMetricValue, publicAccessStatusLabel, publicAccessURL, publicStatusTone, readConnectResponse, readSelfcheckPrefs, readStoredSidebarCollapsed, readUICache, reportIfLooksLikeAutofill, resolveProviderChatURL, resolveProviderTestModel, routeGatewayTestURL, selfRegisterPlaceholderBaseURL, splitCustomDomain, statusTone, testResultBadge, thermalPressureLabel, thinkingDepthSelectOptions, thinkingPresetsForProtocol, trafficLogKeyLabel, trafficLogKeyTitle, trafficLogProviderLabel, trafficLogSourceTitle, trafficRanksEqual, trafficRanksFromMap, uiCacheScope, userAllowedNavIDs, writeSelfcheckPrefs, writeStoredSidebarCollapsed, writeUICache } from './lib';
-import { ChatGPTOAuthUsagePanel, ClaudeOAuthUsagePanel, CursorOAuthUsagePanel, DeepSeekBalancePanel, ProviderCard, ZhipuUsagePanel, isDocumentActive } from './components/panels';
+import { ChatGPTOAuthUsagePanel, ClaudeOAuthUsagePanel, CursorOAuthUsagePanel, DeepSeekBalancePanel, ProviderCard, ZhipuUsagePanel, formatClaudeUsageResetAt, isDocumentActive } from './components/panels';
 import { MultiSelectFilter, SearchableModelSelect } from './components/selects';
 import { APIKey, AdminAuthStatus, AlertPage, AlertRecord, AlertSettingsView, AppLogEntry, ChatTestContext, CloudflareZoneOption, ConsoleUser, DailyRequestPoint, GatewayState, HostMetrics, KeyProfile, LegacyRequestStatsSnapshot, LogEntry, LogPage, NavItemID, Protocol, Provider, ProviderAuthPreview, ProviderCacheTestResult, ProviderChatTestOptions, ProviderConnectKind, ProviderTestResult, ProviderThinkingTestResult, ProvidersImportResult, PublicAccessSettings, RequestAdapter, RequestStatsSnapshot, Route, RouteTestResult, SelfcheckCaseResult, SelfcheckJobStatus, SelfcheckToolInfo, ThemeMode, TrafficRankCache } from './types';
 import { Badge, CopyButton, Field, Modal, NavIcon, SelectField, THEME_STORAGE_KEY, ThemeSwitch, URLRow, applyThemeMode, readStoredTheme, resolveTheme } from './components/ui';
@@ -1262,24 +1262,33 @@ function App() {
     }
   }
 
-  async function resetConsoleUserPassword(user: ConsoleUser) {
-    const password = window.prompt(`为用户「${user.username}」设置新密码（至少 8 位）：`);
-    if (password == null) return;
-    if (password.trim().length < 8) {
+  // 重置用户密码走应用内弹窗：window.prompt 在部分嵌入式浏览器会被静默拦截，按钮形同虚设
+  const [passwordResetUser, setPasswordResetUser] = useState<ConsoleUser | null>(null);
+  const [passwordResetValue, setPasswordResetValue] = useState('');
+  const [passwordResetBusy, setPasswordResetBusy] = useState(false);
+
+  async function confirmPasswordReset() {
+    if (!passwordResetUser) return;
+    if (passwordResetValue.trim().length < 8) {
       showToast('密码至少 8 位');
       return;
     }
+    setPasswordResetBusy(true);
     try {
-      const response = await fetch(`${API_BASE}/__users/${encodeURIComponent(user.id)}/reset-password`, {
+      const response = await fetch(`${API_BASE}/__users/${encodeURIComponent(passwordResetUser.id)}/reset-password`, {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: password.trim() }),
+        body: JSON.stringify({ password: passwordResetValue.trim() }),
       });
       if (!response.ok) throw new Error(await response.text());
       showToast('密码已重置');
+      setPasswordResetUser(null);
+      setPasswordResetValue('');
     } catch (error) {
       showToast(`重置失败：${String(error)}`);
+    } finally {
+      setPasswordResetBusy(false);
     }
   }
 
@@ -3999,6 +4008,7 @@ function App() {
                 <div className="user-meta">
                   <b>{authStatus.username}</b>
                   <span title={dataFetchedAt ? `页面数据最近一次成功拉取的时间（约每 5 秒自动刷新）` : undefined}>
+                    {dataFetchedAt ? <i className="live-dot" aria-hidden="true" /> : null}
                     {authStatus.role === 'user' ? '普通用户' : '管理员'}
                     {dataFetchedAt ? ` · 更新于 ${dataFetchedAt.toLocaleTimeString()}` : ''}
                   </span>
@@ -4237,8 +4247,8 @@ function App() {
                   <h2 className="panel-title">输入 Provider</h2>
                   <p className="panel-desc">
                     {isNormalUser
-                      ? '展示管理员授权给你的 Provider（只读）以及你自己创建的 Provider（可编辑/克隆/删除/对话测试/获取模型）。删除时绑定该 Provider 的 API 密钥引用会自动重置为空。'
-                      : '用户自定义添加的上游 Provider。删除时绑定该 Provider 的 API 密钥引用会自动重置为空。列表按近 3 日请求量排序。支持勾选后导出/导入配置（含 apiKeySource 与已持久化的 OAuth 元数据）。'}
+                      ? '展示管理员授权给你的 Provider（只读）及自己创建的 Provider（可编辑 / 克隆 / 删除 / 测试）。删除时绑定的 API 密钥引用会自动重置为空。'
+                      : '自定义上游 Provider，按近 3 日请求量排序；勾选后可批量导出 / 导入配置（含 OAuth 元数据）。删除时绑定的 API 密钥引用会自动重置为空。'}
                   </p>
                 </div>
                 {isNormalUser ? (
@@ -4374,7 +4384,7 @@ function App() {
                         providerId={provider.id}
                         protocol={protocolLabel(provider.protocol)}
                         tone={protocolTone(provider.protocol)}
-                        url={provider.authType === 'claude_oauth' ? 'Claude OAuth (api.anthropic.com)' : provider.authType === 'cursor_oauth' ? 'Cursor OAuth (本地 gRPC bridge)' : provider.authType === 'chatgpt_oauth' ? 'ChatGPT OAuth (chatgpt.com/codex)' : provider.authType === 'qoder_pat' ? `Qoder PAT (${provider.baseUrl})` : provider.baseUrl}
+                        url={provider.authType === 'claude_oauth' ? 'api.anthropic.com' : provider.authType === 'cursor_oauth' ? '本地 gRPC Bridge' : provider.authType === 'chatgpt_oauth' ? 'chatgpt.com/codex' : provider.baseUrl}
                         keyMask={provider.authType === 'api_key' || !provider.authType ? maskApiKeySource(provider.apiKeySource) : undefined}
                         defaultModel={provider.defaultModel}
                         modelCount={(provider.models || []).length}
@@ -5717,7 +5727,7 @@ function App() {
                           <span className="muted-text" title="该用户的 API Key 最近一次被调用的时间">{lastUsedMs > 0 ? new Date(lastUsedMs).toLocaleString() : '未使用'}</span>
                           <span style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
                             <button className="mini-btn" type="button" onClick={() => openUserModal(user)}>编辑</button>
-                            <button className="mini-btn" type="button" onClick={() => void resetConsoleUserPassword(user)}>重置密码</button>
+                            <button className="mini-btn" type="button" onClick={() => { setPasswordResetValue(''); setPasswordResetUser(user); }}>重置密码</button>
                             <button className="mini-btn" type="button" onClick={() => void toggleUserEnabled(user)}>{user.enabled ? '禁用' : '启用'}</button>
                             <button className="mini-btn danger" type="button" onClick={() => void deleteConsoleUser(user)}>删除</button>
                           </span>
@@ -6256,6 +6266,39 @@ function App() {
         </Modal>
       )}
 
+      {passwordResetUser && (
+        <Modal
+          title="重置用户密码"
+          description={`为用户「${passwordResetUser.username}」设置新密码，至少 8 位。该用户当前会话不受影响，新密码立即生效。`}
+          onClose={() => { setPasswordResetUser(null); setPasswordResetValue(''); }}
+        >
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              void confirmPasswordReset();
+            }}
+          >
+            <div className="form-grid modal-form">
+              <div className="field field-full">
+                <label>新密码（至少 8 位）</label>
+                <input
+                  type="text"
+                  autoComplete="new-password"
+                  value={passwordResetValue}
+                  disabled={passwordResetBusy}
+                  placeholder="至少 8 位"
+                  onChange={(event) => setPasswordResetValue(event.target.value)}
+                />
+              </div>
+            </div>
+            <div className="actions modal-actions">
+              <button type="button" className="btn" disabled={passwordResetBusy} onClick={() => { setPasswordResetUser(null); setPasswordResetValue(''); }}>取消</button>
+              <button type="submit" className="btn primary" disabled={passwordResetBusy || passwordResetValue.trim().length < 8}>{passwordResetBusy ? '重置中…' : '重置密码'}</button>
+            </div>
+          </form>
+        </Modal>
+      )}
+
       {selfcheckCaseDetail && (
         <Modal
           title="自检用例错误详情"
@@ -6474,7 +6517,7 @@ function App() {
                 if (connected) {
                   return (
                     <>
-                      <div className="hint-line">已连接{editingProvider?.claudeOAuth?.accountLabel ? ` · ${editingProvider.claudeOAuth.accountLabel}` : ''}{editingProvider?.claudeOAuth?.expiresAt ? ` · 过期时间：${editingProvider.claudeOAuth.expiresAt}` : ''}</div>
+                      <div className="hint-line">已连接{editingProvider?.claudeOAuth?.accountLabel ? ` · ${editingProvider.claudeOAuth.accountLabel}` : ''}{editingProvider?.claudeOAuth?.expiresAt ? ` · 过期时间：${formatClaudeUsageResetAt(editingProvider.claudeOAuth.expiresAt)}` : ''}</div>
                       <ClaudeOAuthUsagePanel providerId={editingProviderID} connected />
                       <button className="btn danger" disabled={claudeOAuthBusy} onClick={() => void disconnectClaudeOAuth()}>{claudeOAuthBusy ? '处理中…' : '断开连接'}</button>
                     </>
@@ -6508,7 +6551,7 @@ function App() {
                 if (connected) {
                   return (
                     <>
-                      <div className="hint-line">已连接{editingProvider?.cursorOAuth?.accountLabel ? ` · ${editingProvider.cursorOAuth.accountLabel}` : ''}{editingProvider?.cursorOAuth?.expiresAt ? ` · 过期时间：${editingProvider.cursorOAuth.expiresAt}` : ''} · 模型 {editingProvider?.models?.length ?? 0} 个</div>
+                      <div className="hint-line">已连接{editingProvider?.cursorOAuth?.accountLabel ? ` · ${editingProvider.cursorOAuth.accountLabel}` : ''}{editingProvider?.cursorOAuth?.expiresAt ? ` · 过期时间：${formatClaudeUsageResetAt(editingProvider.cursorOAuth.expiresAt)}` : ''} · 模型 {editingProvider?.models?.length ?? 0} 个</div>
                       <CursorOAuthUsagePanel providerId={editingProviderID} connected />
                       <div className="actions" style={{ gap: 8 }}>
                         <button className="btn" disabled={testingProviderID === editingProviderID} onClick={() => void fetchProviderModels(editingProviderID, editingProvider?.name || '', true)}>{testingProviderID === editingProviderID ? '同步中…' : '同步模型'}</button>
@@ -6537,7 +6580,7 @@ function App() {
                 if (connected) {
                   return (
                     <>
-                      <div className="hint-line">已连接{editingProvider?.chatgptOAuth?.accountLabel ? ` · ${editingProvider.chatgptOAuth.accountLabel}` : ''}{editingProvider?.chatgptOAuth?.expiresAt ? ` · 过期时间：${editingProvider.chatgptOAuth.expiresAt}` : ''} · 模型 {editingProvider?.models?.length ?? 0} 个</div>
+                      <div className="hint-line">已连接{editingProvider?.chatgptOAuth?.accountLabel ? ` · ${editingProvider.chatgptOAuth.accountLabel}` : ''}{editingProvider?.chatgptOAuth?.expiresAt ? ` · 过期时间：${formatClaudeUsageResetAt(editingProvider.chatgptOAuth.expiresAt)}` : ''} · 模型 {editingProvider?.models?.length ?? 0} 个</div>
                       <ChatGPTOAuthUsagePanel providerId={editingProviderID} connected />
                       <div className="actions" style={{ gap: 8 }}>
                         <button className="btn" disabled={testingProviderID === editingProviderID} onClick={() => void fetchProviderModels(editingProviderID, editingProvider?.name || '', true)}>{testingProviderID === editingProviderID ? '同步中…' : '同步模型'}</button>

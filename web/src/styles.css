@@ -179,6 +179,7 @@ html { -webkit-text-size-adjust: 100%; }
 body {
   margin: 0;
   min-height: 100vh;
+  min-height: 100dvh;
   color: var(--text);
   font-family: var(--font);
   font-size: 13.5px;
@@ -236,6 +237,8 @@ html[data-theme="dark"] *:hover::-webkit-scrollbar-thumb { background: rgba(152,
   position: sticky;
   top: 16px;
   height: calc(100vh - 32px);
+  /* 移动端浏览器地址栏收放时 100vh 偏大，dvh 修正；旧浏览器回落到上一行 */
+  height: calc(100dvh - 32px);
   padding: 18px 12px 16px;
   border-radius: var(--r-2xl);
   display: flex;
@@ -321,6 +324,7 @@ html[data-theme="dark"] *:hover::-webkit-scrollbar-thumb { background: rgba(152,
   display: inline-flex; align-items: center; gap: 6px;
   width: fit-content;
   border-radius: 999px;
+  border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
   font-size: 11.5px; font-weight: 600;
   white-space: nowrap;
   letter-spacing: 0.005em;
@@ -395,7 +399,7 @@ html[data-theme="dark"] .badge.slate { color: #cbd5e1; }
   left: 0; top: 22%;
   height: 56%; width: 2.5px;
   border-radius: 0 999px 999px 0;
-  background: var(--accent);
+  background: var(--accent-grad);
 }
 .nav-icon {
   width: 22px; height: 22px;
@@ -433,6 +437,7 @@ html[data-theme="dark"] .badge.slate { color: #cbd5e1; }
   display: grid; place-items: center;
   color: #fff; font-size: 12px; font-weight: 600;
   background: var(--accent-grad);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28), 0 3px 8px -3px rgba(79, 70, 229, 0.55);
 }
 .user-meta { flex: 1; min-width: 0; display: grid; }
 .user-meta b { font-size: 12.5px; font-weight: 600; color: var(--sidebar-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -514,7 +519,7 @@ html[data-theme="dark"] .badge.slate { color: #cbd5e1; }
   --btn-h: 36px;
   --btn-bg: var(--surface);
   --btn-fg: var(--text);
-  --btn-border: var(--border-strong);
+  --btn-border: var(--border);
 
   display: inline-flex; align-items: center; justify-content: center;
   gap: 6px;
@@ -527,13 +532,15 @@ html[data-theme="dark"] .badge.slate { color: #cbd5e1; }
   font-size: 13px; font-weight: 600;
   white-space: nowrap;
   text-decoration: none;
+  box-shadow: var(--shadow-soft);
   transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease,
     box-shadow 0.14s ease, transform 0.08s ease;
   user-select: none;
 }
 .btn:hover:not(:disabled) {
   --btn-border: var(--accent-border);
-  background: var(--surface-soft);
+  background: var(--btn-bg);
+  box-shadow: var(--shadow-med);
 }
 .btn:active:not(:disabled) { transform: translateY(1px); }
 .btn:focus-visible { box-shadow: 0 0 0 3px var(--accent-ring); }
@@ -547,11 +554,18 @@ html[data-theme="dark"] .badge.slate { color: #cbd5e1; }
   --btn-bg: var(--accent);
   --btn-fg: #ffffff;
   --btn-border: var(--accent);
+  background-image: var(--accent-grad);
+  background-size: 170% 100%;
+  background-position: 0% 0%;
   box-shadow: 0 6px 16px -6px rgba(79, 70, 229, 0.45);
+  /* 渐变比实底多一档 background-position 过渡：hover 时流光平移 */
+  transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease,
+    box-shadow 0.14s ease, transform 0.08s ease, background-position 0.3s ease;
 }
 .btn.primary:hover:not(:disabled) {
   --btn-bg: var(--accent-strong);
   --btn-border: var(--accent-strong);
+  background-position: 85% 0%;
   box-shadow: 0 10px 22px -8px rgba(79, 70, 229, 0.55);
 }
 
@@ -625,7 +639,7 @@ html[data-theme="dark"] .badge.slate { color: #cbd5e1; }
   cursor: pointer;
   transition: background 0.13s ease, color 0.13s ease;
 }
-.mini-btn:hover:not(:disabled) { background: var(--accent-soft); }
+.mini-btn:hover:not(:disabled) { background: var(--accent-soft); color: var(--accent-strong); }
 .mini-btn.copied { color: var(--green); background: var(--green-soft); }
 .mini-btn.danger { color: var(--red); }
 .mini-btn.danger:hover:not(:disabled) { background: var(--red-soft); }
@@ -656,9 +670,42 @@ html[data-theme="dark"] .badge.slate { color: #cbd5e1; }
   cursor: pointer;
   transition: background 0.13s ease, color 0.13s ease;
 }
-.icon-btn:hover:not(:disabled) { background: var(--surface-sunken); color: var(--text); }
+.icon-btn:hover:not(:disabled) { background: var(--accent-soft); color: var(--accent-strong); }
 .icon-btn.danger { color: var(--red); }
 .icon-btn.danger:hover:not(:disabled) { background: var(--red-soft); color: var(--red); }
+
+/* more-menu：卡片/行内“更多操作”下拉。菜单层 portal 到 body + fixed 定位，
+   不受卡片 overflow:hidden 裁剪；动画仅 transform/opacity。 */
+.more-menu-trigger { min-width: 28px; padding: 0 7px; font-size: 14px; font-weight: 700; letter-spacing: 0.12em; line-height: 1; }
+.more-menu-trigger.open { background: var(--surface-sunken); color: var(--text); }
+.more-menu-list {
+  position: fixed;
+  z-index: var(--z-dropdown);
+  min-width: 128px;
+  padding: 5px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--panel-solid);
+  box-shadow: var(--shadow-pop);
+  display: grid;
+  gap: 2px;
+  animation: more-menu-in 0.14s ease;
+}
+@keyframes more-menu-in { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .more-menu-list { animation: none; } }
+.more-menu-item {
+  display: block; width: 100%; text-align: left;
+  border: 0; border-radius: var(--r-xs);
+  background: transparent;
+  padding: 7px 10px;
+  color: var(--text); font-size: 12.5px; font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+.more-menu-item:hover:not(:disabled) { background: var(--hover); }
+.more-menu-item.danger { color: var(--red); }
+.more-menu-item.danger:hover:not(:disabled) { background: var(--red-soft); }
 
 /* 通用按钮组合 */
 .actions { display: flex; gap: 8px; align-items: center; justify-content: flex-end; flex-wrap: wrap; }
@@ -806,7 +853,7 @@ html[data-theme="dark"] .badge.slate { color: #cbd5e1; }
 .provider-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .provider-title-block { min-width: 0; flex: 1 1 220px; }
 .provider-name { font-size: 15px; line-height: 1.35; white-space: normal; overflow: visible; text-overflow: unset; }
-.provider-subtitle { margin-top: 4px; color: var(--muted); font-size: 11.5px; font-family: var(--mono); }
+.provider-subtitle { margin-top: 4px; color: var(--muted); font-size: 11.5px; font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* api_key 卡：meta 升级为带标签的信息清单（接入地址/密钥/默认模型/可用模型），
    真实内容填充卡片；OAuth 卡仍是单行描述（配额面板已占位） */
 .provider-meta { display: grid; gap: 7px; margin-top: 8px; }
@@ -864,13 +911,14 @@ html[data-theme="dark"] .badge.slate { color: #cbd5e1; }
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   height: var(--control-h);
-  padding: 0 12px;
-  background: var(--surface);
+  padding: 0 12px 0 34px;
+  background: var(--surface) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%235b6478' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='m20 20-3.2-3.2'/%3E%3C/svg%3E") no-repeat 11px center / 14px;
   color: var(--text);
   font-size: 13px;
   font-family: var(--mono);
   transition: border-color 0.13s ease, box-shadow 0.13s ease;
 }
+html[data-theme="dark"] .models-search-input { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%2398a2b8' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='m20 20-3.2-3.2'/%3E%3C/svg%3E"); }
 .models-search-input:focus { outline: none; border-color: var(--accent-border); box-shadow: 0 0 0 3px var(--accent-ring); }
 .models-filter-group { display: flex; flex-wrap: wrap; gap: 6px; }
 /* 筛选 chip：扁平、克制 */
@@ -886,9 +934,10 @@ html[data-theme="dark"] .badge.slate { color: #cbd5e1; }
 }
 .models-filter-chip:hover { border-color: var(--accent-border); color: var(--text); }
 .models-filter-chip.active {
-  border-color: var(--accent);
-  background: var(--accent);
+  border-color: transparent;
+  background: var(--accent-grad);
   color: #fff;
+  box-shadow: 0 4px 14px -5px rgba(79, 70, 229, 0.55);
 }
 .models-toolbar-meta { color: var(--muted); font-size: 12px; font-weight: 600; }
 .model-card.compact { margin-bottom: 0; display: grid; gap: 8px; min-height: 118px; align-content: start; }
@@ -1330,7 +1379,7 @@ html[data-theme="dark"] .test-result-card.fail { background: rgba(239, 68, 68, 0
   color: var(--code); font-family: var(--mono); font-size: 12px; line-height: 1.6;
 }
 .test-result-meta { margin-top: 10px; color: var(--subtle); font-family: var(--mono); font-size: 11px; }
-.hint-line { margin-top: 8px; color: var(--muted); font-size: 12px; font-family: var(--mono); }
+.hint-line { margin-top: 8px; color: var(--muted); font-size: 12px; font-family: var(--mono); overflow-wrap: anywhere; }
 .hint-line.error { color: var(--red); }
 /* field 内紧跟 label 的 hint-line 是"控件行"（如流式响应 checkbox），
    去掉说明文字的 margin-top，并与左侧输入框同高居中，保证行对齐 */
@@ -1443,7 +1492,7 @@ html[data-theme="dark"] .log-row.error { background: rgba(239, 68, 68, 0.12); bo
   font-weight: 500; font-size: 13px;
   opacity: 0;
   pointer-events: none;
-  transition: opacity 0.22s ease, transform 0.22s ease;
+  transition: opacity 0.2s ease, transform 0.32s cubic-bezier(0.2, 0.9, 0.3, 1.18);
   box-shadow: var(--shadow-pop);
   z-index: var(--z-toast);
   max-width: min(90vw, 560px);
@@ -1711,22 +1760,23 @@ html[data-theme="dark"] .usage-calendar-day.edge { background: var(--accent); co
   display: grid; gap: 10px;
 }
 .claude-usage-panel.compact { margin-top: 10px; padding: 10px 12px; gap: 8px; }
-/* 卡片内紧凑配额条：所有额度桶单行横排，重置/明细收进 title 悬浮提示。
+/* 卡片内紧凑配额条：所有额度桶单行横排；重置时间直接可见（过长省略，title 兜底）。
    额度是卡片核心信息：百分比放大加粗、进度条加粗；标题/状态等附带信息缩小。 */
 .claude-usage-panel.compact .claude-usage-title { font-size: 11.5px; font-weight: 600; }
 /* 卡片上"更新于"时间戳最次要，隐藏换取标题/状态的空间（完整面板仍显示） */
 .claude-usage-panel.compact .claude-usage-status { display: none; }
 .claude-usage-panel.compact .claude-usage-grid { grid-template-columns: none; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 8px; }
-.claude-usage-panel.compact .claude-usage-row { padding: 8px 10px; gap: 4px; }
+.claude-usage-panel.compact .claude-usage-row { padding: 8px; gap: 4px; }
 /* 紧凑单元格纵向堆叠：小标签在上、大数字百分比在下（额度是核心信息，数字放大加粗并随用量变色） */
 .claude-usage-panel.compact .claude-usage-head { flex-direction: column; align-items: flex-start; gap: 3px; white-space: normal; overflow: visible; }
 .claude-usage-panel.compact .claude-usage-head span:first-child { font-size: 10.5px; max-width: 100%; white-space: nowrap; }
 .claude-usage-panel.compact .claude-usage-head span:last-child { font-size: 15px; line-height: 1.25; }
-.claude-usage-row:has(.claude-usage-fill.ok) .claude-usage-head span:last-child { color: var(--green); }
-.claude-usage-row:has(.claude-usage-fill.warn) .claude-usage-head span:last-child { color: var(--amber); }
-.claude-usage-row:has(.claude-usage-fill.danger) .claude-usage-head span:last-child { color: var(--red); }
+/* 行级 tone 类直接由 JSX 挂上（替代旧 :has() 选择器，Firefox/Safari 旧版不支持 :has） */
+.claude-usage-row.ok .claude-usage-head span:last-child { color: var(--green); }
+.claude-usage-row.warn .claude-usage-head span:last-child { color: var(--amber); }
+.claude-usage-row.danger .claude-usage-head span:last-child { color: var(--red); }
 .claude-usage-panel.compact .claude-usage-track { height: 5px; }
-.claude-usage-panel.compact .claude-usage-reset { display: none; }
+/* 重置时间在卡片上始终可见（此前仅悬浮 title 才能看到）；空间不足时省略，完整信息仍在 title */
 .claude-usage-title {
   display: flex; align-items: center; justify-content: space-between;
   gap: 10px;
@@ -1760,11 +1810,17 @@ html[data-theme="dark"] .usage-calendar-day.edge { background: var(--accent); co
 .claude-usage-reset {
   color: var(--subtle); font-size: 10.5px; font-family: var(--mono);
   line-height: 1.4;
+  min-height: 1.4em;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-/* 状态文本（"可用" 等），跟在标题行操作区里；过长时省略不挤压标题换行 */
-.claude-usage-state { color: var(--green); font-size: 11px; font-weight: 600; max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.claude-usage-panel.compact .claude-usage-reset { color: var(--muted); font-size: 10px; }
+/* 状态文本：正向（“可用”）收在标题行；告警（“额度已用尽…”）单独成行完整可读 */
+.claude-usage-state { font-size: 11px; font-weight: 600; }
+.claude-usage-state.ok { color: var(--green); max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.claude-usage-state.warn { color: var(--amber); line-height: 1.5; overflow-wrap: anywhere; }
 .claude-usage-panel.compact .claude-usage-title > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-html[data-theme="dark"] .claude-usage-state { color: #6ee7b7; }
+html[data-theme="dark"] .claude-usage-state.ok { color: #6ee7b7; }
+html[data-theme="dark"] .claude-usage-state.warn { color: #fcd34d; }
 .cursor-usage-panel { border-color: var(--border); background: var(--surface-soft); }
 .cursor-usage-panel .claude-usage-title { color: var(--text); }
 
@@ -1881,6 +1937,10 @@ html[data-theme="dark"] .provider-chip { color: #93c5fd; }
 .public-advanced { margin-top: 4px; border-top: 1px solid var(--border); padding-top: 10px; }
 .public-advanced summary { cursor: pointer; color: var(--muted); font-size: 13px; user-select: none; }
 .public-advanced-body { display: flex; flex-direction: column; gap: 12px; margin-top: 12px; }
+/* 防御：个别 Chromium 内核对带 flex/grid 子元素的 <details>，关闭态隐藏会失效——
+   未展开内容泄漏渲染到卡片外，被后续卡片盖住，表现为“按钮点了没反应”。
+   显式按 HTML 契约兜底：未展开时不渲染 summary 以外的子元素。 */
+details:not([open]) > *:not(summary) { display: none !important; }
 .public-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: end; }
 .url-label { color: var(--muted); font-size: 12px; font-weight: 600; white-space: nowrap; }
 
@@ -2072,3 +2132,129 @@ html[data-theme="dark"] .provider-chip { color: #93c5fd; }
   .shell.sidebar-collapsed { grid-template-columns: 1fr; }
   .sidebar.collapsed { display: none; }
 }
+
+/* 动效系统：动画只改透明度/变换，不参与布局计算。
+   呼吸灯与淡入是纯透明度动画（前庭安全），在系统「减少动态效果」开启时仍保留；
+   位移动画（入场平移、悬浮上浮）在任何情况下都温和且可被系统设置关闭。 */
+@keyframes status-breathe {
+  0%, 100% { opacity: 0.1; }
+  50% { opacity: 0.9; }
+}
+@keyframes panel-reveal {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes card-reveal {
+  from { opacity: 0; transform: translateY(5px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes panel-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* 呼吸点：绿色实心点 + 同色光环缓慢呼吸（约 3.2s 一周期）。
+   整个效果自包含在 12px 盒内（核心点 ::before、光环 ::after 都不越界）——
+   父容器常有 overflow:hidden（省略号），向外扩张的光环会被裁成“缺一块的圆”。 */
+.live-dot {
+  position: relative; display: inline-block; flex-shrink: 0;
+  width: 12px; height: 12px;
+  vertical-align: -2px;
+  pointer-events: none;
+}
+.live-dot::before {
+  content: '';
+  position: absolute;
+  inset: 3px;
+  border-radius: 50%;
+  background: var(--green);
+}
+.live-dot::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 1px solid var(--green);
+  opacity: 0.3;
+  animation: status-breathe 3.2s ease-in-out infinite;
+}
+.nav-status-dot.on {
+  position: relative; color: #34d399;
+  /* 导航行无 overflow 裁剪，光环外扩渲染正常；与 .live-dot 同节奏呼吸 */
+}
+.nav-status-dot.on::after {
+  content: '';
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  border: 1.5px solid currentColor;
+  pointer-events: none;
+  animation: status-breathe 3.2s ease-in-out infinite;
+}
+.user-meta .live-dot { margin-right: 7px; }
+.claude-usage-state.ok .live-dot { margin-right: 7px; vertical-align: -2px; }
+
+.main > section { animation: panel-reveal 240ms ease-out; }
+.provider-card-grid > .provider-card { animation: card-reveal 280ms ease-out backwards; }
+.provider-card-grid > .provider-card:nth-child(2) { animation-delay: 35ms; }
+.provider-card-grid > .provider-card:nth-child(3) { animation-delay: 70ms; }
+.provider-card-grid > .provider-card:nth-child(n + 4) { animation-delay: 105ms; }
+
+.icon-btn, .mini-btn, .models-filter-chip, .theme-switch-btn {
+  transition: background-color 160ms ease, color 160ms ease, border-color 160ms ease, transform 160ms ease;
+  touch-action: manipulation;
+}
+.icon-btn:active:not(:disabled), .mini-btn:active:not(:disabled),
+.models-filter-chip:active:not(:disabled), .theme-switch-btn:active:not(:disabled) {
+  transform: scale(0.96);
+}
+@media (hover: hover) and (pointer: fine) {
+  .provider-card.clickable:hover, .model-card.clickable:hover { transform: translateY(-2px); }
+  .btn.primary:hover:not(:disabled) { transform: translateY(-1px); }
+  .btn.primary:active:not(:disabled) { transform: translateY(0); }
+}
+
+/* 系统「减少动态效果」：位移动画与过渡全部关闭；保留纯透明度的呼吸与淡入
+   （这类动画不涉及空间运动，不引发眩晕，且产品要求状态呼吸始终可见）。 */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  .main > section { animation: panel-fade 220ms ease-out !important; }
+  .provider-card-grid > .provider-card { animation: panel-fade 260ms ease-out backwards !important; }
+  .live-dot::after, .nav-status-dot.on::after {
+    animation: status-breathe 3.2s ease-in-out infinite !important;
+  }
+  .provider-card.clickable:hover, .model-card.clickable:hover,
+  .btn:active:not(:disabled), .btn.primary:hover:not(:disabled),
+  .icon-btn:active:not(:disabled), .mini-btn:active:not(:disabled),
+  .models-filter-chip:active:not(:disabled), .theme-switch-btn:active:not(:disabled) {
+    transform: none;
+  }
+}
+
+/* 主题切换过渡：JS 在切换瞬间挂 html.theme-anim 380ms，颜色平滑过渡不跳变 */
+html.theme-anim, html.theme-anim *, html.theme-anim *::before, html.theme-anim *::after {
+  transition: background-color 0.3s ease, color 0.3s ease, border-color 0.3s ease,
+    box-shadow 0.3s ease, fill 0.3s ease, stroke 0.3s ease !important;
+}
+
+/* 忙碌按钮（获取中 / 测试中）：文字轻微呼吸表示进行中 */
+@keyframes busy-pulse {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 0.95; }
+}
+.provider-actions .icon-btn:disabled, .route-actions .icon-btn:disabled {
+  animation: busy-pulse 1.4s ease-in-out infinite;
+}
+
+/* 可点击卡片按压反馈：极轻微收缩，配合 hover 上浮形成按下感 */
+.provider-card.clickable:active, .model-card.clickable:active, .route-card.clickable:active {
+  transform: scale(0.994);
+}
+
+/* 深色主题下卡片顶缘加一条极淡内高光，增强表面立体感 */
+html[data-theme="dark"] .card { box-shadow: var(--shadow-soft), inset 0 1px 0 rgba(255, 255, 255, 0.03); }

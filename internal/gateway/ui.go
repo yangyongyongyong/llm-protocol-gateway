@@ -13,6 +13,7 @@ import (
 var uiNavPaths = map[string]struct{}{
 	"/":                 {},
 	"/login":            {},
+	"/overview":         {},
 	"/input-providers":  {},
 	"/models-menu":      {},
 	"/api-keys":         {},
@@ -20,6 +21,7 @@ var uiNavPaths = map[string]struct{}{
 	"/usage-stats":      {},
 	"/public-access":    {},
 	"/traffic-tokens":   {},
+	"/alerts":           {},
 	"/users":            {},
 	"/self-check":       {},
 	"/machine":          {},

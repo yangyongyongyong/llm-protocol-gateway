@@ -45,8 +45,37 @@ is_our_gateway_pid() {
   [[ -n "$pid" ]] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
   local cmd
-  cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  cmd="$(ps -p "$pid" -o command= 2>/dev/null)"
+  if [[ -z "$cmd" ]]; then
+    # Git Bash 的 ps 不支持 -p；MSYS 的 /proc/<pid>/cmdline 以 NUL 分隔参数
+    cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+  fi
   [[ "$cmd" == *"gateway-dev"* || "$cmd" == *"llm-protocol-gateway"* ]]
+}
+
+# port_pids <port>：列出监听该端口的进程 PID。
+# macOS/Linux 用 lsof；Windows Git Bash 没有 lsof，回退到 netstat -ano（输出形如
+# “TCP  0.0.0.0:18093  0.0.0.0:0  LISTENING  57400”，PID 在第 5 列）。
+port_pids() {
+  local port="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -ti "tcp:${port}" 2>/dev/null
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ano 2>/dev/null | awk -v p=":${port}" '$1=="TCP" && $2 ~ p "$" && $4=="LISTENING" {print $5}' | sort -u
+  fi
+}
+
+kill_pids() {
+  local pid
+  for pid in "$@"; do
+    [[ -n "$pid" ]] || continue
+    if command -v lsof >/dev/null 2>&1; then
+      kill "$pid" 2>/dev/null || true
+    else
+      # netstat 拿到的是 Windows 原生 PID，MSYS kill 不一定生效，优先 taskkill
+      taskkill //F //PID "$pid" >/dev/null 2>&1 || kill "$pid" 2>/dev/null || true
+    fi
+  done
 }
 
 # stop_stale [force]：force=1 时无论旧进程是否健康都停掉（--restart 用）。
@@ -65,11 +94,13 @@ stop_stale() {
     fi
     rm -f "$PID_FILE"
   fi
-  if lsof -ti "tcp:${PORT}" >/dev/null 2>&1; then
-    lsof -ti "tcp:${PORT}" | xargs kill 2>/dev/null || true
+  local pids
+  pids="$(port_pids "$PORT")"
+  if [[ -n "$pids" ]]; then
+    kill_pids $pids
   fi
   for _ in $(seq 1 20); do
-    lsof -ti "tcp:${PORT}" >/dev/null 2>&1 || return 0
+    [[ -z "$(port_pids "$PORT")" ]] && return 0
     sleep 0.05
   done
 }
@@ -126,8 +157,12 @@ mv -f "$BIN_NEW" "$BIN"
 
 echo "starting gateway at ${ADDR}"
 # Start in a new session so quitting Cursor/terminal process groups cannot kill it.
-GATEWAY_PID="$(
-  python3 - "$BIN" "$ADDR" "$LOG_FILE" "$ROOT" <<'PY'
+# macOS/Linux：python3 fork+setsid 完整脱离进程组。Windows Git Bash 下 python3
+# 是商店占位符（或原生 Python 无 os.fork），回退 nohup 后台启动——网关是独立
+# Windows 进程，父 shell 退出不影响其存活。
+if python3 -c 'import os,sys; sys.exit(0 if hasattr(os,"fork") else 1)' >/dev/null 2>&1; then
+  GATEWAY_PID="$(
+    python3 - "$BIN" "$ADDR" "$LOG_FILE" "$ROOT" <<'PY'
 import os, sys
 bin_path, addr, log_file, repo_root = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 log = open(log_file, "a", buffering=1)
@@ -141,7 +176,11 @@ if pid == 0:
     os.execv(bin_path, [bin_path])
 print(pid)
 PY
-)"
+  )"
+else
+  GATEWAY_ADDR="$ADDR" GATEWAY_REPO_ROOT="$ROOT" nohup "$BIN" >>"$LOG_FILE" 2>&1 &
+  GATEWAY_PID=$!
+fi
 echo "$GATEWAY_PID" >"$PID_FILE"
 
 for _ in $(seq 1 50); do

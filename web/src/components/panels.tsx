@@ -13,7 +13,7 @@ function resetCreditEarliestExpiry(credits: ChatGPTResetCredit[]): string {
   }
   return earliest;
 }
-import { Badge } from './ui';
+import { Badge, MoreMenu } from './ui';
 export function RouteCard({ active, name, tone, status, meta, flow, onClick, onTest, onEdit, onClone, onDelete }: { active?: boolean; name: string; tone: BadgeTone; status: string; meta: string; flow: string[]; onClick: () => void; onTest: () => void; onEdit: () => void; onClone: () => void; onDelete: () => void }) {
   return (
     <div className={`route-card clickable ${active ? 'active' : ''}`} onClick={onClick} role="button" tabIndex={0} onKeyDown={(event) => { if (event.key === 'Enter') onClick(); }}>
@@ -173,7 +173,77 @@ export function useOAuthUsageReport<T extends { available?: boolean; error?: str
   };
 }
 
-export function ClaudeOAuthUsagePanel({ providerId, connected, compact }: { providerId: string; connected?: boolean; compact?: boolean }) {
+/** 各家额度面板的公共外壳：标题行（plan 去重 + 状态 + 刷新）+ 告警消息行 + 内容区。
+ *  subtitle 传入卡片副标题：planName 已在其中展示过时不再重复（如 “xxx@gmail.com · plus”）。 */
+export function UsagePanelShell({ panelClass, compact, subtitle, title, planName, stateMessage, loading, fetchedAt, onRefresh, children }: {
+  panelClass?: string;
+  compact?: boolean;
+  subtitle?: string;
+  title: string;
+  planName?: string;
+  stateMessage?: string;
+  loading: boolean;
+  fetchedAt?: string;
+  onRefresh: () => void;
+  children: React.ReactNode;
+}) {
+  const planSuffix = planName && !subtitle?.includes(planName) ? ` · ${planName}` : '';
+  // “可用”是正面信号，收进标题行不占竖向空间；其余（已用尽/降级/异常）单独一行展开，可完整阅读
+  const warnMessage = stateMessage && stateMessage !== '可用' ? stateMessage : '';
+  return (
+    <div
+      className={`claude-usage-panel${panelClass ? ` ${panelClass}` : ''}${compact ? ' compact' : ''}`}
+      onClick={(event) => event.stopPropagation()}
+    >
+      <div className="claude-usage-title">
+        <span>{title}{planSuffix}</span>
+        <span className="claude-usage-actions">
+          {stateMessage === '可用' ? <span className="claude-usage-state ok"><i className="live-dot" aria-hidden="true" />可用</span> : null}
+          {loading ? <span className="claude-usage-status">刷新中…</span> : fetchedAt ? <span className="claude-usage-status">更新于 {formatClaudeUsageResetAt(fetchedAt)}</span> : null}
+          <button
+            type="button"
+            className="btn btn-tiny"
+            disabled={loading}
+            onClick={(event) => {
+              event.stopPropagation();
+              onRefresh();
+            }}
+          >
+            刷新
+          </button>
+        </span>
+      </div>
+      {warnMessage ? <div className="claude-usage-state warn">{warnMessage}</div> : null}
+      {children}
+    </div>
+  );
+}
+
+/** 单个额度桶：标签 + 百分比（随用量变色）+ 进度条 + 重置时间。
+ *  tone class 直接挂在行上（替代旧 :has() 选择器，兼容旧浏览器）。
+ *  compact 下格子窄，重置时间省去“重置 ”前缀只留时间戳（完整文案保留在 title）。 */
+export function UsageBucketRow({ label, percent, note, compact }: { label: string; percent: number; note?: string; compact?: boolean }) {
+  const tone = claudeUsageFillTone(percent);
+  const noteText = note || '';
+  const displayNote = compact ? noteText.replace(/^重置\s*/, '') : noteText;
+  return (
+    <div
+      className={`claude-usage-row ${tone}`}
+      title={noteText ? `${label} ${percent.toFixed(0)}% · ${noteText}` : `${label} ${percent.toFixed(0)}%`}
+    >
+      <div className="claude-usage-head">
+        <span>{label}</span>
+        <span>{percent.toFixed(0)}%</span>
+      </div>
+      <div className="claude-usage-track">
+        <div className={`claude-usage-fill ${tone}`} style={{ width: `${percent}%` }} />
+      </div>
+      <div className="claude-usage-reset">{displayNote}</div>
+    </div>
+  );
+}
+
+export function ClaudeOAuthUsagePanel({ providerId, connected, compact, subtitle }: { providerId: string; connected?: boolean; compact?: boolean; subtitle?: string }) {
   const { report, loading, refresh } = useOAuthUsageReport<ClaudeOAuthUsageReport>(
     Boolean(connected),
     `/__providers/${encodeURIComponent(providerId)}/claude-oauth/usage`,
@@ -189,24 +259,7 @@ export function ClaudeOAuthUsagePanel({ providerId, connected, compact }: { prov
   ].filter((item) => item.bucket);
 
   return (
-    <div className={`claude-usage-panel${compact ? ' compact' : ''}`} onClick={(event) => event.stopPropagation()}>
-      <div className="claude-usage-title">
-        <span>Claude 订阅额度</span>
-        <span className="claude-usage-actions">
-          {loading ? <span className="claude-usage-status">刷新中…</span> : report?.fetchedAt ? <span className="claude-usage-status">更新于 {formatClaudeUsageResetAt(report.fetchedAt)}</span> : null}
-          <button
-            type="button"
-            className="btn btn-tiny"
-            disabled={loading}
-            onClick={(event) => {
-              event.stopPropagation();
-              void refresh();
-            }}
-          >
-            刷新
-          </button>
-        </span>
-      </div>
+    <UsagePanelShell compact={compact} subtitle={subtitle} title="Claude 订阅额度" loading={loading} fetchedAt={report?.fetchedAt} onRefresh={refresh}>
       {!report ? (
         <div className="claude-usage-empty">{loading ? '正在拉取额度…' : '暂无额度数据'}</div>
       ) : !report.available ? (
@@ -215,33 +268,22 @@ export function ClaudeOAuthUsagePanel({ providerId, connected, compact }: { prov
         <div className="claude-usage-empty">未返回额度桶数据</div>
       ) : (
         <div className="claude-usage-grid">
-          {buckets.map(({ key, label, bucket }) => {
-            const percent = Math.min(100, Math.max(0, bucket?.utilization ?? 0));
-            const resetText = bucket?.resets_at ? `重置 ${formatClaudeUsageResetAt(bucket.resets_at)}` : '';
-            return (
-              <div
-                className="claude-usage-row"
-                key={key}
-                title={resetText ? `${label} ${percent.toFixed(0)}% · ${resetText}` : `${label} ${percent.toFixed(0)}%`}
-              >
-                <div className="claude-usage-head">
-                  <span>{label}</span>
-                  <span>{percent.toFixed(0)}%</span>
-                </div>
-                <div className="claude-usage-track">
-                  <div className={`claude-usage-fill ${claudeUsageFillTone(percent)}`} style={{ width: `${percent}%` }} />
-                </div>
-                <div className="claude-usage-reset">重置：{formatClaudeUsageResetAt(bucket?.resets_at)}</div>
-              </div>
-            );
-          })}
+          {buckets.map(({ key, label, bucket }) => (
+            <UsageBucketRow
+              key={key}
+              label={label}
+              percent={Math.min(100, Math.max(0, bucket?.utilization ?? 0))}
+              note={bucket?.resets_at ? `重置 ${formatClaudeUsageResetAt(bucket.resets_at)}` : ''}
+              compact={compact}
+            />
+          ))}
         </div>
       )}
-    </div>
+    </UsagePanelShell>
   );
 }
 
-export function ZhipuUsagePanel({ providerId, compact }: { providerId: string; compact?: boolean }) {
+export function ZhipuUsagePanel({ providerId, compact, subtitle }: { providerId: string; compact?: boolean; subtitle?: string }) {
   const { report, loading, refresh } = useOAuthUsageReport<ZhipuUsageReport>(
     true,
     `/__providers/${encodeURIComponent(providerId)}/zhipu/usage`,
@@ -264,24 +306,7 @@ export function ZhipuUsagePanel({ providerId, compact }: { providerId: string; c
   ].filter((item) => item.bucket);
 
   return (
-    <div className={`claude-usage-panel${compact ? ' compact' : ''}`} onClick={(event) => event.stopPropagation()}>
-      <div className="claude-usage-title">
-        <span>智谱编程套餐额度{report?.level ? ` · ${report.level}` : ''}</span>
-        <span className="claude-usage-actions">
-          {loading ? <span className="claude-usage-status">刷新中…</span> : report?.fetchedAt ? <span className="claude-usage-status">更新于 {formatClaudeUsageResetAt(report.fetchedAt)}</span> : null}
-          <button
-            type="button"
-            className="btn btn-tiny"
-            disabled={loading}
-            onClick={(event) => {
-              event.stopPropagation();
-              void refresh();
-            }}
-          >
-            刷新
-          </button>
-        </span>
-      </div>
+    <UsagePanelShell panelClass="zhipu-usage-panel" compact={compact} subtitle={subtitle} title="智谱编程套餐额度" planName={report?.level} loading={loading} fetchedAt={report?.fetchedAt} onRefresh={refresh}>
       {!report ? (
         <div className="claude-usage-empty">{loading ? '正在拉取额度…' : '暂无额度数据'}</div>
       ) : !report.available ? (
@@ -290,35 +315,24 @@ export function ZhipuUsagePanel({ providerId, compact }: { providerId: string; c
         <div className="claude-usage-empty">未返回额度桶数据（老套餐可能只有 5 小时窗口）</div>
       ) : (
         <div className="claude-usage-grid">
-          {buckets.map(({ key, label, bucket }) => {
-            const percent = Math.min(100, Math.max(0, bucket?.utilization ?? 0));
-            const resetText = bucket?.resets_at ? `重置 ${formatClaudeUsageResetAt(bucket.resets_at)}` : '';
-            return (
-              <div
-                className="claude-usage-row"
-                key={key}
-                title={resetText ? `${label} ${percent.toFixed(0)}% · ${resetText}` : `${label} ${percent.toFixed(0)}%`}
-              >
-                <div className="claude-usage-head">
-                  <span>{label}</span>
-                  <span>{percent.toFixed(0)}%</span>
-                </div>
-                <div className="claude-usage-track">
-                  <div className={`claude-usage-fill ${claudeUsageFillTone(percent)}`} style={{ width: `${percent}%` }} />
-                </div>
-                <div className="claude-usage-reset">重置：{formatClaudeUsageResetAt(bucket?.resets_at)}</div>
-              </div>
-            );
-          })}
+          {buckets.map(({ key, label, bucket }) => (
+            <UsageBucketRow
+              key={key}
+              label={label}
+              percent={Math.min(100, Math.max(0, bucket?.utilization ?? 0))}
+              note={bucket?.resets_at ? `重置 ${formatClaudeUsageResetAt(bucket.resets_at)}` : ''}
+              compact={compact}
+            />
+          ))}
         </div>
       )}
-    </div>
+    </UsagePanelShell>
   );
 }
 
 /** DeepSeek 账户余额面板。与 Zhipu 同为 api_key provider，复用同一套额度面板样式；
  *  但展示的是金额而非百分比进度条，故不渲染 usage-track。 */
-export function DeepSeekBalancePanel({ providerId, compact }: { providerId: string; compact?: boolean }) {
+export function DeepSeekBalancePanel({ providerId, compact, subtitle }: { providerId: string; compact?: boolean; subtitle?: string }) {
   const { report, loading, refresh } = useOAuthUsageReport<DeepSeekBalanceReport>(
     true,
     `/__providers/${encodeURIComponent(providerId)}/deepseek/usage`,
@@ -338,24 +352,7 @@ export function DeepSeekBalancePanel({ providerId, compact }: { providerId: stri
   const infos = report?.balance_infos || [];
 
   return (
-    <div className={`claude-usage-panel${compact ? ' compact' : ''}`} onClick={(event) => event.stopPropagation()}>
-      <div className="claude-usage-title">
-        <span>DeepSeek 账户余额</span>
-        <span className="claude-usage-actions">
-          {loading ? <span className="claude-usage-status">刷新中…</span> : report?.fetchedAt ? <span className="claude-usage-status">更新于 {formatClaudeUsageResetAt(report.fetchedAt)}</span> : null}
-          <button
-            type="button"
-            className="btn btn-tiny"
-            disabled={loading}
-            onClick={(event) => {
-              event.stopPropagation();
-              void refresh();
-            }}
-          >
-            刷新
-          </button>
-        </span>
-      </div>
+    <UsagePanelShell compact={compact} subtitle={subtitle} title="DeepSeek 账户余额" loading={loading} fetchedAt={report?.fetchedAt} onRefresh={refresh}>
       {!report ? (
         <div className="claude-usage-empty">{loading ? '正在拉取余额…' : '暂无余额数据'}</div>
       ) : !report.available ? (
@@ -385,7 +382,7 @@ export function DeepSeekBalancePanel({ providerId, compact }: { providerId: stri
           ) : null}
         </div>
       )}
-    </div>
+    </UsagePanelShell>
   );
 }
 
@@ -397,7 +394,7 @@ export function formatDeepSeekAmount(currency: string, amount?: string) {
   return `${symbol}${value}`;
 }
 
-export function CursorOAuthUsagePanel({ providerId, connected, compact }: { providerId: string; connected?: boolean; compact?: boolean }) {
+export function CursorOAuthUsagePanel({ providerId, connected, compact, subtitle }: { providerId: string; connected?: boolean; compact?: boolean; subtitle?: string }) {
   const { report, loading, refresh } = useOAuthUsageReport<CursorOAuthUsageReport>(
     Boolean(connected),
     `/__providers/${encodeURIComponent(providerId)}/cursor-oauth/usage`,
@@ -408,25 +405,7 @@ export function CursorOAuthUsagePanel({ providerId, connected, compact }: { prov
   const buckets = report?.buckets || [];
 
   return (
-    <div className={`claude-usage-panel cursor-usage-panel${compact ? ' compact' : ''}`} onClick={(event) => event.stopPropagation()}>
-      <div className="claude-usage-title">
-        <span>Cursor 订阅额度{report?.planName ? ` · ${report.planName}` : ''}</span>
-        <span className="claude-usage-actions">
-          {report?.available && report.message ? <span className="claude-usage-state">{report.message}</span> : null}
-          {loading ? <span className="claude-usage-status">刷新中…</span> : report?.fetchedAt ? <span className="claude-usage-status">更新于 {formatClaudeUsageResetAt(report.fetchedAt)}</span> : null}
-          <button
-            type="button"
-            className="btn btn-tiny"
-            disabled={loading}
-            onClick={(event) => {
-              event.stopPropagation();
-              void refresh();
-            }}
-          >
-            刷新
-          </button>
-        </span>
-      </div>
+    <UsagePanelShell panelClass="cursor-usage-panel" compact={compact} subtitle={subtitle} title="Cursor 订阅额度" planName={report?.planName} stateMessage={report?.available ? report.message : undefined} loading={loading} fetchedAt={report?.fetchedAt} onRefresh={refresh}>
       {!report ? (
         <div className="claude-usage-empty">{loading ? '正在拉取额度…' : '暂无额度数据'}</div>
       ) : !report.available ? (
@@ -435,35 +414,22 @@ export function CursorOAuthUsagePanel({ providerId, connected, compact }: { prov
         <div className="claude-usage-empty">{report.message || '未返回额度桶数据'}</div>
       ) : (
         <div className="claude-usage-grid">
-          {buckets.map((bucket, index) => {
-            const percent = Math.min(100, Math.max(0, bucket.utilization ?? 0));
-            const resetText = bucket.resetsAt
-              ? `重置 ${formatClaudeUsageResetAt(bucket.resetsAt)}`
-              : (bucket.detail || '');
-            return (
-              <div
-                className="claude-usage-row"
-                key={`${bucket.label}-${index}`}
-                title={resetText ? `${bucket.label} ${percent.toFixed(0)}% · ${resetText}` : `${bucket.label} ${percent.toFixed(0)}%`}
-              >
-                <div className="claude-usage-head">
-                  <span>{bucket.label}</span>
-                  <span>{percent.toFixed(0)}%</span>
-                </div>
-                <div className="claude-usage-track">
-                  <div className={`claude-usage-fill ${claudeUsageFillTone(percent)}`} style={{ width: `${percent}%` }} />
-                </div>
-                <div className="claude-usage-reset">{resetText}</div>
-              </div>
-            );
-          })}
+          {buckets.map((bucket, index) => (
+            <UsageBucketRow
+              key={`${bucket.label}-${index}`}
+              label={bucket.label}
+              percent={Math.min(100, Math.max(0, bucket.utilization ?? 0))}
+              note={bucket.resetsAt ? `重置 ${formatClaudeUsageResetAt(bucket.resetsAt)}` : (bucket.detail || '')}
+              compact={compact}
+            />
+          ))}
         </div>
       )}
-    </div>
+    </UsagePanelShell>
   );
 }
 
-export function ChatGPTOAuthUsagePanel({ providerId, connected, compact }: { providerId: string; connected?: boolean; compact?: boolean }) {
+export function ChatGPTOAuthUsagePanel({ providerId, connected, compact, subtitle }: { providerId: string; connected?: boolean; compact?: boolean; subtitle?: string }) {
   const { report, loading, refresh } = useOAuthUsageReport<ChatGPTOAuthUsageReport>(
     Boolean(connected),
     `/__providers/${encodeURIComponent(providerId)}/chatgpt-oauth/usage`,
@@ -474,25 +440,7 @@ export function ChatGPTOAuthUsagePanel({ providerId, connected, compact }: { pro
   const buckets = report?.buckets || [];
 
   return (
-    <div className={`claude-usage-panel chatgpt-usage-panel${compact ? ' compact' : ''}`} onClick={(event) => event.stopPropagation()}>
-      <div className="claude-usage-title">
-        <span>ChatGPT Codex 额度{report?.planName ? ` · ${report.planName}` : ''}</span>
-        <span className="claude-usage-actions">
-          {report?.available && report.message ? <span className="claude-usage-state">{report.message}</span> : null}
-          {loading ? <span className="claude-usage-status">刷新中…</span> : report?.fetchedAt ? <span className="claude-usage-status">更新于 {formatClaudeUsageResetAt(report.fetchedAt)}</span> : null}
-          <button
-            type="button"
-            className="btn btn-tiny"
-            disabled={loading}
-            onClick={(event) => {
-              event.stopPropagation();
-              void refresh();
-            }}
-          >
-            刷新
-          </button>
-        </span>
-      </div>
+    <UsagePanelShell panelClass="chatgpt-usage-panel" compact={compact} subtitle={subtitle} title="ChatGPT Codex 额度" planName={report?.planName} stateMessage={report?.available ? report.message : undefined} loading={loading} fetchedAt={report?.fetchedAt} onRefresh={refresh}>
       {!report ? (
         <div className="claude-usage-empty">{loading ? '正在拉取额度…' : '暂无额度数据'}</div>
       ) : !report.available ? (
@@ -501,28 +449,15 @@ export function ChatGPTOAuthUsagePanel({ providerId, connected, compact }: { pro
         <div className="claude-usage-empty">{report.message || '未返回额度桶数据'}</div>
       ) : (
         <div className="claude-usage-grid">
-          {buckets.map((bucket, index) => {
-            const percent = Math.min(100, Math.max(0, bucket.utilization ?? 0));
-            const resetText = bucket.resetsAt
-              ? `重置 ${formatClaudeUsageResetAt(bucket.resetsAt)}`
-              : (bucket.detail || '');
-            return (
-              <div
-                className="claude-usage-row"
-                key={`${bucket.label}-${index}`}
-                title={resetText ? `${bucket.label} ${percent.toFixed(0)}% · ${resetText}` : `${bucket.label} ${percent.toFixed(0)}%`}
-              >
-                <div className="claude-usage-head">
-                  <span>{bucket.label}</span>
-                  <span>{percent.toFixed(0)}%</span>
-                </div>
-                <div className="claude-usage-track">
-                  <div className={`claude-usage-fill ${claudeUsageFillTone(percent)}`} style={{ width: `${percent}%` }} />
-                </div>
-                <div className="claude-usage-reset">{resetText}</div>
-              </div>
-            );
-          })}
+          {buckets.map((bucket, index) => (
+            <UsageBucketRow
+              key={`${bucket.label}-${index}`}
+              label={bucket.label}
+              percent={Math.min(100, Math.max(0, bucket.utilization ?? 0))}
+              note={bucket.resetsAt ? `重置 ${formatClaudeUsageResetAt(bucket.resetsAt)}` : (bucket.detail || '')}
+              compact={compact}
+            />
+          ))}
         </div>
       )}
       {report?.available && report.resetCredits ? (
@@ -554,19 +489,22 @@ export function ChatGPTOAuthUsagePanel({ providerId, connected, compact }: { pro
           )}
         </div>
       ) : null}
-    </div>
+    </UsagePanelShell>
   );
 }
 
 export function ProviderCard({ active, selected, name, providerId, protocol, tone, url, keyMask, defaultModel, modelCount, usedCount, healthStatus, nextRetryAt, testing, chatTesting, readOnly, selectable, providerDisabled, onToggleEnabled, subtitle, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, isQoderPAT, qoderPATConnected, cursorBridge, ownerName, authorizedUserCount, onShowUsers, onToggleSelect, onClick, onTest, onChatTest, onConformance, onEdit, onClone, onDelete }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; keyMask?: string; defaultModel?: string; modelCount?: number; usedCount: number; healthStatus: string; nextRetryAt?: string; testing: boolean; chatTesting?: boolean; readOnly?: boolean; selectable?: boolean; providerDisabled?: boolean; onToggleEnabled?: () => void; subtitle?: string; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; isQoderPAT?: boolean; qoderPATConnected?: boolean; cursorBridge?: CursorBridgeRuntime; ownerName?: string; authorizedUserCount?: number; onShowUsers?: () => void; onToggleSelect: () => void; onClick: () => void; onTest: () => void; onChatTest: () => void; onConformance?: () => void; onEdit: () => void; onClone: () => void; onDelete: () => void }) {
   const oauthConnected = isClaudeOAuth ? claudeOAuthConnected : isCursorOAuth ? cursorOAuthConnected : isChatGPTOAuth ? chatgptOAuthConnected : isQoderPAT ? qoderPATConnected : false;
   const showOAuthBadge = isClaudeOAuth || isCursorOAuth || isChatGPTOAuth || isQoderPAT;
+  // Qoder 用的是 PAT 而非 OAuth，徽章文案跟着认证方式走，避免误导
+  const oauthBadgeLabel = isQoderPAT ? 'PAT' : 'OAuth';
   const isUnavailable = healthStatus === 'unavailable';
   const now = useNowTick(isUnavailable && !!nextRetryAt);
   const retryLabel = isUnavailable ? retrySecondsLabel(nextRetryAt, now) : null;
   const bridgeHint = cursorBridge?.port
     ? ` · :${cursorBridge.port}${cursorBridge.message ? ` · ${cursorBridge.message}` : ''}`
     : (cursorBridge?.message ? ` · ${cursorBridge.message}` : '');
+  const subtitleText = subtitle || providerId;
   return (
     <div className={`provider-card clickable ${active ? 'active' : ''} ${selected ? 'selected' : ''} ${providerDisabled ? 'provider-disabled' : ''}`} onClick={onClick} role="button" tabIndex={0} onKeyDown={(event) => { if (event.key === 'Enter') onClick(); }}>
       <div className="provider-head">
@@ -579,13 +517,14 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
           ) : (
             <div className="provider-name">{name}</div>
           )}
-          <div className="provider-subtitle">{subtitle || `${providerId} · ${protocol}`}</div>
+          {/* 副标题只放账号/ID：协议已由徽章表达，不再重复拼接 */}
+          <div className="provider-subtitle" title={subtitleText}>{subtitleText}</div>
         </div>
         <div className="provider-badges">
           {providerDisabled ? <Badge tone="red">已禁用</Badge> : null}
           <Badge tone={tone}>{protocol}</Badge>
           {showOAuthBadge ? (
-            <Badge tone={oauthConnected ? 'green' : 'amber'}>{oauthConnected ? 'OAuth 已连接' : 'OAuth 未连接'}</Badge>
+            <Badge tone={oauthConnected ? 'green' : 'amber'}>{oauthBadgeLabel}{oauthConnected ? ' 已连接' : ' 未连接'}</Badge>
           ) : (
             <Badge tone={healthTone(healthStatus)}>{healthStatusLabel(healthStatus)}</Badge>
           )}
@@ -616,7 +555,7 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
             </div>
             <div className="provider-meta-row">
               <span className="provider-meta-label">可用模型</span>
-              <span className="provider-meta-value">
+              <span className="provider-meta-value" title={modelCount != null && modelCount > 0 ? undefined : '点击下方「获取模型」拉取可用模型列表'}>
                 {modelCount != null && modelCount > 0 ? `${modelCount} 个` : '未获取 · 可点下方「获取模型」拉取'}
               </span>
             </div>
@@ -625,11 +564,11 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
           <span className="provider-meta-line" title={url}>{url}{isCursorOAuth && cursorBridge?.port ? ` · 127.0.0.1:${cursorBridge.port}` : ''}</span>
         )}
       </div>
-      {isClaudeOAuth && claudeOAuthConnected && !providerDisabled ? <ClaudeOAuthUsagePanel providerId={providerId} connected={claudeOAuthConnected} compact /> : null}
-      {isCursorOAuth && cursorOAuthConnected && !providerDisabled ? <CursorOAuthUsagePanel providerId={providerId} connected={cursorOAuthConnected} compact /> : null}
-      {isChatGPTOAuth && chatgptOAuthConnected && !providerDisabled ? <ChatGPTOAuthUsagePanel providerId={providerId} connected={chatgptOAuthConnected} compact /> : null}
-      {!providerDisabled && !isClaudeOAuth && !isCursorOAuth && !isChatGPTOAuth && !isQoderPAT && /(?:bigmodel\.cn|z\.ai)/i.test(url) ? <ZhipuUsagePanel providerId={providerId} compact /> : null}
-      {!providerDisabled && !isClaudeOAuth && !isCursorOAuth && !isChatGPTOAuth && !isQoderPAT && /deepseek\.com/i.test(url) ? <DeepSeekBalancePanel providerId={providerId} compact /> : null}
+      {isClaudeOAuth && claudeOAuthConnected && !providerDisabled ? <ClaudeOAuthUsagePanel providerId={providerId} connected={claudeOAuthConnected} compact subtitle={subtitle} /> : null}
+      {isCursorOAuth && cursorOAuthConnected && !providerDisabled ? <CursorOAuthUsagePanel providerId={providerId} connected={cursorOAuthConnected} compact subtitle={subtitle} /> : null}
+      {isChatGPTOAuth && chatgptOAuthConnected && !providerDisabled ? <ChatGPTOAuthUsagePanel providerId={providerId} connected={chatgptOAuthConnected} compact subtitle={subtitle} /> : null}
+      {!providerDisabled && !isClaudeOAuth && !isCursorOAuth && !isChatGPTOAuth && !isQoderPAT && /(?:bigmodel\.cn|z\.ai)/i.test(url) ? <ZhipuUsagePanel providerId={providerId} compact subtitle={subtitle} /> : null}
+      {!providerDisabled && !isClaudeOAuth && !isCursorOAuth && !isChatGPTOAuth && !isQoderPAT && /deepseek\.com/i.test(url) ? <DeepSeekBalancePanel providerId={providerId} compact subtitle={subtitle} /> : null}
       <div className="provider-foot" onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
         <div className="provider-foot-meta">
           <span><b>{usedCount}</b> 个 API Key</span>
@@ -650,17 +589,14 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
             <button className="icon-btn" disabled={testing} onClick={onTest} title="从 Provider 接口获取可用模型">{testing ? '获取中' : '获取模型'}</button>
             <button className="icon-btn" disabled={!!chatTesting} onClick={onChatTest} title="直连上游对话接口测试">{chatTesting ? '测试中' : '对话测试'}</button>
             <button className="icon-btn" onClick={onEdit} title="编辑 Provider">编辑</button>
-            <button className="icon-btn" onClick={onClone} title="克隆为新 Provider">克隆</button>
-            <button className="icon-btn danger" onClick={onDelete} title="删除 Provider（绑定该 Provider 的 API 密钥引用将自动重置为空）">删除</button>
-            {onToggleEnabled ? (
-              <button
-                className={`icon-btn${providerDisabled ? '' : ' danger'}`}
-                onClick={onToggleEnabled}
-                title={providerDisabled ? '启用后普通用户恢复可用' : '禁用后普通用户不可见、不可绑定、请求被拒绝（管理员不受影响）'}
-              >
-                {providerDisabled ? '启用' : '禁用'}
-              </button>
-            ) : null}
+            <MoreMenu
+              label="更多操作"
+              items={[
+                { label: '克隆', onClick: onClone },
+                ...(onToggleEnabled ? [{ label: providerDisabled ? '启用' : '禁用', onClick: onToggleEnabled }] : []),
+                { label: '删除', danger: true, onClick: onDelete },
+              ]}
+            />
           </div>
         ) : (
           // 只读（管理员授权给普通用户的 Provider）也允许获取模型与对话测试；

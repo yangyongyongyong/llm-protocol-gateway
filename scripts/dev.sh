@@ -34,6 +34,17 @@ if lsof -ti "tcp:${WEB_PORT}" >/dev/null 2>&1; then
   echo "[dev] stopping stale vite on port ${WEB_PORT}"
   lsof -ti "tcp:${WEB_PORT}" | xargs kill 2>/dev/null || true
   sleep 0.4
+elif ! command -v lsof >/dev/null 2>&1 && command -v netstat >/dev/null 2>&1; then
+  # Windows Git Bash 没有 lsof：用 netstat -ano 找到占用端口的 PID 后 taskkill，
+  # 否则残留的旧 Vite 会把新实例挤到 5174/5175。
+  stale_pids="$(netstat -ano 2>/dev/null | awk -v p=":${WEB_PORT}" '$1=="TCP" && $2 ~ p "$" && $4=="LISTENING" {print $5}' | sort -u)"
+  if [[ -n "$stale_pids" ]]; then
+    echo "[dev] stopping stale vite on port ${WEB_PORT} (pids: $(echo "$stale_pids" | tr '\n' ' '))"
+    for spid in $stale_pids; do
+      taskkill //F //PID "$spid" >/dev/null 2>&1 || kill "$spid" 2>/dev/null || true
+    done
+    sleep 0.4
+  fi
 fi
 
 cd "$ROOT/web"
