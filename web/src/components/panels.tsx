@@ -1,6 +1,6 @@
 // @generated-from main.tsx — 由重构脚本拆分生成，请直接维护本文件。
 import React from 'react';
-import { API_BASE, OAUTH_USAGE_POLL_MS, OAUTH_USAGE_STORAGE_PREFIX, cursorBridgeStatusLabel, cursorBridgeTone, flowBadgeTone, healthStatusLabel, healthTone, retrySecondsLabel, useNowTick } from '../lib';
+import { API_BASE, OAUTH_USAGE_POLL_MS, OAUTH_USAGE_STORAGE_PREFIX, chatgptAccountLabelFriendly, chatgptPlanLabel, cursorBridgeStatusLabel, cursorBridgeTone, flowBadgeTone, healthStatusLabel, healthTone, retrySecondsLabel, useNowTick } from '../lib';
 import { BadgeTone, ChatGPTOAuthUsageReport, ChatGPTResetCredit, ClaudeOAuthUsageBucket, ClaudeOAuthUsageReport, CursorBridgeRuntime, CursorOAuthUsageReport, DeepSeekBalanceReport, ZhipuUsageBucket, ZhipuUsageReport } from '../types';
 
 /** 最早到期的重置卡时间；无效时间为空串。 */
@@ -173,8 +173,9 @@ export function useOAuthUsageReport<T extends { available?: boolean; error?: str
   };
 }
 
-/** 各家额度面板的公共外壳：标题行（plan 去重 + 状态 + 刷新）+ 告警消息行 + 内容区。
- *  subtitle 传入卡片副标题：planName 已在其中展示过时不再重复（如 “xxx@gmail.com · plus”）。 */
+/** 各家额度面板的公共外壳：标题行（plan 档位 + 状态 + 刷新）+ 告警消息行 + 内容区。
+ *  planName 统一走友好名（如 self_serve_business_prolite → Business Pro Lite）；
+ *  展开面板时卡片副标题仍可见，但档位信息足够短，重复展示不影响阅读。 */
 export function UsagePanelShell({ panelClass, compact, subtitle, title, planName, stateMessage, loading, fetchedAt, onRefresh, children }: {
   panelClass?: string;
   compact?: boolean;
@@ -187,7 +188,7 @@ export function UsagePanelShell({ panelClass, compact, subtitle, title, planName
   onRefresh: () => void;
   children: React.ReactNode;
 }) {
-  const planSuffix = planName && !subtitle?.includes(planName) ? ` · ${planName}` : '';
+  const planSuffix = planName ? ` · ${planName}` : '';
   // “可用”是正面信号，收进标题行不占竖向空间；其余（已用尽/降级/异常）单独一行展开，可完整阅读
   const warnMessage = stateMessage && stateMessage !== '可用' ? stateMessage : '';
   return (
@@ -440,7 +441,7 @@ export function ChatGPTOAuthUsagePanel({ providerId, connected, compact, subtitl
   const buckets = report?.buckets || [];
 
   return (
-    <UsagePanelShell panelClass="chatgpt-usage-panel" compact={compact} subtitle={subtitle} title="ChatGPT Codex 额度" planName={report?.planName} stateMessage={report?.available ? report.message : undefined} loading={loading} fetchedAt={report?.fetchedAt} onRefresh={refresh}>
+    <UsagePanelShell panelClass="chatgpt-usage-panel" compact={compact} subtitle={subtitle} title="ChatGPT Codex 额度" planName={chatgptPlanLabel(report?.planName)} stateMessage={report?.available ? report.message : undefined} loading={loading} fetchedAt={report?.fetchedAt} onRefresh={refresh}>
       {!report ? (
         <div className="claude-usage-empty">{loading ? '正在拉取额度…' : '暂无额度数据'}</div>
       ) : !report.available ? (

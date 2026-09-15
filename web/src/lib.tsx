@@ -2159,3 +2159,42 @@ export function formatTokenSummaryCompact(stats: Pick<APIKeyDayStats, 'inputToke
 export const OAUTH_USAGE_POLL_MS = 3 * 60_000;
 
 export const OAUTH_USAGE_STORAGE_PREFIX = 'oauth-usage:';
+
+/**
+ * ChatGPT plan_type → 友好名。上游 wham/usage 与 JWT claims 里是机器串
+ * （self_serve_business_prolite 等），直接展示既长又看不懂档位。
+ * 未知值原样返回，新套餐不会显示成空。
+ */
+const CHATGPT_PLAN_LABELS: Record<string, string> = {
+  free: 'Free',
+  plus: 'Plus',
+  pro: 'Pro',
+  pro_lite: 'Pro Lite',
+  team: 'Team',
+  business: 'Business',
+  enterprise: 'Enterprise',
+  edu: 'Edu',
+  self_serve_business: 'Business',
+  self_serve_business_lite: 'Business Lite',
+  self_serve_business_pro: 'Business Pro',
+  self_serve_business_prolite: 'Business Pro Lite',
+  self_serve_business_pro_lite: 'Business Pro Lite',
+  business_prolite: 'Business Pro Lite',
+};
+
+export function chatgptPlanLabel(planType?: string): string {
+  const value = (planType || '').trim();
+  if (!value) return '';
+  return CHATGPT_PLAN_LABELS[value.toLowerCase()] ?? value;
+}
+
+/** 把 accountLabel（"email · plan_type"）里的 plan 段替换成友好名。 */
+export function chatgptAccountLabelFriendly(label?: string): string {
+  const value = (label || '').trim();
+  if (!value) return '';
+  const idx = value.lastIndexOf(' · ');
+  if (idx < 0) return value;
+  const email = value.slice(0, idx);
+  const plan = value.slice(idx + 3);
+  return plan ? `${email} · ${chatgptPlanLabel(plan)}` : email;
+}
