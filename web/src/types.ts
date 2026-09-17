@@ -393,6 +393,8 @@ export type APIKey = {
   streamEnabled?: boolean;
   // Codex「复制配置」弹窗内“保持账号登录”开关，绑定到具体 key，跨次打开弹窗保留。
   codexKeepOfficialLogin?: boolean;
+  /** 强制该 Key 命中 ChatGPT OAuth(Codex) Provider 时开启 fast 档(service_tier=priority,消耗 2~2.5x)。默认关闭。 */
+  codexForceFast?: boolean;
   fallbackProviderIds?: string[];
   fallbackModelOverrides?: Record<string, string>;
   activeProviderId?: string;

@@ -255,6 +255,7 @@ function App() {
     thinkingDepthOverride: '',
     maxOutputTokens: 0,
     streamEnabled: true,
+    codexForceFast: false,
   });
   const [modelsProviderFilter, setModelsProviderFilter] = useState('__all__');
   const [modelsSearchQuery, setModelsSearchQuery] = useState('');
@@ -2402,6 +2403,7 @@ function App() {
       thinkingDepthOverride: '',
       maxOutputTokens: 0,
       streamEnabled: true,
+      codexForceFast: false,
     });
     setApiKeyModalOpen(true);
   }
@@ -2417,6 +2419,7 @@ function App() {
       thinkingDepthOverride: key.thinkingDepthOverride || '',
       maxOutputTokens: key.maxOutputTokens && key.maxOutputTokens > 0 ? key.maxOutputTokens : 0,
       streamEnabled: key.streamEnabled !== false,
+      codexForceFast: key.codexForceFast === true,
     });
     setApiKeyModalOpen(true);
   }
@@ -3354,6 +3357,7 @@ function App() {
           thinkingDepthOverride: apiKeyDraft.thinkingDepthOverride,
           maxOutputTokens: apiKeyDraft.maxOutputTokens > 0 ? apiKeyDraft.maxOutputTokens : 0,
           streamEnabled: apiKeyDraft.streamEnabled,
+          codexForceFast: apiKeyDraft.codexForceFast === true,
           enabled: true,
         }),
       });
@@ -3429,7 +3433,7 @@ function App() {
     }
   }
 
-  async function updateApiKeyField(key: APIKey, field: 'name' | 'routeId' | 'modelOverride' | 'thinkingDepthOverride' | 'maxOutputTokens' | 'streamEnabled' | 'codexKeepOfficialLogin' | 'enabled', value: string | boolean | number) {
+  async function updateApiKeyField(key: APIKey, field: 'name' | 'routeId' | 'modelOverride' | 'thinkingDepthOverride' | 'maxOutputTokens' | 'streamEnabled' | 'codexKeepOfficialLogin' | 'codexForceFast' | 'enabled', value: string | boolean | number) {
     setSaving(true);
     try {
       const patch: Partial<APIKey> = {};
@@ -3440,6 +3444,7 @@ function App() {
       if (field === 'maxOutputTokens') patch.maxOutputTokens = typeof value === 'number' ? value : Number.parseInt(String(value), 10) || 0;
       if (field === 'streamEnabled') patch.streamEnabled = Boolean(value);
       if (field === 'codexKeepOfficialLogin') patch.codexKeepOfficialLogin = Boolean(value);
+      if (field === 'codexForceFast') patch.codexForceFast = Boolean(value);
       if (field === 'enabled') patch.enabled = Boolean(value);
       const response = await fetch(`${API_BASE}/__apikeys/${encodeURIComponent(key.id)}`, {
         method: 'PATCH',
@@ -7001,6 +7006,18 @@ function App() {
                   onChange={(event) => setApiKeyDraft((current) => ({ ...current, streamEnabled: event.target.checked }))}
                 />
                 允许流式响应（关闭后该 Key 的 stream:true 请求将被拒绝）
+              </label>
+            </div>
+            <div className="field field-full">
+              <label>Codex Fast 档（强制）</label>
+              <label className="hint-line" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <input
+                  type="checkbox"
+                  checked={apiKeyDraft.codexForceFast === true}
+                  onChange={(event) => setApiKeyDraft((current) => ({ ...current, codexForceFast: event.target.checked }))}
+                />
+                开启后，该 Key 的请求只要落到 ChatGPT OAuth（Codex）Provider，就强制以 fast 档转发
+                （service_tier=priority，速度约 1.5~2.5x，额度消耗 2~2.5x），与客户端传参无关；其他类型 Provider 不受影响。默认关闭。
               </label>
             </div>
             <ApiKeyModelMappingControl

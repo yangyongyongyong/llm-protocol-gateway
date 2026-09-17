@@ -20,7 +20,7 @@ func TestPrepareChatGPTCodexRequestBodyNormalizesInputAndStripsUnsupported(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, clientStream, err := prepareChatGPTCodexRequestBody(raw)
+	out, clientStream, err := prepareChatGPTCodexRequestBody(raw, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,6 +57,47 @@ func TestPrepareChatGPTCodexRequestBodyNormalizesInputAndStripsUnsupported(t *te
 	part, _ := content[0].(map[string]any)
 	if stringValue(part["type"]) != "input_text" || stringValue(part["text"]) != "say hi" {
 		t.Fatalf("content part=%v", part)
+	}
+	if _, ok := payload["service_tier"]; ok {
+		t.Fatalf("service_tier must stay absent without the force-fast switch, got %v", payload["service_tier"])
+	}
+}
+
+func TestPrepareChatGPTCodexRequestBodyForceFast(t *testing.T) {
+	raw, err := json.Marshal(map[string]any{
+		"model": "gpt-5.6-sol",
+		"input": []any{map[string]any{
+			"type": "message", "role": "user",
+			"content": []any{map[string]any{"type": "input_text", "text": "hi"}},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _, err := prepareChatGPTCodexRequestBody(raw, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(out, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["service_tier"] != "priority" {
+		t.Fatalf("service_tier=%v want priority", payload["service_tier"])
+	}
+	// An explicit caller-provided tier must also be overridden by the switch.
+	withCallerTier, _ := json.Marshal(map[string]any{
+		"model": "gpt-5.6-sol", "service_tier": "flex",
+		"input": []any{},
+	})
+	out2, _, err := prepareChatGPTCodexRequestBody(withCallerTier, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload2 map[string]any
+	_ = json.Unmarshal(out2, &payload2)
+	if payload2["service_tier"] != "priority" {
+		t.Fatalf("caller tier must be overridden, got %v", payload2["service_tier"])
 	}
 }
 

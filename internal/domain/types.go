@@ -456,6 +456,11 @@ type APIKey struct {
 	// It never touches ~/.codex/auth.json. Default false; bound per API key so
 	// the choice survives across "复制 Codex 配置" dialog opens.
 	CodexKeepOfficialLogin bool `json:"codexKeepOfficialLogin,omitempty"`
+	// CodexForceFast forces OpenAI's fast processing tier (service_tier:
+	// "priority", 2x-2.5x credit burn) on requests that end up on a ChatGPT
+	// OAuth (Codex) provider, regardless of what the caller sends. Key-level
+	// switch like ModelOverride; ignored on every other provider type.
+	CodexForceFast bool `json:"codexForceFast,omitempty"`
 	// FallbackProviderIDs is an ordered list of backup input providers after the
 	// preferred provider on the bound route. Higher priority comes first.
 	FallbackProviderIDs []string `json:"fallbackProviderIds,omitempty"`

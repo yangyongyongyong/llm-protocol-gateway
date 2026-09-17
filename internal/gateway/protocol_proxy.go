@@ -43,7 +43,7 @@ func (s *Server) doOpenAIProviderRequest(ctx context.Context, r *http.Request, p
 			return nil, err
 		}
 		provider = refreshed
-		prepared, _, prepErr := prepareChatGPTCodexRequestBody(body)
+		prepared, _, prepErr := prepareChatGPTCodexRequestBody(body, codexForceFastFrom(ctx))
 		if prepErr != nil {
 			return nil, prepErr
 		}

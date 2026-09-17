@@ -86,7 +86,7 @@ export function ApiKeyDetailPanel({
   tunnelRunning: boolean;
   livePublicURL: string;
   fixedOutputLabels: string[];
-  onUpdateField: (key: APIKey, field: 'name' | 'routeId' | 'modelOverride' | 'thinkingDepthOverride' | 'maxOutputTokens' | 'streamEnabled' | 'codexKeepOfficialLogin' | 'enabled', value: string | boolean | number) => Promise<void>;
+  onUpdateField: (key: APIKey, field: 'name' | 'routeId' | 'modelOverride' | 'thinkingDepthOverride' | 'maxOutputTokens' | 'streamEnabled' | 'codexKeepOfficialLogin' | 'codexForceFast' | 'enabled', value: string | boolean | number) => Promise<void>;
   onUpdateBinding: (key: APIKey, providerId: string, outputProtocol: Protocol) => Promise<void>;
   onUpdateModelAliases: (key: APIKey, modelAliases: Record<string, string>) => Promise<void>;
   onUpdateFallbacks: (key: APIKey, fallbackProviderIds: string[], fallbackModelOverrides: Record<string, string>) => Promise<void>;
@@ -349,6 +349,19 @@ export function ApiKeyDetailPanel({
                 onChange={(event) => void onUpdateField(keyItem, 'streamEnabled', event.target.checked)}
               />
               允许流式响应（关闭后该 Key 的 stream:true 请求将被拒绝）
+            </label>
+          </div>
+          <div className="field">
+            <label>Codex Fast 档（强制）</label>
+            <label className="hint-line" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <input
+                type="checkbox"
+                checked={keyItem.codexForceFast === true}
+                disabled={saving}
+                onChange={(event) => void onUpdateField(keyItem, 'codexForceFast', event.target.checked)}
+              />
+              开启后，该 Key 的请求只要落到 ChatGPT OAuth（Codex）Provider，就强制以 fast 档转发
+              （service_tier=priority，速度约 1.5~2.5x，额度消耗 2~2.5x），与客户端传参无关；其他类型 Provider 不受影响。默认关闭。
             </label>
           </div>
           <ApiKeyModelMappingControl
@@ -662,7 +675,7 @@ export function ApiKeyClientConfigModal({
   publicAvailable: boolean;
   onClose: () => void;
   onToast?: (message: string) => void;
-  onUpdateField?: (key: APIKey, field: 'name' | 'routeId' | 'modelOverride' | 'thinkingDepthOverride' | 'maxOutputTokens' | 'streamEnabled' | 'codexKeepOfficialLogin' | 'enabled', value: string | boolean | number) => Promise<void>;
+  onUpdateField?: (key: APIKey, field: 'name' | 'routeId' | 'modelOverride' | 'thinkingDepthOverride' | 'maxOutputTokens' | 'streamEnabled' | 'codexKeepOfficialLogin' | 'codexForceFast' | 'enabled', value: string | boolean | number) => Promise<void>;
 }) {
   const [networkMode, setNetworkMode] = React.useState<'lan' | 'public'>(publicAvailable ? 'public' : 'lan');
   // 绑定到具体 key（而非只在本次弹窗会话内），跨次打开保留上次选择。

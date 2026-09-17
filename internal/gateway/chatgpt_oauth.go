@@ -505,8 +505,10 @@ func normalizeChatGPTCodexInput(payload map[string]any) {
 
 // prepareChatGPTCodexRequestBody enforces Codex ChatGPT-account constraints:
 // store must be false, stream must be true, input must be a list, and known
-// unsupported sampling/limit fields are stripped.
-func prepareChatGPTCodexRequestBody(body []byte) ([]byte, bool, error) {
+// unsupported sampling/limit fields are stripped. forceFast additionally sets
+// service_tier=priority (OpenAI "fast" mode; the canonical upstream value —
+// fast/priority are aliases and GPT-5.6-era models echo "priority" back).
+func prepareChatGPTCodexRequestBody(body []byte, forceFast bool) ([]byte, bool, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return body, requestBodyWantsStream(body), nil
@@ -517,6 +519,9 @@ func prepareChatGPTCodexRequestBody(body []byte) ([]byte, bool, error) {
 	normalizeChatGPTCodexInput(payload)
 	for _, key := range chatgptCodexUnsupportedParams {
 		delete(payload, key)
+	}
+	if forceFast {
+		payload["service_tier"] = "priority"
 	}
 	out, err := json.Marshal(payload)
 	if err != nil {

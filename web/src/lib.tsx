@@ -997,6 +997,7 @@ export function buildApiKeyPatchBody(key: APIKey, patch: Partial<APIKey> = {}) {
     maxOutputTokens: patch.maxOutputTokens ?? key.maxOutputTokens ?? 0,
     streamEnabled: patch.streamEnabled ?? key.streamEnabled ?? true,
     codexKeepOfficialLogin: patch.codexKeepOfficialLogin ?? key.codexKeepOfficialLogin ?? false,
+    codexForceFast: patch.codexForceFast ?? key.codexForceFast ?? false,
     enabled: patch.enabled ?? key.enabled,
     fallbackProviderIds: patch.fallbackProviderIds ?? key.fallbackProviderIds ?? [],
     fallbackModelOverrides: patch.fallbackModelOverrides ?? key.fallbackModelOverrides ?? {},

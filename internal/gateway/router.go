@@ -609,6 +609,7 @@ func (r *Router) UpdateAPIKey(keyID string, patch domain.APIKey) (domain.APIKey,
 		updated.Enabled = patch.Enabled
 		updated.StreamEnabled = patch.StreamEnabled
 		updated.CodexKeepOfficialLogin = patch.CodexKeepOfficialLogin
+		updated.CodexForceFast = patch.CodexForceFast
 		preferredProviderID := ""
 		if route, ok := r.routeLocked(updated.RouteID); ok {
 			preferredProviderID = route.ProviderID

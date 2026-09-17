@@ -30,10 +30,33 @@ func maxOutputTokensOverrideFrom(ctx context.Context) int {
 }
 
 func attachAPIKeyMaxOutputTokens(r *http.Request, key domain.APIKey, matched bool) *http.Request {
-	if r == nil || !matched || key.MaxOutputTokens <= 0 {
+	if r == nil {
 		return r
 	}
-	return r.WithContext(withMaxOutputTokensOverride(r.Context(), key.MaxOutputTokens))
+	if matched && key.MaxOutputTokens > 0 {
+		r = r.WithContext(withMaxOutputTokensOverride(r.Context(), key.MaxOutputTokens))
+	}
+	if matched && key.CodexForceFast {
+		r = r.WithContext(withCodexForceFast(r.Context()))
+	}
+	return r
+}
+
+type codexForceFastKey struct{}
+
+func withCodexForceFast(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, codexForceFastKey{}, true)
+}
+
+func codexForceFastFrom(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	enabled, _ := ctx.Value(codexForceFastKey{}).(bool)
+	return enabled
 }
 
 const (
