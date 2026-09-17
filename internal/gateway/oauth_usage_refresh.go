@@ -28,6 +28,61 @@ func (s *Server) StartOAuthUsageBackgroundRefresh(ctx context.Context) {
 	}()
 }
 
+// chatgptTokenProactiveRefreshLead refreshes an access token this far before
+// its recorded expiry. OpenAI's refresh tokens are rotating and expire when
+// idle (roughly a week in practice): a lazy refresh-on-request design lets
+// them go stale on quiet accounts and forces a full re-login. Keeping the
+// token in constant rotation avoids that (sub2api runs the same scheme).
+const chatgptTokenProactiveRefreshLead = 30 * time.Minute
+
+// StartChatGPTTokenBackgroundRefresh sweeps ChatGPT OAuth providers on a short
+// interval and proactively rotates access tokens before expiry, so the refresh
+// token never idles long enough to be invalidated server-side.
+func (s *Server) StartChatGPTTokenBackgroundRefresh(ctx context.Context) {
+	go func() {
+		timer := time.NewTimer(3 * time.Minute)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				s.refreshAllChatGPTTokens()
+				timer.Reset(15 * time.Minute)
+			}
+		}
+	}()
+}
+
+func (s *Server) refreshAllChatGPTTokens() {
+	for _, provider := range s.router.State().Providers {
+		if provider.Deleted || provider.Disabled || provider.AuthType != domain.AuthTypeChatGPTOAuth {
+			continue
+		}
+		cred := provider.ChatGPTOAuth
+		if cred == nil || strings.TrimSpace(cred.RefreshToken) == "" {
+			continue
+		}
+		expiresAt := strings.TrimSpace(cred.ExpiresAt)
+		if expiresAt == "" {
+			continue
+		}
+		parsed, err := time.Parse(time.RFC3339, expiresAt)
+		if err != nil {
+			continue
+		}
+		if time.Until(parsed) > chatgptTokenProactiveRefreshLead {
+			continue
+		}
+		refreshed, err := s.ensureFreshChatGPTToken(provider)
+		if err != nil {
+			slog.Warn("chatgpt oauth background refresh failed", "provider", provider.ID, "error", err)
+			continue
+		}
+		slog.Info("chatgpt oauth token refreshed proactively", "provider", provider.ID, "expiresAt", refreshed.ChatGPTOAuth.ExpiresAt)
+	}
+}
+
 func (s *Server) refreshAllOAuthUsage(ctx context.Context) {
 	for _, provider := range s.router.State().Providers {
 		if provider.Deleted || provider.Disabled {

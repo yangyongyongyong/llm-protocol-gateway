@@ -282,6 +282,11 @@ func postChatGPTToken(ctx context.Context, form url.Values) (chatgptTokenRespons
 		return chatgptTokenResponse{}, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	// Match the official Codex CLI identity on the auth endpoint too (sub2api
+	// does the same): bare curl-ish requests are more likely to be rejected by
+	// auth.openai.com risk controls.
+	req.Header.Set("User-Agent", chatgptCodexCLIUserAgent)
+	req.Header.Set("originator", "codex_cli_rs")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return chatgptTokenResponse{}, err
@@ -355,6 +360,17 @@ func (s *Server) ensureFreshChatGPTToken(provider domain.Provider) (domain.Provi
 	}
 	if !chatgptTokenNeedsRefresh(provider.ChatGPTOAuth) {
 		return provider, nil
+	}
+	// OpenAI issues rotating refresh tokens: concurrent callers using the same
+	// refresh_token race each other, and the loser gets refresh_token_reused
+	// which invalidates the whole chain. Serialize per provider.
+	unlock := s.lockOAuthUsageFetch("chatgpt-token:" + provider.ID)
+	defer unlock()
+	// Re-read after acquiring the lock: another goroutine may have refreshed
+	// while we waited, making our in-memory copy stale.
+	fresh, err := s.router.ProviderByID(provider.ID)
+	if err == nil && fresh.ChatGPTOAuth != nil && !chatgptTokenNeedsRefresh(fresh.ChatGPTOAuth) {
+		return fresh, nil
 	}
 	token, err := refreshChatGPTToken(context.Background(), provider.ChatGPTOAuth.RefreshToken)
 	if err != nil {

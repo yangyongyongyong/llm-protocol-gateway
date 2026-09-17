@@ -299,6 +299,7 @@ func (rt *Runtime) Start(cfg Config) error {
 		server.SyncConnectedCursorProvidersWithEmptyModels()
 		server.RebuildUsageStats()
 		server.StartOAuthUsageBackgroundRefresh(context.Background())
+		server.StartChatGPTTokenBackgroundRefresh(context.Background())
 		server.StartProviderFailoverRecovery(context.Background())
 		server.StartUserActivityFlush(context.Background())
 		server.BackfillClaudeOAuthAccountLabels()

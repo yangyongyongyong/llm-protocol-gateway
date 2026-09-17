@@ -130,17 +130,19 @@ func TestWithCloudflaredEdgeDNS(t *testing.T) {
 	if !strings.Contains(joined, "--edge-ip-version 4") || !strings.Contains(joined, "--retries 15") {
 		t.Fatalf("missing tunnel-level flags: %q", joined)
 	}
-	if !strings.Contains(joined, "run --dns-resolver-addrs") || !strings.Contains(joined, "1.1.1.1:53") {
-		t.Fatalf("dns resolvers must follow run: %q", joined)
+	// --dns-resolver-addrs is unsupported on cloudflared 2026.x and must NOT be
+	// injected anymore (PR #4 removed it from the manager).
+	if strings.Contains(joined, "--dns-resolver-addrs") {
+		t.Fatalf("dns-resolver-addrs must not be injected: %q", joined)
 	}
-	if idxRun := strings.Index(joined, " run "); idxRun < 0 || strings.Index(joined, "--dns-resolver-addrs") < idxRun {
-		t.Fatalf("dns-resolver-addrs must be after run: %q", joined)
+	if !strings.HasSuffix(joined, " run") {
+		t.Fatalf("run subcommand must be preserved: %q", joined)
 	}
 
 	withProto := withCloudflaredEdgeDNS(withCloudflaredProtocol([]string{"tunnel", "--config", "c.yml", "run"}, "http2"))
 	joinedProto := strings.Join(withProto, " ")
-	if !strings.Contains(joinedProto, "--protocol http2") || !strings.Contains(joinedProto, "run --dns-resolver-addrs") {
-		t.Fatalf("protocol+dns composition broken: %q", joinedProto)
+	if !strings.Contains(joinedProto, "--protocol http2") || !strings.HasSuffix(joinedProto, " run") {
+		t.Fatalf("protocol composition broken: %q", joinedProto)
 	}
 
 	if len(withCloudflaredEdgeDNS(nil)) != 0 {
