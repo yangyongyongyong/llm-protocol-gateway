@@ -89,6 +89,9 @@ type Server struct {
 	// oauthUsageFetchMu serializes upstream usage fetches per provider so
 	// concurrent UI polls share one in-flight request after cache miss.
 	oauthUsageFetchMu sync.Map
+	// chatgptDigestSessions keeps prompt-cache key continuity for Claude→
+	// Responses conversations whose client sends no session signal at all.
+	chatgptDigestSessions *chatgptDigestSessionStore
 	// webExposedChange is invoked when the UI toggles LAN/Web exposure so the
 	// process owner (CLI runtime / desktop app) can rebind the HTTP listener.
 	webExposedChange func(enabled bool) error

@@ -62,6 +62,19 @@ func (s *Server) doOpenAIProviderRequest(ctx context.Context, r *http.Request, p
 	}
 	if provider.AuthType == domain.AuthTypeChatGPTOAuth {
 		applyChatGPTCodexHeaders(request, provider)
+		// Codex backend routes prompt-cache shards by session headers, not by
+		// the body field: lift prompt_cache_key out of the body and isolate it
+		// per ChatGPT account (sub2api isolateOpenAIUpstreamSessionID).
+		if cacheKey := extractPromptCacheKeyFromBody(body); cacheKey != "" {
+			accountID := ""
+			if provider.ChatGPTOAuth != nil {
+				accountID = provider.ChatGPTOAuth.ChatGPTAccountID
+			}
+			isolated := chatgptSessionIDForCache(provider.ID, accountID, cacheKey)
+			request.Header.Set("session_id", isolated)
+			request.Header.Set("conversation_id", isolated)
+			request.Header.Set("x-client-request-id", isolated)
+		}
 	} else {
 		applyProviderAuth(request, provider, func() string {
 			if skipIncomingAuth {
@@ -233,6 +246,12 @@ func (s *Server) proxyResponsesToClaudeMessages(w http.ResponseWriter, r *http.R
 	responsesReq, err := claudeToResponsesRequestDirect(claudeReq, model)
 	if err != nil {
 		return 0, TokenUsage{}, nil, err
+	}
+	// Stable per-conversation cache key keeps upstream prompt-cache shards
+	// aligned across turns. ChatGPT OAuth turns this into session headers at
+	// send time; plain Responses providers keep it in the body.
+	if cacheKey := s.promptCacheKeyForClaudeRequest(r, claudeReq); cacheKey != "" {
+		responsesReq["prompt_cache_key"] = cacheKey
 	}
 	return s.proxyConvertedThroughResponses(w, r, provider, model, responsesReq, skipIncomingAuth, responsesToClaudeResponseDirect, streamResponsesToClaudeEventsDirect)
 }

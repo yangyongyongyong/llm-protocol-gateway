@@ -11,7 +11,10 @@ import (
 // Complements convert_responses_claude.go (Responses client ↔ Claude upstream).
 
 // claudeSystemToInstructions flattens Claude's system field into a Responses
-// instructions string.
+// instructions string. The Claude Code billing-attribution block
+// ("x-anthropic-billing-header: …") carries per-request fields and is dropped:
+// keeping it would change the instructions prefix every turn and defeat the
+// upstream prompt cache.
 func claudeSystemToInstructions(system any) string {
 	switch typed := system.(type) {
 	case string:
@@ -19,16 +22,17 @@ func claudeSystemToInstructions(system any) string {
 	case []any:
 		parts := make([]string, 0, len(typed))
 		for _, item := range typed {
+			var text string
 			switch v := item.(type) {
 			case string:
-				if t := strings.TrimSpace(v); t != "" {
-					parts = append(parts, t)
-				}
+				text = strings.TrimSpace(v)
 			case map[string]any:
-				if t := stringValue(v["text"]); t != "" {
-					parts = append(parts, t)
-				}
+				text = stringValue(v["text"])
 			}
+			if text == "" || strings.HasPrefix(text, "x-anthropic-billing-header:") {
+				continue
+			}
+			parts = append(parts, text)
 		}
 		return strings.Join(parts, "\n\n")
 	default:
@@ -101,6 +105,7 @@ func claudeMessagesToResponsesInput(messages []any) []any {
 				contentType = "output_text"
 			}
 			input = append(input, map[string]any{
+				"type":    "message",
 				"role":    role,
 				"content": []any{map[string]any{"type": contentType, "text": content}},
 			})
@@ -110,7 +115,7 @@ func claudeMessagesToResponsesInput(messages []any) []any {
 				if len(messageContent) == 0 {
 					return
 				}
-				input = append(input, map[string]any{"role": role, "content": messageContent})
+				input = append(input, map[string]any{"type": "message", "role": role, "content": messageContent})
 				messageContent = make([]any, 0, 4)
 			}
 			for _, rawBlock := range content {
@@ -174,7 +179,12 @@ func claudeMessagesToResponsesInput(messages []any) []any {
 					})
 				case "thinking", "redacted_thinking":
 					flushMessage()
+					// The synthetic rs_* id is only used for item construction;
+					// responsesReasoningItemFromAnthropicBlock must not leak it
+					// into the request (store=false upstreams 404 on replayed
+					// rs ids), same rule sub2api applies on the codex path.
 					if item, ok := responsesReasoningItemFromAnthropicBlock(fmt.Sprintf("rs_%d", len(input)), block); ok {
+						delete(item, "id")
 						input = append(input, item)
 					}
 				}
