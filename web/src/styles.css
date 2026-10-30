@@ -12201,8 +12201,7 @@ html[data-theme="light"] .mon-topo-mesh { background-image: radial-gradient(circ
 .mon-band-label, .mon-band-state { font-size: 11px; line-height: 17px; }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   账号 / 告警 / 规则 三页与参考 UI 对齐（P8–P17，实测数值取自
-   .workbuddy/reviews/ui-parity-verify-1.md 与本轮 ref 重测）。
+   账号 / 告警 / 规则 三页与参考 UI 对齐（P8–P17，实测数值）。
    参考值：工具条 accounts 61 / alerts 64 / rules 54，p14 gap12；告警行 1172×109.5 p16，
    左侧纵向堆叠 + 右侧按钮组；规则卡标题 14/700、参数块 r12 p10 bg black/30；字号整数档。
    只作用于这三页，不碰概览与设置。
@@ -12341,7 +12340,7 @@ select.mon-acc-select-input { border-radius: 12px; }
 /* ── 账号 / 告警 / 规则 三页像素链（1440×900 暗色，参考值取自重测）──────────────
    工具条 accounts 61 / alerts 64 / rules 54，p14 gap12；账号卡首行 206.5、指标块 286.5（p10）；
    告警行 1176×109.5 p16、描述 mt6、元信息 mt10；规则卡 y199.5、参数块 y302.5、行 2/3 卡高 206.5。
-   数值全部实测收敛（见 .workbuddy/reviews/dev-ui-account-rules-report.md）。 */
+   数值全部实测收敛。 */
 
 /* 卡前说明行（参考没有这一行）：单独一片，与工具条同 gap，卡片网格前再让 8。 */
 .mon-acc-body { display: flex; flex-direction: column; min-width: 0; margin-top: -6px; }

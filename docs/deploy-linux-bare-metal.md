@@ -246,10 +246,11 @@ Provider 菜单里的「RTK 压缩」会在转发前调用 [rtk](https://github.
 默认检测服务器上的 `rtk`，缺失时用官方安装脚本装到 `/usr/local/bin`（SHA-256 校验）：
 
 ```bash
-./deploy/deploy-linux.sh                      # 缺失时自动安装最新版
-RTK_VERSION=v0.50.0 ./deploy/deploy-linux.sh  # 安装/升级到指定版本
-INSTALL_RTK=always ./deploy/deploy-linux.sh   # 每次部署都升级
-INSTALL_RTK=never ./deploy/deploy-linux.sh    # 跳过，不碰服务器上的 rtk
+# SERVER_HOST 为必填项（脚本不再内置默认主机），所有示例都需带上
+SERVER_HOST=<服务器地址> ./deploy/deploy-linux.sh                      # 缺失时自动安装最新版
+SERVER_HOST=<服务器地址> RTK_VERSION=v0.50.0 ./deploy/deploy-linux.sh  # 安装/升级到指定版本
+SERVER_HOST=<服务器地址> INSTALL_RTK=always ./deploy/deploy-linux.sh   # 每次部署都升级
+SERVER_HOST=<服务器地址> INSTALL_RTK=never ./deploy/deploy-linux.sh    # 跳过，不碰服务器上的 rtk
 ```
 
 手动安装：

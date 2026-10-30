@@ -20,7 +20,7 @@
 #   ALLOW_UNVERIFIED_BUILD=1 放行，并会打印醒目的警告。校验脚本：scripts/verify-build-provenance.sh
 #
 # 可用环境变量覆盖默认配置（无需改脚本）：
-#   SERVER_HOST   目标服务器 IP/域名      默认 173.249.207.202
+#   SERVER_HOST   目标服务器 IP/域名      必填（无默认值）
 #   SERVER_USER   SSH 用户                默认 root
 #   SSH_KEY       私钥路径                默认 ~/.ssh/greencloud_new
 #   SSH_PORT      SSH 端口                默认 22
@@ -35,12 +35,12 @@
 #
 # 示例：
 #   SERVER_HOST=1.2.3.4 SSH_KEY=~/.ssh/id_ed25519 ./deploy/deploy-linux.sh
-#   GOARCH_TARGET=arm64 ./deploy/deploy-linux.sh
+#   SERVER_HOST=1.2.3.4 GOARCH_TARGET=arm64 ./deploy/deploy-linux.sh
 #
 set -euo pipefail
 
 # ───────────────────────── 配置区 ─────────────────────────
-SERVER_HOST="${SERVER_HOST:-173.249.207.202}"
+SERVER_HOST="${SERVER_HOST:-}"
 SERVER_USER="${SERVER_USER:-root}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/greencloud_new}"
 SSH_PORT="${SSH_PORT:-22}"
@@ -80,7 +80,7 @@ SCP_OPTS=("${SSH_BASE_OPTS[@]}" -P "$SSH_PORT")
 REMOTE="${SERVER_USER}@${SERVER_HOST}"
 rsh() { ssh "${SSH_OPTS[@]}" "$REMOTE" "$@"; }
 
-usage() { sed -n '2,38p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { sed -n '/^# 流程：/,/^set -euo pipefail$/{/^set -euo pipefail$/d;p}' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0; }
 
 # ───────────────────────── 参数解析 ─────────────────────────
 for arg in "$@"; do
@@ -98,6 +98,9 @@ done
 
 # ───────────────────────── 前置检查 ─────────────────────────
 step "0. 前置检查"
+if [[ "$MODE" != "build" && -z "$SERVER_HOST" ]]; then
+  die "未指定目标服务器：SERVER_HOST=1.2.3.4 ./deploy/deploy-linux.sh（SSH 用户另用 SERVER_USER 指定）"
+fi
 if [[ "$MODE" != "build" ]]; then
   [[ -f "$SSH_KEY" ]] || die "找不到 SSH 私钥: $SSH_KEY（用 SSH_KEY=... 指定）"
   command -v ssh >/dev/null || die "缺少 ssh 命令"
@@ -115,8 +118,8 @@ elif [[ "$MODE" == "build" ]]; then
 fi
 
 # ── 源码必须干净、且构建的必须是已提交的 HEAD ──
-# 检查已跟踪文件的改动/新增/删除。未跟踪文件（.workbuddy/、bin/ 等构建与评审产物）不算，
-# 否则每轮评审都会拦住部署；但它们会被打包（web/dist、cursor-bridge/dist），见下面的溯源校验。
+# 检查已跟踪文件的改动/新增/删除。未跟踪文件（.cache/、bin/ 等构建产物）不算，
+# 否则每轮构建都会拦住部署；但它们会被打包（web/dist、cursor-bridge/dist），见下面的溯源校验。
 # 用 diff-index HEAD 而不是 git status（Go 的 buildvcs 也用它判 modified）：
 #   git add 过但没提交的改动 status 会显示为 "M "，diff-index HEAD 仍然算脏；
 #   而 vcs.modified 只反映未跟踪文件和构建期才发生的改动，单靠它查不出「源码与 HEAD 不一致」。

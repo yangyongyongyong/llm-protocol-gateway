@@ -371,7 +371,7 @@ type claudeOAuthTokenResponse struct {
 
 // fetchClaudeOAuthProfileLabel queries api.anthropic.com/api/oauth/profile
 // with the OAuth access token and builds a human account label like
-// "luca.yang@tuya.com · Tuya". Best-effort: callers treat errors as "no label".
+// "user@example.com · Example Corp". Best-effort: callers treat errors as "no label".
 func fetchClaudeOAuthProfileLabel(accessToken string) (string, error) {
 	accessToken = strings.TrimSpace(accessToken)
 	if accessToken == "" {

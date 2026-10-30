@@ -58,12 +58,12 @@ func TestClaimClaudeCallbackIsSingleUse(t *testing.T) {
 // redirect back; everything else has to finish by pasting the code.
 func TestRequestHostIsLoopback(t *testing.T) {
 	cases := map[string]bool{
-		"localhost:18093":       true,
-		"127.0.0.1:18093":       true,
-		"[::1]:18093":           true,
-		"173.249.207.202:18093": false,
-		"gateway.example.com":   false,
-		"192.168.1.5:18093":     false,
+		"localhost:18093":     true,
+		"127.0.0.1:18093":     true,
+		"[::1]:18093":         true,
+		"198.51.100.10:18093": false,
+		"gateway.example.com": false,
+		"192.168.1.5:18093":   false,
 	}
 	for host, want := range cases {
 		if got := requestHostIsLoopback(host); got != want {
@@ -98,12 +98,12 @@ func TestClaudeOAuthCallbackUnknownStateOffersTheAddress(t *testing.T) {
 // loopback-issued flow may rely on the automatic callback.
 func TestClaudeOAuthDefaultModeFollowsTheRequestHost(t *testing.T) {
 	cases := map[string]string{
-		"localhost:18093":       "localhost",
-		"127.0.0.1:18093":       "localhost",
-		"[::1]:18093":           "localhost",
-		"173.249.207.202:18093": "manual",
-		"gateway.example.com":   "manual",
-		"192.168.1.20:18093":    "manual",
+		"localhost:18093":     "localhost",
+		"127.0.0.1:18093":     "localhost",
+		"[::1]:18093":         "localhost",
+		"198.51.100.10:18093": "manual",
+		"gateway.example.com": "manual",
+		"192.168.1.20:18093":  "manual",
 	}
 	for host, want := range cases {
 		if got := claudeOAuthDefaultMode(host); got != want {

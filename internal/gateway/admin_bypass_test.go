@@ -18,7 +18,7 @@ func TestLocalAdminBypassRejectsProxiedDomains(t *testing.T) {
 		{name: "localhost directly", host: "localhost:18093", want: true},
 		{name: "empty host is the desktop app case", host: "", want: true},
 		{name: "public domain through the reverse proxy", host: "llm.lucadesign.uk"},
-		{name: "public IP through the reverse proxy", host: "173.249.207.202:18093"},
+		{name: "public IP through the reverse proxy", host: "198.51.100.10:18093"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			request := httptest.NewRequest(http.MethodGet, "/__auth/status", nil)

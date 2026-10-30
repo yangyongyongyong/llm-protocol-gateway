@@ -55,13 +55,8 @@ desktop/frontend/.history/
 **/cert.pem
 **/tunnel-config.yml
 !internal/tunnel/quick_tunnel_config.yml
-# 审查产物：账本与报告必须进版本控制（它们是对抗式审查的唯一事实源，
-# 曾因整个目录被删而丢失）。证据目录（探针、日志、DB）体积大，仍忽略。
-.workbuddy/*
-!.workbuddy/reviews/
-.workbuddy/reviews/*
-!.workbuddy/reviews/LEDGER.md
-!.workbuddy/reviews/round*-agent-code-review.md
+# 本地 agent 工作目录（截图、探针、临时构建产物），不进库
+.workbuddy/
 
 # Trellis & agent metadata
 .trellis/
@@ -69,9 +64,8 @@ desktop/frontend/.history/
 .codegraph/
 .zcode/
 .ui-audit/
-# Agent 草稿/计划目录：只留在本地，不进库
+# Agent 草稿目录：只留在本地，不进库
 .superpowers/
-docs/superpowers/
 
 # 构建产物
 *.exe

@@ -1,33 +1,33 @@
 // @generated-from main.tsx — 由重构脚本拆分生成，请直接维护本文件。
 import React from 'react';
 import {
-    AdminAuthStatus,
-    APIKey,
-    APIKeyDayStats,
-    BadgeTone,
-    CloudflareZoneOption,
-    GatewayState,
-    LegacyRequestStatsSnapshot,
-    LogEntry,
-    Model,
-    NavItemID,
-    OutputEndpoint,
-    Protocol,
-    Provider,
-    ProviderAuthPreview,
-    ProviderCacheTestResult,
-    ProviderChatTestOptions,
-    ProviderConnectKind,
-    ProviderPreset,
-    ProviderThinkingTestResult,
-    PublicAccessSettings,
-    RequestAdapter,
-    RequestStatsSnapshot,
-    Route,
-    RouteTestResult,
-    SubscriptionCheckin,
-    SubscriptionConnectKind,
-    TimeHint
+  AdminAuthStatus,
+  APIKey,
+  APIKeyDayStats,
+  BadgeTone,
+  CloudflareZoneOption,
+  GatewayState,
+  LegacyRequestStatsSnapshot,
+  LogEntry,
+  Model,
+  NavItemID,
+  OutputEndpoint,
+  Protocol,
+  Provider,
+  ProviderAuthPreview,
+  ProviderCacheTestResult,
+  ProviderChatTestOptions,
+  ProviderConnectKind,
+  ProviderPreset,
+  ProviderThinkingTestResult,
+  PublicAccessSettings,
+  RequestAdapter,
+  RequestStatsSnapshot,
+  Route,
+  RouteTestResult,
+  SubscriptionCheckin,
+  SubscriptionConnectKind,
+  TimeHint
 } from './types';
 
 export const REQUEST_ADAPTER_PRESETS: Array<{ id: string; label: string; hint: string; json: string }> = [
@@ -1679,7 +1679,7 @@ export function providerAccountLabel(provider: Provider): string {
 
 /**
  * 行内展示用的短账号：邮箱只留 @ 之前的一段。
- * 「lylearcherai2@gmail.com · Free」要 216px，日志那一列给不满；账号之间的差别
+ * 「someone@example.com · Free」要 216px，日志那一列给不满；账号之间的差别
  * 本来就在本地部分，域名砍掉不影响认人，完整值仍留在悬浮提示和详情弹窗里。
  */
 export function shortenAccountLabel(label: string): string {

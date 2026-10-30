@@ -4,6 +4,8 @@
 
 **Goal:** 在不改前端的前提下，交付一套可独立运行的监控后端：新增监控事件与状态表、60 秒采集器、16 条规则、飞书/钉钉/企业微信/Telegram 四渠道推送、旧数据迁移，以及 `/__monitor/*` 只读与配置 API。
 
+> 历史执行记录：文中部署命令与 `ssh root@$VPS_HOST` 均为当时的原始记录。`deploy/deploy-linux.sh` 现在要求显式传入 `SERVER_HOST`（不再内置默认主机），照抄旧命令会因缺少该变量而中止。
+
 **Architecture:** 新建 `internal/monitoring` 包承载纯类型、采集、规则引擎、调度与渠道适配，不依赖 `gateway` 或 `store`；`internal/store` 实现持久化接口；`internal/gateway` 实现数据源（复用现有 router/quota/usage/请求日志）并暴露 HTTP API；`internal/app/runtime.go` 负责启动。所有上游交互留在 gateway 侧，规则引擎只消费快照。
 
 **Tech Stack:** Go 1.26（标准库 `net/http`、`database/sql`、`log/slog`）、SQLite（modernc.org/sqlite）、React 19（阶段 2 才动前端）。
@@ -2962,8 +2964,8 @@ Run: `bash deploy/deploy-linux.sh --skip-web`
 > 与自动回滚。
 
 ```bash
-ssh root@173.249.207.202 'systemctl status llm-protocol-gateway --no-pager | head -20'
-ssh root@173.249.207.202 'python3 - <<PY
+ssh root@$VPS_HOST 'systemctl status llm-protocol-gateway --no-pager | head -20'
+ssh root@$VPS_HOST 'python3 - <<PY
 import sqlite3
 db = sqlite3.connect("file:/var/lib/llm-protocol-gateway/gateway.db?mode=ro", uri=True)
 print("tables:", [r[0] for r in db.execute("select name from sqlite_master where type=\"table\" and (name like \"monitor%\" or name in (\"provider_metric_samples\",\"checkin_history\")) order by name")])
@@ -2978,7 +2980,7 @@ Expected：4 张 `monitor_*` 表（`monitor_events`、`monitor_alert_states`、`
 - [x] **Step 4: 采集器心跳与规则状态**
 
 ```bash
-ssh root@173.249.207.202 'python3 - <<PY
+ssh root@$VPS_HOST 'python3 - <<PY
 import sqlite3, time
 db = sqlite3.connect("file:/var/lib/llm-protocol-gateway/gateway.db?mode=ro", uri=True)
 first = db.execute("select value from settings where key=\"monitor_collector_last_success\"").fetchone()
@@ -2997,7 +2999,7 @@ Expected：心跳设置在一分多钟内被推进（证明 tick 循环真的在
 在 VPS 起一个临时接收器（仅监听 127.0.0.1，验完即删）：
 
 ```bash
-ssh root@173.249.207.202 'cat > /tmp/mockhook.py <<EOF
+ssh root@$VPS_HOST 'cat > /tmp/mockhook.py <<EOF
 from http.server import BaseHTTPRequestHandler, HTTPServer
 class H(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -3028,7 +3030,7 @@ nohup python3 /tmp/mockhook.py >/dev/null 2>&1 & echo $!'
 在 VPS 起一个只监听 127.0.0.1 的 401 mock 上游：
 
 ```bash
-ssh root@173.249.207.202 'cat > /tmp/mock401.py <<EOF
+ssh root@$VPS_HOST 'cat > /tmp/mock401.py <<EOF
 from http.server import BaseHTTPRequestHandler, HTTPServer
 class H(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -3082,7 +3084,7 @@ kill 两个 mock 进程、删 `/tmp/mockhook*`、`/tmp/mock401*`。演练 provid
 - [x] **Step 7: 安全回归**
 
 ```bash
-ssh root@173.249.207.202 'journalctl -u llm-protocol-gateway --since "10 min ago" | grep -Ei "token|secret|webhook|sk-|refresh" || true'
+ssh root@$VPS_HOST 'journalctl -u llm-protocol-gateway --since "10 min ago" | grep -Ei "token|secret|webhook|sk-|refresh" || true'
 ```
 
 Expected：无明文；仅有脱敏后的错误。
