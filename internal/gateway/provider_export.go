@@ -251,6 +251,7 @@ func sanitizeImportedWorkBuddy(cred *domain.WorkBuddyCredential) *domain.WorkBud
 		AccountLabel: label,
 		UserID:       userID,
 		Domain:       domainName,
+		DeviceToken:  strings.TrimSpace(cred.DeviceToken),
 	}
 }
 

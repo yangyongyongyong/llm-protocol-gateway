@@ -86,7 +86,7 @@ func workBuddyCheckinOnce(ctx context.Context, site workBuddySite, credential do
 	result := checkinResult{AccountKey: workBuddyCheckinAccountKey(site, credential)}
 	headers := workBuddyAccountHeaders(site, credential)
 	var status workBuddyCheckinStatus
-	if err := workBuddyCall(ctx, http.MethodPost, site.api()+workBuddyCheckinStatusPath, headers, map[string]any{}, &status); err != nil {
+	if err := workBuddyCall(ctx, site, http.MethodPost, site.api()+workBuddyCheckinStatusPath, headers, map[string]any{}, &status); err != nil {
 		return workBuddyCheckinRefused(ctx, site, credential, headers, err)
 	}
 	switch {
@@ -100,7 +100,7 @@ func workBuddyCheckinOnce(ctx context.Context, site workBuddySite, credential do
 		return result
 	}
 	var claim workBuddyCheckinClaim
-	if err := workBuddyCall(ctx, http.MethodPost, site.api()+workBuddyCheckinClaimPath, headers, map[string]any{}, &claim); err != nil {
+	if err := workBuddyCall(ctx, site, http.MethodPost, site.api()+workBuddyCheckinClaimPath, headers, map[string]any{}, &claim); err != nil {
 		refused := workBuddyCheckinRefused(ctx, site, credential, headers, err)
 		if refused.Outcome == domain.CheckinDone {
 			// The event said today was not in yet, so the streak the status
@@ -136,7 +136,7 @@ func workBuddyCheckinRefused(ctx context.Context, site workBuddySite, credential
 	// headers: when those read, the sign-in is good and it is the check-in alone
 	// that wants WorkBuddy's own app.
 	key := workBuddyCheckinAccountKey(site, credential)
-	if probeErr := workBuddyCall(ctx, http.MethodPost, site.api()+workBuddySummaryPath, headers, map[string]any{}, nil); probeErr == nil {
+	if probeErr := workBuddyCall(ctx, site, http.MethodPost, site.api()+workBuddySummaryPath, headers, map[string]any{}, nil); probeErr == nil {
 		return checkinResult{Outcome: domain.CheckinOwnApp, AccountKey: key,
 			Message: "WorkBuddy 用 401 挡下了签到，但这个账号的额度读得出来：它的签到只认 WorkBuddy 客户端，请在 WorkBuddy 应用里点签到"}
 	}

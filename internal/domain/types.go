@@ -516,6 +516,10 @@ type WorkBuddyCredential struct {
 	// hours, not the month ExpiresAt (the refresh token's) implies.
 	SignInAt  string `json:"signInAt,omitempty"`
 	Connected bool   `json:"connected,omitempty"`
+	// DeviceToken is the Turing Shield device token the desktop client sends as
+	// X-Device-Token when present. Never forge or log it; omit the header when
+	// empty (see gateway.resolveWorkBuddyDeviceToken).
+	DeviceToken string `json:"deviceToken,omitempty"`
 }
 
 // ZCodeCredential is a ZCode (zcode.z.ai) subscription: the GLM Coding Plan
