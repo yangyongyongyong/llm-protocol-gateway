@@ -26,10 +26,24 @@ type streamInterrupter interface {
 	closeInterruptedStream(w http.ResponseWriter, cut streamCut)
 }
 
+// streamTurnReporter is an interrupter that also wants the verdict of the
+// streams it carried whole, not only of the ones it had to close. A turn the
+// upstream finished on its own is nobody's error, yet a thinking-only one still
+// leaves the client with an empty answer, and this is the only place on the
+// pass-through path that can notice it.
+type streamTurnReporter interface {
+	reportStreamTurn(cut streamCut)
+}
+
 // claudeStreamInterrupter ends an Anthropic Messages stream that has no
 // message_stop with a stop_reason, so the client shows the text it has and
 // knows the turn did not finish cleanly.
-type claudeStreamInterrupter struct{}
+type claudeStreamInterrupter struct {
+	// onEmptyTurn, when set, is told that the upstream finished a Claude turn
+	// with a stop_reason but never showed the client anything: the answer the
+	// model chose to give was no answer at all.
+	onEmptyTurn func()
+}
 
 func (claudeStreamInterrupter) closeInterruptedStream(w http.ResponseWriter, cut streamCut) {
 	if !cut.messageStarted {
@@ -51,6 +65,26 @@ func (claudeStreamInterrupter) closeInterruptedStream(w http.ResponseWriter, cut
 	_ = closeInterruptedClaudeStream(w, cut.turn(), cut.usage, int(cut.total))
 }
 
+// reportStreamTurn tells onEmptyTurn about a Claude turn that closed with no
+// visible output. A cut stream is not this case — closeInterruptedStream owns
+// it — so only a stream that carried its own closing frame counts.
+func (c claudeStreamInterrupter) reportStreamTurn(cut streamCut) {
+	if c.onEmptyTurn == nil || !cut.messageStarted || !cut.closed || cut.sawVisibleOutput {
+		return
+	}
+	c.onEmptyTurn()
+}
+
+// firstStreamTurnReporter is the interrupter that wants every stream's verdict;
+// nil when this protocol's interrupter does not report turns.
+func firstStreamTurnReporter(end []streamInterrupter) streamTurnReporter {
+	if len(end) == 0 || end[0] == nil {
+		return nil
+	}
+	reporter, _ := end[0].(streamTurnReporter)
+	return reporter
+}
+
 // streamCut is what the bytes of one forwarded stream say about how it ended:
 // enough to close it in its own protocol, whatever its size.
 type streamCut struct {
@@ -58,8 +92,14 @@ type streamCut struct {
 	total          int64
 	messageStarted bool
 	openBlocks     []int
-	id, model      string // Responses stream identity
-	lastSequence   int    // Responses: highest sequence_number already sent
+	// sawVisibleOutput says the Claude turn opened a block the client can read
+	// (text or a tool call). A turn that closed without one is the thinking-only
+	// empty answer.
+	sawVisibleOutput bool
+	// closed says the stream ended with its protocol's own closing frame.
+	closed       bool
+	id, model    string // Responses stream identity
+	lastSequence int    // Responses: highest sequence_number already sent
 }
 
 // turn is the Claude view of the cut, in the shape the closing helper wants.
@@ -660,6 +700,10 @@ func streamPassThroughResponse(w http.ResponseWriter, tee *streamTee, response *
 	_, copyErr := writeWithClientGone(io.MultiWriter(hw, usage), reads)
 	usage.streamEndReader.settleTail()
 	cut := stream.cut(usage, parseUsage, tee.Bytes())
+	cut.closed = usage.closed()
+	if reporter := firstStreamTurnReporter(end); reporter != nil {
+		reporter.reportStreamTurn(cut)
+	}
 	closeTurn := func() {
 		if len(end) > 0 && end[0] != nil && tee.Total() > 0 {
 			end[0].closeInterruptedStream(hw, cut)

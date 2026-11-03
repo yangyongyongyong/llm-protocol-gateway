@@ -23,7 +23,7 @@ func normalizeClaudePassThroughPayload(payload map[string]any) {
 		normalized["system"] = system
 	}
 	if rawMessages, ok := payload["messages"].([]any); ok {
-		normalized["messages"] = normalizeClaudePassThroughMessages(rawMessages)
+		normalized["messages"] = dropTrailingClaudePassThroughThinking(normalizeClaudePassThroughMessages(rawMessages))
 	}
 	if rawTools, ok := payload["tools"].([]any); ok && len(rawTools) > 0 {
 		normalized["tools"] = normalizeClaudePassThroughTools(rawTools)
@@ -218,6 +218,156 @@ func normalizeClaudePassThroughMessages(raw []any) []any {
 		})
 	}
 	return out
+}
+
+// dropTrailingClaudePassThroughThinking removes thinking / redacted_thinking
+// blocks that would otherwise end an assistant message on the native
+// pass-through path.
+//
+// Anthropic refuses such a history outright ("The final block in an assistant
+// message cannot be `thinking`"), and an upstream that does accept it can
+// answer the turn with nothing the client can see at all — a thinking-only
+// reply with stop_reason=end_turn, which reads to the client as the assistant
+// going silent. That empty turn is then replayed as history, and every later
+// turn of the conversation answers the same way; see
+// errThinkingOnlyEmptyResponse for the same verdict on the converter path.
+//
+// Trailing thinking is never re-read by the model, so dropping it is lossless:
+// a thinking block only has to survive when a text/tool_use block follows it in
+// the same turn, which is exactly the case this never touches. An assistant
+// message left with nothing is dropped, and the same-role messages it stood
+// between are merged back into one (Anthropic refuses two of them sent apart).
+//
+// A redacted_thinking block is the exception: it carries the upstream
+// ciphertext a later turn replays, so it stays as one empty thinking
+// placeholder instead of being dropped.
+func dropTrailingClaudePassThroughThinking(messages []any) []any {
+	if len(messages) == 0 {
+		return messages
+	}
+	out := make([]any, 0, len(messages))
+	trimmedAny := false
+	droppedAny := false
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok {
+			out = append(out, raw)
+			continue
+		}
+		if stringValue(message["role"]) == "assistant" {
+			if blocks, ok := message["content"].([]any); ok {
+				trimmed := claudeTrailingThinkingTrimmed(blocks)
+				if trimmed < len(blocks) {
+					trimmedAny = true
+					if trimmed == 0 {
+						if !claudeBlocksHaveRedactedThinking(blocks) {
+							droppedAny = true
+							continue
+						}
+						message = map[string]any{
+							"role":    "assistant",
+							"content": []any{map[string]any{"type": "thinking", "thinking": ""}},
+						}
+					} else {
+						message = map[string]any{
+							"role":    "assistant",
+							"content": blocks[:trimmed],
+						}
+					}
+				}
+			}
+		}
+		out = append(out, message)
+	}
+	if !trimmedAny || len(out) == 0 {
+		// Nothing to drop, or a history that was nothing but those turns:
+		// leave the request as the client wrote it rather than answer
+		// Anthropic's "messages: at least one message is required".
+		return messages
+	}
+	if droppedAny {
+		out = mergeAdjacentClaudePassThroughMessages(out)
+	}
+	return out
+}
+
+// claudeTrailingThinkingTrimmed is the length the blocks would have once the
+// thinking blocks ending them are taken off.
+func claudeTrailingThinkingTrimmed(blocks []any) int {
+	trimmed := len(blocks)
+	for trimmed > 0 {
+		block, ok := blocks[trimmed-1].(map[string]any)
+		if !ok {
+			return trimmed
+		}
+		switch stringValue(block["type"]) {
+		case "thinking", "redacted_thinking":
+			trimmed--
+		default:
+			return trimmed
+		}
+	}
+	return trimmed
+}
+
+func claudeBlocksHaveRedactedThinking(blocks []any) bool {
+	for _, raw := range blocks {
+		if block, ok := raw.(map[string]any); ok && stringValue(block["type"]) == "redacted_thinking" {
+			return true
+		}
+	}
+	return false
+}
+
+// mergeAdjacentClaudePassThroughMessages joins consecutive same-role messages,
+// which Anthropic refuses when they arrive as separate entries.
+func mergeAdjacentClaudePassThroughMessages(messages []any) []any {
+	out := make([]any, 0, len(messages))
+	for _, raw := range messages {
+		message, ok := raw.(map[string]any)
+		if !ok {
+			out = append(out, raw)
+			continue
+		}
+		if n := len(out); n > 0 {
+			if prev, ok := out[n-1].(map[string]any); ok && stringValue(prev["role"]) == stringValue(message["role"]) {
+				if joined, ok := joinClaudePassThroughContent(prev["content"], message["content"]); ok {
+					out[n-1] = map[string]any{"role": stringValue(prev["role"]), "content": joined}
+					continue
+				}
+			}
+		}
+		out = append(out, message)
+	}
+	return out
+}
+
+// joinClaudePassThroughContent appends one message's content to another's,
+// normalising a bare string into the one text block it stands for.
+func joinClaudePassThroughContent(left, right any) (any, bool) {
+	leftBlocks, leftOK := claudePassThroughContentBlocks(left)
+	rightBlocks, rightOK := claudePassThroughContentBlocks(right)
+	if !leftOK || !rightOK {
+		return nil, false
+	}
+	joined := make([]any, 0, len(leftBlocks)+len(rightBlocks))
+	joined = append(joined, leftBlocks...)
+	joined = append(joined, rightBlocks...)
+	return joined, true
+}
+
+func claudePassThroughContentBlocks(content any) ([]any, bool) {
+	switch typed := content.(type) {
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return nil, true
+		}
+		return []any{map[string]any{"type": "text", "text": typed}}, true
+	case []any:
+		return typed, true
+	default:
+		return nil, false
+	}
 }
 
 func normalizeClaudePassThroughMessageContent(content any) any {

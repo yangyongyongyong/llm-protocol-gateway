@@ -22,6 +22,10 @@ const (
 	timingFlagTouchDB           timingFlag = "touch_db"
 	timingFlagThinkingRectify   timingFlag = "thinking_rectify"
 	timingFlagThinkingOnlyRetry timingFlag = "thinking_only_retry"
+	// timingFlagThinkingOnlyEmptyTurn marks a pass-through turn the upstream
+	// finished with a stop_reason but no visible output at all: the client got
+	// an empty answer, and nothing else in the pipeline is able to say so.
+	timingFlagThinkingOnlyEmptyTurn timingFlag = "thinking_only_empty_turn"
 )
 
 type timingContextKey struct{}

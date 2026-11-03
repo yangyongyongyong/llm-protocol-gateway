@@ -31,6 +31,13 @@ type streamEndReader struct {
 	messageStarted bool
 	openBlocks     []int // indexes started without a stop, in start order
 	openSet        map[int]bool
+	// sawVisibleOutput says the Claude turn opened a block the client can
+	// actually see — text or a tool call. A stream that closes with a
+	// stop_reason but never did is the thinking-only empty answer, which reads
+	// to the client as the assistant going silent; the pass-through path
+	// reports it instead of letting it pass unremarked (see
+	// errThinkingOnlyEmptyResponse).
+	sawVisibleOutput bool
 
 	// Responses: the identity a closing frame has to repeat, the highest
 	// sequence_number seen so far, and the tail of events the identity is
@@ -818,12 +825,22 @@ func (r *streamEndReader) settleTail() {
 // no longer its only record.
 func (r *streamEndReader) reachesEnd() bool { return r.tailReachesEnd }
 
+// visibleOutput reports whether the Claude stream ever opened a block the
+// client can read; see sawVisibleOutput.
+func (r *streamEndReader) visibleOutput() bool { return r.sawVisibleOutput }
+
 // scanClaude folds the Claude event a data line carried, so the cut turn can be
 // closed with exactly the blocks it left open.
 func (r *streamEndReader) scanClaude(payload []byte) {
 	var frame struct {
 		Type  string `json:"type"`
 		Index *int   `json:"index"`
+		// content_block names the block a started one is: only a block the
+		// client can read counts as visible output, so a thinking-only turn is
+		// told apart from one that answered.
+		ContentBlock struct {
+			Type string `json:"type"`
+		} `json:"content_block"`
 	}
 	if json.Unmarshal(payload, &frame) != nil {
 		return
@@ -832,6 +849,10 @@ func (r *streamEndReader) scanClaude(payload []byte) {
 	case "message_start":
 		r.messageStarted = true
 	case "content_block_start":
+		switch frame.ContentBlock.Type {
+		case "text", "tool_use", "server_tool_use":
+			r.sawVisibleOutput = true
+		}
 		if frame.Index == nil || r.openSet[*frame.Index] {
 			return
 		}
@@ -857,13 +878,14 @@ func (r *streamEndReader) scanClaude(payload []byte) {
 // cut is the whole stream's account of how it ended.
 func (r *streamEndReader) cut(usage TokenUsage, total int64, logTail []byte) streamCut {
 	cut := streamCut{
-		usage:          usage,
-		total:          total,
-		messageStarted: r.messageStarted,
-		openBlocks:     append([]int(nil), r.openBlocks...),
-		id:             r.id,
-		model:          r.model,
-		lastSequence:   r.lastSequence,
+		usage:            usage,
+		total:            total,
+		messageStarted:   r.messageStarted,
+		openBlocks:       append([]int(nil), r.openBlocks...),
+		sawVisibleOutput: r.sawVisibleOutput,
+		id:               r.id,
+		model:            r.model,
+		lastSequence:     r.lastSequence,
 	}
 	if cut.lastSequence < 0 {
 		cut.lastSequence = 0

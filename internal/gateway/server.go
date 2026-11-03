@@ -6146,7 +6146,35 @@ func (s *Server) proxyClaudeMessages(w http.ResponseWriter, r *http.Request, pro
 	}
 
 	defer response.Body.Close()
-	return writePassThroughResponse(w, response, requestBodyWantsStream(body), usageStreamClaude, ParseClaudeUsage, claudeStreamInterrupter{})
+	return writePassThroughResponse(w, response, requestBodyWantsStream(body), usageStreamClaude, ParseClaudeUsage, s.claudePassThroughInterrupter(r, provider, body))
+}
+
+// claudePassThroughInterrupter is the hook a Claude pass-through stream writes
+// through: it closes a stream the upstream cut, and reports a stream the
+// upstream finished with no visible output at all.
+//
+// The second case is the reason it exists. On the pass-through path every byte
+// reaches the client as it comes, so message_start is already out by the time
+// the turn turns out to be empty: the turn cannot be retried and cannot be
+// rewritten, and the client shows an empty answer as if the model had simply
+// stopped talking. Nothing else in the pipeline can tell that apart from a
+// real reply, so it is said here, once, where an operator can see it. A
+// history that keeps replaying such a turn is what
+// dropTrailingClaudePassThroughThinking removes on the way in.
+func (s *Server) claudePassThroughInterrupter(r *http.Request, provider domain.Provider, body []byte) claudeStreamInterrupter {
+	if provider.AuthType != domain.AuthTypeClaudeOAuth {
+		// Only the Anthropic OAuth upstream is known to answer this way, and a
+		// Claude-compatible relay reports its own failures as errors.
+		return claudeStreamInterrupter{}
+	}
+	model := stringValue(claudeBodyField(body, "model"))
+	return claudeStreamInterrupter{onEmptyTurn: func() {
+		markTimingFlag(r.Context(), timingFlagThinkingOnlyEmptyTurn)
+		if s.logs != nil {
+			s.logs.AddApp("warn", "upstream thinking-only empty turn",
+				fmt.Sprintf("provider=%s model=%s: the upstream closed the turn with no visible output; the client received an empty answer", provider.ID, model))
+		}
+	}}
 }
 
 // sendClaudeMessagesUpstream builds and sends one Claude Messages request to the
