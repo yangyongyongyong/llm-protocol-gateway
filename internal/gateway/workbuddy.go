@@ -1788,11 +1788,18 @@ func applyWorkBuddyHeaders(request *http.Request, provider domain.Provider) {
 }
 
 // applyWorkBuddyChatClientHeaders are the desktop chat headers both CN and intl
-// builds send on /v2/chat/completions (conversation ids, agent intent, SDK
-// fingerprint, optional device token reuse).
+// builds send on /v2/chat/completions: conversation ids, agent intent, the
+// attribution trio, the trace family and the device token (or the error saying
+// the client's security SDK could not make one).
 func applyWorkBuddyChatClientHeaders(request *http.Request, site workBuddySite, credential *domain.WorkBuddyCredential) {
 	conversationID := workBuddyRequestID()
-	conversationRequestID := workBuddyRequestID()
+	// One aggregation id per turn, reused by every request and retry of it; the
+	// caller pins it in the context (see withWorkBuddyTurnRequestID). A caller
+	// that did not gets a fresh one, which is what a per-request client does.
+	conversationRequestID := workBuddyTurnRequestIDFrom(request.Context())
+	if conversationRequestID == "" {
+		conversationRequestID = workBuddyRequestID()
+	}
 	messageID := workBuddyRequestID()
 
 	request.Header.Set("X-Requested-With", "XMLHttpRequest")
@@ -1807,23 +1814,19 @@ func applyWorkBuddyChatClientHeaders(request *http.Request, site workBuddySite, 
 	request.Header.Set("X-Request-ID", messageID)
 	request.Header.Set("X-Root-Request-ID", conversationRequestID)
 	request.Header.Set("X-CodeBuddy-Request", "1")
-	request.Header.Set("X-Agent-Runtime", "local-agent")
-	if site.intl {
-		request.Header.Set("X-Private-Data", "true")
-	} else {
-		request.Header.Set("X-Private-Data", "false")
-	}
-	request.Header.Set("X-Stainless-Lang", "js")
-	request.Header.Set("X-Stainless-Package-Version", "6.25.0")
-	request.Header.Set("X-Stainless-OS", "Windows")
-	request.Header.Set("X-Stainless-Arch", "x64")
-	request.Header.Set("X-Stainless-Runtime", "node")
-	request.Header.Set("X-Stainless-Runtime-Version", "v22.21.1")
-	request.Header.Set("X-Stainless-Retry-Count", "0")
-	request.Header.Set("baggage", "buddyId=,buddyName=,codebuddy.session_id="+conversationID+
-		",codebuddy.conversation_request_id="+conversationRequestID)
+	// The desktop client answers for its own data usage the same way on both
+	// builds. The true/false split is the CLI identity's rule (personal false,
+	// enterprise true), not this one's.
+	request.Header.Set("X-Private-Data", "true")
+	applyWorkBuddyTraceHeaders(request)
+	applyWorkBuddyStainlessHeaders(request)
+	// Token or error, always one: the client's security SDK either mints a
+	// device token or reports that it could not, and a request carrying neither
+	// is a state the real client never reaches.
 	if token := resolveWorkBuddyDeviceToken(credential); token != "" {
 		request.Header.Set("X-Device-Token", token)
+	} else {
+		request.Header.Set("X-Device-Token-Error", workBuddyDeviceTokenError)
 	}
 }
 

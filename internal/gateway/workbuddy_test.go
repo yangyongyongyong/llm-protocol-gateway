@@ -777,9 +777,8 @@ func TestApplyWorkBuddyHeadersCNChatFingerprint(t *testing.T) {
 		"X-Requested-With":    "XMLHttpRequest",
 		"X-IDE-Name":          "WorkBuddy",
 		"X-IDE-Version":       workBuddyClientVersionCN,
-		"X-Private-Data":      "false",
+		"X-Private-Data":      "true",
 		"X-CodeBuddy-Request": "1",
-		"X-Agent-Runtime":     "local-agent",
 	} {
 		if got := request.Header.Get(header); got != want {
 			t.Fatalf("%s = %q, want %q", header, got, want)
@@ -793,8 +792,16 @@ func TestApplyWorkBuddyHeadersCNChatFingerprint(t *testing.T) {
 	if request.Header.Get("X-Device-Token") != "" {
 		t.Fatalf("X-Device-Token = %q, want omitted without credential/env/file", request.Header.Get("X-Device-Token"))
 	}
-	if !strings.Contains(request.Header.Get("baggage"), "codebuddy.session_id=") {
-		t.Fatalf("baggage = %q, want codebuddy session keys", request.Header.Get("baggage"))
+	// Token or error, never neither: the client's SDK reports the failure it had.
+	if got := request.Header.Get("X-Device-Token-Error"); got != workBuddyDeviceTokenError {
+		t.Fatalf("X-Device-Token-Error = %q, want %q", got, workBuddyDeviceTokenError)
+	}
+	// The desktop build sends no x-stainless-* (that is the CLI identity's set).
+	if got := request.Header.Get("X-Stainless-Lang"); got != "" {
+		t.Fatalf("X-Stainless-Lang = %q, want none unless %s=1", got, workBuddyDesktopCompatEnv)
+	}
+	if got := request.Header.Get("baggage"); got != "" {
+		t.Fatalf("baggage = %q, want none (no captured client sends it)", got)
 	}
 }
 

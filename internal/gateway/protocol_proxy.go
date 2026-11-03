@@ -40,6 +40,12 @@ func resolveProviderResponsesURL(provider domain.Provider, model string) string 
 }
 
 func (s *Server) doOpenAIProviderRequest(ctx context.Context, r *http.Request, provider domain.Provider, upstreamURL string, body []byte, accept string, skipIncomingAuth bool) (*http.Response, error) {
+	if isWorkBuddyProvider(provider) {
+		// This turn's aggregation id is made once here, outside every retry a
+		// closure below may make, so all attempts of one user send carry the same
+		// X-Conversation-Request-ID (see applyWorkBuddyChatClientHeaders).
+		ctx = withWorkBuddyTurnRequestID(ctx, workBuddyRequestID())
+	}
 	if isTraeProvider(provider) {
 		// Trae is not an OpenAI endpoint: its agent function is chosen per
 		// model and its reply is Trae's own event stream. sendTraeChat shapes
