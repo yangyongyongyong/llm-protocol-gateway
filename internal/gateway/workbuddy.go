@@ -48,6 +48,13 @@ const (
 	workBuddyDefaultConcurrencyCN   = 3
 	workBuddyDefaultConcurrencyIntl = 2
 
+	// workBuddyDefaultQueueWaitSeconds is how long a request over the account's
+	// in-flight cap waits for a slot. Waiting is what keeps a burst on one
+	// account from being spread over the others by the failover loop: a queued
+	// request stays where it was sent, a failed-over one puts a second account
+	// under the same burst.
+	workBuddyDefaultQueueWaitSeconds = 5
+
 	// workBuddySignInVersion is the CLI version passed to the browser sign-in page.
 	workBuddySignInVersion = workBuddyCLIVersion
 

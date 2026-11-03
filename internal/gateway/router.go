@@ -370,10 +370,6 @@ func (r *Router) AddProvider(provider domain.Provider) (domain.Provider, error) 
 		})
 	}
 	normalizeProvider(&provider)
-	if isWorkBuddyAuthType(provider.AuthType) &&
-		provider.MaxConcurrentRequests == 0 && provider.RequestsPerMinute == 0 {
-		provider.MaxConcurrentRequests = workBuddyDefaultConcurrency(provider.AuthType)
-	}
 
 	r.state.Providers = append(r.state.Providers, provider)
 	r.rebuildModelsLocked()
@@ -445,6 +441,19 @@ func normalizeProvider(provider *domain.Provider) {
 	}
 	if provider.MaxConcurrentRequests > providerConcurrencyCap {
 		provider.MaxConcurrentRequests = providerConcurrencyCap
+	}
+	// A WorkBuddy account's own client sends one request at a time, so the
+	// gateway gives every account a small in-flight cap by default: an agent
+	// that fans out would otherwise put a burst on one account that no real
+	// client ever produces. This lives in normalizeProvider rather than in
+	// AddProvider so accounts loaded from the database get it too — an existing
+	// account otherwise keeps 0 (= unlimited) forever.
+	if isWorkBuddyAuthType(provider.AuthType) &&
+		provider.MaxConcurrentRequests == 0 && provider.RequestsPerMinute == 0 {
+		provider.MaxConcurrentRequests = workBuddyDefaultConcurrency(provider.AuthType)
+		if provider.QueueWaitSeconds == 0 {
+			provider.QueueWaitSeconds = workBuddyDefaultQueueWaitSeconds
+		}
 	}
 	if provider.QueueWaitSeconds < 0 {
 		provider.QueueWaitSeconds = 0
