@@ -181,10 +181,7 @@ func (w workBuddySite) chatBaseURL() string {
 func (w workBuddySite) api() string { return strings.TrimRight(w.endpoint(), "/") }
 
 func (w workBuddySite) clientVersion() string {
-	if w.intl {
-		return workBuddyClientVersionIntl
-	}
-	return workBuddyClientVersionCN
+	return workBuddyDesktopVersion(w.intl)
 }
 
 func (w workBuddySite) uaBrand() string {
@@ -197,19 +194,19 @@ func (w workBuddySite) uaBrand() string {
 // chatUserAgent is the three-segment UA WorkBuddy's chat SDK sends.
 func (w workBuddySite) chatUserAgent() string {
 	ver := w.clientVersion()
-	return "WorkBuddy/" + ver + " " + w.uaBrand() + "/" + ver + " CLI/" + workBuddyCLIVersion
+	return "WorkBuddy/" + ver + " " + w.uaBrand() + "/" + ver + " CLI/" + workBuddyCLIVersionValue()
 }
 
 // rpcUserAgent is the desktop RPC layer (refresh, plugin auth, …).
 func (w workBuddySite) rpcUserAgent() string {
 	ver := w.clientVersion()
 	brand := w.uaBrand()
-	return brand + "/" + ver + " " + brand + "/" + ver + " CLI/" + workBuddyCLIVersion
+	return brand + "/" + ver + " " + brand + "/" + ver + " CLI/" + workBuddyCLIVersionValue()
 }
 
 // v3ConfigUserAgent is what /v3/config model discovery sends.
 func (w workBuddySite) v3ConfigUserAgent() string {
-	return "WorkBuddy/" + w.clientVersion() + " CLI/" + workBuddyCLIVersion
+	return "WorkBuddy/" + w.clientVersion() + " CLI/" + workBuddyCLIVersionValue()
 }
 
 func workBuddyDefaultConcurrency(authType string) int {
@@ -345,7 +342,7 @@ func workBuddySignInURL(authURL string) (string, error) {
 		return "", err
 	}
 	query := parsed.Query()
-	query.Set("version", workBuddySignInVersion)
+	query.Set("version", workBuddyCLIVersionValue())
 	query.Set("loginSessionId", hex.EncodeToString(session))
 	parsed.RawQuery = query.Encode()
 	return parsed.String(), nil

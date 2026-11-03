@@ -165,7 +165,10 @@ func (s *Server) doOpenAIProviderRequest(ctx context.Context, r *http.Request, p
 			applyProviderAuth(request, sendProvider, incomingAuth)
 			applyOpenCodeZenHeaders(request, sendProvider, requestBody)
 			applyRequestAdapterHeaders(request, sendProvider, model)
-			return doHTTPWithTiming(ctx, &http.Client{Timeout: 0}, request)
+			// The account's own connection pool, so no two accounts are ever seen
+			// on one TCP/TLS connection, plus the CN endpoint fallback — see
+			// workbuddy_transport.go.
+			return doHTTPWithTiming(ctx, workBuddyChatClient(sendProvider), request)
 		})
 	}
 	return send(body)
