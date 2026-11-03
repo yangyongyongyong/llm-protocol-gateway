@@ -40,12 +40,16 @@ import (
 // (code 11128).
 
 const (
-	// workBuddyAppVersion is the version the sign-in page is told, and
-	// workBuddyUAVersion the desktop version copilot.tencent.com's gateway
-	// expects in the User-Agent: it rejects an unrecognised one with code
-	// 10085 "请求不合法".
-	workBuddyAppVersion = "2.0.0"
-	workBuddyUAVersion  = "5.5.6"
+	// Desktop client versions aligned with active workbuddy2api-panel references
+	// (CN install-manifest / intl 5.9.4 + CLI product.json genieVersion).
+	workBuddyClientVersionCN        = "5.9.3"
+	workBuddyClientVersionIntl      = "5.9.4"
+	workBuddyCLIVersion             = "2.165.0"
+	workBuddyDefaultConcurrencyCN   = 3
+	workBuddyDefaultConcurrencyIntl = 2
+
+	// workBuddySignInVersion is the CLI version passed to the browser sign-in page.
+	workBuddySignInVersion = workBuddyCLIVersion
 
 	workBuddyChatPath   = "/v2"
 	workBuddyConfigPath = "/v3/config"
@@ -176,6 +180,49 @@ func (w workBuddySite) chatBaseURL() string {
 
 func (w workBuddySite) api() string { return strings.TrimRight(w.endpoint(), "/") }
 
+func (w workBuddySite) clientVersion() string {
+	if w.intl {
+		return workBuddyClientVersionIntl
+	}
+	return workBuddyClientVersionCN
+}
+
+func (w workBuddySite) uaBrand() string {
+	if w.intl {
+		return "workbuddy-ai"
+	}
+	return "WorkBuddy"
+}
+
+// chatUserAgent is the three-segment UA WorkBuddy's chat SDK sends.
+func (w workBuddySite) chatUserAgent() string {
+	ver := w.clientVersion()
+	return "WorkBuddy/" + ver + " " + w.uaBrand() + "/" + ver + " CLI/" + workBuddyCLIVersion
+}
+
+// rpcUserAgent is the desktop RPC layer (refresh, plugin auth, …).
+func (w workBuddySite) rpcUserAgent() string {
+	ver := w.clientVersion()
+	brand := w.uaBrand()
+	return brand + "/" + ver + " " + brand + "/" + ver + " CLI/" + workBuddyCLIVersion
+}
+
+// v3ConfigUserAgent is what /v3/config model discovery sends.
+func (w workBuddySite) v3ConfigUserAgent() string {
+	return "WorkBuddy/" + w.clientVersion() + " CLI/" + workBuddyCLIVersion
+}
+
+func workBuddyDefaultConcurrency(authType string) int {
+	site, ok := workBuddySiteForAuthType(authType)
+	if !ok {
+		return 0
+	}
+	if site.intl {
+		return workBuddyDefaultConcurrencyIntl
+	}
+	return workBuddyDefaultConcurrencyCN
+}
+
 // defaultModels is the plan's known model list, used until the product
 // config answers with the live one.
 func (w workBuddySite) defaultModels(providerID string) []domain.Model {
@@ -298,7 +345,7 @@ func workBuddySignInURL(authURL string) (string, error) {
 		return "", err
 	}
 	query := parsed.Query()
-	query.Set("version", workBuddyAppVersion)
+	query.Set("version", workBuddySignInVersion)
 	query.Set("loginSessionId", hex.EncodeToString(session))
 	parsed.RawQuery = query.Encode()
 	return parsed.String(), nil
@@ -400,7 +447,7 @@ func workBuddyErrorCode(err error) (int, bool) {
 
 // workBuddyCall asks one of WorkBuddy's JSON endpoints, which wrap what they
 // say in {code, msg, data}; code 0 is a success and dst reads data.
-func workBuddyCall(ctx context.Context, method, endpoint string, headers map[string]string, body, dst any) error {
+func workBuddyCall(ctx context.Context, site workBuddySite, method, endpoint string, headers map[string]string, body, dst any) error {
 	var reader io.Reader
 	if body != nil {
 		encoded, _ := json.Marshal(body)
@@ -412,7 +459,7 @@ func workBuddyCall(ctx context.Context, method, endpoint string, headers map[str
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "application/json")
-	request.Header.Set("User-Agent", "WorkBuddy/"+workBuddyUAVersion)
+	request.Header.Set("User-Agent", site.rpcUserAgent())
 	for key, value := range headers {
 		request.Header.Set(key, value)
 	}
@@ -465,7 +512,7 @@ func (s *Server) startWorkBuddyOAuth(providerID string, site workBuddySite) (aut
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), workBuddySignInDeadline)
 	endpoint := site.api() + workBuddyStatePath + "?platform=" + url.QueryEscape(site.platform)
-	if callErr := workBuddyCall(ctx, http.MethodPost, endpoint, headers, map[string]any{}, &state); callErr != nil {
+	if callErr := workBuddyCall(ctx, site, http.MethodPost, endpoint, headers, map[string]any{}, &state); callErr != nil {
 		cancel()
 		return "", "", fmt.Errorf("WorkBuddy 登录初始化失败：%w", callErr)
 	}
@@ -592,7 +639,7 @@ func (s *Server) pollWorkBuddyJSON(
 		case <-time.After(workBuddyPollInterval):
 		}
 		var raw json.RawMessage
-		err := workBuddyCall(ctx, http.MethodGet, endpoint, headers, nil, &raw)
+		err := workBuddyCall(ctx, site, http.MethodGet, endpoint, headers, nil, &raw)
 		switch {
 		case ctx.Err() != nil:
 			return errors.New("登录超时，请重新开始")
@@ -661,7 +708,7 @@ func workBuddyRefreshRequestHeaders(site workBuddySite, credential domain.WorkBu
 func refreshWorkBuddyCredential(ctx context.Context, site workBuddySite, credential domain.WorkBuddyCredential) (domain.WorkBuddyCredential, error) {
 	var got workBuddyCredentialPayload
 	endpoint := site.api() + workBuddyRefreshPath
-	err := workBuddyCall(ctx, http.MethodPost, endpoint, workBuddyRefreshRequestHeaders(site, credential), map[string]any{}, &got)
+	err := workBuddyCall(ctx, site, http.MethodPost, endpoint, workBuddyRefreshRequestHeaders(site, credential), map[string]any{}, &got)
 	if err != nil {
 		return credential, fmt.Errorf("WorkBuddy 令牌刷新失败: %w", err)
 	}
@@ -917,7 +964,23 @@ var workBuddyFlagged = []struct {
 	{regexp.MustCompile(`(?i)You are Claude Code, Anthropic['’]s official CLI for Claude`), "You are Claude Code, Anthropic's CLI for Claude"},
 	{regexp.MustCompile(`(?i)Main branch \(you will usually use this for PRs\)`), "Main branch (usually the base for PRs)"},
 	{regexp.MustCompile(`(?i)(?:the )?Codex CLI is an open source project led by OpenAI\.`), "The Codex CLI is an open source project led by OpenAI."},
+	{regexp.MustCompile(`(?i)You are (?:an AI agent|a coding agent) powered by [^.]+\.`), "You are a helpful coding assistant."},
+	{regexp.MustCompile(`(?i)You are [^.]+ Agent, built by [^.]+\.`), "You are a helpful assistant."},
 }
+
+var (
+	workBuddyBareBillingHeader = regexp.MustCompile(`(?i)x-anthropic-billing-header`)
+	workBuddyBareBillingKV     = regexp.MustCompile(`(?i)\bcc_[a-z0-9_]+=[^;\n]*;?\s*`)
+	workBuddyDSHPathsRe        = regexp.MustCompile(
+		`(?is)Tokens prefixed with @ are paths the user explicitly referenced\..*?path (?:containing|that contains) spaces\.`)
+)
+
+const workBuddyDSHPathsReplacement = "Paths beginning with @ refer to files the user explicitly mentioned. " +
+	"Relative paths are resolved against the project root; absolute paths point " +
+	"to files or directories on the host. A trailing slash marks a directory, so " +
+	"list it when its contents matter. Anything else is a file: open it with the " +
+	"read tool when its contents are needed, and never claim to have inspected it " +
+	"before reading. The @\"...\" form only quotes a path that contains spaces."
 
 // workBuddyRefusedWords is that refusal as WorkBuddy words it, whichever build.
 var workBuddyRefusedWords = regexp.MustCompile(`(?i)unapproved channel|illegal api invocation`)
@@ -937,25 +1000,81 @@ func unflagWorkBuddyText(text string) string {
 	for _, item := range workBuddyFlagged {
 		text = item.pattern.ReplaceAllString(text, item.replacement)
 	}
+	text = workBuddyBareBillingKV.ReplaceAllString(text, "")
+	text = workBuddyBareBillingHeader.ReplaceAllString(text, "x-anthropic-billing-hdr")
+	if strings.Contains(text, "Tokens prefixed with @") {
+		text = workBuddyDSHPathsRe.ReplaceAllString(text, workBuddyDSHPathsReplacement)
+	}
 	return text
 }
 
-// unflagWorkBuddyMessages clears workBuddyFlagged's words out of the system and
-// assistant turns, whether their content is a text or a list of parts, and
-// drops one left with nothing once its billing header went. What a user says
-// goes upstream as it was written: measured on the CN build, a system turn
-// carrying a flagged line draws 11128 from any position in the conversation,
-// and the same line in a user turn answers 200.
-//
-// The assistant turns are read for the same words because the model quotes
-// them back: a chat where it answers "You are Claude Code, Anthropic's
-// official CLI for Claude", or repeats the billing header, is refused on that
-// turn and on every turn after it — the history keeps the line, so the
-// conversation can never continue. Rewriting only the system turn (as this did
-// until 2026-10-23) left those chats refused for good, which is how a Claude
-// Desktop conversation died while a fresh Claude Code one still worked.
-// Measured the same day against copilot.tencent.com: the line in an assistant
-// turn answers 11128, and answers 200 once reworded here.
+// sanitizeWorkBuddyAllMessages rewrites DSH @-path fingerprint blocks in any
+// message role; upstream matches the contiguous paragraph regardless of role.
+func sanitizeWorkBuddyAllMessages(messages []any) ([]any, bool) {
+	changed := false
+	out := make([]any, 0, len(messages))
+	for _, item := range messages {
+		message, ok := item.(map[string]any)
+		if !ok {
+			out = append(out, item)
+			continue
+		}
+		switch content := message["content"].(type) {
+		case string:
+			if !strings.Contains(content, "Tokens prefixed with @") {
+				out = append(out, message)
+				continue
+			}
+			replaced := workBuddyDSHPathsRe.ReplaceAllString(content, workBuddyDSHPathsReplacement)
+			if replaced == content {
+				out = append(out, message)
+				continue
+			}
+			changed = true
+			message["content"] = replaced
+		case []any:
+			parts, partsChanged := sanitizeWorkBuddyContentParts(content)
+			if !partsChanged {
+				out = append(out, message)
+				continue
+			}
+			changed = true
+			message["content"] = parts
+		}
+		out = append(out, message)
+	}
+	return out, changed
+}
+
+func sanitizeWorkBuddyContentParts(parts []any) ([]any, bool) {
+	changed := false
+	out := make([]any, 0, len(parts))
+	for _, item := range parts {
+		part, ok := item.(map[string]any)
+		if !ok {
+			out = append(out, item)
+			continue
+		}
+		text, _ := part["text"].(string)
+		if text == "" || !strings.Contains(text, "Tokens prefixed with @") {
+			out = append(out, part)
+			continue
+		}
+		replaced := workBuddyDSHPathsRe.ReplaceAllString(text, workBuddyDSHPathsReplacement)
+		if replaced == text {
+			out = append(out, part)
+			continue
+		}
+		changed = true
+		part["text"] = replaced
+		out = append(out, part)
+	}
+	return out, changed
+}
+
+// unflagWorkBuddyMessages clears channel-check fingerprints from system and
+// assistant turns (see workBuddyFlagged). sanitizeWorkBuddyAllMessages also
+// rewrites DSH @-path blocks in any role when present.
 func unflagWorkBuddyMessages(messages []any) ([]any, bool) {
 	changed := false
 	out := make([]any, 0, len(messages))
@@ -1108,6 +1227,10 @@ func shapeWorkBuddyChatBody(body []byte) ([]byte, map[string]string, bool) {
 	}
 	if unflagged, wasChanged := unflagWorkBuddyMessages(messages); wasChanged {
 		messages, changed = unflagged, true
+		payload["messages"] = messages
+	}
+	if scrubbed, wasChanged := sanitizeWorkBuddyAllMessages(messages); wasChanged {
+		messages, changed = scrubbed, true
 		payload["messages"] = messages
 	}
 	if workBuddyToolChoiceIsNone(payload["tool_choice"]) {
@@ -1646,10 +1769,9 @@ func normalizeWorkBuddyToolChoice(payload map[string]any) bool {
 	return true
 }
 
-// applyWorkBuddyHeaders authenticates a request with the account's WorkBuddy
-// session. It runs after the generic provider auth, and overwrites the
-// Authorization the API-key path may have set: a WorkBuddy request is only
-// ever signed by its account.
+// applyWorkBuddyHeaders authenticates a chat request with the account's
+// WorkBuddy session and adds the desktop client's attribution headers. It runs
+// after the generic provider auth and overwrites Authorization.
 func applyWorkBuddyHeaders(request *http.Request, provider domain.Provider) {
 	site, ok := workBuddySiteForAuthType(provider.AuthType)
 	if !ok || provider.WorkBuddy == nil {
@@ -1661,30 +1783,48 @@ func applyWorkBuddyHeaders(request *http.Request, provider domain.Provider) {
 	request.Header.Set("X-Domain", workBuddyDomain(site, *credential))
 	request.Header.Set("X-Product", "SaaS")
 	request.Header.Set("X-IDE-Type", "WorkBuddy")
-	request.Header.Set("User-Agent", "WorkBuddy/"+workBuddyUAVersion)
-	if site.intl {
-		applyWorkBuddyClientHeaders(request)
-	}
+	request.Header.Set("User-Agent", site.chatUserAgent())
+	applyWorkBuddyChatClientHeaders(request, site, credential)
 }
 
-// applyWorkBuddyClientHeaders are the rest of what WorkBuddy AI's own chats
-// carry: the request marked as an XHR, the agent's intent, the client's name
-// and version, and the conversation and request ids. Only the international
-// build needs them; its gateway answers an "illegal API invocation from an
-// unapproved channel" without them.
-func applyWorkBuddyClientHeaders(request *http.Request) {
+// applyWorkBuddyChatClientHeaders are the desktop chat headers both CN and intl
+// builds send on /v2/chat/completions (conversation ids, agent intent, SDK
+// fingerprint, optional device token reuse).
+func applyWorkBuddyChatClientHeaders(request *http.Request, site workBuddySite, credential *domain.WorkBuddyCredential) {
+	conversationID := workBuddyRequestID()
+	conversationRequestID := workBuddyRequestID()
+	messageID := workBuddyRequestID()
+
 	request.Header.Set("X-Requested-With", "XMLHttpRequest")
 	request.Header.Set("X-Agent-Intent", "craft")
 	request.Header.Set("X-Agent-Type", "main")
+	request.Header.Set("X-Agent-Purpose", "conversation")
 	request.Header.Set("X-IDE-Name", "WorkBuddy")
-	request.Header.Set("X-IDE-Version", workBuddyUAVersion)
-	for _, header := range []string{"X-Conversation-ID", "X-Conversation-Request-ID"} {
-		if request.Header.Get(header) == "" {
-			request.Header.Set(header, workBuddyRequestID())
-		}
+	request.Header.Set("X-IDE-Version", site.clientVersion())
+	request.Header.Set("X-Conversation-ID", conversationID)
+	request.Header.Set("X-Conversation-Request-ID", conversationRequestID)
+	request.Header.Set("X-Conversation-Message-ID", messageID)
+	request.Header.Set("X-Request-ID", messageID)
+	request.Header.Set("X-Root-Request-ID", conversationRequestID)
+	request.Header.Set("X-CodeBuddy-Request", "1")
+	request.Header.Set("X-Agent-Runtime", "local-agent")
+	if site.intl {
+		request.Header.Set("X-Private-Data", "true")
+	} else {
+		request.Header.Set("X-Private-Data", "false")
 	}
-	request.Header.Set("X-Conversation-Message-ID", workBuddyRequestID())
-	request.Header.Set("X-Request-ID", workBuddyRequestID())
+	request.Header.Set("X-Stainless-Lang", "js")
+	request.Header.Set("X-Stainless-Package-Version", "6.25.0")
+	request.Header.Set("X-Stainless-OS", "Windows")
+	request.Header.Set("X-Stainless-Arch", "x64")
+	request.Header.Set("X-Stainless-Runtime", "node")
+	request.Header.Set("X-Stainless-Runtime-Version", "v22.21.1")
+	request.Header.Set("X-Stainless-Retry-Count", "0")
+	request.Header.Set("baggage", "buddyId=,buddyName=,codebuddy.session_id="+conversationID+
+		",codebuddy.conversation_request_id="+conversationRequestID)
+	if token := resolveWorkBuddyDeviceToken(credential); token != "" {
+		request.Header.Set("X-Device-Token", token)
+	}
 }
 
 // ---- streaming for clients that asked for one JSON object ------------------
@@ -1971,7 +2111,7 @@ func fetchWorkBuddyModels(ctx context.Context, site workBuddySite, credential do
 		return nil, err
 	}
 	applyWorkBuddyHeaders(request, domain.Provider{AuthType: site.authType, WorkBuddy: &credential})
-	request.Header.Set("User-Agent", "CLI/"+workBuddyAppVersion+" WorkBuddy/"+workBuddyUAVersion)
+	request.Header.Set("User-Agent", site.v3ConfigUserAgent())
 	request.Header.Set("X-Requested-With", "XMLHttpRequest")
 	request.Header.Set("Accept", "application/json")
 	response, err := http.DefaultClient.Do(request)

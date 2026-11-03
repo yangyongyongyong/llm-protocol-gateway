@@ -370,6 +370,10 @@ func (r *Router) AddProvider(provider domain.Provider) (domain.Provider, error) 
 		})
 	}
 	normalizeProvider(&provider)
+	if isWorkBuddyAuthType(provider.AuthType) &&
+		provider.MaxConcurrentRequests == 0 && provider.RequestsPerMinute == 0 {
+		provider.MaxConcurrentRequests = workBuddyDefaultConcurrency(provider.AuthType)
+	}
 
 	r.state.Providers = append(r.state.Providers, provider)
 	r.rebuildModelsLocked()

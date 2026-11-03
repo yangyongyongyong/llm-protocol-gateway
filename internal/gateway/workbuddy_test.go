@@ -509,7 +509,7 @@ func TestClaudeMessagesToWorkBuddyShapesTheUpstreamRequest(t *testing.T) {
 		t.Fatalf("the rewrite lost the prompt's meaning: %q", text)
 	}
 	if gotAuth != "Bearer wb-access" || gotUserID != "u-1" || gotDomain != "copilot.tencent.com" ||
-		gotIDEType != "WorkBuddy" || gotUserAgent != "WorkBuddy/"+workBuddyUAVersion {
+		gotIDEType != "WorkBuddy" || gotUserAgent != workBuddyCNSite.chatUserAgent() {
 		t.Fatalf("the plan was not signed as its account: auth=%q user=%q domain=%q ide=%q ua=%q",
 			gotAuth, gotUserID, gotDomain, gotIDEType, gotUserAgent)
 	}
@@ -722,7 +722,7 @@ func TestWorkBuddyCallSurfacesBusinessErrorCode(t *testing.T) {
 	}))
 	defer server.Close()
 
-	err := workBuddyCall(t.Context(), http.MethodGet, server.URL+"/v2/plugin/auth/token", nil, nil, nil)
+	err := workBuddyCall(t.Context(), workBuddyCNSite, http.MethodGet, server.URL+"/v2/plugin/auth/token", nil, nil, nil)
 	code, ok := workBuddyErrorCode(err)
 	if !ok || code != workBuddyRetryTokenCode {
 		t.Fatalf("err = %v (code %d, ok %v), want retry code %d", err, code, ok, workBuddyRetryTokenCode)
@@ -736,7 +736,7 @@ func TestWorkBuddyCallUnwrapsData(t *testing.T) {
 	defer server.Close()
 
 	var got workBuddyCredentialPayload
-	if err := workBuddyCall(t.Context(), http.MethodGet, server.URL, nil, map[string]any{}, &got); err != nil {
+	if err := workBuddyCall(t.Context(), workBuddyCNSite, http.MethodGet, server.URL, nil, map[string]any{}, &got); err != nil {
 		t.Fatalf("call: %v", err)
 	}
 	if got.AccessToken != "at" || got.RefreshToken != "rt" {
@@ -752,7 +752,9 @@ func TestWorkBuddyCallUnwrapsData(t *testing.T) {
 	}
 }
 
-func TestApplyWorkBuddyHeaders(t *testing.T) {
+func TestApplyWorkBuddyHeadersCNChatFingerprint(t *testing.T) {
+	t.Setenv("WORKBUDDY_DEVICE_TOKEN", "")
+	t.Setenv("WORKBUDDY_DEVICE_TOKEN_FILE", "")
 	credential := domain.WorkBuddyCredential{
 		AccessToken: "jwt-access", UserID: "uid-1", Domain: "copilot.tencent.com",
 	}
@@ -762,43 +764,98 @@ func TestApplyWorkBuddyHeaders(t *testing.T) {
 	}
 	applyWorkBuddyHeaders(request, domain.Provider{AuthType: domain.AuthTypeWorkBuddy, WorkBuddy: &credential})
 
+	site := workBuddyCNSite
 	for header, want := range map[string]string{
-		"Authorization": "Bearer jwt-access",
-		"X-User-Id":     "uid-1",
-		"X-Domain":      "copilot.tencent.com",
-		"X-Product":     "SaaS",
-		"X-IDE-Type":    "WorkBuddy",
-		"User-Agent":    "WorkBuddy/" + workBuddyUAVersion,
+		"Authorization":       "Bearer jwt-access",
+		"X-User-Id":           "uid-1",
+		"X-Domain":            "copilot.tencent.com",
+		"X-Product":           "SaaS",
+		"X-IDE-Type":          "WorkBuddy",
+		"User-Agent":          site.chatUserAgent(),
+		"X-Agent-Intent":      "craft",
+		"X-Agent-Purpose":     "conversation",
+		"X-Requested-With":    "XMLHttpRequest",
+		"X-IDE-Name":          "WorkBuddy",
+		"X-IDE-Version":       workBuddyClientVersionCN,
+		"X-Private-Data":      "false",
+		"X-CodeBuddy-Request": "1",
+		"X-Agent-Runtime":     "local-agent",
 	} {
 		if got := request.Header.Get(header); got != want {
 			t.Fatalf("%s = %q, want %q", header, got, want)
 		}
 	}
-	// The China build signs like WorkBuddy's desktop app and nothing more.
-	if request.Header.Get("X-Agent-Intent") != "" {
-		t.Fatal("WorkBuddy (China) must not carry WorkBuddy AI's client headers")
+	for _, header := range []string{"X-Conversation-ID", "X-Conversation-Request-ID", "X-Conversation-Message-ID", "X-Request-ID", "X-Root-Request-ID"} {
+		if got := request.Header.Get(header); len(got) != 32 {
+			t.Fatalf("%s = %q, want a 32-hex id", header, got)
+		}
+	}
+	if request.Header.Get("X-Device-Token") != "" {
+		t.Fatalf("X-Device-Token = %q, want omitted without credential/env/file", request.Header.Get("X-Device-Token"))
+	}
+	if !strings.Contains(request.Header.Get("baggage"), "codebuddy.session_id=") {
+		t.Fatalf("baggage = %q, want codebuddy session keys", request.Header.Get("baggage"))
 	}
 }
 
-func TestApplyWorkBuddyHeadersAIAddsClientHeaders(t *testing.T) {
-	credential := domain.WorkBuddyCredential{AccessToken: "jwt", UserID: "uid-2"}
+func TestApplyWorkBuddyHeadersIntlChatFingerprint(t *testing.T) {
+	credential := domain.WorkBuddyCredential{AccessToken: "jwt", UserID: "uid-2", DeviceToken: "dev-secret"}
 	request, err := http.NewRequest(http.MethodPost, "https://www.workbuddy.ai/v2/chat/completions", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	applyWorkBuddyHeaders(request, domain.Provider{AuthType: domain.AuthTypeWorkBuddyAI, WorkBuddy: &credential})
 
+	site := workBuddyIntlSite
+	if request.Header.Get("User-Agent") != site.chatUserAgent() {
+		t.Fatalf("User-Agent = %q, want %q", request.Header.Get("User-Agent"), site.chatUserAgent())
+	}
+	wantUA := "WorkBuddy/" + workBuddyClientVersionIntl + " workbuddy-ai/" + workBuddyClientVersionIntl + " CLI/" + workBuddyCLIVersion
+	if request.Header.Get("User-Agent") != wantUA {
+		t.Fatalf("User-Agent shape = %q, want %q", request.Header.Get("User-Agent"), wantUA)
+	}
 	if request.Header.Get("X-Agent-Intent") != "craft" {
 		t.Fatalf("X-Agent-Intent = %q, want craft", request.Header.Get("X-Agent-Intent"))
 	}
-	// X-Domain falls back to the endpoint's authority when the account didn't say.
 	if got := request.Header.Get("X-Domain"); got != "www.workbuddy.ai" {
 		t.Fatalf("X-Domain = %q, want www.workbuddy.ai", got)
+	}
+	if request.Header.Get("X-Private-Data") != "true" {
+		t.Fatalf("X-Private-Data = %q, want true for intl", request.Header.Get("X-Private-Data"))
+	}
+	if request.Header.Get("X-Device-Token") != "dev-secret" {
+		t.Fatalf("X-Device-Token = %q, want credential reuse", request.Header.Get("X-Device-Token"))
 	}
 	for _, header := range []string{"X-Conversation-ID", "X-Conversation-Request-ID", "X-Conversation-Message-ID", "X-Request-ID"} {
 		if got := request.Header.Get(header); len(got) != 32 {
 			t.Fatalf("%s = %q, want a 32-hex id", header, got)
 		}
+	}
+}
+
+func TestApplyWorkBuddyHeaders(t *testing.T) {
+	TestApplyWorkBuddyHeadersCNChatFingerprint(t)
+}
+
+func TestApplyWorkBuddyHeadersAIAddsClientHeaders(t *testing.T) {
+	TestApplyWorkBuddyHeadersIntlChatFingerprint(t)
+}
+
+func TestAddProviderWorkBuddyDefaultConcurrency(t *testing.T) {
+	router := NewRouter(domain.GatewayState{})
+	cn, err := router.AddProvider(domain.Provider{Name: "WB CN", AuthType: domain.AuthTypeWorkBuddy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cn.MaxConcurrentRequests != workBuddyDefaultConcurrencyCN {
+		t.Fatalf("CN maxConcurrent = %d, want %d", cn.MaxConcurrentRequests, workBuddyDefaultConcurrencyCN)
+	}
+	intl, err := router.AddProvider(domain.Provider{Name: "WB AI", AuthType: domain.AuthTypeWorkBuddyAI})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if intl.MaxConcurrentRequests != workBuddyDefaultConcurrencyIntl {
+		t.Fatalf("intl maxConcurrent = %d, want %d", intl.MaxConcurrentRequests, workBuddyDefaultConcurrencyIntl)
 	}
 }
 
@@ -897,7 +954,7 @@ func TestWorkBuddySignInStoresAccountSession(t *testing.T) {
 	if !strings.HasPrefix(authURL, "https://www.codebuddy.cn/login") {
 		t.Fatalf("authUrl = %q, want the page WorkBuddy handed out", authURL)
 	}
-	if !strings.Contains(authURL, "loginSessionId=") || !strings.Contains(authURL, "version="+workBuddyAppVersion) {
+	if !strings.Contains(authURL, "loginSessionId=") || !strings.Contains(authURL, "version="+workBuddySignInVersion) {
 		t.Fatalf("authUrl %q lacks the session/version params", authURL)
 	}
 
@@ -1031,7 +1088,7 @@ func TestFetchWorkBuddyModelsReadsCLIAgentConfig(t *testing.T) {
 		if r.URL.Path != workBuddyConfigPath {
 			t.Errorf("path = %s, want %s", r.URL.Path, workBuddyConfigPath)
 		}
-		if want := "CLI/" + workBuddyAppVersion + " WorkBuddy/" + workBuddyUAVersion; r.Header.Get("User-Agent") != want {
+		if want := workBuddyCNSite.v3ConfigUserAgent(); r.Header.Get("User-Agent") != want {
 			t.Errorf("User-Agent = %q, want %q (a bare one gets CodeBuddy IDE's config)", r.Header.Get("User-Agent"), want)
 		}
 		fmt.Fprint(w, `{"code":0,"data":{

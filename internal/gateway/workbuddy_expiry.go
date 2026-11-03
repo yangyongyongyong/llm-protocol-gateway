@@ -128,13 +128,13 @@ type workBuddyPackagesEntry struct {
 
 // workBuddyBatches returns the account's batches, asking the meter only when the
 // cached list is older than workBuddyPackagesTTL.
-func workBuddyBatches(ctx context.Context, providerID, base string, headers map[string]string, now time.Time) []workBuddyPackage {
+func workBuddyBatches(ctx context.Context, site workBuddySite, providerID, base string, headers map[string]string, now time.Time) []workBuddyPackage {
 	if cached, ok := workBuddyPackagesCache.Load(providerID); ok {
 		if entry, typed := cached.(workBuddyPackagesEntry); typed && now.Sub(entry.at) < workBuddyPackagesTTL {
 			return entry.packages
 		}
 	}
-	packages := workBuddyPackagesOf(ctx, base, headers, now)
+	packages := workBuddyPackagesOf(ctx, site, base, headers, now)
 	if len(packages) > 0 {
 		// An empty answer is not worth remembering: it is as likely to be a
 		// refused door as an account with no batches.
@@ -146,7 +146,7 @@ func workBuddyBatches(ctx context.Context, providerID, base string, headers map[
 // workBuddyPackagesOf lists every package of the account that is live or used up
 // (status 0 and 3), paid and free, as WorkBuddy's own client asks for them. A
 // door that answers nothing costs the account no expiry line.
-func workBuddyPackagesOf(ctx context.Context, base string, headers map[string]string, now time.Time) []workBuddyPackage {
+func workBuddyPackagesOf(ctx context.Context, site workBuddySite, base string, headers map[string]string, now time.Time) []workBuddyPackage {
 	day := now.In(beijingZone).Format("2006-01-02")
 	asks := []struct {
 		path string
@@ -169,7 +169,7 @@ func workBuddyPackagesOf(ctx context.Context, base string, headers map[string]st
 			for key, value := range ask.body {
 				body[key] = value
 			}
-			if err := workBuddyCall(ctx, http.MethodPost, base+ask.path, headers, body, &list); err != nil {
+			if err := workBuddyCall(ctx, site, http.MethodPost, base+ask.path, headers, body, &list); err != nil {
 				break
 			}
 			out = append(out, list.Accounts...)
@@ -283,7 +283,7 @@ func workBuddyQuotaFor(ctx context.Context, site workBuddySite, credential domai
 	headers := workBuddyAccountHeaders(site, credential)
 	base := site.api()
 	call := func(path string, dst any) error {
-		err := workBuddyCall(ctx, http.MethodPost, base+path, headers, map[string]any{}, dst)
+		err := workBuddyCall(ctx, site, http.MethodPost, base+path, headers, map[string]any{}, dst)
 		if err == nil || !workBuddyUnauthorized(err) || refresh == nil {
 			return err
 		}
@@ -293,7 +293,7 @@ func workBuddyQuotaFor(ctx context.Context, site workBuddySite, credential domai
 		}
 		credential = updated
 		headers = workBuddyAccountHeaders(site, credential)
-		return workBuddyCall(ctx, http.MethodPost, base+path, headers, map[string]any{}, dst)
+		return workBuddyCall(ctx, site, http.MethodPost, base+path, headers, map[string]any{}, dst)
 	}
 	var summary workBuddySummary
 	if err := call(workBuddySummaryPath, &summary); err != nil {
@@ -305,7 +305,7 @@ func workBuddyQuotaFor(ctx context.Context, site workBuddySite, credential domai
 	if total > 0 {
 		// Only a personal account's credits come in dated batches.
 		key := site.authType + "|" + credential.UserID
-		batches := workBuddyBatches(ctx, key, base, headers, time.Now())
+		batches := workBuddyBatches(ctx, site, key, base, headers, time.Now())
 		quota.Plan, windows = workBuddyQuotaWindows(summary, batches, workBuddyEnterpriseCycle{}, time.Now())
 	} else {
 		// A team account answers the summary with no packages at all; its credits
