@@ -602,6 +602,12 @@ func (lane *providerLane) waiterCount() int {
 func providerConcurrencyConfig(provider domain.Provider) (max int, wait time.Duration) {
 	max = providerConcurrentCap(provider)
 	seconds := provider.QueueWaitSeconds
+	// A WorkBuddy account stored before this default existed has no wait either;
+	// give it one, so a burst waits for a slot instead of failing over onto
+	// another account and spreading the burst (see providerConcurrentCap).
+	if seconds == 0 && max > 0 && provider.MaxConcurrentRequests == 0 && isWorkBuddyAuthType(provider.AuthType) {
+		seconds = workBuddyDefaultQueueWaitSeconds
+	}
 	if seconds < 0 {
 		seconds = 0
 	}
@@ -616,6 +622,14 @@ func providerConcurrentCap(provider domain.Provider) int {
 	max := provider.MaxConcurrentRequests
 	if max < 0 {
 		return 0
+	}
+	// A WorkBuddy account's own client sends one request at a time, so an
+	// account left unconfigured gets a small in-flight cap rather than none.
+	// This is applied where the cap is read, not only where a provider is
+	// saved: accounts already in the database read 0 (= unlimited) and are
+	// never re-saved, so a save-time default never reached them.
+	if max == 0 && provider.RequestsPerMinute == 0 && isWorkBuddyAuthType(provider.AuthType) {
+		max = workBuddyDefaultConcurrency(provider.AuthType)
 	}
 	if max > providerConcurrencyCap {
 		return providerConcurrencyCap

@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"testing"
+	"time"
 
 	"github.com/luca/llm-protocol-gateway/internal/domain"
 )
@@ -74,5 +75,47 @@ func TestNormalizeProviderLeavesOtherProvidersUncapped(t *testing.T) {
 		if provider.MaxConcurrentRequests != 0 {
 			t.Errorf("%s: max concurrent = %d, want 0", authType, provider.MaxConcurrentRequests)
 		}
+	}
+}
+
+// The gate is what actually enforces the cap, and an account loaded from the
+// database is never re-saved — it still reads 0/0/0 forever. The default has to
+// be applied where the cap is read, or it never reaches those accounts at all.
+func TestProviderConcurrencyConfigDefaultsForAStoredAccount(t *testing.T) {
+	cases := []struct {
+		name     string
+		authType string
+		wantMax  int
+	}{
+		{"CN", domain.AuthTypeWorkBuddy, workBuddyDefaultConcurrencyCN},
+		{"intl", domain.AuthTypeWorkBuddyAI, workBuddyDefaultConcurrencyIntl},
+	}
+	for _, testCase := range cases {
+		// Deliberately unnormalised: this is the shape the store hands over.
+		stored := domain.Provider{AuthType: testCase.authType}
+		max, wait := providerConcurrencyConfig(stored)
+		if max != testCase.wantMax {
+			t.Errorf("%s: gate cap = %d, want %d", testCase.name, max, testCase.wantMax)
+		}
+		if wait != time.Duration(workBuddyDefaultQueueWaitSeconds)*time.Second {
+			t.Errorf("%s: gate wait = %v, want %ds", testCase.name, wait, workBuddyDefaultQueueWaitSeconds)
+		}
+	}
+}
+
+// An operator's own numbers are never replaced at the gate either.
+func TestProviderConcurrencyConfigKeepsAnExplicitCap(t *testing.T) {
+	stored := domain.Provider{AuthType: domain.AuthTypeWorkBuddy, MaxConcurrentRequests: 1}
+	max, wait := providerConcurrencyConfig(stored)
+	if max != 1 || wait != 0 {
+		t.Fatalf("gate = %d/%v, want the operator's 1/0s", max, wait)
+	}
+}
+
+// A rate-limited account is configured, not unconfigured: the gate adds no cap.
+func TestProviderConcurrencyConfigLeavesRateLimitedAccountAlone(t *testing.T) {
+	stored := domain.Provider{AuthType: domain.AuthTypeWorkBuddy, RequestsPerMinute: 10}
+	if max, _ := providerConcurrencyConfig(stored); max != 0 {
+		t.Fatalf("gate cap = %d, want 0 for an account capped by rate", max)
 	}
 }
