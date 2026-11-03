@@ -170,6 +170,19 @@ func (s *Server) withAdminAuth(next http.Handler) http.Handler {
 			deniedPermission(w, *required)
 			return
 		}
+		// ScopeOwn 角色（内置普通用户/只读/受限用户及同类自定义角色）除 permission
+		// 外还必须落在 isUserAllowedPath 白名单里；否则 providers.create 等权限
+		// 会误开 /__providers/export 这类管理端点（全站 OAuth 备份泄露）。
+		if current.scopeOf() != domain.ScopeAll {
+			path := r.URL.Path
+			if i := strings.IndexByte(path, '?'); i >= 0 {
+				path = path[:i]
+			}
+			if strings.HasPrefix(path, "/__") && !isUserAllowedPath(r.Method, path) {
+				writeOpenAIError(w, http.StatusForbidden, "administrator access required")
+				return
+			}
+		}
 		// 记录该用户浏览器最近一次控制台请求时间（内存精确，周期性节流落库）。
 		s.noteUserActivity(identity.UserID)
 		next.ServeHTTP(w, withPrincipal(r, identity, current))
@@ -182,6 +195,10 @@ func isUserAllowedPath(method, path string) bool {
 	switch path {
 	case "/__state", "/__logs", "/__request-stats", "/__usage-analysis", "/__apikeys", "/__auth/password", "/__ui-log":
 		return true
+	case "/__profile", "/__profile/avatar":
+		return method == http.MethodGet || method == http.MethodPatch
+	case "/__roles/catalog", "/__roles/grant-targets", "/__roles/options":
+		return method == http.MethodGet
 	}
 	if strings.HasPrefix(path, "/__apikeys/") {
 		return true
