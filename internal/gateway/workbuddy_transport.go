@@ -145,6 +145,10 @@ func (t *workBuddyFailoverTransport) RoundTrip(request *http.Request) (*http.Res
 	if t.base == nil || request == nil || request.URL == nil {
 		return t.base.RoundTrip(request)
 	}
+	// Spelling first, on every path below: Go canonicalises header keys, while
+	// the client's wire bytes are its own literals (see
+	// officialWorkBuddyHeaderSpelling).
+	request = normalizeWorkBuddyHeaderSpelling(request)
 	if !workBuddyIsCNHost(request.URL.Host) {
 		return t.base.RoundTrip(request)
 	}

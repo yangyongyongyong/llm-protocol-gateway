@@ -960,6 +960,13 @@ const workBuddySystemPrompt = "You are a helpful assistant."
 // and "Main branch (you will usually use this for PRs)" each draw 11128 from a
 // system message and answer 200 once replaced. The Codex line still draws it on
 // nothing today but the international build was not measured, so it stays.
+//
+// The rule the replacements follow is the measured one (2026-10-30,
+// magpie-community/plugins packages/workbuddy/REFUSED.md): the check matches a
+// whole opening line exactly, so moving one character is enough — and a
+// replacement that drops what the line said is a bug, not a fix. Adding words
+// does not help ("You are an AI agent powered by DeepSeek Harness CLI." is
+// refused too), while the same shape naming another product passes.
 var workBuddyFlagged = []struct {
 	pattern     *regexp.Regexp
 	replacement string
@@ -968,8 +975,12 @@ var workBuddyFlagged = []struct {
 	{regexp.MustCompile(`(?i)You are Claude Code, Anthropic['’]s official CLI for Claude`), "You are Claude Code, Anthropic's CLI for Claude"},
 	{regexp.MustCompile(`(?i)Main branch \(you will usually use this for PRs\)`), "Main branch (usually the base for PRs)"},
 	{regexp.MustCompile(`(?i)(?:the )?Codex CLI is an open source project led by OpenAI\.`), "The Codex CLI is an open source project led by OpenAI."},
-	{regexp.MustCompile(`(?i)You are (?:an AI agent|a coding agent) powered by [^.]+\.`), "You are a helpful coding assistant."},
-	{regexp.MustCompile(`(?i)You are [^.]+ Agent, built by [^.]+\.`), "You are a helpful assistant."},
+	// The harness identity line a coding agent opens with. A comma is the whole
+	// fix, and the agent still learns which harness it runs in.
+	{regexp.MustCompile(`(?i)You are an AI agent powered by ([^.]+)\.`), "You are an AI agent, powered by ${1}."},
+	{regexp.MustCompile(`(?i)You are a coding agent powered by ([^.]+)\.`), "You are a coding agent, powered by ${1}."},
+	// One punctuation mark moved, nothing else: "You are X Agent, built by Y."
+	{regexp.MustCompile(`(?i)You are ([^.]+) Agent, built by ([^.]+)\.`), "You are ${1} Agent built by ${2}."},
 }
 
 var (
@@ -1774,64 +1785,21 @@ func normalizeWorkBuddyToolChoice(payload map[string]any) bool {
 }
 
 // applyWorkBuddyHeaders authenticates a chat request with the account's
-// WorkBuddy session and adds the desktop client's attribution headers. It runs
-// after the generic provider auth and overwrites Authorization.
+// WorkBuddy session and asks for the desktop client's whole header family. It
+// runs after the generic provider auth and overwrites Authorization.
 func applyWorkBuddyHeaders(request *http.Request, provider domain.Provider) {
 	site, ok := workBuddySiteForAuthType(provider.AuthType)
 	if !ok || provider.WorkBuddy == nil {
 		return
 	}
-	credential := provider.WorkBuddy
-	request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(credential.AccessToken))
-	request.Header.Set("X-User-Id", strings.TrimSpace(credential.UserID))
-	request.Header.Set("X-Domain", workBuddyDomain(site, *credential))
-	request.Header.Set("X-Product", "SaaS")
-	request.Header.Set("X-IDE-Type", "WorkBuddy")
-	request.Header.Set("User-Agent", site.chatUserAgent())
-	applyWorkBuddyChatClientHeaders(request, site, credential)
+	applyWorkBuddyChatHeaders(request, site, provider.WorkBuddy, workBuddyAgentTypeMain)
 }
 
-// applyWorkBuddyChatClientHeaders are the desktop chat headers both CN and intl
-// builds send on /v2/chat/completions: conversation ids, agent intent, the
-// attribution trio, the trace family and the device token (or the error saying
-// the client's security SDK could not make one).
+// applyWorkBuddyChatClientHeaders keeps the old entry point; the family itself
+// lives in workbuddy_chat_headers.go, next to the spelling map that decides how
+// each name goes out on the wire.
 func applyWorkBuddyChatClientHeaders(request *http.Request, site workBuddySite, credential *domain.WorkBuddyCredential) {
-	conversationID := workBuddyRequestID()
-	// One aggregation id per turn, reused by every request and retry of it; the
-	// caller pins it in the context (see withWorkBuddyTurnRequestID). A caller
-	// that did not gets a fresh one, which is what a per-request client does.
-	conversationRequestID := workBuddyTurnRequestIDFrom(request.Context())
-	if conversationRequestID == "" {
-		conversationRequestID = workBuddyRequestID()
-	}
-	messageID := workBuddyRequestID()
-
-	request.Header.Set("X-Requested-With", "XMLHttpRequest")
-	request.Header.Set("X-Agent-Intent", "craft")
-	request.Header.Set("X-Agent-Type", "main")
-	request.Header.Set("X-Agent-Purpose", "conversation")
-	request.Header.Set("X-IDE-Name", "WorkBuddy")
-	request.Header.Set("X-IDE-Version", site.clientVersion())
-	request.Header.Set("X-Conversation-ID", conversationID)
-	request.Header.Set("X-Conversation-Request-ID", conversationRequestID)
-	request.Header.Set("X-Conversation-Message-ID", messageID)
-	request.Header.Set("X-Request-ID", messageID)
-	request.Header.Set("X-Root-Request-ID", conversationRequestID)
-	request.Header.Set("X-CodeBuddy-Request", "1")
-	// The desktop client answers for its own data usage the same way on both
-	// builds. The true/false split is the CLI identity's rule (personal false,
-	// enterprise true), not this one's.
-	request.Header.Set("X-Private-Data", "true")
-	applyWorkBuddyTraceHeaders(request)
-	applyWorkBuddyStainlessHeaders(request)
-	// Token or error, always one: the client's security SDK either mints a
-	// device token or reports that it could not, and a request carrying neither
-	// is a state the real client never reaches.
-	if token := resolveWorkBuddyDeviceToken(credential); token != "" {
-		request.Header.Set("X-Device-Token", token)
-	} else {
-		request.Header.Set("X-Device-Token-Error", workBuddyDeviceTokenError)
-	}
+	applyWorkBuddyChatHeaders(request, site, credential, workBuddyAgentTypeMain)
 }
 
 // ---- streaming for clients that asked for one JSON object ------------------

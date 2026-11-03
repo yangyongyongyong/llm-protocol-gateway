@@ -774,20 +774,46 @@ func TestApplyWorkBuddyHeadersCNChatFingerprint(t *testing.T) {
 		"User-Agent":          site.chatUserAgent(),
 		"X-Agent-Intent":      "craft",
 		"X-Agent-Purpose":     "conversation",
+		"X-Agent-Runtime":     workBuddyAgentRuntimeLocal,
+		"X-Agent-Type":        workBuddyAgentTypeMain,
 		"X-Requested-With":    "XMLHttpRequest",
 		"X-IDE-Name":          "WorkBuddy",
 		"X-IDE-Version":       workBuddyClientVersionCN,
-		"X-Private-Data":      "true",
+		"X-Private-Data":      "false",
 		"X-CodeBuddy-Request": "1",
+		"Accept":              "application/json",
+		"x-stainless-lang":    workBuddySDKLang,
+		"x-stainless-os":      workBuddySDKOS,
+		"x-stainless-arch":    workBuddySDKArch,
+		"x-stainless-runtime": workBuddySDKRuntime,
 	} {
 		if got := request.Header.Get(header); got != want {
 			t.Fatalf("%s = %q, want %q", header, got, want)
 		}
 	}
-	for _, header := range []string{"X-Conversation-ID", "X-Conversation-Request-ID", "X-Conversation-Message-ID", "X-Request-ID", "X-Root-Request-ID"} {
+	// Conversations and ACP connections are hyphenated UUIDv7s; request and
+	// message ids are 32 hex. Sending the wrong shape in either is visible.
+	if got := request.Header.Get("X-Conversation-ID"); len(got) != 36 || !strings.Contains(got, "-") {
+		t.Fatalf("X-Conversation-ID = %q, want a hyphenated UUID", got)
+	}
+	if got := request.Header.Get("acp-connection-id"); len(got) != 36 || !strings.Contains(got, "-") {
+		t.Fatalf("acp-connection-id = %q, want a hyphenated UUID", got)
+	}
+	for _, header := range []string{"X-Conversation-Request-ID", "X-Conversation-Message-ID", "X-Request-ID", "X-Root-Request-ID", "X-Trace-ID", "X-B3-TraceId"} {
 		if got := request.Header.Get(header); len(got) != 32 {
 			t.Fatalf("%s = %q, want a 32-hex id", header, got)
 		}
+	}
+	// The client double-sends both propagation formats, the B3 one in four
+	// segments with a parent span, which is what tells it from our own trio.
+	if got := request.Header.Get("b3"); strings.Count(got, "-") != 3 {
+		t.Fatalf("b3 = %q, want trace-span-flags-parent", got)
+	}
+	if got := request.Header.Get("X-B3-ParentSpanId"); len(got) != 16 {
+		t.Fatalf("X-B3-ParentSpanId = %q, want a 16-hex span", got)
+	}
+	if got, want := request.Header.Get("baggage"), workBuddyBaggage(request.Header.Get("X-Conversation-ID"), request.Header.Get("X-Conversation-Request-ID")); got != want {
+		t.Fatalf("baggage = %q, want %q", got, want)
 	}
 	if request.Header.Get("X-Device-Token") != "" {
 		t.Fatalf("X-Device-Token = %q, want omitted without credential/env/file", request.Header.Get("X-Device-Token"))
@@ -795,13 +821,6 @@ func TestApplyWorkBuddyHeadersCNChatFingerprint(t *testing.T) {
 	// Token or error, never neither: the client's SDK reports the failure it had.
 	if got := request.Header.Get("X-Device-Token-Error"); got != workBuddyDeviceTokenError {
 		t.Fatalf("X-Device-Token-Error = %q, want %q", got, workBuddyDeviceTokenError)
-	}
-	// The desktop build sends no x-stainless-* (that is the CLI identity's set).
-	if got := request.Header.Get("X-Stainless-Lang"); got != "" {
-		t.Fatalf("X-Stainless-Lang = %q, want none unless %s=1", got, workBuddyDesktopCompatEnv)
-	}
-	if got := request.Header.Get("baggage"); got != "" {
-		t.Fatalf("baggage = %q, want none (no captured client sends it)", got)
 	}
 }
 
@@ -833,7 +852,10 @@ func TestApplyWorkBuddyHeadersIntlChatFingerprint(t *testing.T) {
 	if request.Header.Get("X-Device-Token") != "dev-secret" {
 		t.Fatalf("X-Device-Token = %q, want credential reuse", request.Header.Get("X-Device-Token"))
 	}
-	for _, header := range []string{"X-Conversation-ID", "X-Conversation-Request-ID", "X-Conversation-Message-ID", "X-Request-ID"} {
+	if got := request.Header.Get("X-Conversation-ID"); len(got) != 36 || !strings.Contains(got, "-") {
+		t.Fatalf("X-Conversation-ID = %q, want a hyphenated UUID", got)
+	}
+	for _, header := range []string{"X-Conversation-Request-ID", "X-Conversation-Message-ID", "X-Request-ID"} {
 		if got := request.Header.Get(header); len(got) != 32 {
 			t.Fatalf("%s = %q, want a 32-hex id", header, got)
 		}

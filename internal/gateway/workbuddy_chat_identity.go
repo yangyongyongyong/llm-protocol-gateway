@@ -3,8 +3,6 @@ package gateway
 import (
 	"context"
 	"net/http"
-	"os"
-	"runtime"
 	"strings"
 )
 
@@ -64,66 +62,35 @@ func workBuddyTurnRequestIDFrom(ctx context.Context) string {
 }
 
 // applyWorkBuddyTraceHeaders adds the trace family the desktop client sends on a
-// chat: a traceparent, its B3 counterpart, and the X-B3-* trio. The trace is
-// fresh per request (the reference implementation does the same), so no state
-// carries between turns.
+// chat: the X-B3-* quartet (parent span included), the B3 single header with all
+// four segments, and the W3C traceparent. The client sends both formats on every
+// chat, so a request carrying only the trio is a shape it never produces.
 func applyWorkBuddyTraceHeaders(request *http.Request) {
 	trace := workBuddyRequestID()
 	span := workBuddyRequestID()[:16]
+	// No real span tree exists here; the upstream cannot verify parentage, but a
+	// span without a parent is distinguishable from one with — so one is made.
+	parent := workBuddyRequestID()[:16]
 	request.Header.Set("X-Trace-ID", trace)
 	request.Header.Set("traceparent", "00-"+trace+"-"+span+"-01")
-	request.Header.Set("b3", trace+"-"+span+"-1")
+	request.Header.Set("b3", trace+"-"+span+"-1-"+parent)
 	request.Header.Set("X-B3-TraceId", trace)
+	request.Header.Set("X-B3-ParentSpanId", parent)
 	request.Header.Set("X-B3-SpanId", span)
 	request.Header.Set("X-B3-Sampled", "1")
 }
 
-// applyWorkBuddyStainlessHeaders adds the x-stainless-* group the official CLI's
-// requests carry, which the OpenAI Node SDK writes by itself.
+// applyWorkBuddyStainlessHeaders adds the SDK block the official chat carries.
 //
-// It is off by default. Those headers belong to the CLI identity: the captured
-// desktop client sends none of them, and a request claiming an Electron desktop
-// User-Agent while declaring a Node SDK and its runtime is a combination no real
-// client produces — a newer fingerprint of its own rather than a better disguise.
-// WORKBUDDY_DESKTOP_COMPAT=1 turns them on for an operator who has measured that
-// their upstream wants them.
+// The chat path runs the OpenAI Node SDK, so the client's own captures have all
+// of these; they are the client's constants rather than this host's, which is
+// why they are fixed (see workBuddySDKOS / workBuddySDKArch).
 func applyWorkBuddyStainlessHeaders(request *http.Request) {
-	if strings.TrimSpace(os.Getenv(workBuddyDesktopCompatEnv)) != "1" {
-		return
-	}
-	request.Header.Set("X-Stainless-Lang", "js")
-	request.Header.Set("X-Stainless-Package-Version", workBuddySDKVersion)
-	request.Header.Set("X-Stainless-OS", workBuddyStainlessOS())
-	request.Header.Set("X-Stainless-Arch", workBuddyStainlessArch())
-	request.Header.Set("X-Stainless-Runtime", "node")
-	request.Header.Set("X-Stainless-Runtime-Version", workBuddyNodeVersion)
-	request.Header.Set("X-Stainless-Retry-Count", "0")
-}
-
-// workBuddyStainlessOS names this host's OS the way the Node SDK does.
-func workBuddyStainlessOS() string {
-	switch runtime.GOOS {
-	case "windows":
-		return "Windows"
-	case "darwin":
-		return "MacOS"
-	case "linux":
-		return "Linux"
-	default:
-		return runtime.GOOS
-	}
-}
-
-// workBuddyStainlessArch names this host's architecture the way the Node SDK does.
-func workBuddyStainlessArch() string {
-	switch runtime.GOARCH {
-	case "amd64":
-		return "x64"
-	case "arm64":
-		return "arm64"
-	case "386":
-		return "ia32"
-	default:
-		return runtime.GOARCH
-	}
+	request.Header.Set("x-stainless-lang", workBuddySDKLang)
+	request.Header.Set("x-stainless-package-version", workBuddySDKVersion)
+	request.Header.Set("x-stainless-os", workBuddySDKOS)
+	request.Header.Set("x-stainless-arch", workBuddySDKArch)
+	request.Header.Set("x-stainless-runtime", workBuddySDKRuntime)
+	request.Header.Set("x-stainless-runtime-version", workBuddyNodeVersion)
+	request.Header.Set("x-stainless-retry-count", "0")
 }

@@ -41,10 +41,23 @@ func resolveProviderResponsesURL(provider domain.Provider, model string) string 
 
 func (s *Server) doOpenAIProviderRequest(ctx context.Context, r *http.Request, provider domain.Provider, upstreamURL string, body []byte, accept string, skipIncomingAuth bool) (*http.Response, error) {
 	if isWorkBuddyProvider(provider) {
-		// This turn's aggregation id is made once here, outside every retry a
-		// closure below may make, so all attempts of one user send carry the same
-		// X-Conversation-Request-ID (see applyWorkBuddyChatClientHeaders).
-		ctx = withWorkBuddyTurnRequestID(ctx, workBuddyRequestID())
+		// The three ids are pinned here, outside every retry a closure below may
+		// make, so all attempts of one user send carry the same values (see
+		// applyWorkBuddyChatHeaders).
+		turn := workBuddyRequestID()
+		ctx = withWorkBuddyTurnRequestID(ctx, turn)
+		// Conversation and root are session-scoped, not turn-scoped: reuse the
+		// client's own session header when it sent one, so a conversation keeps
+		// its ids across turns instead of looking like a new conversation on
+		// every request.
+		session := requestSessionID(r, nil)
+		if session == "" {
+			session = turn
+		}
+		ctx = withWorkBuddyConversationID(ctx,
+			workBuddyStableUUID("conversation:"+provider.ID+":"+session))
+		ctx = withWorkBuddySessionRootID(ctx,
+			workBuddyStableHex("root:"+provider.ID+":"+session))
 	}
 	if isTraeProvider(provider) {
 		// Trae is not an OpenAI endpoint: its agent function is chosen per

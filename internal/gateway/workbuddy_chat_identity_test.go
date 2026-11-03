@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/luca/llm-protocol-gateway/internal/domain"
@@ -97,42 +98,57 @@ func TestWorkBuddyDeviceTokenOrErrorAlwaysOne(t *testing.T) {
 	}
 }
 
-// The SDK fingerprint is the CLI identity's, not the desktop client's: it is only
-// sent when the operator opts in, on either build.
-func TestWorkBuddyStainlessHeadersAreOptIn(t *testing.T) {
+// The chat path runs the OpenAI Node SDK, so the client's own captures carry the
+// whole SDK block on every chat. Sending none of it is a shape no capture shows.
+func TestWorkBuddyStainlessHeadersAlwaysSent(t *testing.T) {
 	t.Setenv("WORKBUDDY_DEVICE_TOKEN", "")
 	t.Setenv("WORKBUDDY_DEVICE_TOKEN_FILE", "")
 	credential := domain.WorkBuddyCredential{AccessToken: "jwt", UserID: "uid-s"}
 
-	t.Setenv(workBuddyDesktopCompatEnv, "")
-	off := newWorkBuddyChatRequest(t, context.Background())
-	applyChatHeadersForSite(t, off, domain.AuthTypeWorkBuddy, credential)
-	for _, header := range []string{
-		"X-Stainless-Lang", "X-Stainless-Package-Version", "X-Stainless-OS",
-		"X-Stainless-Arch", "X-Stainless-Runtime", "X-Stainless-Runtime-Version",
-		"X-Stainless-Retry-Count",
-	} {
-		if got := off.Header.Get(header); got != "" {
-			t.Fatalf("%s = %q, want none by default", header, got)
-		}
-	}
+	request := newWorkBuddyChatRequest(t, context.Background())
+	applyChatHeadersForSite(t, request, domain.AuthTypeWorkBuddy, credential)
 
-	t.Setenv(workBuddyDesktopCompatEnv, "1")
-	on := newWorkBuddyChatRequest(t, context.Background())
-	applyChatHeadersForSite(t, on, domain.AuthTypeWorkBuddy, credential)
 	for header, want := range map[string]string{
-		"X-Stainless-Lang":            "js",
-		"X-Stainless-Package-Version": workBuddySDKVersion,
-		"X-Stainless-Runtime":         "node",
-		"X-Stainless-Retry-Count":     "0",
+		"x-stainless-lang":            workBuddySDKLang,
+		"x-stainless-package-version": workBuddySDKVersion,
+		"x-stainless-os":              workBuddySDKOS,
+		"x-stainless-arch":            workBuddySDKArch,
+		"x-stainless-runtime":         workBuddySDKRuntime,
+		"x-stainless-runtime-version": workBuddyNodeVersion,
+		"x-stainless-retry-count":     "0",
 	} {
-		if got := on.Header.Get(header); got != want {
-			t.Fatalf("opted in %s = %q, want %q", header, got, want)
+		if got := request.Header.Get(header); got != want {
+			t.Fatalf("%s = %q, want %q", header, got, want)
 		}
 	}
 	// The CLI's own request budget was never measured for the desktop client.
-	if got := on.Header.Get("X-Stainless-Timeout"); got != "" {
-		t.Fatalf("X-Stainless-Timeout = %q, want none", got)
+	if got := request.Header.Get("x-stainless-timeout"); got != "" {
+		t.Fatalf("x-stainless-timeout = %q, want none", got)
+	}
+}
+
+// The family the client sends on every chat that is easy to leave out by
+// accident, because none of it changes what the answer says.
+func TestWorkBuddyAgentRuntimeAndBaggageAlwaysPresent(t *testing.T) {
+	t.Setenv("WORKBUDDY_DEVICE_TOKEN", "")
+	t.Setenv("WORKBUDDY_DEVICE_TOKEN_FILE", "")
+	request := newWorkBuddyChatRequest(t, context.Background())
+	applyChatHeadersForSite(t, request, domain.AuthTypeWorkBuddy,
+		domain.WorkBuddyCredential{AccessToken: "jwt", UserID: "uid-b"})
+
+	if got := request.Header.Get("X-Agent-Runtime"); got != workBuddyAgentRuntimeLocal {
+		t.Fatalf("X-Agent-Runtime = %q, want %q", got, workBuddyAgentRuntimeLocal)
+	}
+	conversation := request.Header.Get("X-Conversation-ID")
+	turn := request.Header.Get("X-Conversation-Request-ID")
+	want := "buddyId=,buddyName=,codebuddy.session_id=" + conversation +
+		",codebuddy.conversation_request_id=" + turn
+	if got := request.Header.Get("baggage"); got != want {
+		t.Fatalf("baggage = %q, want %q", got, want)
+	}
+	// Both ids the baggage repeats must be the ones the request actually carries.
+	if conversation == "" || turn == "" {
+		t.Fatal("baggage repeats ids the request did not send")
 	}
 }
 
@@ -140,18 +156,21 @@ func TestWorkBuddyStainlessHeadersAreOptIn(t *testing.T) {
 func TestWorkBuddyTraceHeadersAgreeWithEachOther(t *testing.T) {
 	t.Setenv("WORKBUDDY_DEVICE_TOKEN", "")
 	t.Setenv("WORKBUDDY_DEVICE_TOKEN_FILE", "")
-	t.Setenv(workBuddyDesktopCompatEnv, "")
 	request := newWorkBuddyChatRequest(t, context.Background())
 	applyChatHeadersForSite(t, request, domain.AuthTypeWorkBuddy,
 		domain.WorkBuddyCredential{AccessToken: "jwt", UserID: "uid-t"})
 
 	trace := request.Header.Get("X-Trace-ID")
 	span := request.Header.Get("X-B3-SpanId")
+	parent := request.Header.Get("X-B3-ParentSpanId")
 	if len(trace) != 32 {
 		t.Fatalf("X-Trace-ID = %q, want a 32-hex trace", trace)
 	}
 	if len(span) != 16 {
 		t.Fatalf("X-B3-SpanId = %q, want a 16-hex span", span)
+	}
+	if len(parent) != 16 {
+		t.Fatalf("X-B3-ParentSpanId = %q, want a 16-hex span", parent)
 	}
 	if got, want := request.Header.Get("X-B3-TraceId"), trace; got != want {
 		t.Fatalf("X-B3-TraceId = %q, want %q", got, want)
@@ -162,27 +181,67 @@ func TestWorkBuddyTraceHeadersAgreeWithEachOther(t *testing.T) {
 	if got, want := request.Header.Get("traceparent"), "00-"+trace+"-"+span+"-01"; got != want {
 		t.Fatalf("traceparent = %q, want %q", got, want)
 	}
-	if got, want := request.Header.Get("b3"), trace+"-"+span+"-1"; got != want {
+	// The B3 single header carries four segments; the client sends both
+	// formats, and a three-segment one is what this gateway alone would produce.
+	if got, want := request.Header.Get("b3"), trace+"-"+span+"-1-"+parent; got != want {
 		t.Fatalf("b3 = %q, want %q", got, want)
 	}
 }
 
-// Both builds answer for their own data usage the same way; the true/false split
-// belongs to the CLI identity.
-func TestWorkBuddyPrivateDataIsTrueOnBothBuilds(t *testing.T) {
+// X-Private-Data follows the release, not the account: the intl build ships with
+// model optimization off by default and declares "true", the CN build on and
+// declares "false". Every CN chat carrying "true" is the opposite of the client.
+func TestWorkBuddyPrivateDataFollowsTheRelease(t *testing.T) {
 	t.Setenv("WORKBUDDY_DEVICE_TOKEN", "")
 	t.Setenv("WORKBUDDY_DEVICE_TOKEN_FILE", "")
-	t.Setenv(workBuddyDesktopCompatEnv, "")
 	credential := domain.WorkBuddyCredential{AccessToken: "jwt", UserID: "uid-p"}
 
-	for _, authType := range []string{domain.AuthTypeWorkBuddy, domain.AuthTypeWorkBuddyAI} {
+	for authType, want := range map[string]string{
+		domain.AuthTypeWorkBuddy:   "false",
+		domain.AuthTypeWorkBuddyAI: "true",
+	} {
 		request := newWorkBuddyChatRequest(t, context.Background())
 		applyChatHeadersForSite(t, request, authType, credential)
-		if got := request.Header.Get("X-Private-Data"); got != "true" {
-			t.Fatalf("%s X-Private-Data = %q, want true", authType, got)
+		if got := request.Header.Get("X-Private-Data"); got != want {
+			t.Fatalf("%s X-Private-Data = %q, want %q", authType, got, want)
 		}
-		if got := request.Header.Get("X-Agent-Runtime"); got != "" {
-			t.Fatalf("%s X-Agent-Runtime = %q, want none on the desktop identity", authType, got)
+	}
+}
+
+// Go canonicalises header keys, which turns X-Request-ID into X-Request-Id on the
+// wire. The spelling map is what keeps the initialisms the client uses.
+func TestWorkBuddyHeaderSpellingKeepsInitialisms(t *testing.T) {
+	request := newWorkBuddyChatRequest(t, context.Background())
+	applyChatHeadersForSite(t, request, domain.AuthTypeWorkBuddy,
+		domain.WorkBuddyCredential{AccessToken: "jwt", UserID: "uid-spell"})
+
+	spelled := normalizeWorkBuddyHeaderSpelling(request)
+	for _, name := range []string{
+		"X-Request-ID", "X-Trace-ID", "X-Conversation-ID", "X-Conversation-Request-ID",
+		"X-Conversation-Message-ID", "X-Root-Request-ID", "X-IDE-Type", "X-IDE-Name",
+		"X-IDE-Version", "X-B3-TraceId", "X-B3-ParentSpanId", "X-B3-SpanId",
+		"x-stainless-lang", "acp-connection-id", "x-codebuddy-request", "baggage",
+	} {
+		if _, ok := spelled.Header[name]; !ok {
+			t.Errorf("%s missing from the spelled header set", name)
 		}
+	}
+	// The Go special-cases keep their canonical form, or the transport stops
+	// seeing them and replaces the User-Agent with its own default. The chat path
+	// leaves Accept-Encoding to the transport, so it is set here to prove the map
+	// leaves it alone rather than to assert it is always present.
+	request.Header.Set("Accept-Encoding", "gzip")
+	spelled = normalizeWorkBuddyHeaderSpelling(request)
+	for _, name := range []string{"User-Agent", "Accept-Encoding", "Content-Type", "Accept"} {
+		if _, ok := spelled.Header[name]; !ok {
+			t.Errorf("%s lost its canonical spelling", name)
+		}
+	}
+	if got := spelled.Header.Get("User-Agent"); !strings.Contains(got, "WorkBuddy/") {
+		t.Fatalf("User-Agent = %q, want the client's", got)
+	}
+	// The original request is left alone: callers read it back after sending.
+	if _, ok := request.Header["X-Request-ID"]; ok {
+		t.Fatal("normalisation rewrote the caller's request")
 	}
 }
