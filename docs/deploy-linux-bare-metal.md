@@ -468,15 +468,20 @@ curl -s http://127.0.0.1:18093/__health
 
 关于**未跟踪文件**：默认只提交已跟踪文件的改动，并在有未跟踪文件时给出提示。原因是
 `go build` 会把它们算进 `vcs.modified=true`，gc 的溯源校验（§4.3）会因此拒收产物。
-两条出路：`--include-untracked` 把它们一起提交；或者在一个干净的 `git worktree` 里发布
+两条出路：`--include-untracked` 把它们一起提交；或者在**一个干净的本地克隆**里发布
 （不动别人的工作区）：
 
 ```bash
-git worktree add --detach /tmp/lpg-clean HEAD
-# 新 worktree 没有 node_modules，用软链/目录联接指向现有依赖（web/node_modules 被 ignore，不影响溯源）
-ln -s "$PWD/web/node_modules" /tmp/lpg-clean/web/node_modules    # Windows: mklink /J
-cd /tmp/lpg-clean && bash deploy/release-all.sh -m "fix(ui): xxx"
+git clone --local /path/to/llm-protocol-gateway /tmp/lpg-clean
+cd /tmp/lpg-clean
+# 新克隆没有 node_modules：用软链/目录联接指向现有依赖（web/node_modules 被 ignore，不影响溯源）
+ln -s /path/to/llm-protocol-gateway/web/node_modules web/node_modules   # Windows: mklink /J
+SERVER_HOST=<gc-ip> bash deploy/deploy-linux.sh
 ```
+
+注意**不要**用 `git worktree add` 代替克隆：linked worktree 里 `go build` 不会内嵌
+`vcs.revision/vcs.modified`（实测 Go 1.26 直接跳过 VCS 标记），溯源校验会报
+「二进制里没有 vcs 信息」并拒绝上传。克隆是独立仓库，溯源正常。
 
 - gc 的版本号来自 `scripts/build-version.sh`（`YYYYMMDD.HHMMSS` UTC），不是 git tag；
   sjc 的版本号是镜像 tag（`vX.Y.Z`）。两者都对应同一个 commit，可用 `go version -m` 核对。
