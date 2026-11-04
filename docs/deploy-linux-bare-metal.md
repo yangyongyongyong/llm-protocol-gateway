@@ -460,10 +460,23 @@ curl -s http://127.0.0.1:18093/__health
 ./deploy/release-all.sh --skip-gc -m "只发 sjc"    # 只走 Docker 蓝绿
 ./deploy/release-all.sh --skip-sjc -m "只发 gc"    # 只跑 deploy-linux.sh
 ./deploy/release-all.sh --no-wait -m "触发即返回"  # 不等 sjc 上线
+./deploy/release-all.sh --include-untracked -m "连新文件一起发"  # 默认不提交未跟踪文件
 ```
 
 环境变量：`REMOTES`（默认 `origin fork`）、`RELEASE_BRANCH`、`GC_HOST`、`SJC_URL`、
 `WAIT_TIMEOUT`，以及透传给 deploy-linux.sh 的 `SSH_KEY` / `SSH_PORT` / `SERVER_USER`。
+
+关于**未跟踪文件**：默认只提交已跟踪文件的改动，并在有未跟踪文件时给出提示。原因是
+`go build` 会把它们算进 `vcs.modified=true`，gc 的溯源校验（§4.3）会因此拒收产物。
+两条出路：`--include-untracked` 把它们一起提交；或者在一个干净的 `git worktree` 里发布
+（不动别人的工作区）：
+
+```bash
+git worktree add --detach /tmp/lpg-clean HEAD
+# 新 worktree 没有 node_modules，用软链/目录联接指向现有依赖（web/node_modules 被 ignore，不影响溯源）
+ln -s "$PWD/web/node_modules" /tmp/lpg-clean/web/node_modules    # Windows: mklink /J
+cd /tmp/lpg-clean && bash deploy/release-all.sh -m "fix(ui): xxx"
+```
 
 - gc 的版本号来自 `scripts/build-version.sh`（`YYYYMMDD.HHMMSS` UTC），不是 git tag；
   sjc 的版本号是镜像 tag（`vX.Y.Z`）。两者都对应同一个 commit，可用 `go version -m` 核对。

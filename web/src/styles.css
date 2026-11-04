@@ -12710,12 +12710,20 @@ body { font-size: 14px; }
    --------------------------------------------------------------------------- */
 .wb-task-panel {
   display: grid; gap: 6px;
+  /* 卡片只有 300 多像素宽：显式 minmax(0,1fr) 才让子项按容器收窄。
+     只写 display:grid 时隐式列按 max-content 撑开，行内按钮不换行、直接顶出卡片。 */
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0; max-width: 100%;
   padding-top: 8px; border-top: 1px solid var(--border);
 }
-.wb-task-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
-.wb-task-title { font-size: 11.5px; font-weight: 700; color: var(--fg, var(--muted)); }
+.wb-task-panel > * { min-width: 0; }
+.wb-task-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; min-width: 0; }
+/* 标题行自己是一组：标题吃剩余宽度、说明按需省略，按钮组整组换行。 */
+.wb-task-headline { display: flex; align-items: baseline; gap: 6px; flex: 1 1 auto; min-width: 0; }
+.wb-task-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; flex: 0 1 auto; min-width: 0; }
+.wb-task-title { flex: none; font-size: 11.5px; font-weight: 700; color: var(--fg, var(--muted)); }
 .wb-task-meta {
-  flex: 1 1 auto; min-width: 0;
+  min-width: 0;
   font-size: 10.5px; color: var(--muted);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
@@ -12762,10 +12770,11 @@ body { font-size: 14px; }
 .wb-task-log-line[data-tone="warn"] { color: var(--amber); }
 .wb-task-log-code { flex: none; font-weight: 600; }
 .wb-task-log-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.wb-task-list { display: grid; gap: 4px; }
-.wb-task-row { display: grid; gap: 3px; padding: 4px 0; border-bottom: 1px dashed var(--border); }
+.wb-task-list { display: grid; gap: 4px; grid-template-columns: minmax(0, 1fr); }
+.wb-task-row { display: grid; gap: 3px; grid-template-columns: minmax(0, 1fr); min-width: 0; padding: 4px 0; border-bottom: 1px dashed var(--border); }
 .wb-task-row:last-child { border-bottom: 0; }
 .wb-task-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.wb-task-line > * { min-width: 0; }
 .wb-task-name {
   flex: 1 1 auto; min-width: 0;
   font-size: 11px; font-weight: 600; color: var(--fg, var(--muted));
@@ -12810,5 +12819,5 @@ body { font-size: 14px; }
 html[data-theme="dark"] .wb-task-notice { color: #6ee7b7; }
 html[data-theme="dark"] .wb-task-log-line[data-tone="ok"] { color: #6ee7b7; }
 html[data-theme="dark"] .wb-task-badge[data-tone="ok"] { color: #6ee7b7; border-color: #6ee7b7; }
-.wb-task-progress { display: flex; align-items: center; gap: 6px; }
+.wb-task-progress { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .wb-task-count { flex: none; font-size: 9.5px; color: var(--muted); }

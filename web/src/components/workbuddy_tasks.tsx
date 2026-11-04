@@ -184,40 +184,46 @@ export function WorkBuddyTaskPanel({ providerId, connected, compact }: { provide
   return (
     <div className="wb-task-panel" data-running={running ? 'true' : 'false'}>
       <div className="wb-task-head">
-        <span className="wb-task-title">任务中心</span>
-        <span className="wb-task-meta" title={`共 ${tasks.length} 个任务，其中 ${automatable} 个可以自动完成`}>
-          {tasks.length > 0 ? `${done}/${tasks.length} 已领取 · 可自动 ${automatable}` : '—'}
-        </span>
-        <button
-          type="button"
-          className="wb-task-btn primary"
-          disabled={Boolean(busy) || running || view?.readOnly}
-          title={view?.readOnly ? '国际版任务只读，请在官方客户端操作' : '按动作表逐项推进所有可自动任务'}
-          onClick={() => void runTasks()}
-        >
-          {running ? '执行中…' : '一键完成'}
-        </button>
-        <button
-          type="button"
-          className="wb-task-btn"
-          disabled={Boolean(busy)}
-          title="发一条 chat_request_send：连登天数与 first_buddy 的门槛都看它"
-          onClick={() => void reportActivity()}
-        >
-          活跃上报
-        </button>
-        <button
-          type="button"
-          className="wb-task-btn"
-          disabled={Boolean(busy)}
-          title="续期令牌 + 活跃上报 + 签到 + 补领达标未领的奖励"
-          onClick={() => void keepalive()}
-        >
-          保活
-        </button>
-        <button type="button" className="wb-task-btn" disabled={loading} onClick={() => void load()}>
-          {loading ? '…' : '刷新'}
-        </button>
+        <div className="wb-task-headline">
+          <span className="wb-task-title">任务中心</span>
+          <span className="wb-task-meta" title={tasks.length > 0 ? `共 ${tasks.length} 个任务，其中 ${automatable} 个可以自动完成` : ''}>
+            {tasks.length > 0 ? `${done}/${tasks.length} 已领取 · 可自动 ${automatable}` : '—'}
+          </span>
+        </div>
+        {/* 按钮单独成组：卡片只有 300 多像素宽，和标题挤在同一行会把按钮顶出边界。
+            整组要么跟在标题后面，要么整体换行，永远不会被裁掉。 */}
+        <div className="wb-task-actions">
+          <button
+            type="button"
+            className="wb-task-btn primary"
+            disabled={Boolean(busy) || running || view?.readOnly}
+            title={view?.readOnly ? '国际版任务只读，请在官方客户端操作' : '按动作表逐项推进所有可自动任务'}
+            onClick={() => void runTasks()}
+          >
+            {running ? '执行中…' : '一键完成'}
+          </button>
+          <button
+            type="button"
+            className="wb-task-btn"
+            disabled={Boolean(busy)}
+            title="发一条 chat_request_send：连登天数与 first_buddy 的门槛都看它"
+            onClick={() => void reportActivity()}
+          >
+            活跃上报
+          </button>
+          <button
+            type="button"
+            className="wb-task-btn"
+            disabled={Boolean(busy)}
+            title="续期令牌 + 活跃上报 + 签到 + 补领达标未领的奖励"
+            onClick={() => void keepalive()}
+          >
+            保活
+          </button>
+          <button type="button" className="wb-task-btn" disabled={loading} onClick={() => void load()}>
+            {loading ? '…' : '刷新'}
+          </button>
+        </div>
       </div>
 
       {automation ? (

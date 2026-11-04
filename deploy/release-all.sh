@@ -24,6 +24,7 @@
 #   ./deploy/release-all.sh --skip-gc -m "only sjc"               # 只发 sjc
 #   ./deploy/release-all.sh --skip-sjc -m "only gc"               # 只发 gc
 #   ./deploy/release-all.sh --no-wait -m "不等待上线"             # 触发后立即返回
+#   ./deploy/release-all.sh --include-untracked -m "连新文件一起发"  # 默认不提交未跟踪文件
 #
 # 可用环境变量覆盖默认配置：
 #   REMOTES        推送的远程名（空格分隔）        默认 "origin fork"
@@ -49,6 +50,7 @@ SKIP_GC=0
 SKIP_SJC=0
 NO_WAIT=0
 DRY_RUN=0
+INCLUDE_UNTRACKED=0
 BUMP="patch"
 TAG=""
 COMMIT_MESSAGE=""
@@ -91,6 +93,7 @@ while [[ $# -gt 0 ]]; do
     --skip-sjc)   SKIP_SJC=1; shift ;;
     --no-wait)    NO_WAIT=1; shift ;;
     --dry-run)    DRY_RUN=1; shift ;;
+    --include-untracked) INCLUDE_UNTRACKED=1; shift ;;
     -h|--help)    usage ;;
     *) die "未知参数: $1（--help 查看用法）" ;;
   esac
@@ -104,7 +107,9 @@ command -v curl >/dev/null || die "缺少 curl（等 sjc 上线要用）"
 
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "当前目录不是 git 仓库: $ROOT"
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-[[ "$BRANCH" != "HEAD" ]] || die "处于 detached HEAD，先切回 $RELEASE_BRANCH"
+# detached HEAD 允许（在临时 worktree 里发布时就是这种状态）：推送用的是 HEAD:refs/heads/<分支>，
+# 与本地是否挂着分支无关；tag 也是仓库级的。只提示一句，免得以为推错了。
+[[ "$BRANCH" != "HEAD" ]] || { BRANCH="(detached HEAD)"; warn "处于 detached HEAD：按 HEAD 推送 $RELEASE_BRANCH"; }
 if [[ "$BRANCH" != "$RELEASE_BRANCH" ]]; then
   warn "当前分支是 $BRANCH，发布分支约定为 $RELEASE_BRANCH"
   warn "继续会推 $BRANCH 到各远端的 $RELEASE_BRANCH；Ctrl-C 可中止"
@@ -172,20 +177,46 @@ if [[ "$DRY_RUN" == "1" ]]; then warn "dry-run：只打印命令，不提交、�
 
 # ───────────────────────── 2. 提交 ─────────────────────────
 step "2. 提交改动"
-CHANGES="$(git status --porcelain)"
-if [[ -z "$CHANGES" ]]; then
-  info "工作区干净，跳过提交（本次只发版本 $TAG）"
-  if [[ "$DRY_RUN" != "1" ]] && [[ -z "$COMMIT_MESSAGE" ]]; then
-    : # 无改动时不需要提交说明
+# 只提交「已跟踪文件的改动」是默认行为：未跟踪的新文件可能是另一条工作流的半成品，
+# 而且 go build 把未跟踪文件也算脏（vcs.modified=true），gc 的溯源校验会因此拒收产物。
+# 确实要一起发就显式 --include-untracked。
+TRACKED_CHANGES="$(git status --porcelain --untracked-files=no)"
+UNTRACKED="$(git ls-files --others --exclude-standard)"
+if [[ -n "$UNTRACKED" ]]; then
+  if [[ "$INCLUDE_UNTRACKED" == "1" ]]; then
+    info "未跟踪文件按 --include-untracked 一并提交："
+  else
+    warn "有未跟踪文件，本轮不提交（它们会把 gc 的 vcs.modified 变成 true）："
   fi
+  printf '%s\n' "$UNTRACKED" | sed 's/^/    /' | head -20
+  untracked_count="$(printf '%s\n' "$UNTRACKED" | wc -l | tr -d ' ')"
+  [[ "$untracked_count" -gt 20 ]] && dim "    …（共 $untracked_count 个未跟踪文件）"
+  if [[ "$INCLUDE_UNTRACKED" != "1" ]]; then
+    warn "要让它们参与本次发布：加 --include-untracked；要保住 gc 的溯源校验：先提交或清理它们"
+  fi
+fi
+
+if [[ -z "$TRACKED_CHANGES" ]] && { [[ "$INCLUDE_UNTRACKED" != "1" ]] || [[ -z "$UNTRACKED" ]]; }; then
+  info "没有需要提交的改动，本次只发版本 $TAG"
 else
   [[ -n "$COMMIT_MESSAGE" ]] || COMMIT_MESSAGE="chore(release): $TAG"
-  printf '%s\n' "$CHANGES" | sed 's/^/    /' | head -20
-  count="$(printf '%s\n' "$CHANGES" | wc -l | tr -d ' ')"
-  [[ "$count" -gt 20 ]] && dim "    …（共 $count 个改动）"
-  run git add -A
-  run git commit -m "$COMMIT_MESSAGE"
-  ok "已提交：$COMMIT_MESSAGE"
+  if [[ -n "$TRACKED_CHANGES" ]]; then
+    printf '%s\n' "$TRACKED_CHANGES" | sed 's/^/    /' | head -20
+    count="$(printf '%s\n' "$TRACKED_CHANGES" | wc -l | tr -d ' ')"
+    [[ "$count" -gt 20 ]] && dim "    …（共 $count 个改动）"
+  fi
+  if [[ "$INCLUDE_UNTRACKED" == "1" ]]; then
+    run git add -A
+  else
+    # -u 只更新已跟踪文件，未跟踪文件留在工作区
+    run git add -u
+  fi
+  if [[ "$DRY_RUN" != "1" ]] && git diff --cached --quiet; then
+    info "暂存区为空（改动可能已提交过），跳过提交"
+  else
+    run git commit -m "$COMMIT_MESSAGE"
+    ok "已提交：$COMMIT_MESSAGE"
+  fi
 fi
 [[ -n "$COMMIT_MESSAGE" ]] || COMMIT_MESSAGE="chore(release): $TAG"
 
