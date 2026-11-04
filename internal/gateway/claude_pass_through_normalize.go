@@ -25,16 +25,32 @@ func normalizeClaudePassThroughPayload(payload map[string]any) {
 	if rawMessages, ok := payload["messages"].([]any); ok {
 		normalized["messages"] = dropTrailingClaudePassThroughThinking(normalizeClaudePassThroughMessages(rawMessages))
 	}
+	declaredTools := 0
 	if rawTools, ok := payload["tools"].([]any); ok && len(rawTools) > 0 {
-		normalized["tools"] = normalizeClaudePassThroughTools(rawTools)
+		if normalizedTools := normalizeClaudePassThroughTools(rawTools); len(normalizedTools) > 0 {
+			normalized["tools"] = normalizedTools
+			declaredTools = len(normalizedTools)
+		}
 	}
 	// 历史里调用过、这次请求却没有声明的工具（tool_search 一类按需加载工具集的
 	// 客户端就是这样）：Anthropic 直接拒绝（"Requests which include tool_use or
-	// tool_result blocks must define tools"），一个空 tools 也一样。给它们补一个
-	// 占位声明，并把选项设成 none —— 客户端这次没打算调用任何工具。
+	// tool_result blocks must define tools"），一个空 tools 也一样。补一个占位
+	// 声明让历史合法。
+	//
+	// 占位声明和 tool_choice 是两件事，只有前者能解决问题。tool_choice=none 只在
+	// 这一轮确实没声明任何工具时才是实话（客户端这一轮不打算用工具，也顺带挡住
+	// 模型去调那个占位名）。
+	//
+	// 客户端明明声明了一堆工具、只是历史里多了一个已经不在声明表里的名字时，绝不能
+	// 设 none：Claude Code 默认根本不发 tool_choice，下面的
+	// normalizeClaudePassThroughToolChoice 读到 nil 就不会覆盖，none 会一路带到
+	// 上游，模型被禁止调用任何工具，只能回一句文字——而历史里那条 tool_use 永远在，
+	// 于是这一段会话的每一轮都被禁，看起来就是「回复一句就不继续往下干了」。
 	if stubbed, ok := stubUndeclaredHistoryTools(normalized); ok {
 		normalized["tools"] = stubbed
-		normalized["tool_choice"] = map[string]any{"type": "none"}
+		if declaredTools == 0 {
+			normalized["tool_choice"] = map[string]any{"type": "none"}
+		}
 	}
 	if toolChoice := normalizeClaudePassThroughToolChoice(payload["tool_choice"]); toolChoice != nil {
 		normalized["tool_choice"] = toolChoice
@@ -61,6 +77,11 @@ func normalizeClaudePassThroughPayload(payload map[string]any) {
 	// 实测模型可能不是 Claude：关闭 thinking 的写法按模型族改写（glm 不认识
 	// thinking.type，会把它当默认开启思考）。
 	normalizeClaudeThinkingOff(normalized, stringValue(normalized["model"]))
+	// 只能自适应思考的模型（opus-5-5 / fable / mythos）不接受 xhigh/max：被
+	// 拒绝还算好的，真发下去它会把输出预算全烧在思考上、正文一个字不出，客户端
+	// 收到的是一个「正常结束但什么都没说」的回合（thinking-only 空回合）。
+	// Key 把思考深度覆盖成 max 时，每一轮都会踩到。
+	clampClaudeAdaptiveEffort(normalized, stringValue(normalized["model"]))
 	for key := range payload {
 		delete(payload, key)
 	}
@@ -169,6 +190,7 @@ func rewriteClaudeUpstreamMaxTokens(body []byte, provider domain.Provider, maxTo
 	payload["max_tokens"] = effectiveClaudeMaxTokens(model, maxTokensOverride)
 	sanitizeClaudePassThroughDisabledThinkingEffort(payload)
 	normalizeClaudeThinkingOff(payload, model)
+	clampClaudeAdaptiveEffort(payload, model)
 	out, err := json.Marshal(payload)
 	if err != nil {
 		return body

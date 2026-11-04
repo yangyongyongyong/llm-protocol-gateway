@@ -25,6 +25,19 @@ func modelEffortLevels(model string) []string {
 	case strings.Contains(id, "deepseek"), strings.Contains(id, "kimi"), strings.Contains(id, "moonshot"):
 		return []string{"low", "high", "max"}
 	}
+	// Claude 的档位取决于哪一代：只能自适应思考的（opus-5-5 / fable / mythos）
+	// 不接受 xhigh/max —— 它照样会收下，然后把输出预算全烧在思考上、正文一个字
+	// 不出（thinking-only 空回合），所以这里必须声明到 high 封顶。可关思考的
+	// 一代（opus-5 等）只在 disabled+xhigh 时受限，adaptive 的 xhigh/max 合法，
+	// 保持完整档位。
+	if rule, known := claudeThinkingOffOf(model); known {
+		switch rule {
+		case claudeOffNever, claudeOffBetweenTools:
+			return []string{"low", "medium", "high"}
+		default:
+			return []string{"low", "medium", "high", "xhigh", "max"}
+		}
+	}
 	return nil
 }
 

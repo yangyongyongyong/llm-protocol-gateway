@@ -147,6 +147,38 @@ func normalizeClaudeThinkingOff(payload map[string]any, model string) bool {
 	}
 }
 
+// clampClaudeAdaptiveEffort lowers output_config.effort to what the model
+// accepts, for the models that can only think adaptively at all: opus-5-5,
+// fable and mythos (claudeOffNever) take any effort, but a request that asks for
+// xhigh or max through them spends its output budget on thinking and answers
+// nothing — which reaches the client as a finished turn with no visible output,
+// the thinking-only empty turn. A key whose thinking depth is overridden to
+// "max" (api_keys.thinking_depth_override) hits this on every single turn, which
+// is exactly what an opus-5-5 subscription was seen doing: output_tokens 47, 53,
+// 63 with thinking_tokens 45, 51, 61 and not one text block.
+//
+// Models that accept "disabled" up to a modest effort (claudeOffUpToHigh, opus-5
+// among them) are not this case: an adaptive request at xhigh is legal for them
+// and is left alone. Their only incompatibility is disabled + xhigh, which
+// sanitizeClaudePassThroughDisabledThinkingEffort already handles.
+func clampClaudeAdaptiveEffort(payload map[string]any, model string) bool {
+	if payload == nil {
+		return false
+	}
+	rule, known := claudeThinkingOffOf(model)
+	if !known || rule != claudeOffNever {
+		return false
+	}
+	effort := strings.ToLower(strings.TrimSpace(outputConfigEffort(payload)))
+	if effort != "xhigh" && effort != "max" {
+		return false
+	}
+	setOutputConfigEffort(payload, "high")
+	return true
+}
+
+// outputConfigEffort reads output_config.effort, the level a Messages request
+// asks the model to reason at.
 func outputConfigEffort(payload map[string]any) string {
 	config, _ := payload["output_config"].(map[string]any)
 	return stringValue(config["effort"])

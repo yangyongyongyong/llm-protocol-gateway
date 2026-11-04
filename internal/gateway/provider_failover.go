@@ -556,6 +556,27 @@ func (s *Server) refreshProviderUnavailableCountdown(providerID string, hard boo
 	s.setProviderUnavailable(providerID, hard, reason, retryAfter, body, false)
 }
 
+// setProviderUnavailableUntil holds providerID out of rotation until at, without
+// re-logging and without recomputing the rest. The moment comes from the
+// account's own usage reading, which is the vendor's answer rather than anything
+// the failure body said, so it is used as it is.
+func (s *Server) setProviderUnavailableUntil(providerID string, at time.Time, hard bool, reason string) {
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" || at.IsZero() {
+		return
+	}
+	s.providerAvailabilityMu.Lock()
+	if s.providerAvailability == nil {
+		s.providerAvailability = make(map[string]providerUnavailableState)
+	}
+	s.providerAvailability[providerID] = providerUnavailableState{
+		nextRetry: at,
+		hard:      hard,
+		reason:    truncateReason(reason),
+	}
+	s.providerAvailabilityMu.Unlock()
+}
+
 // markProviderAvailable clears any tracked "unavailable" cooldown for
 // providerID, e.g. once a live request or background probe succeeds again.
 func (s *Server) markProviderAvailable(providerID string) {
@@ -750,6 +771,52 @@ func (s *Server) cooldownHint(providerID, retryAfter string, body []byte, now ti
 	return hint
 }
 
+// providerQuotaRestCap bounds a rest that the account's own usage reading
+// named, as opposed to one the rate ladder guessed. A Claude subscription's
+// window reopens at most five hours after it was spent, so that is the longest
+// rest a spent window can justify. The rate cap (30m) is for request throttling:
+// holding a spent quota to it made the gateway ask again four minutes later, be
+// refused again, and double the ladder — the "consecutive=3, 4, 5" run in the
+// log is one account being retried inside a window that had hours left.
+const providerQuotaRestCap = 5 * time.Hour
+
+// claudeSpentWindowReset is the moment a Claude subscription's spent window
+// reopens, read from the usage panel's cache. spent is false when no window is
+// known to be used up right now, which is the common case: most Cooldowns are a
+// throttle, not a quota.
+func (s *Server) claudeSpentWindowReset(providerID string, now time.Time) (time.Time, bool) {
+	if s == nil || s.oauthUsageCache == nil {
+		return time.Time{}, false
+	}
+	cached, ok := s.oauthUsageCache.getAllowStale(s.oauthUsageCacheKeyFor("claude", providerID))
+	if !ok {
+		return time.Time{}, false
+	}
+	report, ok := cached.(ClaudeOAuthUsageReport)
+	if !ok || !report.Available {
+		return time.Time{}, false
+	}
+	var spent, idle []*ClaudeOAuthUsageBucket
+	for _, bucket := range []*ClaudeOAuthUsageBucket{report.FiveHour, report.SevenDay, report.SevenDayOverageIncluded} {
+		if bucket == nil {
+			continue
+		}
+		if bucket.Utilization >= claudeUsageHardThresholdPct {
+			spent = append(spent, bucket)
+		} else {
+			idle = append(idle, bucket)
+		}
+	}
+	if len(spent) == 0 {
+		return time.Time{}, false
+	}
+	at := exhaustedReset(time.Time{}, spent, idle, now)
+	if at.IsZero() || !at.After(now) {
+		return time.Time{}, false
+	}
+	return at, true
+}
+
 // cooldownTTL is how long providerID rests: the upstream's own hint when it
 // names a time, the class default otherwise. Only "how long" comes from the
 // upstream — whether the mark shows as hard still comes from the classifier,
@@ -804,8 +871,26 @@ func (s *Server) cooldownTTL(providerID, retryAfter string, body []byte, hard bo
 		}
 	}
 	if !hint.resetsAt.IsZero() {
-		if until := hint.resetsAt.Sub(now); until > ttl && until <= providerRateRestCap {
-			ttl = until
+		if until := hint.resetsAt.Sub(now); until > ttl {
+			// A spent subscription window reopens when it reopens, however far
+			// out: the rate cap is for throttling, not for a quota that is gone.
+			// Bounded by providerQuotaRestCap, and only when the usage reading
+			// confirms a window really is spent — a vendor's "resets in 6 days"
+			// carried by a plain 429 is still a plan window, not this.
+			limit := providerRateRestCap
+			spent := false
+			if _, isSpent := s.claudeSpentWindowReset(providerID, now); isSpent {
+				limit = providerQuotaRestCap
+				spent = true
+			}
+			switch {
+			case until <= limit:
+				ttl = until
+			case spent:
+				// The window reopens past the cap: rest the cap, not whatever
+				// rung of the rate ladder the failure count happened to be on.
+				ttl = limit
+			}
 		}
 	}
 	return ttl
@@ -1643,6 +1728,21 @@ func (s *Server) reprobeUnavailableProviders(ctx context.Context) {
 			continue
 		}
 		if s.probeProviderAvailable(ctx, provider) {
+			// A Claude subscription's /models probe costs no allowance and
+			// answers even while every window is spent: the account is not back
+			// until its usage reading says a window reopened. Trusting the probe
+			// alone is what recovered a spent account a second after it was
+			// marked (the log's "marked unavailable 20:00:05" / "provider
+			// recovered 20:00:06"), and the next request was refused again.
+			if at, spent := s.claudeSpentWindowReset(id, time.Now()); spent {
+				prev, _ := s.providerUnavailableSnapshot(id)
+				reason := prev.reason
+				if strings.TrimSpace(reason) == "" {
+					reason = "quota window spent"
+				}
+				s.setProviderUnavailableUntil(id, at, prev.hard, reason)
+				continue
+			}
 			s.markProviderAvailable(id)
 			if s.logs != nil {
 				s.logs.AddApp("info", "provider recovered", fmt.Sprintf("provider=%s", id))

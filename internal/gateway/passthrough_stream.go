@@ -684,7 +684,11 @@ func streamPassThroughResponse(w http.ResponseWriter, tee *streamTee, response *
 	usage := newStreamUsageReader(kind)
 	stream := &passThroughOpeningWriter{w: w, limit: passThroughLogBufferMax, tee: tee}
 	stream.setEnd(&usage.streamEndReader)
-	hw := newSSEHeartbeatResponseWriter(stream)
+	// A turn the Anthropic OAuth upstream closes with no visible output is
+	// rewritten to an error frame here, so the client asks again instead of
+	// taking silence as the answer (see claudeEmptyTurnGuard).
+	out, emptyTurn := claudeEmptyTurnGuardFor(stream, end)
+	hw := newSSEHeartbeatResponseWriter(out)
 	hw.WriteHeader(response.StatusCode)
 	stopHeartbeat := startSSEHeartbeat(hw, sseHeartbeatInterval)
 	defer stopHeartbeat()
@@ -698,6 +702,11 @@ func streamPassThroughResponse(w http.ResponseWriter, tee *streamTee, response *
 	// hw.Write already serializes, the stream writer hands each byte to the
 	// client at once, and usage sees every byte rather than the capped copy.
 	_, copyErr := writeWithClientGone(io.MultiWriter(hw, usage), reads)
+	if emptyTurn != nil {
+		// The upstream's last frame may not have ended on a blank line: write
+		// what is left so the closing rewrite below still happens.
+		emptyTurn.close()
+	}
 	usage.streamEndReader.settleTail()
 	cut := stream.cut(usage, parseUsage, tee.Bytes())
 	cut.closed = usage.closed()

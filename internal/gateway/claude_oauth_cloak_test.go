@@ -237,10 +237,20 @@ func TestRemapClaudeOAuthToolNamePreservesMCPNamespacedNames(t *testing.T) {
 	}
 }
 
-func TestApplyClaudeOAuthCloakingReplacesOpenCodeSystem(t *testing.T) {
+// The client's own system prompt is what makes the model act: a turn sent
+// without it answers a line, or only thinks and says nothing (a thinking-only
+// empty turn). The cloak therefore lifts Claude Code's billing line out of the
+// client's system and re-issues it first, keeping every other block verbatim —
+// magpie's rule for the same upstream (billing_line.go, withoutBillingLine).
+func TestApplyClaudeOAuthCloakingKeepsClientSystem(t *testing.T) {
+	const clientPrompt = "You are OpenCode, the best coding agent on the planet."
 	payload := map[string]any{
-		"model":  "claude-sonnet-5",
-		"system": "You are OpenCode, the best coding agent on the planet.",
+		"model": "claude-sonnet-5",
+		"system": []any{
+			map[string]any{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.318.924; cc_entrypoint=cli; cch=abcde;"},
+			map[string]any{"type": "text", "text": claudeOAuthAgentIdentifier},
+			map[string]any{"type": "text", "text": clientPrompt},
+		},
 		"messages": []any{
 			map[string]any{"role": "user", "content": "hello"},
 		},
@@ -251,25 +261,48 @@ func TestApplyClaudeOAuthCloakingReplacesOpenCodeSystem(t *testing.T) {
 	applyClaudeOAuthCloaking(payload)
 
 	system := payload["system"].([]any)
-	if !strings.HasPrefix(stringValue(system[0].(map[string]any)["text"]), "x-anthropic-billing-header:") {
-		t.Fatalf("expected billing header in system[0], got %#v", system[0])
+	if !claudeOAuthBillingLine.MatchString(stringValue(system[0].(map[string]any)["text"])) {
+		t.Fatalf("expected a billing-only block in system[0], got %#v", system[0])
 	}
 	if stringValue(system[1].(map[string]any)["text"]) != claudeOAuthAgentIdentifier {
 		t.Fatalf("expected agent identifier in system[1], got %#v", system[1])
 	}
-	user := payload["messages"].([]any)[0].(map[string]any)["content"].(string)
-	if !strings.Contains(user, "<system-reminder>") {
-		t.Fatalf("expected forwarded system context in first user message, got %q", user)
+	// The client's own prompt survives, byte for byte, and appears once.
+	var kept []string
+	for _, item := range system[2:] {
+		kept = append(kept, stringValue(item.(map[string]any)["text"]))
+	}
+	if len(kept) != 1 || kept[0] != clientPrompt {
+		t.Fatalf("expected the client system kept once after the cloak, got %#v", kept)
+	}
+	// Nothing is moved into the user message any more.
+	if user, ok := payload["messages"].([]any)[0].(map[string]any)["content"].(string); !ok || user != "hello" {
+		t.Fatalf("expected the first user message untouched, got %#v", payload["messages"])
 	}
 	if payload["tools"].([]any)[0].(map[string]any)["name"] != "Bash" {
 		t.Fatalf("expected remapped tool name Bash, got %#v", payload["tools"])
 	}
 }
 
+// A system the cloak already built is left alone, so the function is idempotent.
+func TestApplyClaudeOAuthCloakingIsIdempotent(t *testing.T) {
+	payload := map[string]any{
+		"model":    "claude-sonnet-5",
+		"system":   "Rules.",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}
+	applyClaudeOAuthCloaking(payload)
+	first := len(payload["system"].([]any))
+	applyClaudeOAuthCloaking(payload)
+	if second := len(payload["system"].([]any)); second != first {
+		t.Fatalf("cloaking twice grew the system from %d to %d blocks", first, second)
+	}
+}
+
 func TestClaudeOAuthBillingHTTPHeaderValue(t *testing.T) {
 	payload := map[string]any{
 		"model":  "claude-sonnet-5",
-		"system": buildClaudeOAuthCloakedSystem(),
+		"system": buildClaudeOAuthSystem(nil),
 		"messages": []any{
 			map[string]any{"role": "user", "content": "hi"},
 		},
@@ -291,7 +324,7 @@ func TestClaudeOAuthBillingHTTPHeaderValue(t *testing.T) {
 func TestSignClaudeOAuthCCH(t *testing.T) {
 	payload := map[string]any{
 		"model":  "claude-sonnet-5",
-		"system": buildClaudeOAuthCloakedSystem(),
+		"system": buildClaudeOAuthSystem(nil),
 		"messages": []any{
 			map[string]any{"role": "user", "content": "hi"},
 		},
@@ -321,7 +354,7 @@ func TestReverseRemapClaudeOAuthToolName(t *testing.T) {
 
 func TestEnsureClaudeOAuthCacheControl(t *testing.T) {
 	payload := map[string]any{
-		"system": buildClaudeOAuthCloakedSystem(),
+		"system": buildClaudeOAuthSystem(nil),
 		"tools": []any{
 			map[string]any{"name": "Bash"},
 			map[string]any{"name": "Read"},

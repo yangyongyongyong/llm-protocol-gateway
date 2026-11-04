@@ -6198,6 +6198,9 @@ func (s *Server) claudePassThroughInterrupter(r *http.Request, provider domain.P
 // regular Claude API-key providers), returning the raw response.
 func (s *Server) sendClaudeMessagesUpstream(r *http.Request, provider domain.Provider, body []byte) (*http.Response, error) {
 	isOAuth := provider.AuthType == domain.AuthTypeClaudeOAuth
+	// 这个上游拒过的 thinking 签名先剥掉：一次拒签之后，对话的后续每一轮都不必
+	// 再花一次 400 去重新学同一件事（对标 magpie thinking_bound.go 的记忆）。
+	body = stripRefusedClaudeThinkingBody(body, provider)
 	// 直通 Claude 兼容上游（智谱 GLM 等）的校验与 Anthropic 不同：stop_sequences
 	// 非字符串项直接 400、空串会让流在第一个 token 前就停止、超过 4 条被拒；
 	// 关闭 thinking 的写法也随模型族而变（见 normalizeClaudeThinkingOff）。
@@ -6290,7 +6293,25 @@ func (s *Server) maybeRectifyClaudeThinkingResend(r *http.Request, provider doma
 	if !shouldRectifyThinkingSignature(errBody) {
 		return response, false
 	}
-	rectifiedBody, result := rectifyClaudeThinkingBody(body)
+	// 先按 400 指到的位置精准剥离（对标 magpie thinking_bound.go）：只删被拒
+	// 的那一块及其后的 thinking，并记住这些签名，下一轮首次就剥掉。精准剥离
+	// 命中不了（错误没指向具体块）时才回退到整请求整流，保留原有覆盖面。
+	rectifiedBody, result, boundApplied := rectifyClaudeThinkingBoundBody(body, errBody, provider)
+	if boundApplied {
+		s.logs.AddApp("info", "thinking signature refused, cutting from the named block", fmt.Sprintf(
+			"provider=%s removed_thinking=%d removed_redacted=%d",
+			provider.ID, result.removedThinkingBlocks, result.removedRedactedThinkingBlocks))
+		markTimingFlag(r.Context(), timingFlagThinkingRectify)
+		retryResp, retryErr := resend(rectifiedBody)
+		if retryErr != nil {
+			s.logs.AddApp("warn", "thinking rectifier retry transport error", retryErr.Error())
+			dumpThinkingRectify(provider.ID, body, rectifiedBody, errBody, nil, retryErr, result)
+			return response, false
+		}
+		dumpThinkingRectify(provider.ID, body, rectifiedBody, errBody, retryResp, nil, result)
+		return retryResp, true
+	}
+	rectifiedBody, result = rectifyClaudeThinkingBody(body)
 	if !result.applied {
 		s.logs.AddApp("warn", "thinking rectifier matched but nothing to strip", fmt.Sprintf("provider=%s", provider.ID))
 		return response, false
@@ -6312,6 +6333,8 @@ func (s *Server) maybeRectifyClaudeThinkingResend(r *http.Request, provider doma
 
 func (s *Server) doClaudeProviderRequest(ctx context.Context, r *http.Request, provider domain.Provider, body []byte, accept string) (*http.Response, error) {
 	isOAuth := provider.AuthType == domain.AuthTypeClaudeOAuth
+	// 同上：这个上游拒过的 thinking 签名不再重复提交。
+	body = stripRefusedClaudeThinkingBody(body, provider)
 	var request *http.Request
 	var err error
 	if isOAuth {

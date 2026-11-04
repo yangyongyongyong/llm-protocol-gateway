@@ -75,6 +75,19 @@ func isAnthropicServerToolName(name string) bool {
 
 // applyClaudeOAuthCloaking rewrites OAuth upstream bodies so Anthropic attributes
 // traffic to the Claude Code plan bucket instead of extra usage.
+//
+// The client's own system prompt is kept. This path used to replace the whole
+// system with a canned Claude Code imitation and forward a three-line summary of
+// the real one into the first user message, so a real client's system — its
+// environment, its CLAUDE.md, the agent loop's "keep going until the task is
+// done", its tool-use rules — never reached the model. A turn that has none of
+// that answers a line, or only thinks and says nothing at all, which is exactly
+// how a thinking-only empty turn is produced. Magpie's rule for the same
+// upstream is that everything but the billing line goes as the client sent it,
+// byte for byte (billing_line.go, withoutBillingLine); this follows it: the
+// billing line is lifted out of the client's system and re-issued as the first
+// block, the agent identifier goes before the client's own blocks so the OAuth
+// upstream still recognises the caller, and every other block is kept verbatim.
 func applyClaudeOAuthCloaking(payload map[string]any) {
 	if payload == nil {
 		return
@@ -82,137 +95,103 @@ func applyClaudeOAuthCloaking(payload map[string]any) {
 	if _, ok := payload["messages"]; !ok {
 		return
 	}
-	if claudeOAuthSystemAlreadyCloaked(payload) {
-		remapClaudeOAuthToolNames(payload)
-		ensureClaudeOAuthCacheControl(payload)
-		return
-	}
-
-	originalSystem := extractClaudeSystemTexts(payload)
-	cloakedSystem := buildClaudeOAuthCloakedSystem()
-	payload["system"] = cloakedSystem
-
-	if combined := strings.TrimSpace(strings.Join(originalSystem, "\n\n")); combined != "" {
-		forwarded := sanitizeForwardedOAuthSystemPrompt(combined)
-		if forwarded != "" {
-			prependClaudeOAuthUserContext(payload, forwarded)
-		}
+	if !claudeOAuthSystemAlreadyCloaked(payload) {
+		payload["system"] = buildClaudeOAuthSystem(payload["system"])
 	}
 	remapClaudeOAuthToolNames(payload)
 	ensureClaudeOAuthCacheControl(payload)
 }
 
+// claudeOAuthBillingLine matches a system block that is Claude Code's billing
+// line and nothing else. Mirrors magpie's billing_line.go billingLine: the
+// header names only key=value pairs, each ended by a semicolon. A block that
+// merely mentions the header — a client's own rules may quote it — is not a
+// billing line and is kept as the client wrote it.
+var claudeOAuthBillingLine = regexp.MustCompile(`^\s*x-anthropic-billing-header:(\s*[A-Za-z_]+=[^;\s]*;)*\s*$`)
+
+// claudeOAuthSystemAlreadyCloaked reports a system this function already built:
+// the billing block first, the agent identifier second. Anything else is
+// rebuilt, so a client whose own system happens to start with a mixed billing
+// block never loses the rest of it.
 func claudeOAuthSystemAlreadyCloaked(payload map[string]any) bool {
-	system := payload["system"]
-	blocks, ok := system.([]any)
-	if !ok || len(blocks) == 0 {
+	blocks, ok := payload["system"].([]any)
+	if !ok || len(blocks) < 2 {
 		return false
 	}
 	first, ok := blocks[0].(map[string]any)
+	if !ok || !claudeOAuthBillingLine.MatchString(stringValue(first["text"])) {
+		return false
+	}
+	second, ok := blocks[1].(map[string]any)
 	if !ok {
 		return false
 	}
-	text := stringValue(first["text"])
-	return strings.HasPrefix(text, "x-anthropic-billing-header:")
+	return stringValue(second["text"]) == claudeOAuthAgentIdentifier
 }
 
-func claudeOAuthSystemHasBilling(payload map[string]any) bool {
-	for _, text := range extractClaudeSystemTexts(payload) {
-		if strings.HasPrefix(text, "x-anthropic-billing-header:") {
-			return true
-		}
+// buildClaudeOAuthSystem is the system sent upstream: the billing block, the
+// agent identifier, then the client's own blocks as it wrote them.
+func buildClaudeOAuthSystem(system any) []any {
+	blocks := make([]any, 0, 8)
+	blocks = append(blocks, claudeOAuthBillingBlock())
+	blocks = append(blocks, map[string]any{"type": "text", "text": claudeOAuthAgentIdentifier})
+	for _, text := range claudeOAuthClientSystemTexts(system) {
+		blocks = append(blocks, map[string]any{"type": "text", "text": text})
 	}
-	return false
+	return blocks
 }
 
-func isClaudeOAuthBillingBlock(block map[string]any) bool {
-	return strings.HasPrefix(stringValue(block["text"]), "x-anthropic-billing-header:")
-}
-
-func buildClaudeOAuthCloakedSystem() []any {
-	billingText := fmt.Sprintf(
-		"x-anthropic-billing-header: cc_version=%s; cc_entrypoint=cli; cch=%s;",
-		claudeOAuthBillingVersion,
-		claudeOAuthBillingCCHPlaceholder,
-	)
-	staticPrompt := strings.Join([]string{
-		claudeOAuthStaticIntro,
-		claudeOAuthStaticSystem,
-		claudeOAuthStaticDoingTasks,
-		claudeOAuthStaticTone,
-		claudeOAuthStaticOutput,
-	}, "\n\n")
-	return []any{
-		map[string]any{"type": "text", "text": billingText},
-		map[string]any{"type": "text", "text": claudeOAuthAgentIdentifier},
-		map[string]any{"type": "text", "text": staticPrompt},
-	}
-}
-
-func extractClaudeSystemTexts(payload map[string]any) []string {
-	system := payload["system"]
+// claudeOAuthClientSystemTexts is the client's own system text, in order, with
+// Claude Code's billing line left out (it is re-issued as its own block above, so
+// keeping it would send it twice) and the agent identifier left out when the
+// client already wrote exactly that.
+func claudeOAuthClientSystemTexts(system any) []string {
 	switch typed := system.(type) {
 	case string:
-		if strings.TrimSpace(typed) != "" {
-			return []string{strings.TrimSpace(typed)}
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" || claudeOAuthBillingLine.MatchString(trimmed) {
+			return nil
 		}
+		if trimmed == claudeOAuthAgentIdentifier {
+			return nil
+		}
+		return []string{trimmed}
 	case []any:
-		parts := make([]string, 0, len(typed))
+		texts := make([]string, 0, len(typed))
 		for _, item := range typed {
 			block, ok := item.(map[string]any)
 			if !ok || stringValue(block["type"]) != "text" {
 				continue
 			}
-			if text := strings.TrimSpace(stringValue(block["text"])); text != "" {
-				if strings.HasPrefix(text, "x-anthropic-billing-header:") {
-					continue
-				}
-				parts = append(parts, text)
+			text := stringValue(block["text"])
+			if strings.TrimSpace(text) == "" || claudeOAuthBillingLine.MatchString(text) {
+				continue
 			}
+			if strings.TrimSpace(text) == claudeOAuthAgentIdentifier {
+				continue
+			}
+			texts = append(texts, text)
 		}
-		return parts
+		return texts
+	default:
+		return nil
 	}
-	return nil
 }
 
-func sanitizeForwardedOAuthSystemPrompt(text string) string {
-	if strings.TrimSpace(text) == "" {
-		return ""
-	}
-	return strings.TrimSpace(`Use the available tools when needed to help with software engineering tasks.
-Keep responses concise and focused on the user's request.
-Prefer acting on the user's task over describing product-specific workflows.`)
+func isClaudeOAuthBillingBlock(block map[string]any) bool {
+	return claudeOAuthBillingLine.MatchString(stringValue(block["text"]))
 }
 
-func prependClaudeOAuthUserContext(payload map[string]any, text string) {
-	rawMessages, ok := payload["messages"].([]any)
-	if !ok || len(rawMessages) == 0 {
-		return
-	}
-	prefix := fmt.Sprintf(`<system-reminder>
-As you answer the user's questions, you can use the following context from the system:
-%s
-
-IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.
-</system-reminder>
-`, text)
-
-	for index, item := range rawMessages {
-		entry, ok := item.(map[string]any)
-		if !ok || stringValue(entry["role"]) != "user" {
-			continue
-		}
-		switch content := entry["content"].(type) {
-		case string:
-			entry["content"] = prefix + content
-		case []any:
-			entry["content"] = append([]any{map[string]any{"type": "text", "text": prefix}}, content...)
-		default:
-			entry["content"] = prefix
-		}
-		rawMessages[index] = entry
-		payload["messages"] = rawMessages
-		return
+// claudeOAuthBillingBlock is the billing header Claude Code writes first in its
+// system. signClaudeOAuthCCH replaces the cch placeholder with the real value.
+func claudeOAuthBillingBlock() map[string]any {
+	return map[string]any{
+		"type": "text",
+		"text": fmt.Sprintf(
+			"x-anthropic-billing-header: cc_version=%s; cc_entrypoint=cli; cch=%s;",
+			claudeOAuthBillingVersion,
+			claudeOAuthBillingCCHPlaceholder,
+		),
 	}
 }
 
@@ -730,36 +709,3 @@ func cloneMap(source map[string]any) map[string]any {
 	}
 	return out
 }
-
-const (
-	claudeOAuthStaticIntro = `You are an interactive CLI tool that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.
-
-IMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.`
-
-	claudeOAuthStaticSystem = `# System
-You are powered by the model named Sonnet. The exact model ID is not yet known.
-Assistant knowledge cutoff is January 2025.
-
-IMPORTANT: Assist with defensive security tasks only. Refuse to create, modify, or improve code that may be used maliciously.
-
-IMPORTANT: Always use the TodoWrite tool to plan and track tasks throughout the conversation.`
-
-	claudeOAuthStaticDoingTasks = `# Doing tasks
-The user will primarily request you perform software engineering tasks. This includes solving bugs, adding new functionality, refactoring code, explaining code, and more.
-
-- Use the available tools to complete tasks.
-- When doing file search, prefer dedicated tools over shell commands when possible.
-- Read files before editing them when needed.
-- Run commands and verify results when appropriate.`
-
-	claudeOAuthStaticTone = `# Tone and style
-- Only use emojis if the user explicitly requests it.
-- Your output will be displayed on a command line interface. Keep responses short and concise.
-- Output text to communicate with the user; only use tools to complete tasks.
-- NEVER create files unless they're absolutely necessary for achieving your goal.`
-
-	claudeOAuthStaticOutput = `# Output efficiency
-- Prefer concise answers and short updates.
-- Do not repeat the full task unless the user asks.
-- When referencing code, include file paths and line numbers when useful.`
-)
