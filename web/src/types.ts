@@ -267,6 +267,114 @@ export type WorkBuddyUsage = {
   checkin?: SubscriptionCheckin;
 };
 
+/**
+ * 任务中心里的一个成长任务（后端 workBuddyTask 的投影）。
+ *
+ * progressKnown=false 是国际版的列表形态：它根本不报进度，target/current 因此
+ * 可以缺省；claimable/claimed 是后端按厂商计数推算的，不是猜的。
+ */
+export type WorkBuddyTaskItem = {
+  taskCode: string;
+  title?: string;
+  description?: string;
+  taskDesc?: string;
+  credit: number;
+  energy: number;
+  hasReward?: boolean;
+  taskType?: string;
+  tag?: string;
+  jumpUrl?: string;
+  locked?: boolean;
+  progressKnown: boolean;
+  target?: number;
+  current?: number;
+  acceptStatus?: string;
+  status?: string;
+  claimable?: boolean;
+  claimed?: boolean;
+  /** 网关知道怎么推进这个任务（有对应动作）。 */
+  automatable?: boolean;
+  /** 动作说明，做按钮的 tooltip。 */
+  action?: string;
+  /** 小程序口径专属任务。 */
+  mp?: boolean;
+};
+
+/** 一个任务的结果：done 只表示服务端确认领奖，其余状态各自说明。 */
+export type WorkBuddyTaskResult = {
+  ok?: boolean;
+  status?: string;
+  message?: string;
+  progressBefore?: string;
+  progressAfter?: string;
+  claimable?: boolean;
+  claimed?: boolean;
+  credit?: number;
+  energy?: number;
+  claimError?: string;
+  attempt?: boolean;
+  actionRun?: boolean;
+  taskCode?: string;
+  desc?: string;
+};
+
+export type WorkBuddyRunEvent = {
+  kind: 'phase' | 'task_start' | 'result' | string;
+  taskCode?: string;
+  message?: string;
+  result?: WorkBuddyTaskResult;
+};
+
+/** 一次执行（异步，按 runId 轮询）。 */
+export type WorkBuddyRun = {
+  id: string;
+  providerId: string;
+  running: boolean;
+  startedAt: string;
+  finishedAt?: string;
+  events: WorkBuddyRunEvent[];
+  results: WorkBuddyTaskResult[];
+  error?: string;
+};
+
+/** 每个 Provider 的每日自动化设置（设置表里按 provider 存）。 */
+export type WorkBuddyAutomation = {
+  dailyTasks: boolean;
+  dailyKeepalive: boolean;
+  /** 每日执行时刻（北京时间 0-23）。 */
+  hour: number;
+  lastRunDay?: string;
+  lastRunAt?: string;
+  lastSummary?: string;
+  /** 判定「今天」用的北京日期。 */
+  today: string;
+};
+
+export type WorkBuddyTaskCenter = {
+  supported: boolean;
+  connected: boolean;
+  /** 国际版：成长中心只读，写入一律被拒。 */
+  readOnly: boolean;
+  accountKey?: string;
+  tasks: WorkBuddyTaskItem[];
+  error?: string;
+  fetchedAt?: string;
+  automation: WorkBuddyAutomation;
+  run?: WorkBuddyRun;
+};
+
+/** 一次保活的结果：续期 / 活跃上报 / 签到 / 补领。 */
+export type WorkBuddyKeepaliveResult = {
+  refreshed?: boolean;
+  expiresAt?: string;
+  activity?: boolean;
+  checkin?: string;
+  sweepAccepted?: number;
+  sweepClaimed?: number;
+  message?: string;
+  error?: string;
+};
+
 export type ZCodeOAuthInfo = {
   connected?: boolean;
   /** 用户点了「暂停」：后端仍存有 ZCode 铸造的项目密钥，只是暂停转发。 */

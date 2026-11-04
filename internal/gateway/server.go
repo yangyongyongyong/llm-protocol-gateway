@@ -117,8 +117,15 @@ type Server struct {
 	// checkinMu guards checkinRunning, the set of providers whose check-in is in
 	// flight: the loop and a press of the same account must not both spend its
 	// one-shot refresh token.
-	checkinMu               sync.Mutex
-	checkinRunning          map[string]bool
+	checkinMu      sync.Mutex
+	checkinRunning map[string]bool
+	// workBuddyRunMu guards the task-center runs: workBuddyRuns holds every run
+	// the console started (its events and per-task results), and
+	// workBuddyProviderRuns points one provider at its latest run, which is how
+	// a second click is turned away while the first is still going.
+	workBuddyRunMu          sync.Mutex
+	workBuddyRuns           map[string]*workBuddyRun
+	workBuddyProviderRuns   map[string]string
 	tunnels                 *tunnel.Manager
 	pendingClaudeOAuth      *claudeOAuthPendingStore
 	pendingCursorOAuth      *cursorOAuthPendingStore
@@ -525,6 +532,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /__providers/{id}/workbuddy-oauth/status", s.handleWorkBuddyOAuthStatus)
 	mux.HandleFunc("POST /__providers/{id}/workbuddy-oauth/disconnect", s.handleWorkBuddyOAuthDisconnect)
 	mux.HandleFunc("GET /__providers/{id}/workbuddy-oauth/usage", s.handleWorkBuddyUsage)
+	// The task center: read the list, run one or every task, report activity, and
+	// keep the account alive. A run outlives the request that started it (its
+	// actions pace themselves), so it is polled by run id.
+	mux.HandleFunc("GET /__providers/{id}/workbuddy-oauth/tasks", s.handleWorkBuddyTasks)
+	mux.HandleFunc("POST /__providers/{id}/workbuddy-oauth/tasks/auto", s.handleWorkBuddyTasksAuto)
+	mux.HandleFunc("GET /__providers/{id}/workbuddy-oauth/tasks/run", s.handleWorkBuddyRunStatus)
+	mux.HandleFunc("POST /__providers/{id}/workbuddy-oauth/activity", s.handleWorkBuddyActivity)
+	mux.HandleFunc("POST /__providers/{id}/workbuddy-oauth/keepalive", s.handleWorkBuddyKeepalive)
+	mux.HandleFunc("POST /__providers/{id}/workbuddy-oauth/automation", s.handleWorkBuddyAutomation)
 	mux.HandleFunc("POST /__providers/{id}/zcode-oauth/start", s.handleZCodeOAuthStart)
 	mux.HandleFunc("GET /__providers/{id}/zcode-oauth/status", s.handleZCodeOAuthStatus)
 	mux.HandleFunc("POST /__providers/{id}/zcode-oauth/pause", s.handleZCodeOAuthPause)

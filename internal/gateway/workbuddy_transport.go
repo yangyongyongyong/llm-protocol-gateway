@@ -24,17 +24,19 @@ import (
 //     wb_upstream_pool.py). This gateway instead gives each account its own
 //     transport, and therefore its own pool.
 //
-//  2. The CN chat endpoint. copilot.tencent.com resets the TLS handshake when it
-//     is reached from an overseas egress (the reference exposes
-//     WB_CN_CHAT_UPSTREAM for exactly this: "copilot.tencent.com 从海外出口连接时
-//     TLS 握手会被复位"), while www.workbuddy.cn serves the same API and is
-//     reachable from abroad. Rather than make an operator configure that, the
-//     transport tries the alternate host when the primary cannot even be dialled,
-//     and holds on to it for a while once it answers.
+//  2. The CN chat endpoint. The desktop client's own host is www.workbuddy.cn —
+//     the one it declares as X-Domain — so that is what chat is configured to
+//     use. copilot.tencent.com serves the same API and is kept as the fallback,
+//     because an overseas egress resets its TLS handshake more often (the
+//     reference gateway exposes WB_CN_CHAT_UPSTREAM for exactly this:
+//     "copilot.tencent.com 从海外出口连接时 TLS 握手会被复位"). Rather than make an
+//     operator configure that, the transport tries the alternate host when the
+//     primary cannot even be dialled, and holds on to it for a while once it
+//     answers.
 
 const (
-	workBuddyCNPrimaryHost   = "copilot.tencent.com"
-	workBuddyCNAlternateHost = "www.workbuddy.cn"
+	workBuddyCNPrimaryHost   = "www.workbuddy.cn"
+	workBuddyCNAlternateHost = "copilot.tencent.com"
 
 	// workBuddyEndpointHoldOff is how long the alternate host is used after the
 	// primary was found unreachable. Long enough to stop paying a failed

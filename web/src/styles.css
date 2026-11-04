@@ -12704,3 +12704,111 @@ body { font-size: 14px; }
 .nav-group-rule { display: none; }
 /* 组标题彻底移出 flex 流（否则 gap 仍占位），分隔线由 .nav-group 的边框承担。 */
 .nav-group > .nav-group-label { display: none; }
+
+/* ---------------------------------------------------------------------------
+   WorkBuddy 任务中心面板（一键完成 / 活跃上报 / 保活 / 每日自动化）
+   --------------------------------------------------------------------------- */
+.wb-task-panel {
+  display: grid; gap: 6px;
+  padding-top: 8px; border-top: 1px solid var(--border);
+}
+.wb-task-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.wb-task-title { font-size: 11.5px; font-weight: 700; color: var(--fg, var(--muted)); }
+.wb-task-meta {
+  flex: 1 1 auto; min-width: 0;
+  font-size: 10.5px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.wb-task-btn {
+  flex: none;
+  font: inherit; font-size: 10.5px; font-weight: 600;
+  padding: 3px 9px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--surface); color: var(--muted);
+  cursor: pointer;
+}
+.wb-task-btn:hover:not(:disabled) { border-color: var(--accent-border); color: var(--accent-strong); }
+.wb-task-btn:disabled { opacity: 0.6; cursor: default; }
+.wb-task-btn.primary {
+  border-color: var(--accent-border); background: var(--accent-soft); color: var(--accent-strong);
+}
+.wb-task-auto-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.wb-task-toggle {
+  flex: none;
+  font: inherit; font-size: 10.5px; font-weight: 600;
+  padding: 2px 8px; border-radius: 999px;
+  border: 1px dashed var(--border-strong); background: transparent; color: var(--muted);
+  cursor: pointer;
+}
+.wb-task-toggle.on {
+  border-style: solid; border-color: var(--accent-border);
+  background: var(--accent-soft); color: var(--accent-strong);
+}
+.wb-task-toggle:disabled { opacity: 0.6; cursor: default; }
+.wb-task-last {
+  flex: 1 1 100%;
+  font-size: 10.5px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.wb-task-error { font-size: 10.5px; color: var(--red); overflow-wrap: anywhere; }
+.wb-task-notice { font-size: 10.5px; color: var(--green); overflow-wrap: anywhere; }
+.wb-task-log {
+  display: grid; gap: 2px;
+  padding: 4px 6px; border-radius: 6px;
+  background: var(--surface); border: 1px solid var(--border);
+}
+.wb-task-log-line { display: flex; gap: 6px; min-width: 0; font-size: 10.5px; color: var(--muted); }
+.wb-task-log-line[data-tone="ok"] { color: var(--green); }
+.wb-task-log-line[data-tone="bad"] { color: var(--red); }
+.wb-task-log-line[data-tone="warn"] { color: var(--amber); }
+.wb-task-log-code { flex: none; font-weight: 600; }
+.wb-task-log-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wb-task-list { display: grid; gap: 4px; }
+.wb-task-row { display: grid; gap: 3px; padding: 4px 0; border-bottom: 1px dashed var(--border); }
+.wb-task-row:last-child { border-bottom: 0; }
+.wb-task-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.wb-task-name {
+  flex: 1 1 auto; min-width: 0;
+  font-size: 11px; font-weight: 600; color: var(--fg, var(--muted));
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.wb-task-tag {
+  margin-left: 4px; padding: 0 4px; border-radius: 4px;
+  font-size: 9px; font-style: normal; font-weight: 600;
+  color: var(--accent-strong); background: var(--accent-soft);
+}
+.wb-task-reward { flex: none; font-size: 10px; color: var(--muted); }
+.wb-task-badge {
+  flex: none; padding: 0 5px; border-radius: 999px;
+  font-size: 9.5px; font-weight: 600;
+  border: 1px solid var(--border); color: var(--muted);
+}
+.wb-task-badge[data-tone="ok"] { color: var(--green); border-color: var(--green); }
+.wb-task-badge[data-tone="bad"] { color: var(--red); border-color: var(--red); }
+.wb-task-badge[data-tone="warn"] { color: var(--amber); border-color: var(--amber); }
+.wb-task-run {
+  flex: none; font: inherit; font-size: 10px; font-weight: 600;
+  padding: 1px 7px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--surface); color: var(--muted);
+  cursor: pointer;
+}
+.wb-task-run:hover:not(:disabled) { border-color: var(--accent-border); color: var(--accent-strong); }
+.wb-task-run:disabled { opacity: 0.6; cursor: default; }
+.wb-task-bar {
+  position: relative; flex: 1 1 auto; height: 4px; border-radius: 999px;
+  background: var(--border); overflow: hidden;
+}
+.wb-task-bar > i { position: absolute; inset: 0 auto 0 0; display: block; background: var(--accent); }
+.wb-task-row[data-state="done"] .wb-task-bar > i { background: var(--green); }
+.wb-task-row[data-state="claimable"] .wb-task-bar > i { background: var(--amber); }
+.wb-task-result { font-size: 10px; color: var(--muted); overflow-wrap: anywhere; }
+.wb-task-more {
+  justify-self: start;
+  font: inherit; font-size: 10.5px; font-weight: 600;
+  padding: 2px 0; border: 0; background: transparent; color: var(--accent-strong);
+  cursor: pointer;
+}
+html[data-theme="dark"] .wb-task-notice { color: #6ee7b7; }
+html[data-theme="dark"] .wb-task-log-line[data-tone="ok"] { color: #6ee7b7; }
+html[data-theme="dark"] .wb-task-badge[data-tone="ok"] { color: #6ee7b7; border-color: #6ee7b7; }
+.wb-task-progress { display: flex; align-items: center; gap: 6px; }
+.wb-task-count { flex: none; font-size: 9.5px; color: var(--muted); }

@@ -79,24 +79,35 @@ const (
 	workBuddyTokenExpirySkew = time.Minute
 )
 
-// The two builds' API roots; vars so tests can point them at an httptest
-// server.
+// The builds' API roots. The CN service answers on two names. Chat goes to
+// www.workbuddy.cn, which is the host the 5.9.3 desktop client itself declares
+// as its X-Domain; copilot.tencent.com stays as the chat fallback because an
+// overseas egress reaches it less reliably (see workbuddy_transport.go).
+// Billing, check-in and quota answer on either name — both were measured
+// returning code 0 — and use www.workbuddy.cn so the whole account-facing
+// surface sits on one host.
+//
+// Vars so tests can point them at an httptest server.
 var (
-	workBuddyCNEndpoint   = "https://copilot.tencent.com"
-	workBuddyIntlEndpoint = "https://www.workbuddy.ai"
+	workBuddyCNEndpoint     = "https://www.workbuddy.cn"
+	workBuddyCNChatEndpoint = "https://www.workbuddy.cn"
+	workBuddyIntlEndpoint   = "https://www.workbuddy.ai"
 )
 
 // workBuddySite is one WorkBuddy build: its endpoint, the platform its
 // sign-in names, whether it carries WorkBuddy AI's extra client headers, and
 // the models its plan is known to serve.
 type workBuddySite struct {
-	authType   string
-	name       string
-	platform   string
-	intl       bool
-	endpoint   func() string
-	models     []workBuddyModel
-	wbClientID string
+	authType string
+	name     string
+	platform string
+	intl     bool
+	endpoint func() string
+	// chatEndpoint is the root chat goes to when it differs from the account
+	// endpoints; nil means "same as endpoint".
+	chatEndpoint func() string
+	models       []workBuddyModel
+	wbClientID   string
 }
 
 type workBuddyModel struct {
@@ -106,10 +117,11 @@ type workBuddyModel struct {
 
 var (
 	workBuddyCNSite = workBuddySite{
-		authType: domain.AuthTypeWorkBuddy,
-		name:     "WorkBuddy",
-		platform: "workbuddy",
-		endpoint: func() string { return workBuddyCNEndpoint },
+		authType:     domain.AuthTypeWorkBuddy,
+		name:         "WorkBuddy",
+		platform:     "workbuddy",
+		endpoint:     func() string { return workBuddyCNEndpoint },
+		chatEndpoint: func() string { return workBuddyCNChatEndpoint },
 		models: []workBuddyModel{
 			{ID: "auto", Context: 168_000},
 			{ID: "hy4-preview-f", Context: 1_000_000},
@@ -182,7 +194,11 @@ func isWorkBuddyProvider(provider domain.Provider) bool {
 // gateway appends /chat/completions to it like it does for any OpenAI-Chat
 // provider.
 func (w workBuddySite) chatBaseURL() string {
-	return strings.TrimRight(w.endpoint(), "/") + workBuddyChatPath
+	base := w.endpoint()
+	if w.chatEndpoint != nil {
+		base = w.chatEndpoint()
+	}
+	return strings.TrimRight(base, "/") + workBuddyChatPath
 }
 
 func (w workBuddySite) api() string { return strings.TrimRight(w.endpoint(), "/") }
@@ -449,6 +465,20 @@ func workBuddyErrorCode(err error) (int, bool) {
 	return 0, false
 }
 
+// The billing surface's HTTP identity: the client asks for it the way a browser
+// does (axios is the web layer's HTTP client), which is a different UA and Accept
+// from the ones the account calls carry.
+const (
+	workBuddyBillingUserAgent = "axios/1.16.1"
+	workBuddyBillingAccept    = "application/json, text/plain, */*"
+)
+
+// workBuddyIsBillingPath reports whether an account call is part of the billing /
+// growth surface, which is asked with the web layer's identity.
+func workBuddyIsBillingPath(endpoint string) bool {
+	return strings.Contains(endpoint, "/billing/")
+}
+
 // workBuddyCall asks one of WorkBuddy's JSON endpoints, which wrap what they
 // say in {code, msg, data}; code 0 is a success and dst reads data.
 func workBuddyCall(ctx context.Context, site workBuddySite, method, endpoint string, headers map[string]string, body, dst any) error {
@@ -462,11 +492,27 @@ func workBuddyCall(ctx context.Context, site workBuddySite, method, endpoint str
 		return err
 	}
 	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Accept", "application/json")
-	request.Header.Set("User-Agent", site.rpcUserAgent())
+	if workBuddyIsBillingPath(endpoint) {
+		// The billing / growth surface is the web layer: the client reaches it
+		// with the browser HTTP stack, whose User-Agent is axios. Measured: this
+		// UA gets code 0 from /billing/… and code 12403 from /v3/config, so it is
+		// decided per path rather than applied to every account call.
+		request.Header.Set("Accept", workBuddyBillingAccept)
+		request.Header.Set("User-Agent", workBuddyBillingUserAgent)
+	} else {
+		request.Header.Set("Accept", "application/json")
+		request.Header.Set("User-Agent", site.rpcUserAgent())
+	}
 	for key, value := range headers {
 		request.Header.Set(key, value)
 	}
+	return workBuddyDo(request, dst)
+}
+
+// workBuddyDo sends an account request and reads its {code, msg, data} envelope.
+// It is the half of workBuddyCall that does not build the request, so the paths
+// whose body is not a map (the report channel's JSON array) decode the same way.
+func workBuddyDo(request *http.Request, dst any) error {
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		return err

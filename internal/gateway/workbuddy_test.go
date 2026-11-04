@@ -18,9 +18,13 @@ import (
 // returned restore function runs.
 func pointWorkBuddyAt(t *testing.T, cn, ai string) {
 	t.Helper()
-	oldCN, oldAI := workBuddyCNEndpoint, workBuddyIntlEndpoint
-	workBuddyCNEndpoint, workBuddyIntlEndpoint = cn, ai
-	t.Cleanup(func() { workBuddyCNEndpoint, workBuddyIntlEndpoint = oldCN, oldAI })
+	oldCN, oldCNChat, oldAI := workBuddyCNEndpoint, workBuddyCNChatEndpoint, workBuddyIntlEndpoint
+	// Chat follows the same httptest server, so a test that points the account
+	// endpoints at one server gets chat there too.
+	workBuddyCNEndpoint, workBuddyCNChatEndpoint, workBuddyIntlEndpoint = cn, cn, ai
+	t.Cleanup(func() {
+		workBuddyCNEndpoint, workBuddyCNChatEndpoint, workBuddyIntlEndpoint = oldCN, oldCNChat, oldAI
+	})
 }
 
 // messageContent reads one message's text, whichever shape the body left it in.

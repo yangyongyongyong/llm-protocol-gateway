@@ -40,6 +40,7 @@ import {
 } from '../types';
 import {SubscriptionUsagePanel} from './subscription';
 import {Badge, BrandIcon, MoreMenu} from './ui';
+import {WorkBuddyTaskPanel} from './workbuddy_tasks';
 
 /** 最早到期的重置卡时间；无效时间为空串。 */
 function resetCreditEarliestExpiry(credits: ChatGPTResetCredit[]): string {
@@ -1047,6 +1048,8 @@ export function WorkBuddyUsagePanel({ providerId, accountKey, connected, compact
       {/* 哪批积分先过期：厂商报了日期才写这一行 */}
       {expiry ? <TimeLine hint={expiry} className="subscription-expiry" /> : null}
       {checkin?.supported ? <CheckinRow providerId={providerId} view={checkin} onChange={setCheckinOverride} /> : null}
+      {/* 任务中心：一键完成、活跃上报、保活，以及两个每日开关。 */}
+      <WorkBuddyTaskPanel providerId={providerId} connected={connected} compact={compact} />
     </UsagePanelShell>
   );
 }
