@@ -439,6 +439,37 @@ curl -s http://127.0.0.1:18093/__health
 - 数据库 schema 在启动时自动迁移，升级不丢数据；升级前仍建议按第 14 节做一次备份。
 - 回滚：停服务，`cp bin/gateway.bak-<日期> bin/gateway`，启动即可（旧二进制兼容新库结构）。
 
+### 13.1 一键发布（两台 VPS）
+
+`deploy/release-all.sh` 把两条发布链路合成一条命令（Git Bash / Linux / macOS 都能跑）：
+
+```bash
+./deploy/release-all.sh -m "feat(xxx): 说明"     # 提交 → 推两个仓库 → 打 tag → 发两台
+```
+
+它依次做：提交工作区改动 → push `main` 到 `origin`（上游）和 `fork`（cus45，sjc webhook 挂这里）
+→ 打 `vX.Y.Z` tag 并推到两个仓库（触发 sjc 的 Actions → Docker 镜像 → Release → webhook →
+蓝绿切换）→ 执行 `deploy/deploy-linux.sh` 发布本机（gc）→ 轮询 sjc 公网版本号直到等于新 tag。
+
+常用开关：
+
+```bash
+./deploy/release-all.sh --dry-run -m "test"        # 只打印命令，不动仓库也不发布
+./deploy/release-all.sh --bump minor -m "feat: x"  # v1.0.8 → v1.1.0（默认 patch）
+./deploy/release-all.sh --tag v1.2.0 -m "release"  # 指定 tag
+./deploy/release-all.sh --skip-gc -m "只发 sjc"    # 只走 Docker 蓝绿
+./deploy/release-all.sh --skip-sjc -m "只发 gc"    # 只跑 deploy-linux.sh
+./deploy/release-all.sh --no-wait -m "触发即返回"  # 不等 sjc 上线
+```
+
+环境变量：`REMOTES`（默认 `origin fork`）、`RELEASE_BRANCH`、`GC_HOST`、`SJC_URL`、
+`WAIT_TIMEOUT`，以及透传给 deploy-linux.sh 的 `SSH_KEY` / `SSH_PORT` / `SERVER_USER`。
+
+- gc 的版本号来自 `scripts/build-version.sh`（`YYYYMMDD.HHMMSS` UTC），不是 git tag；
+  sjc 的版本号是镜像 tag（`vX.Y.Z`）。两者都对应同一个 commit，可用 `go version -m` 核对。
+- `REMOTES` 里必须包含 `cus45/llm-protocol-gateway`，否则 tag 打不到 webhook 所在的仓库，
+  sjc 不会自动发布（脚本在前置检查里会拦下）。
+
 ---
 
 ## 14. 备份与恢复
