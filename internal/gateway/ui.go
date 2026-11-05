@@ -256,6 +256,10 @@ func isModelProtocolPath(path string) bool {
 	case path == "/v1/models",
 		strings.HasPrefix(path, "/v1/chat/completions"),
 		strings.HasPrefix(path, "/v1/images/"),
+		// Video submit and poll are model calls too: without this prefix the local/LAN
+		// host path never forwards them to the mux, and they answer a plain 404
+		// ("page not found") while the route itself is registered.
+		strings.HasPrefix(path, "/v1/videos/"),
 		strings.HasPrefix(path, "/v1/embeddings"),
 		// Speech-to-text: the body is a multipart upload, still a model call
 		// (it is admitted, quota-checked and billed like one).
