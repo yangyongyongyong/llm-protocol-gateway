@@ -220,7 +220,19 @@ Provider 行上的 `proxyUrl` 现在对 WorkBuddy chat 生效（`http://`、`htt
 强类型 int 会让整条 streak 读取失败。修正后（数值字段全部容错 + 回归用例）同一调用不再报错，说明 streak 端点已被调用并解析成功；
 该账号当前无待领礼包、无可兑换档位、无抽奖次数，故本次积分为 0。
 
-### 仍未对齐（下一轮）
+### 第四次发布新增：续写
+
+| 能力 | 落地 | 说明 |
+| --- | --- | --- |
+| 续写 | `workbuddy_continue.go` | 非流式答案被输出上限截断时自动续接，最多 3 段。触发条件是 `finish_reason` 为 `length` 或 `max_tokens`（两侧同义，上游原样透传），或正文为空；只走聚合路径（流式客户端字节即到即发）；不续工具调用 |
+| 客户端意图 | `server.go` handleClaudeMessages | 在入口把 `stream:false` 记进 context：转换链会把 `stream` 强制成 true、`Accept` 也会被改成 SSE，两者都不能当判据（这一条是线上调试出来的） |
+
+线上实测（陌账号 `hy4free`，`max_tokens=64` 非流式）：`output_tokens` **64 → 256**（首段 + 3 段），
+耗时 1.5s → 5.8~10.7s。开关 `WORKBUDDY_CONTINUE=1`（gc 已通过 systemd drop-in 开启）。
+
+顺带测到一个独立问题：`hy4free` 这类带思考的模型在小 `max_tokens` 下会把预算全花在 thinking 上，
+正文为空（`text_len=0`）——续写只能续思考。这属于「预算分配」问题而非续写缺陷，需要单独决策（抬 `max_tokens` 或压 reasoning 档位）。
+
 
 1. `/v1/messages` 直连路由：国内版 Claude 模型（`claude-opus-5.5` 等）走该路由才吃
    `output_config.effort`。**当前目标账号 `workbuddy-订阅-陌` 的 17 个模型里没有 Claude 系**，
@@ -232,3 +244,17 @@ Provider 行上的 `proxyUrl` 现在对 WorkBuddy chat 生效（`http://`、`htt
    （改图 / 出视频 / 联网检索 / webfetch / MCP / 去水印）。
 5. 上下文窗口四级查找链的后三级兜底（上游动态已有，缺 model.json / 静态种子 / models.dev）。
 6. 上报回读校验（上报后回读 `growth/streak` 判断是否真计分）。
+### 仍未对齐（下一轮）
+
+已在本轮完成：`/v1/messages` 判断（本 fleet 无 WorkBuddy 账号带 Claude 模型，见下）、免费日窗、续写、
+积分保底与到期加权、模型级冷却、积分任务域（礼包/连登/抽奖）。
+
+| 项 | 状态 | 阻塞点 |
+| --- | --- | --- |
+| `/v1/messages` 直连路由 + thinking 块过滤 | 未实现 | 现网 3 个带 Claude 模型的 Provider 是 `claude-订阅账号`×2 与 `cursor-订阅账号`，**没有 WorkBuddy 账号带 Claude 系模型**，实现即死代码且无法验证 |
+| 上下文窗口四级查找链（后三级） | 未实现 | 上游 `/v3/config` 已给 contextLength，兜底链只在字段缺失时有用；优先级低 |
+| 上报回读校验 | 未实现 | 上报后回读 `growth/streak` 判断是否真计分；需要额外的上游调用 |
+| 能力端点（改图/出视频/检索/webfetch/MCP/去水印） | 未实现 | 工作量最大的一块，且本地 `/v1/images/generations`、`/v1/embeddings` 当前走通用鉴权、不带 WorkBuddy 头族 |
+| 埋点三元组按 realm 分档 | 不做（缺证据） | 没有国际版真机抓包的 `commit`/`releaseDate`，硬编一套比现状更假 |
+| 成长任务剩余域（旅行/补签/开学季券码/国际版 trial/注册补地区） | 未实现 | 优先级低于已完成的礼包/连登/抽奖 |
+
