@@ -90,6 +90,9 @@ func workBuddyDerivedID(credential domain.WorkBuddyCredential, salt string, widt
 func workBuddyReportFingerprint(site workBuddySite, credential domain.WorkBuddyCredential) map[string]any {
 	now := time.Now().UnixMilli()
 	version := site.clientVersion()
+	// The build triple is per-realm: see workbuddy_report_build.go for why the commit
+	// and releaseDate are configurable and what is missing for the intl build.
+	build := workBuddyReportBuildFor(site)
 	fingerprint := map[string]any{
 		"timezone":     "Asia/Shanghai",
 		"reportDelay":  2000,
@@ -97,8 +100,8 @@ func workBuddyReportFingerprint(site workBuddySite, credential domain.WorkBuddyC
 		"username":     credential.AccountLabel,
 		"userNickname": credential.AccountLabel,
 		"product":      "SaaS",
-		"releaseDate":  workBuddyReportReleaseDate,
-		"commit":       workBuddyReportCommit,
+		"releaseDate":  build.ReleaseDate,
+		"commit":       build.Commit,
 		"ideName":      "WorkBuddy",
 		"ideType":      "WorkBuddy",
 		"ideVersion":   version,
