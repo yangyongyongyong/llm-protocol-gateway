@@ -165,7 +165,11 @@ func workBuddyTravelPass(ctx context.Context, site workBuddySite, credential dom
 	}
 	if !buddy.Exists {
 		// The first_buddy task adopts one; this pass has nothing to travel with.
-		return credit, nil
+		//
+		// Said out loud rather than silently: "no buddy" and "the buddy routes are
+		// unreachable" both spend nothing, and an operator looking at a card that never
+		// moves needs to tell them apart.
+		return credit, []string{"travel: 账号还没有猫（由 first_buddy 任务领养）"}
 	}
 
 	state, err := workBuddyTravelStatusNow(ctx, site, credential)
@@ -192,6 +196,7 @@ func workBuddyTravelPass(ctx context.Context, site workBuddySite, credential dom
 		}
 	case "traveling", "travelling":
 		// Nothing to do until it lands.
+		notes = append(notes, "travel: 出行中，等到站后领奖")
 	default:
 		notes = append(notes, "travel state: "+state.State)
 	}

@@ -27,8 +27,11 @@ func TestWorkBuddyTravelPassWithoutABuddy(t *testing.T) {
 	defer cleanup()
 	credit, notes := workBuddyTravelPass(context.Background(), workBuddyCNSite,
 		domain.WorkBuddyCredential{AccessToken: "t"})
-	if credit != 0 || len(notes) != 0 {
-		t.Fatalf("credit=%v notes=%v, want a quiet pass", credit, notes)
+	if credit != 0 {
+		t.Fatalf("credit=%v, want nothing earned", credit)
+	}
+	if len(notes) != 1 || !strings.Contains(notes[0], "还没有猫") {
+		t.Fatalf("notes=%v, want the no-buddy note", notes)
 	}
 }
 
