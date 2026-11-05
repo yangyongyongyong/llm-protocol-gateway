@@ -182,6 +182,12 @@ func classifyWorkBuddyFailure(status int, body []byte) (failoverClass, string, b
 	if status == http.StatusPaymentRequired {
 		return failoverHard, "http_402_payment", true
 	}
+	// The free model's daily window: the account is healthy, the allowance is spent
+	// until a stated instant. Before this branch a 429 here was read as a soft
+	// throttle and rested the whole account after a few hits.
+	if status == http.StatusTooManyRequests && workBuddyIsFreeWindowRefusal(body) {
+		return failoverBusy, "wb_free_model_window", true
+	}
 	code, ok := workBuddyFailureCode(body)
 	if !ok {
 		return failoverNone, "", false
@@ -226,14 +232,15 @@ func workBuddyModelRestKey(providerID, model string) string {
 }
 
 // restWorkBuddyModel keeps a model out of rotation for this provider for a while.
-func restWorkBuddyModel(providerID, model string, until time.Time) {
+func restWorkBuddyModel(providerID, model string, now, until time.Time) {
 	if strings.TrimSpace(providerID) == "" || strings.TrimSpace(model) == "" {
 		return
 	}
 	workBuddyModelRests.Store(workBuddyModelRestKey(providerID, model), until)
-	// Prune against the real clock, not against `until`: pruning with the entry's
-	// own deadline would drop the entry just written.
-	pruneWorkBuddyModelRests(time.Now())
+	// Prune against the caller's clock: pruning with the entry's own deadline would
+	// drop the entry just written, and pruning with the wall clock would drop
+	// entries a caller set for a simulated instant.
+	pruneWorkBuddyModelRests(now)
 }
 
 // pruneWorkBuddyModelRests drops entries that have expired, and enforces the
@@ -281,6 +288,12 @@ func workBuddyModelRested(providerID, model string, now time.Time) bool {
 // noteWorkBuddyModelRest records a rest for a model-level verdict and reports
 // whether it did. A code that blames the account never rests a model.
 func noteWorkBuddyModelRest(providerID, model string, status int, body []byte, now time.Time) bool {
+	// The free model's window states its own reset instant, which is more precise
+	// than any fixed rest this file could guess.
+	if status == http.StatusTooManyRequests && workBuddyIsFreeWindowRefusal(body) {
+		restWorkBuddyModel(providerID, model, now, now.Add(workBuddyFrequencyRest(body, now)))
+		return true
+	}
 	code, ok := workBuddyFailureCode(body)
 	if !ok {
 		return false
@@ -291,10 +304,10 @@ func noteWorkBuddyModelRest(providerID, model string, status int, body []byte, n
 	}
 	switch verdict {
 	case workBuddyVerdictModelLimited:
-		restWorkBuddyModel(providerID, model, now.Add(workBuddyModelRestDefault))
+		restWorkBuddyModel(providerID, model, now, now.Add(workBuddyModelRestDefault))
 		return true
 	case workBuddyVerdictBusy:
-		restWorkBuddyModel(providerID, model, now.Add(workBuddyModelRestBusy))
+		restWorkBuddyModel(providerID, model, now, now.Add(workBuddyModelRestBusy))
 		return true
 	}
 	return false

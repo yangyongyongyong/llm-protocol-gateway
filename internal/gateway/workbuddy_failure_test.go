@@ -85,7 +85,7 @@ func TestWorkBuddyFailureCodeAcceptsBothForms(t *testing.T) {
 // across accounts.
 func TestWorkBuddyModelRestsAreScopedAndExpire(t *testing.T) {
 	now := time.Now()
-	restWorkBuddyModel("provider-a", "glm-5.3", now.Add(time.Minute))
+	restWorkBuddyModel("provider-a", "glm-5.3", now, now.Add(time.Minute))
 	if !workBuddyModelRested("provider-a", "glm-5.3", now) {
 		t.Fatal("the rest was not recorded")
 	}
@@ -128,7 +128,7 @@ func TestNoteWorkBuddyModelRestOnlyForModelLevelCodes(t *testing.T) {
 // The console reads a model's rest state through one accessor.
 func TestWorkBuddyModelStateOf(t *testing.T) {
 	now := time.Now()
-	restWorkBuddyModel("provider-s", "m1", now.Add(5*time.Minute))
+	restWorkBuddyModel("provider-s", "m1", now, now.Add(5*time.Minute))
 	state := workBuddyModelStateOf("provider-s", "m1", now)
 	if !state.Rested || state.RestTill.IsZero() {
 		t.Fatalf("state = %+v, want a rest", state)
