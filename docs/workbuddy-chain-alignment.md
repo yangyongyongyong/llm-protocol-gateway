@@ -329,6 +329,49 @@ glm-5.3        → 200，SSE 正常出流（走 chat，未被误路由）
 顺带把 `11158`（账号套餐不含该模型）补进错误码表：判为模型级（换号可能换到有该套餐的账号），
 但不永久休息该模型（套餐可升级）。
 
+### 第九次发布新增：出视频与查任务
+
+| 路由 | 上游 | 说明 |
+| --- | --- | --- |
+| `POST /v1/videos/generations` | `/v2/videos/generations` | 提交任务，透传厂商回执（含任务 id） |
+| `POST /v1/videos/tasks` | `/v2/videos/tasks` | 用 `{task_id}` 查询 |
+| `GET /v1/videos/{taskID}` | `/v2/videos/tasks` | OpenAI 风格轮询 |
+
+两个关键点：**任务只能被提交账号读**，所以按任务 id 记台账（内存、24h TTL、上限 4096），
+未知任务明确报 404 而不是猜一个账号去读别人的任务；**状态原样透传不归一**，`Done`/`Succeeded`
+兼容历史拼写 `succeeded`/`success`。解析宽容：`data[].url` 与顶层 `url`/`video_url` 都认，
+错误取 `msg`/`message`/`error` 三形态。时长/模型/缺 prompt 的边界由上游判定，网关不重复校验。
+
+线上探测（陌账号，未提交真实任务、不消耗额度）：
+
+```
+不存在的模型        → 400 {"code":14407,"msg":"...Video model [probe-...] route config not found"}
+minimax-video-h3 1s → 400 {"code":14407,"msg":"unsupported video duration: 1 seconds,
+                                             supported range: 4-15 seconds"}
+未知任务查询        → 404 {"error":{"message":"unknown video task; submit it through this gateway first"}}
+```
+
+第二条是强证据：真实模型被上游**受理**，只因时长越界被拒，错误码与 4-15 秒区间和参考实现记录逐字一致。
+
+### 这一轮同时修掉一个「注册了却 404」的坑
+
+视频路由注册后线上仍回**纯文本 404**（`404 page not found`），而紧邻的图像路由正常。
+根因不在注册，而在 `withHostSeparatedServing` 的 default 分支：只有 `isModelProtocolPath` 为真的路径
+才转给 API handler，而该白名单缺 `/v1/videos/` 前缀——请求根本没进 mux。
+embeddings 当初踩过同一个坑（`ui_embeddings_path_test.go` 即为此而设）。
+已补前缀并新增 `ui_videos_path_test.go`（路径判定 + 本地转发 + api/ui 双 host）。
+
+### 仍未对齐（下一轮）
+
+已完成（objective 的 11 项中 10 项）：错误码分类、`/v1/messages`、免费日窗、续写、积分保底与到期加权、
+模型级冷却、上报回读、上下文窗口、能力端点（图像/改图/embeddings/视频）、成长任务（礼包/连登/抽奖）。
+
+| 项 | 状态 | 阻塞点 |
+| --- | --- | --- |
+| 联网检索 / webfetch / MCP / 去水印 | 未实现 | 检索类会消耗真实额度且无免费档；去水印需 URL 白名单防 SSRF |
+| 埋点三元组按 realm 分档 | 不做（缺证据） | 没有国际版真机抓包的 commit/releaseDate |
+| 成长任务剩余域（旅行/补签/开学季券码/国际版 trial/注册补地区） | 未实现 | 部分需国际版写入能力；优先级最低 |
+
 ### 仍未对齐（下一轮）
 
 已完成：错误码分类、模型级冷却、免费日窗、积分保底与到期加权、积分任务域、续写、图像端点、
