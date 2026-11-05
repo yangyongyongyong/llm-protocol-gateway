@@ -265,6 +265,35 @@ edits       → 400 {"code":11101,"msg":"...cannot unmarshal string into ... Edi
 顺带修掉两个自己引入/沿袭的缺陷：workbuddy 图像分支此前只返回不写响应（会丢成功响应）；
 非 2xx 被包成 502，客户端看不到厂商原文。
 
+### 第六次发布新增：embeddings
+
+`/v1/embeddings` 与图像同为「通用透传 + 裸 Bearer + 双 `/v2` 前缀」的缺陷，现已改走 `<账号根>/v2/embeddings`
+并带全量桌面头族（复用 `executeWorkBuddyEndpoint`）。
+
+线上实测（陌账号）：
+
+```
+不存在模型 → 500 {"code":11351,"msg":"Generate embedding failed ... not found"}   # 路径/头族/鉴权全通
+bge-m3     → 200，dim = 1024                                                  # 与参考实现记录的规格一致
+```
+
+这条链在改动前是**完全不可用**的（`/v2/v2/embeddings` + 无身份头），现在能真实出向量。
+
+### 仍未对齐（下一轮）
+
+已完成：错误码分类、模型级冷却、免费日窗、积分保底与到期加权、积分任务域（礼包/连登/抽奖）、
+续写、图像端点（生成/改图）、embeddings。
+
+| 项 | 状态 | 阻塞点 |
+| --- | --- | --- |
+| `/v1/messages` 直连路由 + thinking 块过滤 | 未实现 | 现网带 Claude 模型的 3 个 Provider 是 `claude-订阅账号`×2 与 `cursor-订阅账号`，**没有 WorkBuddy 账号带 Claude 系模型**；实现即死代码 |
+| 出视频（`/v2/videos/generations`、`/v2/videos/tasks`） | 未实现 | 需任务台账（只有提交账号能查），且没有可用视频模型可验 |
+| 联网检索 / webfetch / MCP / 去水印 | 未实现 | 工作量较大；去水印需 URL 白名单防 SSRF |
+| 上下文窗口四级查找链（后三级） | 未实现 | 上游 `/v3/config` 已给 contextLength，兜底链优先级低 |
+| 上报回读校验 | 未实现 | 需额外上游调用回读 `growth/streak` |
+| 埋点三元组按 realm 分档 | 不做（缺证据） | 没有国际版真机抓包的 commit/releaseDate |
+| 成长任务剩余域（旅行/补签/开学季券码/国际版 trial/注册补地区） | 未实现 | 优先级低于已完成的礼包/连登/抽奖 |
+
 ### 仍未对齐（下一轮）
 
 已完成：错误码分类、模型级冷却、免费日窗、积分保底与到期加权、积分任务域（礼包/连登/抽奖）、
