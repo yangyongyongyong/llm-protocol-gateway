@@ -509,8 +509,12 @@ type workBuddyKeepaliveResult struct {
 	Checkin       string `json:"checkin,omitempty"`
 	SweepAccepted int    `json:"sweepAccepted"`
 	SweepClaimed  int    `json:"sweepClaimed"`
-	Message       string `json:"message,omitempty"`
-	Error         string `json:"error,omitempty"`
+	// Rewards is what the credit-earning domains paid out this round: the starter
+	// gift, streak redemptions and lottery draws (see workbuddy_rewards.go).
+	RewardsCredit float64 `json:"rewardsCredit,omitempty"`
+	RewardsNotes  string  `json:"rewardsNotes,omitempty"`
+	Message       string  `json:"message,omitempty"`
+	Error         string  `json:"error,omitempty"`
 }
 
 // keepaliveWorkBuddy rotates the token, reports activity, presses the check-in
@@ -555,7 +559,15 @@ func (s *Server) keepaliveWorkBuddy(ctx context.Context, providerID string) work
 	} else if result.Error == "" {
 		result.Error = "补领失败：" + sweepErr.Error()
 	}
-	parts := make([]string, 0, 4)
+	// The credit-earning domains, one more independent step: a starter gift waiting,
+	// streak tiers that unlocked, lottery draws that are sitting unused. None of it
+	// costs a conversation, and a refusal in one domain never stops the others.
+	rewards := workBuddyRewardsPass(ctx, session.site, session.credential)
+	result.RewardsCredit = rewards.Total()
+	if len(rewards.Notes) > 0 {
+		result.RewardsNotes = strings.Join(rewards.Notes, "；")
+	}
+	parts := make([]string, 0, 5)
 	if result.Refreshed {
 		parts = append(parts, "令牌已续期")
 	}
@@ -567,6 +579,9 @@ func (s *Server) keepaliveWorkBuddy(ctx context.Context, providerID string) work
 	}
 	if result.SweepClaimed > 0 {
 		parts = append(parts, "补领 "+strconv.Itoa(result.SweepClaimed)+" 个任务")
+	}
+	if result.RewardsCredit > 0 {
+		parts = append(parts, "积分 +"+strconv.FormatFloat(result.RewardsCredit, 'f', -1, 64))
 	}
 	if len(parts) == 0 {
 		parts = append(parts, "保活已执行")
