@@ -34,7 +34,7 @@ func sendWorkBuddyOne400(t *testing.T, body string) (*http.Response, string, int
 		return http.DefaultClient.Do(request)
 	}
 	chat := []byte(`{"model":"glm-5.3","stream":false,"messages":[{"role":"user","content":"hi"}]}`)
-	response, err := server.sendWorkBuddyChat(domain.Provider{ID: "wb1"}, "glm-5.3", chat, nil, send)
+	response, err := server.sendWorkBuddyChat(domain.Provider{ID: "wb1"}, "glm-5.3", chat, nil, send, false)
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}

@@ -528,7 +528,7 @@ func TestSendWorkBuddyChatAnswersAfterTools(t *testing.T) {
 		`{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"Bash","arguments":"{}"}}]},` +
 		`{"role":"tool","tool_call_id":"c1","content":"ok"},` +
 		`{"role":"user","content":"继续"}]}`)
-	response, err := server.sendWorkBuddyChat(domain.Provider{ID: "wb1"}, "gemini-3.8-flash", body, nil, send)
+	response, err := server.sendWorkBuddyChat(domain.Provider{ID: "wb1"}, "gemini-3.8-flash", body, nil, send, false)
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -551,7 +551,7 @@ func TestSendWorkBuddyChatAnswersAfterTools(t *testing.T) {
 
 	// The next chat for the same model goes with the reply up front.
 	bodies = bodies[:0]
-	response, err = server.sendWorkBuddyChat(domain.Provider{ID: "wb1"}, "gemini-3.8-flash", body, nil, send)
+	response, err = server.sendWorkBuddyChat(domain.Provider{ID: "wb1"}, "gemini-3.8-flash", body, nil, send, false)
 	if err != nil {
 		t.Fatalf("second send: %v", err)
 	}

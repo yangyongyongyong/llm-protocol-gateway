@@ -190,7 +190,11 @@ func (s *Server) doOpenAIProviderRequest(ctx context.Context, r *http.Request, p
 			// on one TCP/TLS connection, plus the CN endpoint fallback — see
 			// workbuddy_transport.go.
 			return doHTTPWithTiming(ctx, workBuddyChatClient(sendProvider), request)
-		})
+		},
+			// Only a client that wants one JSON object can have a cut answer joined up:
+			// a streaming client gets bytes as they arrive, so a continuation there
+			// would mean holding the whole answer back (see workbuddy_continue.go).
+			workBuddyWantsAggregatedAnswer(ctx))
 	}
 	return send(body)
 }
@@ -469,6 +473,13 @@ func (s *Server) proxyConvertedThroughChat(w http.ResponseWriter, r *http.Reques
 	if forcedStream {
 		chatReq["stream"] = true
 	}
+	// The client wants one JSON object; the upstream call still streams. Marked on
+	// the context so the WorkBuddy exit can rebuild and, if the answer was cut,
+	// continue it (see workbuddy_continue.go).
+	// The client's intent was captured at the handler entry, before conversion and
+	// before the stream flag was forced to true for an upstream that refuses
+	// non-stream calls (see handleClaudeMessages).
+	ctx := r.Context()
 	upstreamBody, err := json.Marshal(chatReq)
 	if err != nil {
 		return 0, TokenUsage{}, nil, err
@@ -497,7 +508,7 @@ func (s *Server) proxyConvertedThroughChat(w http.ResponseWriter, r *http.Reques
 		if bodyErr != nil {
 			return nil, bodyErr
 		}
-		return s.doOpenAIProviderRequest(r.Context(), r, provider, resolveProviderChatURLWithAdapter(provider, model), adaptedBody, accept, skipIncomingAuth)
+		return s.doOpenAIProviderRequest(ctx, r, provider, resolveProviderChatURLWithAdapter(provider, model), adaptedBody, accept, skipIncomingAuth)
 	}
 	send := sendUpstream
 	if forcedStream {

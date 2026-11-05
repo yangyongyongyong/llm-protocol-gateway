@@ -1549,7 +1549,7 @@ type workBuddySender func(provider domain.Provider, body []byte) (*http.Response
 // refresh token's, about a month away) never predicts, so one forced refresh
 // and a single re-send happen here. The refresh also persists the rotated
 // token, so the next request starts from the new one.
-func (s *Server) sendWorkBuddyChat(provider domain.Provider, model string, body []byte, aliases map[string]string, send workBuddySender) (*http.Response, error) {
+func (s *Server) sendWorkBuddyChat(provider domain.Provider, model string, body []byte, aliases map[string]string, send workBuddySender, aggregate bool) (*http.Response, error) {
 	key := provider.ID + "\x00" + strings.ToLower(strings.TrimSpace(model))
 	if _, remembered := s.workBuddyAfterTools.Load(key); remembered {
 		if quiet := replyAfterWorkBuddyTools(body); quiet != nil {
@@ -1627,6 +1627,12 @@ func (s *Server) sendWorkBuddyChat(provider domain.Provider, model string, body 
 			// message and the failover classifier sees the same text.
 			return restore()
 		}
+	}
+	// An answer the upstream cut off is joined up before the client sees it, but only
+	// on the aggregated path: a streaming client gets its bytes as they arrive (see
+	// workbuddy_continue.go).
+	if aggregate {
+		response = s.continueWorkBuddyAnswer(provider, model, body, send, response)
 	}
 	restoreWorkBuddyToolNames(response, aliases)
 	return response, nil

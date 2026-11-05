@@ -3488,7 +3488,7 @@ func (s *Server) executeProviderChatHTTP(r *http.Request, provider domain.Provid
 			applyProviderAuth(request, sendProvider, r.Header.Get("Authorization"))
 			applyOpenCodeZenHeaders(request, sendProvider, requestBody)
 			return (&http.Client{Timeout: 120 * time.Second}).Do(request)
-		})
+		}, false)
 	} else {
 		response, err = send(body)
 	}
@@ -4256,6 +4256,12 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	// anything as large as a Claude Code prompt, so the log cannot recover it
 	// later. A route/key default overwrites this further down.
 	r = withReasoningEffort(r, reasoningLabelFromMap(req))
+	// Remember what the client asked for before any conversion rewrites it: a Claude
+	// client with stream:false expects one JSON object, and only that shape can have
+	// a cut answer continued (see workbuddy_continue.go).
+	if clientStream, _ := req["stream"].(bool); !clientStream {
+		r = r.WithContext(withWorkBuddyAggregateAnswer(r.Context(), true))
+	}
 
 	route, err := s.router.ActiveOpenAIChatRoute()
 	var matchedKey domain.APIKey
@@ -4374,6 +4380,12 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		req = map[string]any{}
 	}
 	r = withReasoningEffort(r, reasoningLabelFromMap(req))
+	// Remember what the client asked for before any conversion rewrites it: a Claude
+	// client with stream:false expects one JSON object, and only that shape can have
+	// a cut answer continued (see workbuddy_continue.go).
+	if clientStream, _ := req["stream"].(bool); !clientStream {
+		r = r.WithContext(withWorkBuddyAggregateAnswer(r.Context(), true))
+	}
 	// A client may carry a compaction token (minted by our own
 	// handleOpenAIResponsesCompact) back into a normal request's input array;
 	// expand it into a plain message before anything downstream sees it — see
@@ -4852,6 +4864,12 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 		req = map[string]any{}
 	}
 	r = withReasoningEffort(r, reasoningLabelFromMap(req))
+	// Remember what the client asked for before any conversion rewrites it: a Claude
+	// client with stream:false expects one JSON object, and only that shape can have
+	// a cut answer continued (see workbuddy_continue.go).
+	if clientStream, _ := req["stream"].(bool); !clientStream {
+		r = r.WithContext(withWorkBuddyAggregateAnswer(r.Context(), true))
+	}
 
 	var route domain.Route
 	var matchedKey domain.APIKey
@@ -5966,7 +5984,7 @@ func (s *Server) proxyOpenAIChat(w http.ResponseWriter, r *http.Request, provide
 			applyOpenCodeZenHeaders(request, sendProvider, requestBody)
 			applyRequestAdapterHeaders(request, sendProvider, model)
 			return doHTTPWithTiming(r.Context(), &http.Client{Timeout: 0}, request)
-		})
+		}, forcedStream)
 	} else {
 		response, err = send(body)
 	}
