@@ -612,6 +612,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/videos/generations", s.handleOpenAIVideosGenerations)
 	mux.HandleFunc("POST /v1/videos/tasks", s.handleOpenAIVideosTask)
 	mux.HandleFunc("GET /v1/videos/{taskID}", s.handleOpenAIVideoTaskByID)
+	// The two agent tools: web search and page fetch, which answer without the
+	// {code,msg,data} envelope the account surface uses (see workbuddy_agenttool.go).
+	mux.HandleFunc("POST /v1/search", s.handleWorkBuddySearch)
+	mux.HandleFunc("POST /v1/webfetch", s.handleWorkBuddyWebFetch)
 	mux.HandleFunc("POST /openai/v1/images/generations", s.handleOpenAIImagesGenerations)
 	mux.HandleFunc("POST /openai/v1/responses", s.handleOpenAIResponses)
 	// Real OpenAI Responses API endpoint Codex CLI calls for "remote

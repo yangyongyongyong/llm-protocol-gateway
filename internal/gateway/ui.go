@@ -260,6 +260,10 @@ func isModelProtocolPath(path string) bool {
 		// host path never forwards them to the mux, and they answer a plain 404
 		// ("page not found") while the route itself is registered.
 		strings.HasPrefix(path, "/v1/videos/"),
+		// The agent tools are model calls too (they are admitted and billed like one),
+		// and a path the allowlist does not know never reaches the mux on a local host.
+		path == "/v1/search",
+		path == "/v1/webfetch",
 		strings.HasPrefix(path, "/v1/embeddings"),
 		// Speech-to-text: the body is a multipart upload, still a model call
 		// (it is admitted, quota-checked and billed like one).
