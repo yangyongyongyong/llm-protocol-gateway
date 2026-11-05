@@ -301,6 +301,46 @@ bge-m3     → 200，dim = 1024                                                 
 已知模型表、默认值。不做持久缓存（缓存一个实时值没有收益）与 models.dev（会给模型同步路径
 加外部 HTTP 依赖，而本上游从不省略该字段）。结论写在这里，避免以后被当作遗漏。
 
+### 第八次发布新增：`/v1/messages` 路由
+
+这是本次对齐里**收益最大**的一项：chat 路由的 `reasoning_effort` 几乎不起作用（low / max / 非法值
+分别 3884 / 5144 / 5715 中位输出 token），只有 Messages 路由的 `output_config.effort` 被真正执行
+（low 5748 vs max 30850）。本仓此前所有 WorkBuddy 模型一律走 chat，Claude 系因此完全拿不到 effort。
+
+| 项 | 实现 |
+| --- | --- |
+| 开闸范围 | 只对参考实测可在该路由应答的四个模型：`claude-opus-5.5` / `claude-sonnet-5.5` / `claude-opus-5` / `claude-opus-4.8-1m`；其它模型保持 chat（猜未测模型会把握手变成 404） |
+| 限定条件 | 仅国内版（国际版 `/v1/messages` 恒 404）、仅流式（该路由只支持流式） |
+| 头族 | 复用桌面头族 + `anthropic-version: 2023-06-01`；URL 由账号根拼，不用已含 `/v2` 的 base |
+| 11159 防护 | 丢弃**无 `signature`** 的 `thinking` 块；其余原样（该路由不跑渠道检查，客户端 billing 行与身份句都不改写） |
+| 开关 | `WORKBUDDY_MESSAGES_ROUTE`（默认开，置 `0` 退回 chat） |
+
+线上探测（陌账号，该账号没有 Claude 模型，故两边都失败——但**失败的来源不同**，这就是证据）：
+
+```
+claude-opus-5.5 → 400 {"code":11158,"msg":"model [claude-opus-5.5] is not allowed for user type
+                      [personal_free_user]","retry_policy":{...},"displayMsg":{"en":..,"zh":..}}
+glm-5.3        → 200，SSE 正常出流（走 chat，未被误路由）
+```
+
+`11158` 的响应形态（`retry_policy` + 双语 `displayMsg`）是 **Messages 路由专属**的，证明请求确实打到了
+`/v1/messages`；`glm-5.3` 正常出流证明闸门按模型名精确分流、没有把 chat 模型误送过去。
+
+顺带把 `11158`（账号套餐不含该模型）补进错误码表：判为模型级（换号可能换到有该套餐的账号），
+但不永久休息该模型（套餐可升级）。
+
+### 仍未对齐（下一轮）
+
+已完成：错误码分类、模型级冷却、免费日窗、积分保底与到期加权、积分任务域、续写、图像端点、
+embeddings、上报回读、上下文窗口解析链、**`/v1/messages` 路由**。
+
+| 项 | 状态 | 阻塞点 |
+| --- | --- | --- |
+| 出视频（`/v2/videos/generations`、`/v2/videos/tasks`） | 未实现 | 需任务台账（只有提交账号能查），且没有可用视频模型可验 |
+| 联网检索 / webfetch / MCP / 去水印 | 未实现 | 检索类会消耗真实额度且无免费档；去水印需 URL 白名单防 SSRF |
+| 埋点三元组按 realm 分档 | 不做（缺证据） | 没有国际版真机抓包的 commit/releaseDate |
+| 成长任务剩余域（旅行/补签/开学季券码/国际版 trial/注册补地区） | 未实现 | 优先级低于已完成的礼包/连登/抽奖 |
+
 ### 仍未对齐（下一轮）
 
 已完成：错误码分类、模型级冷却、免费日窗、积分保底与到期加权、积分任务域、续写、
