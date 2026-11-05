@@ -257,6 +257,31 @@ func TestIsUserAllowedPathProviderUsage(t *testing.T) {
 		{http.MethodGet, "/__quota-tasks/q1/runs", true},
 		{http.MethodPost, "/__quota-tasks/q1/runs", false},
 		{http.MethodDelete, "/__quota-tasks/q1/run", false},
+		// 任务中心与订阅卡的日常动作：归属在 handler 内按 provider 授权判定
+		// （requireProviderAccessForUser / requireProviderOwnerForUser）。这些路径
+		// 曾漏在白名单外，导致用户在自己账号的卡片上看到
+		// "administrator access required"。
+		{http.MethodGet, "/__providers/p1/workbuddy-oauth/tasks", true},
+		{http.MethodPost, "/__providers/p1/workbuddy-oauth/tasks/auto", true},
+		{http.MethodGet, "/__providers/p1/workbuddy-oauth/tasks/run", true},
+		{http.MethodPost, "/__providers/p1/workbuddy-oauth/activity", true},
+		{http.MethodPost, "/__providers/p1/workbuddy-oauth/keepalive", true},
+		{http.MethodPost, "/__providers/p1/workbuddy-oauth/automation", true},
+		// 动词不得串用：任务中心是 GET 的列表 + POST 的动作。
+		{http.MethodPost, "/__providers/p1/workbuddy-oauth/tasks", false},
+		{http.MethodDelete, "/__providers/p1/workbuddy-oauth/tasks/auto", false},
+		// ZCode / Trae 的浏览器登录与暂停开关同样只对归属者开放。
+		{http.MethodPost, "/__providers/p1/zcode-oauth/start", true},
+		{http.MethodGet, "/__providers/p1/zcode-oauth/status", true},
+		{http.MethodPost, "/__providers/p1/zcode-oauth/pause", true},
+		{http.MethodPost, "/__providers/p1/zcode-oauth/resume", true},
+		{http.MethodPost, "/__providers/p1/trae-oauth/start", true},
+		{http.MethodGet, "/__providers/p1/trae-oauth/status", true},
+		{http.MethodPost, "/__providers/p1/trae-oauth/pause", true},
+		{http.MethodPost, "/__providers/p1/trae-oauth/resume", true},
+		// 家族与动词不得串用：pause 只属于有暂停语义的家族，tasks 只属于 WorkBuddy。
+		{http.MethodPost, "/__providers/p1/claude-oauth/pause", false},
+		{http.MethodPost, "/__providers/p1/trae-oauth/tasks", false},
 		{http.MethodGet, "/__state", true},
 		{http.MethodGet, "/__apikeys/abc/profiles", true},
 	}

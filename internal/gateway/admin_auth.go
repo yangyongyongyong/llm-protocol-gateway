@@ -321,7 +321,8 @@ func isUserProviderManagementPath(method, path string) bool {
 			// checkin/auto is the daily switch on a subscription's card; the
 			// owner of the card owns it, as they own the RTK switch.
 			return parts[2] == "auto" && method == http.MethodPost
-		case "claude-oauth", "cursor-oauth", "chatgpt-oauth", "qoder-pat", "qoder-oauth", "workbuddy-oauth":
+		case "claude-oauth", "cursor-oauth", "chatgpt-oauth", "qoder-pat", "qoder-oauth",
+			"zcode-oauth", "trae-oauth", "workbuddy-oauth":
 			// A Qoder connection has two doors: qoder-oauth is the browser
 			// device flow (start/status), qoder-pat the pasted token
 			// (complete/status). Both share disconnect, and reconnect is the
@@ -335,10 +336,18 @@ func isUserProviderManagementPath(method, path string) bool {
 			case "reconnect":
 				return method == http.MethodPost && parts[1] == "qoder-pat"
 			case "pause", "resume":
-				// The shared subscription panel pauses and resumes with its own
-				// verbs; only Qoder answers them, on the same handlers as
-				// disconnect and reconnect.
-				return method == http.MethodPost && parts[1] == "qoder-oauth"
+				// The subscription panels pause and resume with their own verbs,
+				// on the same handlers as disconnect and reconnect.
+				return method == http.MethodPost && subscriptionPausableFamily(parts[1])
+			case "tasks":
+				// The WorkBuddy task center's list (任务中心): the owner of the
+				// card reads their own account's tasks. Without this a ScopeOwn
+				// user's own card answered "administrator access required".
+				return method == http.MethodGet && parts[1] == "workbuddy-oauth"
+			case "activity", "keepalive", "automation":
+				// The card's daily actions (活跃上报 / 保活) and the two switches
+				// behind them. All three check provider access inside the handler.
+				return method == http.MethodPost && parts[1] == "workbuddy-oauth"
 			}
 			return false
 		case "self-register-token":
@@ -349,6 +358,28 @@ func isUserProviderManagementPath(method, path string) bool {
 			return parts[2] == "revoke" && method == http.MethodPost
 		}
 		return false
+	}
+	// The WorkBuddy task center's run endpoints: 一键完成 starts a run, and the
+	// run is polled by id. Both answer only for a provider the caller can access,
+	// which the handler checks with requireProviderAccessForUser.
+	if len(parts) == 4 && parts[1] == "workbuddy-oauth" && parts[2] == "tasks" {
+		switch parts[3] {
+		case "auto":
+			return method == http.MethodPost
+		case "run":
+			return method == http.MethodGet
+		}
+		return false
+	}
+	return false
+}
+
+// subscriptionPausableFamily reports whether an OAuth family has the pause and
+// resume verbs the shared subscription panel offers.
+func subscriptionPausableFamily(family string) bool {
+	switch family {
+	case "qoder-oauth", "zcode-oauth", "trae-oauth":
+		return true
 	}
 	return false
 }

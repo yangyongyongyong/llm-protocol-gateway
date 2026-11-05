@@ -346,6 +346,19 @@ func providerRoutePermission(method, path string) *domain.Permission {
 		{"/conformance", domain.PermProvidersTest},
 		{"/checkin/auto", domain.PermProvidersEdit},
 		{"/checkin", domain.PermProvidersTest},
+		// The WorkBuddy task center. Before these entries the whole family fell
+		// through to the "-oauth/" catch-all below and mapped to
+		// providers.secret, so running a daily task demanded the credential
+		// permission — a role that may run tasks but not read keys was refused.
+		// The ladder matches the rest of the card: reading the list is view,
+		// running a task is test (like 签到), turning the daily switch on is edit
+		// (like checkin/auto).
+		{"/workbuddy-oauth/tasks/auto", domain.PermProvidersTest},
+		{"/workbuddy-oauth/tasks/run", domain.PermProvidersTest},
+		{"/workbuddy-oauth/tasks", domain.PermProvidersView},
+		{"/workbuddy-oauth/activity", domain.PermProvidersTest},
+		{"/workbuddy-oauth/keepalive", domain.PermProvidersTest},
+		{"/workbuddy-oauth/automation", domain.PermProvidersEdit},
 	}
 	for _, item := range suffixes {
 		if strings.HasSuffix(rest, item.suffix) {
