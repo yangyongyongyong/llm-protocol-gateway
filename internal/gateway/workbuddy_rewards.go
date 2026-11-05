@@ -91,17 +91,21 @@ type workBuddyLottery struct {
 
 // workBuddyRewardsOutcome is what one pass collected, for the console and logs.
 type workBuddyRewardsOutcome struct {
-	GiftClaimed   float64  `json:"giftClaimed,omitempty"`
-	StreakCredit  float64  `json:"streakCredit,omitempty"`
-	LotteryCredit float64  `json:"lotteryCredit,omitempty"`
-	TiersRedeemed []int    `json:"tiersRedeemed,omitempty"`
-	Draws         int      `json:"draws,omitempty"`
-	Notes         []string `json:"notes,omitempty"`
+	GiftClaimed   float64 `json:"giftClaimed,omitempty"`
+	StreakCredit  float64 `json:"streakCredit,omitempty"`
+	LotteryCredit float64 `json:"lotteryCredit,omitempty"`
+	TiersRedeemed []int   `json:"tiersRedeemed,omitempty"`
+	Draws         int     `json:"draws,omitempty"`
+	// TravelCredit is what the buddy's trip paid, and MakeupUsed how many cards were
+	// spent repairing the streak (see workbuddy_travel.go).
+	TravelCredit float64  `json:"travelCredit,omitempty"`
+	MakeupUsed   int      `json:"makeupUsed,omitempty"`
+	Notes        []string `json:"notes,omitempty"`
 }
 
 // Total is everything this pass brought in.
 func (outcome workBuddyRewardsOutcome) Total() float64 {
-	return outcome.GiftClaimed + outcome.StreakCredit + outcome.LotteryCredit
+	return outcome.GiftClaimed + outcome.StreakCredit + outcome.LotteryCredit + outcome.TravelCredit
 }
 
 // workBuddyGiftStatusOf asks whether a starter gift is waiting.
@@ -279,7 +283,15 @@ func workBuddyRewardsPass(ctx context.Context, site workBuddySite, credential do
 		}
 	}
 
-	// 2. Streak tiers.
+	// 2. Repair the streak before trading it.
+	//
+	// A makeup card that repairs yesterday is what keeps a days-long run alive; redeeming
+	// tiers first would trade that run for one day's credit (see workbuddy_travel.go).
+	used, repairNotes := workBuddyRepairStreak(ctx, site, credential, 3)
+	outcome.MakeupUsed = used
+	outcome.Notes = append(outcome.Notes, repairNotes...)
+
+	// 3. Streak tiers.
 	if streak, err := workBuddyStreakNow(ctx, site, credential); err != nil {
 		outcome.Notes = append(outcome.Notes, "streak: "+workBuddyShortError(err))
 	} else {
@@ -299,7 +311,12 @@ func workBuddyRewardsPass(ctx context.Context, site workBuddySite, credential do
 		}
 	}
 
-	// 3. Lottery draws, one at a time, never in a burst: the draws are the
+	// 4. One day's travel: claim what landed, or send the buddy out again.
+	travelCredit, travelNotes := workBuddyTravelPass(ctx, site, credential)
+	outcome.TravelCredit = travelCredit
+	outcome.Notes = append(outcome.Notes, travelNotes...)
+
+	// 5. Lottery draws, one at a time, never in a burst: the draws are the
 	// account's own chances and a failure mid-way must not lose the rest.
 	if lottery, err := workBuddyLotteryNow(ctx, site, credential); err != nil {
 		outcome.Notes = append(outcome.Notes, "lottery: "+workBuddyShortError(err))
