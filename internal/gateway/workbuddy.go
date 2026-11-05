@@ -2391,7 +2391,11 @@ func fetchWorkBuddyModels(ctx context.Context, site workBuddySite, credential do
 					continue
 				}
 				model.Name = detail.Name
-				model.ContextLength = detail.MaxInputTokens
+				// Through the resolver, not straight from the field: a model the config
+				// lists without maxInputTokens would otherwise have its window wiped to 0,
+				// losing the known-model table and the default that sit behind it
+				// (model_context.go).
+				model.ContextLength = resolveModelContextLength(id, detail.MaxInputTokens)
 				model.MaxOutputTokens = detail.MaxOutputTokens
 				model.Free, model.Rate, model.RateWas = workBuddyModelPrice(detail, envelope.Data.Promotions, time.Now())
 				break

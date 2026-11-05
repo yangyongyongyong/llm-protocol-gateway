@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -509,6 +510,10 @@ type workBuddyKeepaliveResult struct {
 	Checkin       string `json:"checkin,omitempty"`
 	SweepAccepted int    `json:"sweepAccepted"`
 	SweepClaimed  int    `json:"sweepClaimed"`
+	// StreakDays / ActivityNote are the read-back of the activity report: the vendor
+	// answers 200 to reports it drops, and the streak is how that shows.
+	StreakDays   int    `json:"streakDays,omitempty"`
+	ActivityNote string `json:"activityNote,omitempty"`
 	// Rewards is what the credit-earning domains paid out this round: the starter
 	// gift, streak redemptions and lottery draws (see workbuddy_rewards.go).
 	RewardsCredit float64 `json:"rewardsCredit,omitempty"`
@@ -539,12 +544,19 @@ func (s *Server) keepaliveWorkBuddy(ctx context.Context, providerID string) work
 		}
 		return result
 	}
-	if reportErr := workBuddyReportActivity(ctx, session.site, session.credential); reportErr != nil {
+	// Reported, then verified: a 200 that was silently dropped is the failure mode the
+	// reference implementation warns about, and it leaves the streak stuck at zero
+	// forever (see workbuddy_readback.go).
+	if readback, reportErr := s.workBuddyReportActivityVerified(ctx, providerID, session.site, session.credential); reportErr != nil {
 		if result.Error == "" {
 			result.Error = "活跃上报失败：" + reportErr.Error()
 		}
 	} else {
-		result.Activity = true
+		result.Activity = readback.Reported
+		result.StreakDays = readback.StreakDays
+		if readback.Note != "" {
+			result.ActivityNote = readback.Note
+		}
 	}
 	// The check-in is a step of its own: the build may not run one (WorkBuddy AI
 	// ships without it), and a gateway started without a check-in store has
@@ -572,7 +584,11 @@ func (s *Server) keepaliveWorkBuddy(ctx context.Context, providerID string) work
 		parts = append(parts, "令牌已续期")
 	}
 	if result.Activity {
-		parts = append(parts, "活跃已上报")
+		label := "活跃已上报"
+		if result.StreakDays > 0 {
+			label = fmt.Sprintf("活跃已上报（连登 %d 天）", result.StreakDays)
+		}
+		parts = append(parts, label)
 	}
 	if result.Checkin != "" {
 		parts = append(parts, "签到："+result.Checkin)
