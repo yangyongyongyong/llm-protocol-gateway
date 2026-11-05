@@ -80,6 +80,11 @@ var workBuddyFailureCodes = map[int]struct {
 
 	// The account's own session or billing is the problem.
 	12153: {workBuddyVerdictSessionDead, "wb_session_dead"},
+	// "model [x] is not allowed for user type [y]" — measured live on the Messages
+	// route: the account's plan cannot use that model at all. It is model-level for
+	// routing purposes (ask another provider, which may have a different plan), but it
+	// also names the plan, so it must not rest the model forever.
+	11158: {workBuddyVerdictModelLimited, "wb_model_not_in_plan"},
 	14017: {workBuddyVerdictPayment, "wb_payment_required"},
 	14018: {workBuddyVerdictPayment, "wb_payment_required"},
 	// 10085 "请求不合法" is the upstream refusing an unrecognised User-Agent. It

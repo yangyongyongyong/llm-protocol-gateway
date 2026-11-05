@@ -19,6 +19,8 @@ func TestClassifyWorkBuddyFailurePutsModelCodesOnTheModel(t *testing.T) {
 		{`{"code":11115,"msg":"model unavailable"}`, failoverBusy},
 		{`{"code":11135,"msg":"unsupported"}`, failoverBusy},
 		{`{"code":11148,"msg":"limited"}`, failoverBusy},
+		// Measured live on the Messages route: the plan does not include the model.
+		{`{"code":11158,"msg":"model [claude-opus-5.5] is not allowed for user type [personal_free_user]"}`, failoverBusy},
 		{`{"code":6020,"msg":"upstream busy"}`, failoverBusy},
 		{`{"code":6021,"msg":"upstream busy"}`, failoverBusy},
 		{`{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`, failoverPromptRefusal},
