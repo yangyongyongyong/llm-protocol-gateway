@@ -165,7 +165,27 @@ magpie 的 WorkBuddy 插件是另一条独立实现路线，且带一手实测�
   `provider_schedule` 五种模式。可移植的是「按模型冷却」「积分保底」「到期加权」三件，
   见 P1。
 
-## 五、配置
+## 五、线上验证（gc，2026-11-05）
+
+发布方式：`gc`（173.249.207.202）手工复刻 `deploy/deploy-linux.sh` 的服务器端步骤（本机无
+bash/WSL，原脚本跑不了）：交叉编译 `linux/amd64` + `npm run build` → 打包 → scp → 备份 →
+替换 → `systemctl restart` → 健康检查。版本 `20261105.075133`，服务
+`llm-protocol-gateway.service` active，`providers=59 routes=25 apiKeys=12`。
+
+验证账号：**`workbuddy-订阅-陌`**。用临时 route + 临时 key 钉住该账号，验完立即删除
+（不动现网任何配置）。
+
+| 验证项 | 结果 | 说明 |
+| --- | --- | --- |
+| Provider 模型拉取（`/v3/config`） | **200，709ms**，模型表完整 | 走新链路：TLS 指纹 + 头序 + UA + 单出口，对真实上游可用 |
+| 真实对话（Claude 协议，免费模型 `hy4free`） | **200，1665ms**，返回「在的」 | 请求日志 `id=143901 provider_id=workbuddy-订阅-陌 model=hy4free status=200` |
+| **DSH 身份句脱敏**（system 带 `You are an AI agent powered by DeepSeek Harness.`） | **200，2725ms** | 改前该行必 11128。这是脱敏规则在真实账号上的直接证据 |
+| 流式链路（SSE） | **200，1422ms**，事件序列完整 | `message_start → content_block_start/delta/stop → message_delta → message_stop`，21 个 `thinking_delta` 正常透出 |
+
+未在本轮验证的：付费模型（避免消耗账号额度）、模型级冷却与免费日窗（需触发限流才有数据）、
+`/v1/messages` 直连路由（尚未实现，见 3.3 第 1 条）。
+
+## 六、配置
 
 | 变量 | 取值 | 默认 | 说明 |
 | --- | --- | --- | --- |
