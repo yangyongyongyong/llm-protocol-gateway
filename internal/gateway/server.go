@@ -6062,7 +6062,7 @@ func (s *Server) proxyOpenAIImages(w http.ResponseWriter, r *http.Request, provi
 	// bearer alone is not enough, and the generic path below posts to a doubled /v2
 	// prefix (see workbuddy_endpoints.go).
 	if _, isWorkBuddyRender := workBuddyRenderSite(provider); isWorkBuddyRender {
-		return s.executeWorkBuddyImage(r, provider, workBuddyImagePathFor(r.Context()), body)
+		return s.executeWorkBuddyImage(w, r, provider, workBuddyImagePathFor(r.Context()), body)
 	}
 	// 只用 Provider 自己的凭证。以前这里会在 Provider 没有 Key 时把调用方的
 	// Authorization 原样转给厂商——那是网关自己的 Key，发给上游等于泄露。

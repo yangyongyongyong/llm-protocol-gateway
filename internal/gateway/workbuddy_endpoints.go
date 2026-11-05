@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -126,6 +127,7 @@ func workBuddyRenderSite(provider domain.Provider) (workBuddySite, bool) {
 // executeWorkBuddyImage calls one of the image routes and answers like the generic
 // image executor does.
 func (s *Server) executeWorkBuddyImage(
+	w http.ResponseWriter,
 	r *http.Request,
 	provider domain.Provider,
 	path string,
@@ -135,14 +137,24 @@ func (s *Server) executeWorkBuddyImage(
 	if !ok {
 		return 0, TokenUsage{}, nil, fmt.Errorf("provider %q is not a WorkBuddy account", provider.ID)
 	}
+	if path == workBuddyImageEditsPath {
+		body = normalizeWorkBuddyImageEditBody(body)
+	}
 	status, payload, err := s.workBuddyEndpointCall(r.Context(), provider, workBuddyEndpointURL(site, path), body, "application/json", "application/json")
 	if err != nil {
 		return 0, TokenUsage{}, nil, err
 	}
-	if status < 200 || status >= 300 {
-		// The vendor's own words, so the client can tell a bad prompt from a dead
-		// account.
-		return status, TokenUsage{}, payload, fmt.Errorf("workbuddy image request answered HTTP %d", status)
+	// The status and body go back as they came, refusal included: the vendor's own
+	// words are what let a client tell a bad prompt (400) from a dead account (401)
+	// from a busy one (429). Wrapping them into a gateway error turned every one of
+	// those into an opaque 502.
+	//
+	// The body is written here because this path owns its response: the generic image
+	// executor writes through proxyOpenAIImagesUpstream, and its caller only logs.
+	if w != nil {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(status)
+		_, _ = w.Write(payload)
 	}
 	return status, TokenUsage{}, payload, nil
 }
@@ -171,4 +183,36 @@ func workBuddyImagePathFor(ctx context.Context) string {
 		return workBuddyImageEditsPath
 	}
 	return workBuddyImageGenerationsPath
+}
+
+// normalizeWorkBuddyImageEditBody makes an edit body the shape the upstream parses.
+//
+// Measured live (2026-11-05): a single `image` string is refused with
+// `code 11101 "cannot unmarshal string into Go struct field EditImageRequest.image of
+// type []string"`. The official client always sends the array form, so a client that
+// sends one image as a string is the shape that fails — wrapping it in a one-element
+// array is the whole fix, and it changes nothing else.
+func normalizeWorkBuddyImageEditBody(body []byte) []byte {
+	if len(body) == 0 {
+		return body
+	}
+	var payload map[string]any
+	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	decoder.UseNumber()
+	if decoder.Decode(&payload) != nil || payload == nil {
+		return body
+	}
+	image, has := payload["image"]
+	if !has {
+		return body
+	}
+	if _, isString := image.(string); !isString {
+		return body
+	}
+	payload["image"] = []any{image}
+	encoded := encodeJSONWithoutEscaping(payload)
+	if encoded == nil {
+		return body
+	}
+	return encoded
 }

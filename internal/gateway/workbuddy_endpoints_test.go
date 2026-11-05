@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -122,7 +123,8 @@ func TestExecuteWorkBuddyImageTalksToTheRoute(t *testing.T) {
 		WorkBuddy: &domain.WorkBuddyCredential{AccessToken: "tok", UserID: "uid-9", Domain: "www.workbuddy.cn"}}
 	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"prompt":"cat"}`))
 
-	status, _, payload, err := gateway.executeWorkBuddyImage(request, provider, workBuddyImageGenerationsPath, []byte(`{"prompt":"cat"}`))
+	recorder := httptest.NewRecorder()
+	status, _, payload, err := gateway.executeWorkBuddyImage(recorder, request, provider, workBuddyImageGenerationsPath, []byte(`{"prompt":"cat"}`))
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -156,10 +158,73 @@ func TestExecuteWorkBuddyImageUsesTheEditsRoute(t *testing.T) {
 	provider := domain.Provider{ID: "wb-2", AuthType: domain.AuthTypeWorkBuddy,
 		WorkBuddy: &domain.WorkBuddyCredential{AccessToken: "tok", UserID: "uid"}}
 	request := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(`{}`))
-	if _, _, _, err := gateway.executeWorkBuddyImage(request, provider, workBuddyImagePathFor(withWorkBuddyImagesEdits(request.Context())), []byte(`{}`)); err != nil {
+	if _, _, _, err := gateway.executeWorkBuddyImage(httptest.NewRecorder(), request, provider, workBuddyImagePathFor(withWorkBuddyImagesEdits(request.Context())), []byte(`{}`)); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	if seenPath != "/v2/images/edits" {
 		t.Fatalf("upstream path = %q", seenPath)
+	}
+}
+
+// The body has to reach the client: this path owns its response, unlike the generic
+// executor which writes through its own helper.
+func TestExecuteWorkBuddyImageWritesTheBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		_, _ = writer.Write([]byte(`{"error":{"message":"no such model"}}`))
+	}))
+	defer server.Close()
+	previousEndpoint := workBuddyCNEndpoint
+	workBuddyCNEndpoint = server.URL
+	defer func() { workBuddyCNEndpoint = previousEndpoint }()
+
+	gateway := &Server{}
+	provider := domain.Provider{ID: "wb-3", AuthType: domain.AuthTypeWorkBuddy,
+		WorkBuddy: &domain.WorkBuddyCredential{AccessToken: "t", UserID: "u"}}
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{}`))
+	recorder := httptest.NewRecorder()
+	status, _, _, err := gateway.executeWorkBuddyImage(recorder, request, provider, workBuddyImageGenerationsPath, []byte(`{}`))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if !strings.Contains(recorder.Body.String(), "no such model") {
+		t.Fatalf("body not written: %q", recorder.Body.String())
+	}
+	if recorder.Code != status {
+		t.Fatalf("written status = %d, returned %d", recorder.Code, status)
+	}
+}
+
+// Measured live: the upstream refuses a single image string ("cannot unmarshal string
+// into … image of type []string"). Wrapping is the whole fix.
+func TestNormalizeWorkBuddyImageEditBodyWrapsASingleImage(t *testing.T) {
+	got := normalizeWorkBuddyImageEditBody([]byte(`{"model":"m","prompt":"blue","image":"data:image/png;base64,AA"}`))
+	var payload map[string]any
+	if err := json.Unmarshal(got, &payload); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	images, isList := payload["image"].([]any)
+	if !isList || len(images) != 1 {
+		t.Fatalf("image = %T %v, want a one-element array", payload["image"], payload["image"])
+	}
+	if images[0] != "data:image/png;base64,AA" {
+		t.Fatalf("image[0] = %v", images[0])
+	}
+	if payload["prompt"] != "blue" {
+		t.Fatalf("the rest of the body changed: %v", payload)
+	}
+}
+
+// An array is already right, and a body without the field is left alone.
+func TestNormalizeWorkBuddyImageEditBodyLeavesOtherShapesAlone(t *testing.T) {
+	arrayForm := []byte(`{"image":["a","b"]}`)
+	if got := normalizeWorkBuddyImageEditBody(arrayForm); string(got) != string(arrayForm) {
+		t.Fatalf("array form was rewritten: %s", string(got))
+	}
+	noImage := []byte(`{"prompt":"x"}`)
+	if got := normalizeWorkBuddyImageEditBody(noImage); string(got) != string(noImage) {
+		t.Fatalf("body without image was rewritten: %s", string(got))
+	}
+	if got := normalizeWorkBuddyImageEditBody([]byte("not json")); string(got) != "not json" {
+		t.Fatalf("garbage was rewritten: %s", string(got))
 	}
 }
