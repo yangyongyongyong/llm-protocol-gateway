@@ -31,10 +31,10 @@ func decodeQoderBody(t *testing.T, raw []byte) map[string]any {
 	return body
 }
 
-// Qoder's own system line comes first and the caller's follows it: the endpoint
-// routes on that line, so a request built the OpenAI way — caller's system as
-// the first message — is not the same request.
-func TestQoderChatBodyPutsQodersSystemLineFirst(t *testing.T) {
+// A caller that sent its own system prompt gets exactly that. Qoder's own
+// prompt is not appended to it: two system prompts give the model two sets of
+// instructions, and the endpoint routes on the first one it finds.
+func TestQoderChatBodyUsesTheCallersSystemPrompt(t *testing.T) {
 	info := qoderTestModelInfo(t)
 	raw, err := qoderChatBody("ultimate", []byte(`{
 		"model":"ultimate",
@@ -46,21 +46,21 @@ func TestQoderChatBodyPutsQodersSystemLineFirst(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := decodeQoderBody(t, raw)
-	system, ok := body["system"].([]any)
-	if !ok || len(system) != 1 {
-		t.Fatalf("system blocks wrong: %v", body["system"])
-	}
-	text := system[0].(map[string]any)["text"].(string)
-	if !strings.HasPrefix(text, qoderSys) {
-		t.Fatalf("Qoder's line must come first, got %q", text)
-	}
-	if !strings.HasSuffix(text, "Be terse.") {
-		t.Fatalf("the caller's system must ride with it, got %q", text)
-	}
 	messages := body["messages"].([]any)
 	first := messages[0].(map[string]any)
 	if first["role"] != "system" {
 		t.Fatalf("the body's first turn must be the system block, got %v", first["role"])
+	}
+	// Qoder's client sends the system prompt as one string, not as blocks.
+	text, ok := first["content"].(string)
+	if !ok {
+		t.Fatalf("the system turn holds one string, got %T", first["content"])
+	}
+	if text != "Be terse." {
+		t.Fatalf("the caller's system prompt must replace Qoder's, got %q", text)
+	}
+	if _, repeated := body["system"]; repeated {
+		t.Fatal("the system prompt belongs in the turns only, not beside them")
 	}
 	for _, item := range messages[1:] {
 		if role := item.(map[string]any)["role"]; role == "system" {
@@ -68,7 +68,7 @@ func TestQoderChatBodyPutsQodersSystemLineFirst(t *testing.T) {
 		}
 	}
 	// Everything the endpoint keys on besides the messages.
-	if body["agent_id"] != "agent_common" || body["task_id"] != "common" || body["session_type"] != "app" {
+	if body["agent_id"] != "agent_common" || body["task_id"] != "common" || body["session_type"] != qoderSessionType {
 		t.Fatalf("agent identity wrong: %v", body)
 	}
 	if _, ok := body["model_config"].(map[string]any); !ok {
@@ -80,10 +80,183 @@ func TestQoderChatBodyPutsQodersSystemLineFirst(t *testing.T) {
 	}
 }
 
-func TestQoderChatBodyCarriesToolsAndToolTurns(t *testing.T) {
+// A caller that sent no system prompt gets Qoder's own, and the endpoint routes
+// on the line it opens with.
+func TestQoderChatBodySendsQodersOwnPromptWhenTheCallerSendsNone(t *testing.T) {
 	info := qoderTestModelInfo(t)
 	raw, err := qoderChatBody("ultimate", []byte(`{
 		"model":"ultimate",
+		"messages":[{"role":"user","content":"hi"}]}`), info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := decodeQoderBody(t, raw)
+	first := body["messages"].([]any)[0].(map[string]any)
+	text, _ := first["content"].(string)
+	if !strings.HasPrefix(text, qoderSystemLine) {
+		t.Fatalf("the routed-on line is missing: %q", text[:minInt(len(text), 120)])
+	}
+	if len(text) < 5000 {
+		t.Fatalf("the embedded prompt is %d chars, which is not Qoder's own", len(text))
+	}
+	if text != qoderBaseSystemPrompt {
+		t.Fatal("the body must carry the embedded prompt verbatim")
+	}
+}
+
+// The embedded prompt is data next to the code, and data can be the wrong file:
+// it has to still open with the line the endpoint routes on.
+func TestQoderEmbeddedPromptStartsWithTheRoutedLine(t *testing.T) {
+	if !strings.HasPrefix(qoderBaseSystemPrompt, qoderSystemLine) {
+		t.Fatalf("the embedded prompt opens with %q", qoderBaseSystemPrompt[:minInt(len(qoderBaseSystemPrompt), 120)])
+	}
+	if !strings.Contains(qoderBaseSystemPrompt, "</example>") {
+		t.Fatal("the prompt looks truncated: Qoder's own ends with its examples")
+	}
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// Every key a Qoder client writes is present, so the endpoint is handed the
+// shape its own client produces rather than a plain OpenAI body.
+func TestQoderChatBodyCarriesTheClientsOwnShape(t *testing.T) {
+	info := qoderTestModelInfo(t)
+	raw, err := qoderChatBody("ultimate", []byte(`{
+		"model":"ultimate",
+		"messages":[{"role":"user","content":"hi"}]}`), info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := decodeQoderBody(t, raw)
+	for _, key := range []string{
+		"request_id", "request_set_id", "chat_record_id", "stream", "chat_task",
+		"chat_context", "image_urls", "is_reply", "is_retry", "session_id",
+		"code_language", "source", "version", "chat_prompt", "parameters",
+		"aliyun_user_type", "session_type", "agent_id", "task_id", "model_config",
+		"messages", "tools", "business",
+	} {
+		if _, ok := body[key]; !ok {
+			t.Fatalf("%q is missing from the body: %v", key, body)
+		}
+	}
+	if body["stream"] != true {
+		t.Fatal("the upstream only answers as a stream")
+	}
+	chatContext := body["chat_context"].(map[string]any)
+	if text := chatContext["text"].(map[string]any); text["text"] != "hi" {
+		t.Fatalf("chat_context.text must carry the prompt, got %v", chatContext["text"])
+	}
+	business := body["business"].(map[string]any)
+	if business["model_key"] != info.Key {
+		t.Fatalf("the turn is billed against its model key, got %v", business["model_key"])
+	}
+	if business["product"] != qoderBusinessProduct || business["version"] != qoderCOSYVersion {
+		t.Fatalf("business identity wrong: %v", business)
+	}
+	config := body["model_config"].(map[string]any)
+	if config["format"] != "openai" || config["source"] != "system" || config["model"] != "" {
+		t.Fatalf("model_config shape wrong: %v", config)
+	}
+}
+
+// A conversation keeps one window id between turns, while each new question
+// gets its own turn id: the first keys the prompt cache, the second groups one
+// answer's tool steps for billing.
+func TestQoderChatBodyKeepsTheWindowAndMovesTheTurn(t *testing.T) {
+	info := qoderTestModelInfo(t)
+	build := func(messages string) map[string]any {
+		t.Helper()
+		raw, err := qoderChatBody("ultimate", []byte(`{"model":"ultimate","messages":`+messages+`}`), info)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return decodeQoderBody(t, raw)
+	}
+	first := build(`[{"role":"user","content":"write a parser"}]`)
+	second := build(`[{"role":"user","content":"write a parser"},{"role":"assistant","content":"done"},{"role":"user","content":"and now add tests"}]`)
+	if first["session_id"] != second["session_id"] {
+		t.Fatalf("the window must survive the next turn: %v then %v", first["session_id"], second["session_id"])
+	}
+	if first["chat_record_id"] == second["chat_record_id"] {
+		t.Fatal("a new question must be its own turn")
+	}
+	if first["request_id"] == second["request_id"] {
+		t.Fatal("every request is its own request")
+	}
+	// Re-sending the same question (a retry, or a tool step) reuses its turn.
+	again := build(`[{"role":"user","content":"write a parser"}]`)
+	if again["chat_record_id"] != first["chat_record_id"] {
+		t.Fatal("the same question must reuse its turn id")
+	}
+}
+
+// A client that names its own conversation keeps that name as the window.
+func TestQoderChatBodyUsesTheClientsOwnSession(t *testing.T) {
+	info := qoderTestModelInfo(t)
+	raw, err := qoderChatBodyWith("ultimate", []byte(`{
+		"model":"ultimate",
+		"messages":[{"role":"user","content":"hi"}]}`), info, qoderBodyContext{SessionKey: "session-42"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := decodeQoderBody(t, raw); body["session_id"] != "session-42" {
+		t.Fatalf("session_id = %v, want the client's own id", body["session_id"])
+	}
+}
+
+// qoderCNStructuredInfo is a model the CN site serves and that reads structured
+// tool turns: its key is one the gateway keeps on the structured path.
+func qoderCNStructuredInfo() qoderModelInfo {
+	return qoderModelInfo{
+		Key:            "qwen3.8-max",
+		DisplayName:    "Qwen3.8-Max",
+		MaxInputTokens: 180000,
+		Efforts:        []string{"low", "high"},
+		DefaultEffort:  "high",
+		Thinks:         true,
+	}
+}
+
+// Only the last tool result reaches the endpoint whole; older ones are cut to
+// the same fixed bytes on every later turn, which is what keeps the prefix
+// stable enough for the cache to hit.
+func TestQoderChatBodyTrimsOlderToolResults(t *testing.T) {
+	info := qoderCNStructuredInfo()
+	long := strings.Repeat("detailed output line\n", 400)
+	body := func() string {
+		return `[{"role":"user","content":"read both"},` +
+			`{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read","arguments":"{}"}},{"id":"call_2","type":"function","function":{"name":"read","arguments":"{}"}}]},` +
+			`{"role":"tool","tool_call_id":"call_1","content":` + jsonString(long) + `},` +
+			`{"role":"tool","tool_call_id":"call_2","content":` + jsonString(long) + `}]`
+	}
+	first := qoderToolResultsOf(t, build(t, body(), info, qoderBodyContext{Site: qoderCNSite}))
+	second := qoderToolResultsOf(t, build(t, body(), info, qoderBodyContext{Site: qoderCNSite}))
+	if len(first) != 2 {
+		t.Fatalf("tool turns wrong: %v", first)
+	}
+	if first[0] == long {
+		t.Fatal("an older result must be trimmed")
+	}
+	if !strings.Contains(first[0], strings.TrimSpace(qoderToolResultMarker)) {
+		t.Fatalf("the trim marker is missing: %q", first[0])
+	}
+	if first[1] != long {
+		t.Fatal("the result the turn is answering must stay whole")
+	}
+	if first[0] != second[0] {
+		t.Fatal("a trimmed result must send the same bytes on every turn")
+	}
+}
+
+func TestQoderChatBodyCarriesToolsAndToolTurns(t *testing.T) {
+	info := qoderCNStructuredInfo()
+	raw, err := qoderChatBodyWith("qwen3.8-max", []byte(`{
+		"model":"qwen3.8-max",
 		"messages":[
 			{"role":"user","content":"read it"},
 			{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.go\"}"}}]},
@@ -91,7 +264,7 @@ func TestQoderChatBodyCarriesToolsAndToolTurns(t *testing.T) {
 			{"role":"user","content":[{"type":"text","text":"and now?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}
 		],
 		"tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object","properties":{}}}}]
-	}`), info)
+	}`), info, qoderBodyContext{Site: qoderCNSite})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +335,10 @@ func TestQoderChatBodyDropsToolsWhenChoiceIsNone(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := decodeQoderBody(t, raw)
-	if _, ok := body["tools"]; ok {
+	// The key is present but empty: Qoder's client always sends its tools key,
+	// and an absent one is not the body it writes.
+	tools, ok := body["tools"].([]any)
+	if !ok || len(tools) != 0 {
 		t.Fatalf("tools must be taken off the request: %v", body["tools"])
 	}
 }
@@ -178,10 +354,45 @@ func TestQoderChatBodyAsksForRequiredToolChoiceInWords(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := decodeQoderBody(t, raw)
-	text := body["system"].([]any)[0].(map[string]any)["text"].(string)
+	messages := body["messages"].([]any)
+	text, _ := messages[0].(map[string]any)["content"].(string)
 	if !strings.Contains(text, "You must call an available function") {
 		t.Fatalf("the vendor's API is told the answer's format in words, got %q", text)
 	}
+}
+
+// build runs one OpenAI request through the body builder.
+func build(t *testing.T, messages string, info qoderModelInfo, context qoderBodyContext) map[string]any {
+	t.Helper()
+	raw, err := qoderChatBodyWith("ultimate", []byte(`{"model":"ultimate","messages":`+messages+`}`), info, context)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return decodeQoderBody(t, raw)
+}
+
+// jsonString renders a Go string as a JSON string literal.
+func jsonString(value string) string {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return `""`
+	}
+	return string(raw)
+}
+
+// qoderToolResultsOf reads the tool turns out of a built body, in order.
+func qoderToolResultsOf(t *testing.T, body map[string]any) []string {
+	t.Helper()
+	var out []string
+	for _, item := range body["messages"].([]any) {
+		message := item.(map[string]any)
+		if message["role"] != "tool" {
+			continue
+		}
+		text, _ := message["content"].(string)
+		out = append(out, text)
+	}
+	return out
 }
 
 // The level asked for has to become one the model actually offers, and thinking

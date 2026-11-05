@@ -84,6 +84,9 @@ func (s *Server) doOpenAIProviderRequest(ctx context.Context, r *http.Request, p
 		if qoderModel == "" {
 			qoderModel = strings.TrimSpace(provider.DefaultModel)
 		}
+		// The client's own conversation id, when it sends one, keys Qoder's
+		// upstream prompt cache, so it has to survive to the body builder.
+		ctx = withQoderSessionKey(ctx, requestSessionID(r, nil))
 		response, err := s.sendQoderChat(ctx, provider, qoderModel, body)
 		if response == nil {
 			return nil, err

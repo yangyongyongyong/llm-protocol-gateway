@@ -157,9 +157,137 @@ func TestQoderCOSYHeadersEnvelopeShape(t *testing.T) {
 	}
 }
 
-func TestQoderCOSYHeadersRefuseAnAccountWithoutAMachineID(t *testing.T) {
-	if _, err := qoderCOSYHeaders(qoderGlobalSite.qoderChatURL(), qoderAccount{UID: "u", Token: "t"}, "", 0); err == nil {
-		t.Fatal("expected an error when the account has no machine id")
+// The device identity is derived from the uid, so an account stored without a
+// machine id still signs: Qoder's own client never has one stored, it computes
+// it, and the envelope has to look the same either way.
+func TestQoderCOSYHeadersDeriveAMachineIdentityWhenNoneIsStored(t *testing.T) {
+	headers, err := qoderCOSYHeaders(qoderGlobalSite.qoderChatURL(), qoderAccount{UID: "fx-demo-uid", Token: "t"}, "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := headers["Cosy-MachineId"]; got != qoderDeriveID("fx-demo-uid", "machine") {
+		t.Fatalf("Cosy-MachineId = %q, want the derived machine id", got)
+	}
+	for _, required := range []string{"Cosy-Key", "Cosy-Date", "Cosy-User", "Cosy-MachineId", "Cosy-MachineToken", "Cosy-MachineType", "Cosy-MachineOS", "Cosy-MachineHostname", "Cosy-Version"} {
+		if strings.TrimSpace(headers[required]) == "" {
+			t.Errorf("%s missing from the envelope", required)
+		}
+	}
+	// An account without a uid cannot be signed for at all.
+	if _, err := qoderCOSYHeaders(qoderGlobalSite.qoderChatURL(), qoderAccount{Token: "t"}, "", 0); err == nil {
+		t.Fatal("expected an error when the account has no uid")
+	}
+}
+
+// The client identity in the envelope is the one the CLI claims, not the app's:
+// inference and the model list are served to the CLI, and every field below is
+// a fixed value in Qoder's own client.
+func TestQoderCOSYHeadersCarryTheClientsIdentity(t *testing.T) {
+	headers, err := qoderCOSYHeaders(qoderGlobalSite.qoderChatURL(), qoderAccount{UID: "u1", Token: "t"}, "", 1_700_000_000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"Cosy-Business-Product": "cli",
+		"Cosy-Business-Type":    "agent",
+		"Cosy-Scene":            "assistant",
+		"Cosy-ClientType":       "5",
+		"Cosy-ClientIp":         "169.254.198.161",
+		"Cosy-Data-Policy":      "agree",
+		"Cosy-Version":          "1.1.75",
+		"User-Agent":            "undici",
+		"Login-Version":         "v2",
+		"Accept-Encoding":       "identity",
+	}
+	for header, value := range want {
+		if headers[header] != value {
+			t.Errorf("%s = %q, want %q", header, headers[header], value)
+		}
+	}
+	// The machine id, token and type are three different values; sending one in
+	// all three is what a client Qoder never shipped looks like.
+	if headers["Cosy-MachineId"] == headers["Cosy-MachineToken"] ||
+		headers["Cosy-MachineToken"] == headers["Cosy-MachineType"] {
+		t.Fatalf("machine identity fields must differ: %+v", headers)
+	}
+	if len(headers["Cosy-MachineToken"]) != 43 {
+		t.Errorf("machine token is 43 characters, got %d", len(headers["Cosy-MachineToken"]))
+	}
+	if len(headers["Cosy-MachineType"]) != 18 {
+		t.Errorf("machine type is 18 characters, got %d", len(headers["Cosy-MachineType"]))
+	}
+	if hostname := headers["Cosy-MachineHostname"]; !strings.HasPrefix(hostname, "DESKTOP-") || len(hostname) != 15 {
+		t.Errorf("machine hostname = %q, want DESKTOP- and seven hex digits", hostname)
+	}
+}
+
+// The codec is Qoder's own: a shuffled alphabet, the padding character '$', and
+// the standard grouping rotated in three parts. These vectors come from the
+// vendor client, so a change here is a change the endpoint will refuse.
+func TestQoderEncodeBodyMatchesTheClientsCodec(t *testing.T) {
+	cases := []struct{ plain, wire string }{
+		{"", ""},
+		{"a", "$p$#"},
+		{"ab", "$SB#"},
+		{"abc", "MSK#"},
+		{"abcd", "$$KMD_#S"},
+		{"{}", "$kwm"},
+		{`{"x":1}`, "ep$$BMn%mYKI"},
+		{"hello", "q$FruHPH"},
+		{"abcdefghijkl", ")POtrHFOD(i#SKMD"},
+	}
+	for _, tc := range cases {
+		if got := qoderEncodeBody([]byte(tc.plain)); got != tc.wire {
+			t.Errorf("qoderEncodeBody(%q) = %q, want %q", tc.plain, got, tc.wire)
+		}
+	}
+}
+
+// The derived device identity is a function of the uid alone, and these vectors
+// are the client's own output.
+func TestQoderDerivedDeviceIdentity(t *testing.T) {
+	const uid = "fx-demo-uid"
+	if got := qoderDeriveID(uid, "machine"); got != "1aa25689-af59-4701-a8d2-05b206925edd" {
+		t.Errorf("machine id = %q", got)
+	}
+	if got := qoderDeriveMachineToken(uid); got != "65yzHqohRdD9Z3iyZZ_0NrsfofQoU1oB4yGKlLZ8sMF" {
+		t.Errorf("machine token = %q", got)
+	}
+	if got := qoderDeriveMachineType(uid); got != "706b608dd21e4e70a0" {
+		t.Errorf("machine type = %q", got)
+	}
+	if got := qoderDeriveMachineHostname(uid); got != "DESKTOP-5E64A1D" {
+		t.Errorf("machine hostname = %q", got)
+	}
+	// Two accounts must not share a machine identity.
+	if qoderDeriveID("uid-a", "machine") == qoderDeriveID("uid-b", "machine") {
+		t.Error("two accounts share a machine id")
+	}
+}
+
+// The identity blob is rebuilt only when the access token changes: Qoder's
+// client keeps one COSY key pair per signed-in session.
+func TestQoderCOSYSessionIsReusedUntilTheTokenChanges(t *testing.T) {
+	account := qoderAccount{UID: "session-uid", Token: "token-1"}
+	firstInfo, firstKey, err := qoderUserBlob(account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	againInfo, againKey, err := qoderUserBlob(account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstInfo != againInfo || firstKey != againKey {
+		t.Fatal("the key pair must be reused between requests")
+	}
+	rotated := account
+	rotated.Token = "token-2"
+	rotatedInfo, rotatedKey, err := qoderUserBlob(rotated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rotatedInfo == firstInfo || rotatedKey == firstKey {
+		t.Fatal("a rotated token must rebuild the key pair")
 	}
 }
 

@@ -319,6 +319,28 @@ func TestQoderChunkReaderReadsUsageAfterTheFinishFrame(t *testing.T) {
 	}
 }
 
+// An envelope that quotes its status is still a refusal: read as an int, one
+// quoted value made the whole frame unparseable and the refusal vanished into
+// a silently dropped line.
+func TestQoderStreamReadsAQuotedEnvelopeStatus(t *testing.T) {
+	reply := qoderFrame(t, map[string]any{
+		"statusCodeValue": "403",
+		"code":            "10605",
+		"body":            `{"isQueued":true,"retryAfterSeconds":7}`,
+	})
+	reader := newQoderChunkReader(strings.NewReader(reply), "ultimate")
+	out, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "error") {
+		t.Fatalf("a quoted status must still be reported, got %q", string(out))
+	}
+	if !strings.Contains(string(out), upstreamBusyErrorType) {
+		t.Fatalf("a queued refusal must be labelled busy, got %q", string(out))
+	}
+}
+
 func TestQoderFailureMapsUpstreamCodes(t *testing.T) {
 	cases := []struct {
 		name       string

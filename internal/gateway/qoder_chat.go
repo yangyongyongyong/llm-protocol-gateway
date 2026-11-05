@@ -32,14 +32,48 @@ const (
 	qoderCallOpen  = "\x3ctool_call\x3e"
 	qoderCallClose = "\x3c/tool_call\x3e"
 
-	// qoderSys is the line Qoder's own client puts first: the endpoint routes
-	// on it, so a request without it is not answered the same way.
-	qoderSys = "You are a Qoder agent. Use the instructions below and the tools available to you to assist the user."
-
 	// qoderDefaultMaxTokens is what the reply is given room for when the client
 	// asked for none.
 	qoderDefaultMaxTokens = 32000
+
+	// qoderTransientStatus is Qoder's front end wrapping a provider-side failure:
+	// the account is fine, the vendor's own upstream is not.
+	qoderTransientStatus = 418
+
+	// qoderMaxBodyBytes is the largest body the endpoint takes. Qoder sits
+	// behind a proxy with a 30 MB request limit that resets the connection
+	// rather than answering, and a reset reads as a transient network fault —
+	// retried until the account looks broken. 29 MB leaves room for the codec's
+	// growth.
+	qoderMaxBodyBytes = 29 << 20
+
+	// The English tails the client's own error classifier reads. Without them a
+	// busy model, an empty balance and a daily cap all get shown to the user as
+	// "your API key is invalid", because the classifier looks for the words and
+	// not at the status.
+	qoderQueuedHint      = " [rate limit: upstream model queue is full (10605), retry later]"
+	qoderQuotaHint       = " [quota exhausted: upstream account credits exhausted (112), top up or enable another account]"
+	qoderDailyHint       = " [usage limit reached: upstream daily request count exceeded (110), retry after local midnight]"
+	qoderSessionDeadHint = " [auth: the upstream session has expired, sign in again]"
 )
+
+// qoderSessionDeadMarkers are the answers Qoder's client reads as "this
+// session is over": the token lapsed server-side, so no retry on this account
+// can work and the user has to sign in again.
+var qoderSessionDeadMarkers = []string{"TOKEN_EXPIRE", "12153", "Offline user session not found"}
+
+// qoderSessionDead reports whether a refusal says the sign-in itself is gone.
+func qoderSessionDead(code, message string) bool {
+	if code == "12153" {
+		return true
+	}
+	for _, marker := range qoderSessionDeadMarkers {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
 
 var (
 	qoderFuncRe  = regexp.MustCompile(`(?s)\x3cfunction=([^>]+)\x3e(.*?)\x3c/function\x3e`)
@@ -104,36 +138,31 @@ func (s *Server) sendQoderChat(ctx context.Context, provider domain.Provider, mo
 	if !ok {
 		return nil, fmt.Errorf("Qoder 的模型列表里没有 %q，请在控制台同步模型或换一个模型", model)
 	}
-	plain, err := qoderChatBody(model, body, info)
+	plain, err := qoderChatBodyWith(model, body, info, qoderBodyContext{
+		SessionKey: qoderSessionKeyFrom(ctx),
+		Site:       qoderSiteOf(provider),
+	})
 	if err != nil {
 		return nil, err
 	}
 	wire := qoderEncodeBody(plain)
-	endpoint := qoderSiteOf(provider).qoderChatURL()
-	headers, err := qoderCOSYHeaders(endpoint, qoderAccount{
-		UID:       credential.UID,
-		Name:      credential.Name,
-		Email:     credential.Email,
-		Token:     credential.AccessToken,
-		MachineID: credential.MachineID,
-	}, wire, time.Now().Unix())
-	if err != nil {
-		return nil, err
+	if len(wire) > qoderMaxBodyBytes {
+		// Refused here rather than sent: the endpoint's proxy drops a body this
+		// size without answering, which the failover would read as a network
+		// fault and retry across the whole account pool.
+		return qoderFailureResponse(http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("请求体过大（编码后 %d 字节，上限 %d 字节）：网关已在本地拦下、未发送。请减少图片数量或尺寸后重试。", len(wire), qoderMaxBodyBytes), 0), nil
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(wire))
-	if err != nil {
-		return nil, err
+	site := qoderSiteOf(provider)
+	account := qoderAccount{
+		UID:          credential.UID,
+		Name:         credential.Name,
+		Email:        credential.Email,
+		Token:        credential.AccessToken,
+		MachineID:    credential.MachineID,
+		RefreshToken: credential.RefreshToken,
 	}
-	for key, value := range headers {
-		request.Header.Set(key, value)
-	}
-	request.Header.Set("Accept", "text/event-stream")
-	request.Header.Set("Cache-Control", "no-cache")
-	request.Header.Set("X-Model-Key", info.Key)
-	if info.Source != "" {
-		request.Header.Set("X-Model-Source", info.Source)
-	}
-	response, err := http.DefaultClient.Do(request)
+	response, err := qoderPost(ctx, site, qoderChatPath, wire, info.Key, info.Source, account)
 	if err != nil {
 		return nil, err
 	}
@@ -143,13 +172,34 @@ func (s *Server) sendQoderChat(ctx context.Context, provider domain.Provider, mo
 		status, message, wait := qoderFailure(response.StatusCode, payload)
 		return qoderFailureResponse(status, message, wait), nil
 	}
-	response.Body = newQoderChunkReader(response.Body, model)
+	reader := newQoderChunkReaderWithTools(response.Body, model, qoderDeclaredToolNames(body))
+	// A queue or a transient fault can be retried inside the stream, while
+	// nothing has reached the client yet. Reopening re-signs the call: the
+	// envelope's date is covered by the signature and must be fresh.
+	reader.ctx = ctx
+	reader.reopen = func(callCtx context.Context) (io.Reader, error) {
+		replay, replayErr := qoderPost(callCtx, site, qoderChatPath, wire, info.Key, info.Source, account)
+		if replayErr != nil {
+			return nil, replayErr
+		}
+		if replay.StatusCode/100 != 2 {
+			replayPayload, _ := io.ReadAll(io.LimitReader(replay.Body, 1<<20))
+			_ = replay.Body.Close()
+			_, message, _ := qoderFailure(replay.StatusCode, replayPayload)
+			return nil, errors.New(message)
+		}
+		return replay.Body, nil
+	}
+	response.Body = reader
 	response.Header.Set("Content-Type", "text/event-stream; charset=utf-8")
 	response.Header.Set("Cache-Control", "no-cache")
 	response.ContentLength = -1
 	return response, nil
 }
 
+// qoderPost sends one already-encoded body under a freshly signed envelope.
+// Signing is per call, not per request: the timestamp is inside the signature
+// and inside Cosy-Date, so a retried call has to be signed again.
 // qoderWithListing refetches the account's model list, reporting whether it now
 // has one.
 func (s *Server) qoderWithListing(ctx context.Context, provider domain.Provider) (domain.Provider, bool) {
@@ -176,50 +226,45 @@ func mustQoderListing(raw json.RawMessage) qoderListing {
 	return listing
 }
 
+// qoderSessionKeyContext carries the client's own conversation id to the body
+// builder: the branch that picks a provider still has the request, the transport
+// that signs the call does not.
+type qoderSessionKeyContext struct{}
+
+func withQoderSessionKey(ctx context.Context, key string) context.Context {
+	if strings.TrimSpace(key) == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, qoderSessionKeyContext{}, key)
+}
+
+func qoderSessionKeyFrom(ctx context.Context) string {
+	key, _ := ctx.Value(qoderSessionKeyContext{}).(string)
+	return key
+}
+
 // qoderChatBody is the plaintext JSON Qoder's agent_chat_generation takes for
 // an OpenAI chat completion request.
 func qoderChatBody(model string, raw []byte, info qoderModelInfo) ([]byte, error) {
+	return qoderChatBodyWith(model, raw, info, qoderBodyContext{})
+}
+
+// qoderChatBodyWith is qoderChatBody with the conversation's own context: the
+// session the client named, and the account's user type.
+func qoderChatBodyWith(model string, raw []byte, info qoderModelInfo, context qoderBodyContext) ([]byte, error) {
 	var chat map[string]any
 	if err := json.Unmarshal(raw, &chat); err != nil {
 		return nil, fmt.Errorf("解析对话请求失败: %w", err)
 	}
-	system := qoderSystemText(chat)
-	tools := qoderToolsOf(chat)
-	if len(tools) > 0 {
-		system += "\nYou must call an available function in this response."
-	}
-	sysBlock := map[string]any{"type": "text", "text": system}
-	thinking, effort := qoderEffort(qoderAskedEffort(chat), info)
-	maxTokens := qoderRequestedMaxTokens(chat)
-	params := map[string]any{"enable_thinking": thinking, "max_tokens": maxTokens}
-	if effort != "" {
-		params["reasoning_effort"] = effort
-	}
-	if window := qoderWindowFor(chat, info, maxTokens); window > 0 {
-		params["context_length"] = window
-	}
-	messages := append([]any{map[string]any{"role": "system", "content": []any{sysBlock}}}, qoderMessagesOf(chat)...)
-	body := map[string]any{
-		"parameters": params,
-		"business": map[string]any{
-			"product": "app", "version": qoderCOSYVersion, "type": "agent",
-			"id": randomHex(16), "name": model, "begin_at": time.Now().UnixMilli(), "stage": "start",
-		},
-		"agent_id":     "agent_common",
-		"task_id":      "common",
-		"session_type": "app",
-		"model_config": info.Config,
-		"system":       []any{sysBlock},
-		"messages":     messages,
-	}
-	if len(tools) > 0 {
-		body["tools"] = tools
-	}
-	return json.Marshal(body)
+	return qoderRequestBody(model, chat, info, context)
 }
 
-// qoderSystemText is Qoder's own line, then the caller's: the endpoint takes
-// one system block, so every system turn of the request is folded into it.
+// qoderSystemText is the one system block a Qoder request carries.
+//
+// A caller that sent a system prompt gets exactly that: it replaces Qoder's own
+// rather than being appended to it, because two system prompts give the model
+// two sets of instructions and neither wins. A caller that sent none gets
+// Qoder's, which is what its own client sends when nobody overrides it.
 func qoderSystemText(chat map[string]any) string {
 	var parts []string
 	for _, item := range messageList(chat) {
@@ -228,16 +273,15 @@ func qoderSystemText(chat map[string]any) string {
 			continue
 		}
 		if role := strings.ToLower(qoderStringOf(message["role"])); role == "system" || role == "developer" {
-			if text := qoderTextOf(message["content"]); text != "" {
+			if text := qoderTextOf(message["content"]); strings.TrimSpace(text) != "" {
 				parts = append(parts, text)
 			}
 		}
 	}
-	system := qoderSys
-	if len(parts) > 0 {
-		system += "\n\n" + strings.Join(parts, "\n\n")
+	if len(parts) == 0 {
+		return qoderBaseSystemPrompt
 	}
-	return system
+	return strings.Join(parts, "\n\n")
 }
 
 // qoderToolChoiceNone is the one case where the caller's tools must not be
@@ -297,7 +341,12 @@ func qoderToolsOf(chat map[string]any) []any {
 // tool turns named by tool_call_id. A tool turn holds text only, so images a
 // tool returned follow in a user turn — as the start of the user's own turn
 // when one comes next.
-func qoderMessagesOf(chat map[string]any) []any {
+//
+// structured says whether this model's history goes out as real tool turns. Not
+// every model Qoder serves accepts them: several answer a structured history
+// with a provider_error and lose the turn, so those get the text envelope the
+// vendor client itself writes instead (see qoderTextualAssistantContent).
+func qoderMessagesOf(chat map[string]any, structured bool) []any {
 	var out []any
 	names := map[string]string{}
 	var queued []any
@@ -322,11 +371,12 @@ func qoderMessagesOf(chat map[string]any) []any {
 		switch role {
 		case "tool":
 			text := qoderTextOf(message["content"])
+			callID := qoderStringOf(message["tool_call_id"])
+			name := firstNonEmpty(names[callID], qoderStringOf(message["name"]))
 			images := qoderImageBlocks(message["content"])
 			if len(images) > 0 {
-				callID := qoderStringOf(message["tool_call_id"])
 				of := "tool call " + callID
-				if name := firstNonEmpty(names[callID], qoderStringOf(message["name"])); name != "" {
+				if name != "" {
 					of = name + " (" + of + ")"
 				}
 				note := fmt.Sprintf("[The tool returned %d images; they follow in the next message.]", len(images))
@@ -340,14 +390,29 @@ func qoderMessagesOf(chat map[string]any) []any {
 				}
 				text += note
 			}
+			if !structured {
+				// The vendor client's text envelope: a user turn that names the
+				// tool its body came from. A model that cannot read structured
+				// tool turns still reads this one.
+				out = append(out, map[string]any{"role": "user", "content": qoderTextualToolResult(name, text)})
+				continue
+			}
 			out = append(out, map[string]any{
 				"role":         "tool",
-				"tool_call_id": qoderStringOf(message["tool_call_id"]),
+				"tool_call_id": callID,
 				"content":      text,
 			})
 		case "assistant":
-			calls := qoderAssistantCalls(message, names)
 			text := qoderTextOf(message["content"])
+			// The call names are needed by a later result's envelope whichever
+			// shape the call itself travels in, so they are collected either way.
+			calls := qoderAssistantCalls(message, names)
+			if !structured {
+				if content := qoderTextualAssistantContent(message, text); content != "" {
+					out = append(out, map[string]any{"role": "assistant", "content": content})
+				}
+				continue
+			}
 			if len(calls) > 0 {
 				out = append(out, map[string]any{"role": "assistant", "content": text, "tool_calls": calls})
 				continue
@@ -744,13 +809,29 @@ func qoderFailure(status int, payload []byte) (int, string, time.Duration) {
 		}
 		// A queue is the model being busy, not the account being out of
 		// standing: the same token reads models and usage fine, so nothing here
-		// marks the sign-in.
-		return http.StatusServiceUnavailable, fmt.Sprintf("Qoder %s，请 %ds 后重试", what, int(wait.Seconds())+1), wait
+		// marks the sign-in. The English tail is for the client's own error
+		// classifier: without it a busy model gets shown as a bad API key.
+		return http.StatusServiceUnavailable,
+			fmt.Sprintf("Qoder %s，请 %ds 后重试%s", what, int(wait.Seconds())+1, qoderQueuedHint),
+			wait
+	}
+	// Qoder's own client treats these three as "sign in again"; a 403 carrying
+	// one of them is that, whatever status the refusal came back as.
+	if qoderSessionDead(code, message) {
+		return http.StatusUnauthorized, "Qoder 的登录已失效，请重新登录" + qoderSessionDeadHint, 0
 	}
 	switch {
-	case qoderCodeIn(code, []string{"110", "112", "113", "114", "115", "116", "117", "118", "119", "122"}):
+	case code == "112" || strings.Contains(strings.ToLower(message), "pricingurl"):
+		return http.StatusTooManyRequests, "额度已用完：" + message + qoderQuotaHint, 0
+	case code == "110" || strings.Contains(strings.ToLower(message), "billing daily count exceeded"):
+		return http.StatusTooManyRequests, "额度已用完（今日次数已达上限，次日恢复）：" + message + qoderDailyHint, 0
+	case qoderCodeIn(code, []string{"113", "114", "115", "116", "117", "118", "119", "122"}):
 		return http.StatusTooManyRequests, "额度已用完：" + message, 0
-	case qoderCodeIn(code, []string{"406", "416", "430", "80411", "80412", "100400", "100401", "100403"}):
+	case code == "430":
+		// The vendor refuses a client it considers too old; nothing about the
+		// account or the request will change that.
+		return http.StatusBadRequest, "Qoder 客户端 / 网关版本过低，请升级（430）", 0
+	case qoderCodeIn(code, []string{"406", "416", "80411", "80412", "100400", "100401", "100403"}):
 		return http.StatusBadRequest, fmt.Sprintf("Qoder 拒绝了这个请求（%s）：%s", code, message), 0
 	case code == "105":
 		return http.StatusUnauthorized, "Qoder 的登录已失效，请重新登录", 0
@@ -761,6 +842,12 @@ func qoderFailure(status int, payload []byte) (int, string, time.Duration) {
 		return status, "Qoder：" + message, 0
 	case status == http.StatusTooManyRequests || strings.Contains(strings.ToLower(message), "quota"):
 		return http.StatusTooManyRequests, "额度已用完：" + message, 0
+	case status == qoderTransientStatus:
+		// 418 is Qoder's own front end wrapping a provider-side failure: it is
+		// not this account's fault, so it is reported as a transient upstream
+		// failure and the failover loop moves on instead of handing the client a
+		// status it has no meaning for.
+		return http.StatusBadGateway, "Qoder 的上游暂时不可用，请稍后重试：" + message, 0
 	}
 	return status, "Qoder：" + message, 0
 }
@@ -781,13 +868,25 @@ func qoderCodeIn(code string, set []string) bool {
 // expects, and Qoder's waiting time as Retry-After so the failover and the
 // client both honor it.
 func qoderFailureResponse(status int, message string, wait time.Duration) *http.Response {
-	kind := "api_error"
-	if status == http.StatusTooManyRequests {
-		kind = "rate_limit_error"
+	// Counted here because this is where a refusal becomes the client's
+	// response: a local size guard is not the vendor pushing back, so it is not
+	// counted as one.
+	if status != http.StatusRequestEntityTooLarge {
+		qoderNoteRefusal(status, message, wait)
 	}
+	kind := "api_error"
+	switch status {
+	case http.StatusTooManyRequests:
+		kind = "rate_limit_error"
+	case http.StatusRequestEntityTooLarge:
+		kind = "payload_too_large"
+	}
+	// The numeric code beside the message is what an OpenAI client shows and
+	// what some of them switch on; the status alone leaves them guessing.
 	payload, _ := json.Marshal(map[string]any{"error": map[string]any{
 		"message": message,
 		"type":    kind,
+		"code":    status,
 		"status":  status,
 	}})
 	response := &http.Response{

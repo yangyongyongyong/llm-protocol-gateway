@@ -17,6 +17,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -432,14 +433,38 @@ func qoderCatalogModels(providerID string, models []qoderStaticModel, infos []qo
 }
 
 // qoderFetchListing asks the site's model endpoint. The call carries the same
-// COSY envelope every /algo call does; a GET signs an empty body.
+// COSY envelope every /algo call does, and the listing is a GET that still
+// sends a body: the codec's form of "{}", which is what the signature covers.
+//
+// Any host may answer it: a listing is a cheap read, so a refused or unreachable
+// gateway is walked past rather than reported — the next candidate lists the
+// same models.
 func qoderFetchListing(ctx context.Context, site qoderSite, account qoderAccount) (json.RawMessage, error) {
-	endpoint := site.qoderModelsURL()
-	headers, err := qoderCOSYHeaders(endpoint, account, "", 0)
+	wire := qoderEncodeBody([]byte("{}"))
+	var lastErr error
+	for _, host := range site.qoderHosts() {
+		listing, err := qoderFetchListingFrom(ctx, host+qoderModelsPath, wire, account)
+		if err == nil {
+			return listing, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("qoder: 该站点没有可用的模型列表主机")
+	}
+	return nil, lastErr
+}
+
+// qoderFetchListingFrom is one attempt at one host.
+func qoderFetchListingFrom(ctx context.Context, endpoint, wire string, account qoderAccount) (json.RawMessage, error) {
+	headers, err := qoderCOSYHeaders(endpoint, account, wire, 0)
 	if err != nil {
 		return nil, err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, strings.NewReader(wire))
 	if err != nil {
 		return nil, err
 	}
@@ -515,11 +540,12 @@ func qoderAccountOf(provider domain.Provider) qoderAccount {
 		return qoderAccount{}
 	}
 	return qoderAccount{
-		UID:       provider.QoderPAT.UID,
-		Name:      provider.QoderPAT.Name,
-		Email:     provider.QoderPAT.Email,
-		Token:     provider.QoderPAT.AccessToken,
-		MachineID: provider.QoderPAT.MachineID,
+		UID:          provider.QoderPAT.UID,
+		Name:         provider.QoderPAT.Name,
+		Email:        provider.QoderPAT.Email,
+		Token:        provider.QoderPAT.AccessToken,
+		MachineID:    provider.QoderPAT.MachineID,
+		RefreshToken: provider.QoderPAT.RefreshToken,
 	}
 }
 

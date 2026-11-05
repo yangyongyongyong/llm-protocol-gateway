@@ -244,19 +244,31 @@ func newQoderCampaignSender(server *Server, providerID string, site qoderSite, c
 
 func (sender *qoderCampaignSender) call(ctx context.Context, method, endpoint string, dst any) error {
 	status, err := qoderCampaignCall(ctx, sender.site, method, endpoint, sender.token, sender.credential, dst)
-	if err == nil || !sender.rotatable || sender.rotationUsed || (status != http.StatusUnauthorized && status != http.StatusForbidden) {
-		return err
+	if err == nil {
+		return nil
 	}
-	sender.rotationUsed = true
-	rotated, refreshErr := sender.server.rotateQoderDeviceTokenFor(ctx, sender.providerID, sender.site, sender.credential)
-	if refreshErr != nil {
-		return err
+	refused := status == http.StatusUnauthorized || status == http.StatusForbidden
+	if refused && sender.rotatable && !sender.rotationUsed {
+		sender.rotationUsed = true
+		rotated, refreshErr := sender.server.rotateQoderDeviceTokenFor(ctx, sender.providerID, sender.site, sender.credential)
+		if refreshErr == nil {
+			sender.credential = rotated
+			if token, _ := qoderCampaignToken(rotated); token != "" {
+				sender.token = token
+			}
+			if _, retryErr := qoderCampaignCall(ctx, sender.site, method, endpoint, sender.token, sender.credential, dst); retryErr == nil {
+				return nil
+			}
+		}
 	}
-	sender.credential = rotated
-	if token, _ := qoderCampaignToken(rotated); token != "" {
-		sender.token = token
+	if refused {
+		// Some accounts' campaign pages answer the plain account identity even
+		// when the app's is refused: try it before reporting a failure the user
+		// can do nothing about.
+		if _, retryErr := qoderCampaignDo(ctx, method, endpoint, qoderAccountHeaders(sender.site, sender.credential), sender.token, dst); retryErr == nil {
+			return nil
+		}
 	}
-	_, err = qoderCampaignCall(ctx, sender.site, method, endpoint, sender.token, sender.credential, dst)
 	return err
 }
 
@@ -282,19 +294,23 @@ func qoderCampaignToken(credential domain.QoderCredential) (string, bool) {
 	return strings.TrimSpace(credential.AccessToken), rotatable
 }
 
-// qoderCampaignCall asks one campaigns URL as the account. Qoder's own client
-// sends these with Cosy-ClientType 10 and a plain "Qoder" user agent; the
-// international site additionally wants the machine identity of the Qoder
-// install, which only its native helper can hand out.
+// qoderCampaignCall asks one campaigns URL as the account's desktop client.
+//
+// The machine headers are the important part and the easy part to get wrong: the
+// vendor filters the whole campaign list for an account whose request carries a
+// derived machine identity rather than this machine's real one. So the six
+// machine headers go out only when the native helper answered — and on the site
+// that needs them, a request without them is not sent at all.
 func qoderCampaignCall(ctx context.Context, site qoderSite, method, endpoint, bearer string, credential domain.QoderCredential, dst any) (int, error) {
-	machine := map[string]string{}
-	if site.AuthType == domain.AuthTypeQoderPAT {
-		headers, err := qoderMachineIdentity(ctx, strings.TrimSpace(credential.UID))
-		if err != nil {
-			return 0, err
-		}
-		machine = headers
+	machine, err := qoderCampaignMachineIdentity(ctx, site, credential)
+	if err != nil {
+		return 0, err
 	}
+	return qoderCampaignDo(ctx, method, endpoint, qoderCampaignHeaders(site, machine), bearer, dst)
+}
+
+// qoderCampaignDo sends one request with the given headers.
+func qoderCampaignDo(ctx context.Context, method, endpoint string, headers map[string]string, bearer string, dst any) (int, error) {
 	var body io.Reader
 	if method == http.MethodPost {
 		body = strings.NewReader("{}")
@@ -303,13 +319,17 @@ func qoderCampaignCall(ctx context.Context, site qoderSite, method, endpoint, be
 	if err != nil {
 		return 0, err
 	}
-	request.Header.Set("Accept", "application/json")
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Authorization", "Bearer "+bearer)
-	request.Header.Set("Cosy-ClientType", "10")
-	request.Header.Set("User-Agent", "Qoder")
-	for key, value := range machine {
+	for key, value := range headers {
+		if value == "" {
+			continue
+		}
 		request.Header.Set(key, value)
+	}
+	// The account's own bearer stays authoritative: the header builders describe
+	// the client, not the credential.
+	request.Header.Set("Authorization", "Bearer "+bearer)
+	if method == http.MethodPost {
+		request.Header.Set("Content-Type", "application/json")
 	}
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
@@ -329,6 +349,55 @@ func qoderCampaignCall(ctx context.Context, site qoderSite, method, endpoint, be
 	return response.StatusCode, nil
 }
 
+// qoderCampaignHeaders is what Qoder's desktop client sends to the campaign
+// pages: the app's own client identity, plus this machine's identity when the
+// native helper could name it.
+func qoderCampaignHeaders(site qoderSite, machine map[string]string) map[string]string {
+	headers := map[string]string{
+		"Accept":          "application/json",
+		"User-Agent":      "Qoder",
+		"Cosy-ClientType": qoderClientTypeDesktop,
+		// The campaign pages are served to the app, whose version is its own —
+		// not the CLI version the inference calls claim.
+		"Cosy-Version": qoderDesktopVersion,
+	}
+	for key, value := range machine {
+		headers[key] = value
+	}
+	return headers
+}
+
+// qoderDesktopVersion is the app version the campaign pages are served to.
+const qoderDesktopVersion = "0.4.8"
+
+// qoderAccountHeaders is the plain account identity: the one the check-in, quota
+// and userinfo endpoints take. It carries no Cosy headers at all — the account
+// pages and the app pages are two different clients to Qoder.
+func qoderAccountHeaders(site qoderSite, credential domain.QoderCredential) map[string]string {
+	uid := strings.TrimSpace(credential.UID)
+	referer := strings.TrimRight(site.Web, "/") + "/"
+	return map[string]string{
+		"Accept":     "application/json, text/plain, */*",
+		"User-Agent": qoderAccountUserAgent(site),
+		"Origin":     site.Web,
+		"Referer":    referer,
+		// A fresh request id per call, and ids derived from the account so the
+		// same account looks like the same device on every call.
+		"X-Request-ID": randomHex(16),
+		"X-Machine-ID": qoderDeriveID(uid, "machine"),
+		"X-Session-ID": qoderDeriveID(uid, "session"),
+	}
+}
+
+// qoderAccountUserAgent is the user agent the account endpoints are served to:
+// the domestic client calls itself QoderWork, the international one Qoder.
+func qoderAccountUserAgent(site qoderSite) string {
+	if site.AuthType == domain.AuthTypeQoderCN {
+		return "QoderWork/" + qoderCOSYVersion
+	}
+	return "Qoder/" + qoderCOSYVersion
+}
+
 // ---- the device identity Qoder's international site asks for ---------------
 
 var qoderMachineMu sync.Mutex
@@ -346,9 +415,26 @@ type qoderMachineCacheEntry struct {
 // binary, and it is refused rather than sent upstream.
 var printableHeaderValue = regexp.MustCompile(`^[\x20-\x7e]+$`)
 
-// qoderMachineIdentity is the Cosy-MachineToken / Cosy-MachineType pair Qoder's
-// native helper reads off this machine. The uid goes over stdin, never on the
-// command line.
+// qoderCampaignMachineIdentity is this machine's identity headers for the site
+// the account belongs to, or nothing at all on the site that does not ask.
+//
+// Qoder CN's campaign pages are served without a machine identity; the
+// international site checks it, and a request that cannot carry it is refused
+// before it leaves here rather than answered with a filtered list.
+func qoderCampaignMachineIdentity(ctx context.Context, site qoderSite, credential domain.QoderCredential) (map[string]string, error) {
+	if site.AuthType != domain.AuthTypeQoderPAT {
+		return nil, nil
+	}
+	return qoderMachineIdentity(ctx, strings.TrimSpace(credential.UID))
+}
+
+// qoderMachineIdentity is this machine's identity as Qoder's native helper reads
+// it: the token, its type, the machine code, plus the OS and hostname the client
+// reports alongside them. The uid goes over stdin, never on the command line.
+//
+// All six travel together because they only mean something together: a request
+// carrying some of a machine's identity is neither this machine nor a derived
+// one, and the vendor treats it as a client it did not ship.
 func qoderMachineIdentity(ctx context.Context, uid string) (map[string]string, error) {
 	if strings.TrimSpace(uid) == "" {
 		return nil, errors.New("Qoder 签到要按账号 uid 读本机设备身份，请重新登录")
@@ -385,19 +471,59 @@ func qoderMachineIdentity(ctx context.Context, uid string) (map[string]string, e
 	var identity struct {
 		MachineToken string `json:"machineToken"`
 		MachineType  string `json:"machineType"`
+		MachineCode  string `json:"machineCode"`
 	}
 	if json.Unmarshal([]byte(line), &identity) != nil {
 		return nil, errors.New("Qoder 签到：本机 Qoder 给的设备身份读不出来，请重启或更新 Qoder")
 	}
 	token := strings.TrimSpace(identity.MachineToken)
 	kind := strings.TrimSpace(identity.MachineType)
+	code := strings.TrimSpace(identity.MachineCode)
 	if token == "" || kind == "" || len(token) > 4096 || len(kind) > 4096 ||
 		!printableHeaderValue.MatchString(token) || !printableHeaderValue.MatchString(kind) {
 		return nil, errors.New("Qoder 签到：本机 Qoder 给的设备身份不合法，请重启或更新 Qoder")
 	}
-	headers := map[string]string{"Cosy-MachineToken": token, "Cosy-MachineType": kind}
+	if code == "" || len(code) > 4096 || !printableHeaderValue.MatchString(code) {
+		// The code is derived from the uid when the helper does not name one,
+		// which keeps the six headers coherent instead of five-and-a-half.
+		code = qoderDeriveID(uid, "machinecode")
+	}
+	headers := map[string]string{
+		"Cosy-MachineId":       qoderDeriveID(uid, "machine"),
+		"Cosy-MachineToken":    token,
+		"Cosy-MachineType":     kind,
+		"Cosy-MachineCode":     code,
+		"Cosy-MachineOS":       qoderMachineOS(),
+		"Cosy-MachineHostname": qoderLocalHostname(),
+	}
 	qoderMachineIdentities[uid] = qoderMachineCacheEntry{headers: headers, at: time.Now()}
 	return headers, nil
+}
+
+// qoderLocalHostname is this machine's own name, normalised the way the vendor
+// client sends it: visible ASCII only, trimmed to what a header takes. An empty
+// answer means the header is left out rather than filled with a guess.
+func qoderLocalHostname() string {
+	name, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	name = strings.TrimSpace(name)
+	// Header values are Latin-1 here: anything else is folded to a dash so a
+	// machine named in another script still produces a legal value.
+	var cleaned strings.Builder
+	for _, char := range name {
+		if char >= 0x20 && char <= 0x7e {
+			cleaned.WriteRune(char)
+			continue
+		}
+		cleaned.WriteByte('-')
+	}
+	out := strings.Trim(cleaned.String(), "- ")
+	if len(out) > 96 {
+		out = strings.TrimRight(out[:96], "- ")
+	}
+	return out
 }
 
 // qoderRuntimeInfoPath finds Qoder's native device-identity helper: the desktop

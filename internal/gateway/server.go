@@ -453,6 +453,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /__monitor/rules", s.handleMonitorRules)
 	mux.HandleFunc("PUT /__monitor/rules", s.handleMonitorUpdateRules)
 	mux.HandleFunc("PATCH /__settings/web-exposed", s.handleSetWebExposed)
+	// What Qoder says when it refuses, and a probe that tells a busy model from
+	// a broken account.
+	mux.HandleFunc("GET /__qoder/telemetry", s.handleQoderTelemetry)
+	mux.HandleFunc("POST /__qoder/diag/queue", s.handleQoderQueueDiag)
 	mux.HandleFunc("PATCH /__public-access", s.handleUpdatePublicAccess)
 	mux.HandleFunc("PATCH /__endpoints/{id}", s.handleUpdateEndpoint)
 	mux.HandleFunc("GET /__public", s.handlePublicStatus)
@@ -3380,7 +3384,7 @@ func (s *Server) executeProviderChatHTTP(r *http.Request, provider domain.Provid
 		if refreshErr != nil {
 			return providerChatHTTPResult{Error: refreshErr.Error(), TargetURL: endpoint, LatencyMs: time.Since(started).Milliseconds()}
 		}
-		response, sendErr := s.sendQoderChat(r.Context(), refreshed, resolvedModel, body)
+		response, sendErr := s.sendQoderChat(withQoderSessionKey(r.Context(), requestSessionID(r, payload)), refreshed, resolvedModel, body)
 		if response == nil {
 			message := "Qoder 没有应答"
 			if sendErr != nil {

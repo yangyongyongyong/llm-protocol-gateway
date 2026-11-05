@@ -1179,6 +1179,13 @@ func (s *Server) recordProviderRequestOutcome(providerID string, status int, bod
 // next backup provider. retryAfter is the attempt's upstream Retry-After header,
 // which (with the body's reset hints) decides how long a cooldown lasts.
 func (s *Server) applyProviderFailoverOutcome(providerID string, status int, body []byte, retryAfter string, err error) bool {
+	return s.applyProviderFailoverOutcomeCtx(context.Background(), providerID, status, body, retryAfter, err)
+}
+
+// applyProviderFailoverOutcomeCtx is applyProviderFailoverOutcome with the
+// request's own context, which is where a Qoder failure waits to be charged
+// (see provider_cooldown_qoder.go).
+func (s *Server) applyProviderFailoverOutcomeCtx(ctx context.Context, providerID string, status int, body []byte, retryAfter string, err error) bool {
 
 	providerID = strings.TrimSpace(providerID)
 	if providerID == "" {
@@ -1204,9 +1211,15 @@ func (s *Server) applyProviderFailoverOutcome(providerID string, status int, bod
 	}
 	switch class {
 	case failoverHard:
+		if s.applyQoderCooldown(ctx, providerID, class, status, body, retryAfter, reason, err) {
+			return true
+		}
 		s.clearSoftFailures(providerID)
 		s.markProviderUnavailable(providerID, true, reason, retryAfter, body)
 	case failoverSoft:
+		if s.applyQoderCooldown(ctx, providerID, class, status, body, retryAfter, reason, err) {
+			return true
+		}
 		count := s.bumpSoftFailure(providerID)
 		if count >= providerSoftFailureThreshold {
 			s.markProviderUnavailable(providerID, false, fmt.Sprintf("%s consecutive=%d", reason, count), retryAfter, body)
@@ -1279,6 +1292,9 @@ func (s *Server) executeProtocolFlowWithFailover(
 	matchedKey domain.APIKey,
 	gatewayKeyMatched bool,
 ) (int, TokenUsage, []byte, domain.RouteDecision, string, error) {
+	// One request, one ledger of failures on probation: a Qoder failure is only
+	// charged once some account answers this turn (see provider_cooldown_qoder.go).
+	r = r.WithContext(withQoderBlame(r.Context()))
 	// The key's own quota is decided before any provider is touched: switching
 	// accounts would not help, since every provider on the chain is refused by the
 	// same key, and a refusal that reaches an upstream spends that account's
@@ -1490,7 +1506,7 @@ func (s *Server) executeProtocolFlowWithFailover(
 				w.Header().Set("Retry-After", strconv.Itoa(laneWait))
 				return http.StatusTooManyRequests, TokenUsage{}, nil, attemptDecision, attemptModel, execErr
 			}
-			transportFailoverWorthy := s.applyProviderFailoverOutcome(providerID, 0, nil, "", execErr)
+			transportFailoverWorthy := s.applyProviderFailoverOutcomeCtx(r.Context(), providerID, 0, nil, "", execErr)
 			// Transport errors are worth another account only while nothing of
 			// this turn has reached the client. Once the first byte is out —
 			// a streamed request, or a deferred attempt whose turn was
@@ -1553,7 +1569,7 @@ func (s *Server) executeProtocolFlowWithFailover(
 			return status, usage, respBody, attemptDecision, attemptModel, r.Context().Err()
 		}
 
-		attemptFailoverWorthy := s.applyProviderFailoverOutcome(providerID, status, respBody, writer.UpstreamHeader("Retry-After"), nil)
+		attemptFailoverWorthy := s.applyProviderFailoverOutcomeCtx(r.Context(), providerID, status, respBody, writer.UpstreamHeader("Retry-After"), nil)
 		if canDefer && attemptFailoverWorthy {
 			noteScheduleAttempt(r.Context(), monitor.RequestAttempt{ProviderID: providerID, Model: attemptModel, Status: status, Ms: elapsed, Reason: attemptFailoverReason(respBody), Error: summarizeUpstreamHTTPError(status, respBody), Deferred: true})
 			writer.Discard()
@@ -1603,6 +1619,9 @@ func (s *Server) executeProtocolFlowWithFailover(
 		if !attemptFailoverWorthy {
 			s.setSessionPinFor(sessionKey, providerID, s.sessionPinTTL(matchedKey.ScheduleMode))
 			served = true
+			// An account answered this turn, so the refusals that came before it
+			// really were those accounts' own.
+			qoderBlameBucketFrom(r.Context()).flush(s)
 		}
 		s.noteProviderUsage(providerID, usage)
 		noteScheduleAttempt(r.Context(), monitor.RequestAttempt{ProviderID: providerID, Model: attemptModel, Status: status, Ms: elapsed, Reason: attemptReasonServed})

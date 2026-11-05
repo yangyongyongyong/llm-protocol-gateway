@@ -12,10 +12,13 @@ package gateway
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -33,22 +36,103 @@ type qoderChunkReader struct {
 	toolIndex int
 	nextCall  int
 	usage     map[string]any
+	// pendingCall holds a native tool call until its name arrives, keyed by the
+	// upstream's index; emittedCall and emittedIndex remember which of them have
+	// already reached the client, and under which index this gateway gave them.
+	pendingCall  map[int]*qoderNativeCall
+	emittedCall  map[int]bool
+	emittedIndex map[int]int
 	// finishReason is what the turn ended on, remembered until the last frame:
 	// Qoder sends its usage after the finish, in a chunk with no choices.
 	finishReason string
+	// ctx and reopen are what let a refusal be retried on the same account
+	// rather than handed to the failover loop: a queue is the model being busy,
+	// so another account would answer the same way, and the wait is something
+	// the client can be told about while it happens.
+	ctx    context.Context
+	reopen func(context.Context) (io.Reader, error)
+	// dataSent says a chunk with content or a call reached the client: once that
+	// happened the answer is under way and retrying is no longer possible.
+	dataSent bool
+	// queueRounds, queueSince and reopenRounds bound the two kinds of retry.
+	queueRounds  int
+	queueSince   time.Time
+	reopenRounds int
+	// body is the upstream stream being read. A retry replaces it, so the reader
+	// owns closing it: whoever abandons the reader must not leave a connection
+	// open behind it.
+	body io.Closer
+}
+
+// qoderQueue* bound how long a queued request waits before the refusal is passed
+// on. The per-round wait is capped as well: a vendor that names an hour must not
+// park the client for an hour, and the total budget is what finally decides.
+const (
+	qoderQueueMaxRounds   = 3
+	qoderQueueWaitMax     = 180 * time.Second
+	qoderQueueBudget      = 600 * time.Second
+	qoderQueueSingleWait  = 60 * time.Second
+	qoderQueueDefaultWait = 30 * time.Second
+	qoderQueueJitterMax   = 2000 // milliseconds
+	// qoderReopenRounds is how many times a transient upstream failure is
+	// retried on the same account before the failover loop is given the turn.
+	qoderReopenRounds = 2
+)
+
+var qoderSleep = time.Sleep
+
+// qoderNativeCall is a tool call read off the upstream's own delta: the pieces
+// arrive over several frames, in no fixed order.
+type qoderNativeCall struct {
+	id        string
+	name      string
+	arguments string
 }
 
 func newQoderChunkReader(body io.Reader, model string) *qoderChunkReader {
+	return newQoderChunkReaderWithTools(body, model, nil)
+}
+
+// newQoderChunkReaderWithTools is newQoderChunkReader for a request that
+// declared tools: the names are what let a leaked call be told from prose about
+// one, so only a block naming a declared tool is lifted.
+func newQoderChunkReaderWithTools(body io.Reader, model string, tools map[string]bool) *qoderChunkReader {
+	reader := &qoderChunkReader{
+		scanner:      newQoderScanner(body),
+		id:           "chatcmpl-" + randomHex(6),
+		created:      time.Now().Unix(),
+		model:        model,
+		toolIndex:    -1,
+		text:         qoderText{allowed: tools},
+		pendingCall:  map[int]*qoderNativeCall{},
+		emittedCall:  map[int]bool{},
+		emittedIndex: map[int]int{},
+	}
+	if closer, ok := body.(io.Closer); ok {
+		reader.body = closer
+	}
+	return reader
+}
+
+// newQoderScanner reads one upstream stream line by line.
+func newQoderScanner(body io.Reader) *bufio.Scanner {
 	scanner := bufio.NewScanner(body)
 	// One frame can carry a whole tool call's argument blob.
 	scanner.Buffer(make([]byte, 0, 64*1024), 4<<20)
-	return &qoderChunkReader{
-		scanner:   scanner,
-		id:        "chatcmpl-" + randomHex(6),
-		created:   time.Now().Unix(),
-		model:     model,
-		toolIndex: -1,
+	return scanner
+}
+
+// pendingCall is the call being assembled for one upstream index.
+func (r *qoderChunkReader) pendingCallFor(index int) *qoderNativeCall {
+	if r.pendingCall == nil {
+		r.pendingCall = map[int]*qoderNativeCall{}
 	}
+	call, ok := r.pendingCall[index]
+	if !ok {
+		call = &qoderNativeCall{}
+		r.pendingCall[index] = call
+	}
+	return call
 }
 
 func (r *qoderChunkReader) Read(p []byte) (int, error) {
@@ -79,7 +163,16 @@ func (r *qoderChunkReader) Read(p []byte) (int, error) {
 	}
 }
 
-func (r *qoderChunkReader) Close() error { return nil }
+// Close closes the upstream stream this reader was reading, whichever attempt
+// that is by now: an abandoned turn must not leave a connection open.
+func (r *qoderChunkReader) Close() error {
+	if r.body == nil {
+		return nil
+	}
+	err := r.body.Close()
+	r.body = nil
+	return err
+}
 
 // consume takes one SSE line. Qoder frames its replies as plain "data:" lines,
 // and a line that is not one — an event name, a comment, a keep-alive — carries
@@ -93,7 +186,11 @@ func (r *qoderChunkReader) consume(line string) {
 		return
 	}
 	var envelope struct {
-		StatusCodeValue int             `json:"statusCodeValue"`
+		// The status arrives as a number on most frames and as a string on
+		// some, so it is read as raw bytes: typed as an int, one quoted status
+		// makes the whole envelope unreadable and the frame is dropped — which
+		// looks exactly like a refusal that never happened.
+		StatusCodeValue json.RawMessage `json:"statusCodeValue"`
 		Code            json.Number     `json:"code"`
 		Message         string          `json:"message"`
 		Body            json.RawMessage `json:"body"`
@@ -105,23 +202,35 @@ func (r *qoderChunkReader) consume(line string) {
 	// the field has to be unwrapped before it can be read; an envelope that
 	// sends it as an object is taken as it stands.
 	body := qoderEnvelopeBody(envelope.Body)
-	if envelope.StatusCodeValue != 0 && envelope.StatusCodeValue != http.StatusOK {
+	status := qoderEnvelopeStatus(envelope.StatusCodeValue)
+	if status != 0 && status != http.StatusOK {
 		data := body
 		if len(data) == 0 {
 			data = []byte(payload)
 		}
-		status, message, wait := qoderFailure(envelope.StatusCodeValue, data)
+		answerStatus, message, wait := qoderFailure(status, data)
 		// The queue verdict lives on the envelope, not always in its body: a
 		// body that is only the queue state names no code, so qoderFailure
 		// read from it alone answers a plain 403 and the account looks broken.
 		// Any frame whose envelope says 10605 is the model being busy, never
 		// the account — ask again with the whole frame and keep the wait.
 		if qoderEnvelopeQueued(envelope.Code, data) && wait == 0 {
-			if s2, m2, w2 := qoderFailure(envelope.StatusCodeValue, []byte(payload)); w2 > 0 {
-				status, message, wait = s2, m2, w2
+			if s2, m2, w2 := qoderFailure(status, []byte(payload)); w2 > 0 {
+				answerStatus, message, wait = s2, m2, w2
 			}
 		}
-		r.emitErrorQueued(fmt.Sprintf("%s（HTTP %d）", message, status), wait)
+		// A queued model answers every account the same way, so the wait is
+		// worth taking here rather than handing the turn on. A transient fault
+		// is retried a couple of times on this account before the failover loop
+		// sees it. Neither is possible once the answer has started.
+		if qoderEnvelopeQueued(envelope.Code, data) || wait > 0 {
+			if r.retryQueued(wait) {
+				return
+			}
+		} else if r.retryTransient(answerStatus) {
+			return
+		}
+		r.emitErrorQueued(fmt.Sprintf("%s（HTTP %d）", message, answerStatus), wait)
 		return
 	}
 	if strings.TrimSpace(string(body)) == "[DONE]" {
@@ -150,9 +259,26 @@ func (r *qoderChunkReader) consume(line string) {
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 		Usage map[string]any `json:"usage"`
+		// The vendor sometimes puts an error inside an otherwise normal chunk.
+		// It is counted, not acted on: the frame's own status is what decides
+		// how the turn ends.
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
 	}
 	if json.Unmarshal(body, &chunk) != nil {
 		return
+	}
+	if chunk.Error.Message != "" {
+		message := chunk.Error.Message
+		if chunk.Error.Type != "" {
+			message += " " + chunk.Error.Type
+		}
+		// Counted only: which kinds have been seen is exposed through the
+		// telemetry snapshot, and the frame's own status still decides the turn.
+		_, _ = noteQoderInnerError(message)
 	}
 	if len(chunk.Choices) == 0 {
 		if chunk.Usage != nil {
@@ -184,25 +310,44 @@ func (r *qoderChunkReader) consume(line string) {
 		if index != r.toolIndex {
 			r.flushText()
 			r.toolIndex = index
-			id := strings.TrimSpace(call.ID)
-			if id == "" {
-				id = "call_" + randomHex(16)
+		}
+		pending := r.pendingCallFor(index)
+		if id := strings.TrimSpace(call.ID); id != "" {
+			pending.id = id
+		}
+		if name := strings.TrimSpace(call.Function.Name); name != "" {
+			pending.name = name
+		}
+		pending.arguments += call.Function.Arguments
+		if r.emittedCall[index] {
+			if call.Function.Arguments != "" {
+				r.emit(map[string]any{"tool_calls": []any{map[string]any{
+					"index": r.emittedIndex[index],
+					"function": map[string]any{
+						"arguments": call.Function.Arguments,
+					},
+				}}})
 			}
-			r.emit(map[string]any{"tool_calls": []any{map[string]any{
-				"index": r.nextCall, "id": id, "type": "function",
-				"function": map[string]any{"name": call.Function.Name, "arguments": ""},
-			}}})
-			r.nextCall++
-			r.text.sawTool = true
+			continue
 		}
-		if call.Function.Arguments != "" {
-			r.emit(map[string]any{"tool_calls": []any{map[string]any{
-				"index": r.nextCall - 1,
-				"function": map[string]any{
-					"arguments": call.Function.Arguments,
-				},
-			}}})
+		// A call whose name has not arrived is not a call yet: putting an empty
+		// name on the wire gives the client a tool it cannot look up, and some
+		// of them retry the same turn forever.
+		if pending.name == "" {
+			continue
 		}
+		r.emittedCall[index] = true
+		r.emittedIndex[index] = r.nextCall
+		id := pending.id
+		if id == "" {
+			id = "call_" + randomHex(16)
+		}
+		r.emit(map[string]any{"tool_calls": []any{map[string]any{
+			"index": r.nextCall, "id": id, "type": "function",
+			"function": map[string]any{"name": pending.name, "arguments": pending.arguments},
+		}}})
+		r.nextCall++
+		r.text.sawTool = true
 	}
 	if chunk.Choices[0].FinishReason != "" {
 		// The finish reason does not end the reading: Qoder sends its usage in
@@ -242,6 +387,17 @@ func (r *qoderChunkReader) emit(delta map[string]any) {
 	if !r.began {
 		r.began = true
 		r.writeChunk(map[string]any{"role": "assistant", "content": ""}, "", nil)
+	}
+	// Anything with substance ends the window in which a refusal could still be
+	// retried: the client is already reading this answer.
+	if _, ok := delta["content"]; ok {
+		r.dataSent = true
+	}
+	if text, ok := delta["reasoning_content"].(string); ok && text != "" {
+		r.dataSent = true
+	}
+	if _, ok := delta["tool_calls"]; ok {
+		r.dataSent = true
 	}
 	r.writeChunk(delta, "", nil)
 }
@@ -289,7 +445,10 @@ func (r *qoderChunkReader) finish() {
 	}
 	finish := "stop"
 	switch {
-	case r.text.sawTool || r.toolIndex >= 0:
+	case r.text.sawTool || r.nextCall > 0:
+		// nextCall counts the calls that actually reached the client: one held
+		// back for a missing name is not a call, so a turn that only held one
+		// still finished normally.
 		finish = "tool_calls"
 	case r.finishReason == "length":
 		// A reply cut off by the token budget is not a finished one: the agent
@@ -321,6 +480,9 @@ func (r *qoderChunkReader) emitErrorQueued(message string, wait time.Duration) {
 	if r.done {
 		return
 	}
+	// A refusal that arrives inside the stream is still a refusal the client
+	// sees; it is counted here because no HTTP status carried it.
+	qoderNoteRefusal(http.StatusServiceUnavailable, message, wait)
 	errType := "api_error"
 	if wait > 0 {
 		errType = upstreamBusyErrorType
@@ -328,6 +490,119 @@ func (r *qoderChunkReader) emitErrorQueued(message string, wait time.Duration) {
 	payload, _ := json.Marshal(map[string]any{"error": map[string]any{"message": message, "type": errType}})
 	r.out = append(r.out, []byte("data: "+string(payload)+"\n\n"))
 	r.done = true
+}
+
+// retryQueued waits out a queued model and asks again. It reports whether the
+// turn was handed to a fresh attempt; false means the refusal has to surface.
+//
+// The wait is something the client is told about, not a silent pause: Qoder's
+// own client reports the queue, and a request that sits mute for minutes reads
+// as a hang. Nothing else can be tried instead — a queue is the model, not the
+// account — so the turn stays here while the budget lasts.
+func (r *qoderChunkReader) retryQueued(wait time.Duration) bool {
+	if r.reopen == nil || r.dataSent || r.done {
+		return false
+	}
+	if r.queueRounds >= qoderQueueMaxRounds {
+		return false
+	}
+	if wait <= 0 {
+		wait = qoderQueueDefaultWait
+	}
+	if wait > qoderQueueWaitMax {
+		return false
+	}
+	if r.queueSince.IsZero() {
+		r.queueSince = time.Now()
+	}
+	if time.Since(r.queueSince)+wait > qoderQueueBudget {
+		return false
+	}
+	r.queueRounds++
+	r.emitQueueNotice(wait)
+	sleep := wait
+	if sleep > qoderQueueSingleWait {
+		sleep = qoderQueueSingleWait
+	}
+	qoderSleep(sleep + time.Second + qoderQueueJitter())
+	return r.reload()
+}
+
+// retryTransient asks again after a fault that says the vendor's own upstream
+// stumbled rather than this account: a couple of tries on the same account, then
+// the failover loop decides.
+func (r *qoderChunkReader) retryTransient(status int) bool {
+	if r.reopen == nil || r.dataSent || r.done {
+		return false
+	}
+	if status < http.StatusInternalServerError && status != qoderTransientStatus {
+		return false
+	}
+	if r.reopenRounds >= qoderReopenRounds {
+		return false
+	}
+	r.reopenRounds++
+	qoderSleep(time.Duration(r.reopenRounds) * time.Second)
+	return r.reload()
+}
+
+// reload swaps in a fresh upstream stream. The one being abandoned is closed
+// here: it belongs to this reader, not to the caller of reopen.
+func (r *qoderChunkReader) reload() bool {
+	if r.reopen == nil {
+		return false
+	}
+	_ = r.Close()
+	body, err := r.reopen(r.ctx)
+	if err != nil || body == nil {
+		// Nothing more can be asked of this account; the refusal that stopped
+		// the retry is what the client has to see.
+		r.reopen = nil
+		return false
+	}
+	r.scanner = newQoderScanner(body)
+	if closer, ok := body.(io.Closer); ok {
+		r.body = closer
+	}
+	return true
+}
+
+// emitQueueNotice tells the client the model is busy and how long it has waited.
+// It is an ordinary chunk with no content, so every client keeps reading it as
+// an empty delta while the queue clears.
+func (r *qoderChunkReader) emitQueueNotice(wait time.Duration) {
+	waited := int(time.Since(r.queueSince).Seconds())
+	notice := map[string]any{
+		"id":      r.id,
+		"object":  "chat.completion.chunk",
+		"created": r.created,
+		"model":   r.model,
+		"choices": []any{map[string]any{
+			"index": 0, "delta": map[string]any{"content": ""}, "finish_reason": nil,
+		}},
+		"qoder_queue": map[string]any{
+			"queued":         true,
+			"waited_seconds": waited,
+			"wait_seconds":   int(wait.Seconds()),
+			"budget_seconds": int(qoderQueueBudget.Seconds()),
+			"message": fmt.Sprintf("上游模型排队中（10605 / RESOURCE_LIMIT）：已等待 %d 秒，仍在队列中",
+				waited),
+		},
+	}
+	raw, err := json.Marshal(notice)
+	if err != nil {
+		return
+	}
+	r.out = append(r.out, []byte("data: "+string(raw)+"\n\n"))
+}
+
+// qoderQueueJitter is the spread added to a queue wait: every client of a busy
+// model waking at the same instant would just rebuild the queue.
+func qoderQueueJitter() time.Duration {
+	if qoderQueueJitterMax <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Intn(qoderQueueJitterMax)) * time.Millisecond
 }
 
 // qoderEnvelopeQueued reports whether a failure frame names the model as busy.
@@ -361,6 +636,21 @@ func qoderEnvelopeBody(raw json.RawMessage) []byte {
 	return raw
 }
 
+// qoderEnvelopeStatus reads the envelope's own status, which Qoder sends as a
+// number on most frames and as a quoted number on some. Zero means it named
+// none, which the caller reads as a normal frame.
+func qoderEnvelopeStatus(raw json.RawMessage) int {
+	text := strings.Trim(strings.TrimSpace(string(raw)), `"`)
+	if text == "" || text == "null" {
+		return 0
+	}
+	value, err := strconv.Atoi(text)
+	if err != nil {
+		return 0
+	}
+	return value
+}
+
 func nilIfEmpty(value string) any {
 	if value == "" {
 		return nil
@@ -374,11 +664,18 @@ func nilIfEmpty(value string) any {
 // never the answer; a block whose JSON is whole when the stream simply stops is
 // still the call. A tag inside code or prose stays text.
 type qoderText struct {
-	textBuf string
-	callBuf string
-	inCall  bool
+	// buf is what has arrived and is not yet decided: either the tail that might
+	// still become a marker, or a block being read.
+	buf     string
+	kind    qoderEchoKind
 	sawTool bool
 	sent    string
+	// allowed is the tool names the request declared. A block naming anything
+	// else is prose about tools, so it is passed on as text rather than lifted.
+	allowed map[string]bool
+	// held counts frames that arrived without resolving the block, so a block
+	// that never closes cannot hold the answer back forever.
+	held int
 }
 
 type qoderFragment struct {
@@ -398,54 +695,151 @@ const (
 )
 
 func (a *qoderText) feed(input string) []qoderFragment {
+	a.buf += input
 	var out []qoderFragment
-	for input != "" {
-		if !a.inCall {
-			combined := a.textBuf + input
-			a.textBuf = ""
-			index := strings.Index(combined, qoderCallOpen)
-			if index < 0 {
-				keep := qoderCallSuffix(combined)
-				if keep < len(combined) {
-					give := combined[:len(combined)-keep]
+	for {
+		if a.kind == qoderEchoNone {
+			kind, at := qoderEchoStart(a.buf)
+			if at < 0 {
+				keep := qoderEchoHoldTail(a.buf)
+				if keep < len(a.buf) {
+					give := a.buf[:len(a.buf)-keep]
+					a.buf = a.buf[len(a.buf)-keep:]
 					a.text(give)
 					out = append(out, qoderFragment{text: give})
-					a.textBuf = combined[len(combined)-keep:]
-				} else {
-					a.textBuf = combined
 				}
-				break
+				return out
 			}
-			if index > 0 {
-				a.text(combined[:index])
-				out = append(out, qoderFragment{text: combined[:index]})
+			if at > 0 {
+				give := a.buf[:at]
+				a.buf = a.buf[at:]
+				a.text(give)
+				out = append(out, qoderFragment{text: give})
 			}
-			input = combined[index+len(qoderCallOpen):]
-			a.inCall = true
+			a.kind = kind
+			a.held = 0
 			continue
 		}
-		combined := a.callBuf + input
-		a.callBuf = ""
-		end := strings.Index(combined, qoderCallClose)
-		if end < 0 {
-			a.callBuf = combined
-			break
+		block, rest, resolved := a.take()
+		if !resolved {
+			a.held++
+			if len(a.buf) <= qoderEchoHoldMaxChars && a.held <= qoderEchoHoldMaxFrames {
+				return out
+			}
+			// Past either limit the text is sent on: a block that never closes
+			// must not cost the client its whole answer.
+			give := a.buf
+			a.buf, a.kind, a.held = "", qoderEchoNone, 0
+			a.text(give)
+			out = append(out, qoderFragment{text: give})
+			continue
 		}
-		body := combined[:end]
-		a.inCall = false
+		a.buf, a.held = rest, 0
+		fragments := a.resolve(block)
+		a.kind = qoderEchoNone
+		out = append(out, fragments...)
+		for _, fragment := range fragments {
+			if fragment.err != "" {
+				return out
+			}
+		}
+	}
+}
+
+// take reads the block the current kind is waiting for: the block's bytes, what
+// follows it, and whether the block arrived whole.
+func (a *qoderText) take() (block, rest string, resolved bool) {
+	switch a.kind {
+	case qoderEchoTag:
+		if end := strings.Index(a.buf[len(qoderCallOpen):], qoderCallClose); end >= 0 {
+			cut := len(qoderCallOpen) + end + len(qoderCallClose)
+			return a.buf[:cut], a.buf[cut:], true
+		}
+		return "", "", false
+	case qoderEchoMarker:
+		span := qoderEchoMarkerRe.FindStringIndex(a.buf)
+		if span == nil {
+			return "", "", false
+		}
+		_, end, ok := qoderEchoJSONSpan(a.buf[span[1]:])
+		if !ok {
+			return "", "", false
+		}
+		cut := span[1] + end
+		return a.buf[:cut], a.buf[cut:], true
+	case qoderEchoDSML:
+		matches := qoderDSMLInvoke.FindAllStringSubmatchIndex(a.buf, -1)
+		if len(matches) == 0 {
+			return "", "", false
+		}
+		// Every invoke that closed is taken; the rest stays for the next frame.
+		cut := matches[len(matches)-1][1]
+		return a.buf[:cut], a.buf[cut:], true
+	}
+	return "", "", false
+}
+
+// resolve turns one whole block into fragments for the current kind.
+func (a *qoderText) resolve(block string) []qoderFragment {
+	// Inside a code fence the block is an example being discussed, not a call;
+	// the <tool_call> path below decides that for itself.
+	if a.kind != qoderEchoTag && qoderQuoted(a.sent) {
+		a.text(block)
+		return []qoderFragment{{text: block}}
+	}
+	switch a.kind {
+	case qoderEchoTag:
+		body := strings.TrimSuffix(strings.TrimPrefix(block, qoderCallOpen), qoderCallClose)
 		if call, ok := qoderParseCall(body); ok {
 			a.sawTool = true
-			out = append(out, qoderFragment{call: &call})
-		} else if qoderCallish(body) && !qoderQuoted(a.sent) {
-			return append(out, qoderFragment{err: qoderCallUnreadable})
-		} else {
-			literal := qoderCallOpen + body + qoderCallClose
-			a.text(literal)
-			out = append(out, qoderFragment{text: literal})
+			return []qoderFragment{{call: &call}}
 		}
-		input = combined[end+len(qoderCallClose):]
+		if qoderCallish(body) && !qoderQuoted(a.sent) {
+			return []qoderFragment{{err: qoderCallUnreadable}}
+		}
+	case qoderEchoMarker:
+		span := qoderEchoMarkerRe.FindStringIndex(block)
+		if span == nil {
+			break
+		}
+		start, end, ok := qoderEchoJSONSpan(block[span[1]:])
+		if !ok {
+			break
+		}
+		payload := block[span[1]+start : span[1]+end]
+		verdict, parsed := qoderParseEchoArray(payload, a.allowed)
+		if !parsed {
+			break
+		}
+		if verdict.unreadable && !qoderQuoted(a.sent) {
+			// The array parsed and named real tools, but an entry's arguments
+			// are not JSON: the model meant to call something this turn, so the
+			// turn fails rather than pass a半-readable call on.
+			return []qoderFragment{{err: qoderCallUnreadable}}
+		}
+		if verdict.declared && len(verdict.calls) > 0 {
+			a.sawTool = true
+			fragments := make([]qoderFragment, 0, len(verdict.calls))
+			for index := range verdict.calls {
+				fragments = append(fragments, qoderFragment{call: &verdict.calls[index]})
+			}
+			return fragments
+		}
+	case qoderEchoDSML:
+		verdict, ok := qoderParseEchoDSML(block)
+		if !ok || !verdict.declared || len(verdict.calls) == 0 {
+			break
+		}
+		a.sawTool = true
+		fragments := make([]qoderFragment, 0, len(verdict.calls))
+		for index := range verdict.calls {
+			fragments = append(fragments, qoderFragment{call: &verdict.calls[index]})
+		}
+		return fragments
 	}
-	return out
+	// Anything that did not turn out to be a call is the answer, verbatim.
+	a.text(block)
+	return []qoderFragment{{text: block}}
 }
 
 // text remembers what has been given out: whether the next block is inside code
@@ -453,9 +847,14 @@ func (a *qoderText) feed(input string) []qoderFragment {
 func (a *qoderText) text(given string) { a.sent += given }
 
 func (a *qoderText) flush() []qoderFragment {
-	if a.inCall {
-		body := a.callBuf
-		a.inCall, a.callBuf = false, ""
+	kind, block := a.kind, a.buf
+	a.kind, a.buf, a.held = qoderEchoNone, "", 0
+	if block == "" {
+		return nil
+	}
+	switch kind {
+	case qoderEchoTag:
+		body := strings.TrimPrefix(block, qoderCallOpen)
 		if qoderCallish(body) && !qoderQuoted(a.sent) {
 			if call, ok := qoderParseCall(body); ok {
 				a.sawTool = true
@@ -463,30 +862,29 @@ func (a *qoderText) flush() []qoderFragment {
 			}
 			return []qoderFragment{{err: qoderCallCutShort}}
 		}
-		literal := qoderCallOpen + body
-		a.text(literal)
-		if literal != "" {
-			return []qoderFragment{{text: literal}}
+	case qoderEchoMarker:
+		// A marker that never completed is either the gateway's own bookkeeping
+		// echoed back (dropped: the user was never meant to read it) or an
+		// answer that merely talks about the marker (sent on). Only the first
+		// has JSON behind it.
+		if !qoderQuoted(a.sent) && qoderMarkerOpensJSON(block) {
+			return nil
+		}
+	case qoderEchoDSML:
+		if verdict, ok := qoderParseEchoDSML(block); ok && verdict.declared && len(verdict.calls) > 0 {
+			a.sawTool = true
+			fragments := make([]qoderFragment, 0, len(verdict.calls))
+			for index := range verdict.calls {
+				fragments = append(fragments, qoderFragment{call: &verdict.calls[index]})
+			}
+			return fragments
+		}
+		if !qoderQuoted(a.sent) {
+			return nil
 		}
 	}
-	if a.textBuf != "" {
-		given := a.textBuf
-		a.textBuf = ""
-		a.text(given)
-		return []qoderFragment{{text: given}}
-	}
-	return nil
-}
-
-// qoderCallSuffix is the length of the tail that could still become a call
-// marker — a frame that ends mid-tag must not leak the partial tag as text.
-func qoderCallSuffix(value string) int {
-	for size := len(qoderCallOpen) - 1; size > 0; size-- {
-		if strings.HasSuffix(value, qoderCallOpen[:size]) {
-			return size
-		}
-	}
-	return 0
+	a.text(block)
+	return []qoderFragment{{text: block}}
 }
 
 // qoderCallish says a block was on its way to being a call: its JSON began, or
