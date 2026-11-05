@@ -756,10 +756,17 @@ func (r *Router) UpdateAPIKey(keyID string, patch domain.APIKey) (domain.APIKey,
 			updated.Name = strings.TrimSpace(patch.Name)
 		}
 		if routeID := strings.TrimSpace(patch.RouteID); routeID != "" {
-			if _, ok := r.routeLocked(routeID); !ok {
-				return domain.APIKey{}, fmt.Errorf("route %q not found", routeID)
+			// 只在「真的改绑到另一条 route」时校验存在性。前端提交方案快照时会把
+			// key 当前的 routeId 一起回传，若那条 route 已被删除（provider 被
+			// purge 后 route 随之消失），为一条没改动的字段报 route not found 会
+			// 把整个保存动作挡死——用户连备选都存不进去，也就无法再用「设为首选」
+			// 重建 route 把密钥救回来。
+			if routeID != strings.TrimSpace(updated.RouteID) {
+				if _, ok := r.routeLocked(routeID); !ok {
+					return domain.APIKey{}, fmt.Errorf("route %q not found", routeID)
+				}
+				updated.RouteID = routeID
 			}
-			updated.RouteID = routeID
 		}
 		updated.ModelOverride = strings.TrimSpace(patch.ModelOverride)
 		if patch.ModelAliases != nil {
