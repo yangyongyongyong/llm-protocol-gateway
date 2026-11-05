@@ -608,6 +608,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1beta/", s.handleGeminiGenerateContent)
 	mux.HandleFunc("POST /v1/models/", s.handleGeminiGenerateContent)
 	mux.HandleFunc("POST /v1/images/generations", s.handleOpenAIImagesGenerations)
+	mux.HandleFunc("POST /v1/images/edits", s.handleOpenAIImagesEdits)
 	mux.HandleFunc("POST /openai/v1/images/generations", s.handleOpenAIImagesGenerations)
 	mux.HandleFunc("POST /openai/v1/responses", s.handleOpenAIResponses)
 	// Real OpenAI Responses API endpoint Codex CLI calls for "remote
@@ -4480,6 +4481,15 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 	slog.Info("handled responses request", "route", route.ID, "model", logModel, "action", decision.Action, "stream", stream)
 }
 
+// handleOpenAIImagesEdits serves POST /v1/images/edits.
+//
+// It is the generation handler with one difference: which upstream route the render
+// goes to. Everything else — key matching, route resolution, refusals — is identical,
+// so delegating keeps the two from drifting.
+func (s *Server) handleOpenAIImagesEdits(w http.ResponseWriter, r *http.Request) {
+	s.handleOpenAIImagesGenerations(w, r.WithContext(withWorkBuddyImagesEdits(r.Context())))
+}
+
 func (s *Server) handleOpenAIImagesGenerations(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	body, err := io.ReadAll(r.Body)
@@ -6047,6 +6057,12 @@ func (s *Server) proxyOpenAIImages(w http.ResponseWriter, r *http.Request, provi
 	body, bodyErr := applyRequestAdapterBody(provider, model, body)
 	if bodyErr != nil {
 		return 0, TokenUsage{}, nil, bodyErr
+	}
+	// A WorkBuddy account renders on its own route with the desktop header family: the
+	// bearer alone is not enough, and the generic path below posts to a doubled /v2
+	// prefix (see workbuddy_endpoints.go).
+	if _, isWorkBuddyRender := workBuddyRenderSite(provider); isWorkBuddyRender {
+		return s.executeWorkBuddyImage(r, provider, workBuddyImagePathFor(r.Context()), body)
 	}
 	// 只用 Provider 自己的凭证。以前这里会在 Provider 没有 Key 时把调用方的
 	// Authorization 原样转给厂商——那是网关自己的 Key，发给上游等于泄露。
