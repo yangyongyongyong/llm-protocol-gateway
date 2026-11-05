@@ -6280,6 +6280,18 @@ func (s *Server) sendClaudeMessagesUpstream(r *http.Request, provider domain.Pro
 			return nil, err
 		}
 		request.Header.Set("Accept", r.Header.Get("Accept"))
+	} else if site, isWorkBuddy := workBuddySiteForAuthType(provider.AuthType); isWorkBuddy && workBuddyMessagesApplies(provider, workBuddyMessagesBodyModel(body), requestBodyWantsStream(body)) {
+		// The China build serves its Claude models on the Messages route; that is the
+		// only place `output_config.effort` is honoured (see workbuddy_messages.go).
+		// Every other model keeps the chat path below, which is where the reference
+		// measured it working.
+		body = sanitizeWorkBuddyMessagesBody(body)
+		request, err = newWorkBuddyMessagesRequest(r.Context(), provider, workBuddyMessagesURL(site), body)
+		if err != nil {
+			return nil, err
+		}
+		client := workBuddyChatClient(provider)
+		return client.Do(workBuddyRequestExit(request))
 	} else {
 		upstreamURL := strings.TrimSpace(provider.BaseURL)
 		if upstreamURL == "" {
