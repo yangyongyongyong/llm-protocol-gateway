@@ -361,6 +361,45 @@ minimax-video-h3 1s → 400 {"code":14407,"msg":"unsupported video duration: 1 s
 embeddings 当初踩过同一个坑（`ui_embeddings_path_test.go` 即为此而设）。
 已补前缀并新增 `ui_videos_path_test.go`（路径判定 + 本地转发 + api/ui 双 host）。
 
+### 第十次发布新增：联网检索与网页抓取
+
+| 路由 | 上游 | 说明 |
+| --- | --- | --- |
+| `POST /v1/search` | `/agenttool/v1/search` | 联网检索，返回 `results[]` / `total_results` |
+| `POST /v1/webfetch` | `/agenttool/v1/webfetch` | 抓正文，返回 markdown |
+
+两条都走 chat 域、**没有 `{code,msg,data}` 信封**，正文即结果，故原样透传不做包装（自己造一层信封
+等于换了一个 API）。参考实现实测的三条规则直接落进实现：
+
+- `provider` 是**响应**字段，请求里带任何值都 `400 code 15003` → 请求体由服务端**重建**，只保留
+  `query`/`max_results`；客户端回显上一次响应也无法污染下一次请求
+- `type` 只有小写 `text2text` 合法 → 固定写入，不采信客户端大小写
+- `max_results` 是上限不是保证（服务端硬顶约 10），官方固定 5 → 缺省 5、超过 10 按 10 钳制
+
+线上实测（陌账号，额度极轻）：
+
+```
+/v1/search   → 200，total_results=3（真实结果：go-sponge.com、CSDN SSE 文章…）
+               响应里 provider 由厂商回填 —— 正是请求该字段被剥离的反证
+/v1/webfetch → 200，title="Example Domain"，content=982 字节 markdown
+               字段比参考实现记录的更多：content_type/content_length/truncated/status_code/context
+```
+
+这是继 embeddings 之后第二条**产出真实业务结果**的新链路。
+
+### 仍未对齐（下一轮）
+
+已完成：错误码分类、`/v1/messages`、免费日窗、续写、积分保底与到期加权、模型级冷却、上报回读、
+上下文窗口、能力端点（图像/改图/embeddings/视频/检索/webfetch）、成长任务（礼包/连登/抽奖）。
+
+| 项 | 状态 | 阻塞点 |
+| --- | --- | --- |
+| MCP 服务端（`/mcp`） | 未实现 | 无状态 JSON-RPC 子集 + 六个工具面，工作量最大的一块；与已有网关功能重叠度高 |
+| 去水印裁切 | 未实现 | 需 COS 域名白名单 + 禁跟随重定向防 SSRF；且要有真实带水印图片才能验 |
+| 嵌入 `agentic_search`（综述式检索） | 未实现 | SSE 长连接、单次 40-66s / 约 47K prompt token，成本高 |
+| 埋点三元组按 realm 分档 | 不做（缺证据） | 没有国际版真机抓包的 commit/releaseDate |
+| 成长任务剩余域（旅行/补签/开学季券码/国际版 trial/注册补地区） | 未实现 | 部分需国际版写入能力；优先级最低 |
+
 ### 仍未对齐（下一轮）
 
 已完成（objective 的 11 项中 10 项）：错误码分类、`/v1/messages`、免费日窗、续写、积分保底与到期加权、
