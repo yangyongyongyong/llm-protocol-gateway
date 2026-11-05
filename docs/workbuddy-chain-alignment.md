@@ -244,17 +244,40 @@ Provider 行上的 `proxyUrl` 现在对 WorkBuddy chat 生效（`http://`、`htt
    （改图 / 出视频 / 联网检索 / webfetch / MCP / 去水印）。
 5. 上下文窗口四级查找链的后三级兜底（上游动态已有，缺 model.json / 静态种子 / models.dev）。
 6. 上报回读校验（上报后回读 `growth/streak` 判断是否真计分）。
+### 第五次发布新增：图像端点
+
+| 能力 | 落地 | 说明 |
+| --- | --- | --- |
+| 图像生成 | `workbuddy_endpoints.go` | 修掉既有缺陷：原路径只有裸 Bearer，且把 `/images/generations` 拼在**已含 `/v2` 的 base** 上（`/v2/v2/...`），对 WorkBuddy 账号不可用。现按账号根拼 `/v2/images/generations`，复用 `applyWorkBuddyChatHeaders` 带全量桌面头族与本账号连接池 |
+| 图像改图 | `POST /v1/images/edits` | 新路由，复用生成处理器的鉴权/路由/拒绝逻辑，仅用 context 标记区分上游路由；`image` 字段归一为数组 |
+
+线上实测（陌账号，模型故意不存在，只看厂商回应）：
+
+```
+generations → 400 {"code":14401,"msg":"...Image model [probe-no-such-image-model] route config not found"}
+edits       → 400 {"code":11101,"msg":"...cannot unmarshal string into ... EditImageRequest.image of type []string"}
+            → 归一后 → 400 {"code":14401,"msg":"...route config not found"}
+```
+
+两条都拿到厂商原话，说明路径、头族、鉴权全部打通；edits 的卡点从「字段类型」前移到「模型不存在」，
+符合预期。**注意该账号没有专用图像模型**（只有 hy4free/hy4std），所以这里验证的是链路而非出图结果。
+
+顺带修掉两个自己引入/沿袭的缺陷：workbuddy 图像分支此前只返回不写响应（会丢成功响应）；
+非 2xx 被包成 502，客户端看不到厂商原文。
+
 ### 仍未对齐（下一轮）
 
-已在本轮完成：`/v1/messages` 判断（本 fleet 无 WorkBuddy 账号带 Claude 模型，见下）、免费日窗、续写、
-积分保底与到期加权、模型级冷却、积分任务域（礼包/连登/抽奖）。
+已完成：错误码分类、模型级冷却、免费日窗、积分保底与到期加权、积分任务域（礼包/连登/抽奖）、
+续写、图像端点（生成/改图，带头族）。
 
 | 项 | 状态 | 阻塞点 |
 | --- | --- | --- |
-| `/v1/messages` 直连路由 + thinking 块过滤 | 未实现 | 现网 3 个带 Claude 模型的 Provider 是 `claude-订阅账号`×2 与 `cursor-订阅账号`，**没有 WorkBuddy 账号带 Claude 系模型**，实现即死代码且无法验证 |
-| 上下文窗口四级查找链（后三级） | 未实现 | 上游 `/v3/config` 已给 contextLength，兜底链只在字段缺失时有用；优先级低 |
-| 上报回读校验 | 未实现 | 上报后回读 `growth/streak` 判断是否真计分；需要额外的上游调用 |
-| 能力端点（改图/出视频/检索/webfetch/MCP/去水印） | 未实现 | 工作量最大的一块，且本地 `/v1/images/generations`、`/v1/embeddings` 当前走通用鉴权、不带 WorkBuddy 头族 |
-| 埋点三元组按 realm 分档 | 不做（缺证据） | 没有国际版真机抓包的 `commit`/`releaseDate`，硬编一套比现状更假 |
+| `/v1/messages` 直连路由 + thinking 块过滤 | 未实现 | 现网带 Claude 模型的 3 个 Provider 是 `claude-订阅账号`×2 与 `cursor-订阅账号`，**没有 WorkBuddy 账号带 Claude 系模型**；实现即死代码 |
+| `/v1/embeddings` 带 WorkBuddy 头族 | 未实现 | 与图像同源缺陷，但 embeddings 走通用透传 `serveOpenAIPassThrough`，接缝未验证 |
+| 出视频（`/v2/videos/generations`、`/v2/videos/tasks`） | 未实现 | 需任务台账（只有提交账号能查） |
+| 联网检索 / webfetch / MCP / 去水印 | 未实现 | 工作量较大；去水印需 URL 白名单防 SSRF |
+| 上下文窗口四级查找链（后三级） | 未实现 | 上游 `/v3/config` 已给 contextLength，兜底链优先级低 |
+| 上报回读校验 | 未实现 | 需额外上游调用回读 `growth/streak` |
+| 埋点三元组按 realm 分档 | 不做（缺证据） | 没有国际版真机抓包的 commit/releaseDate，硬编比现状更假 |
 | 成长任务剩余域（旅行/补签/开学季券码/国际版 trial/注册补地区） | 未实现 | 优先级低于已完成的礼包/连登/抽奖 |
 
