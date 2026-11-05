@@ -124,7 +124,7 @@ func TestExecuteWorkBuddyImageTalksToTheRoute(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"prompt":"cat"}`))
 
 	recorder := httptest.NewRecorder()
-	status, _, payload, err := gateway.executeWorkBuddyImage(recorder, request, provider, workBuddyImageGenerationsPath, []byte(`{"prompt":"cat"}`))
+	status, _, payload, err := gateway.executeWorkBuddyEndpoint(recorder, request, provider, workBuddyImageGenerationsPath, []byte(`{"prompt":"cat"}`))
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestExecuteWorkBuddyImageUsesTheEditsRoute(t *testing.T) {
 	provider := domain.Provider{ID: "wb-2", AuthType: domain.AuthTypeWorkBuddy,
 		WorkBuddy: &domain.WorkBuddyCredential{AccessToken: "tok", UserID: "uid"}}
 	request := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(`{}`))
-	if _, _, _, err := gateway.executeWorkBuddyImage(httptest.NewRecorder(), request, provider, workBuddyImagePathFor(withWorkBuddyImagesEdits(request.Context())), []byte(`{}`)); err != nil {
+	if _, _, _, err := gateway.executeWorkBuddyEndpoint(httptest.NewRecorder(), request, provider, workBuddyImagePathFor(withWorkBuddyImagesEdits(request.Context())), []byte(`{}`)); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	if seenPath != "/v2/images/edits" {
@@ -182,7 +182,7 @@ func TestExecuteWorkBuddyImageWritesTheBody(t *testing.T) {
 		WorkBuddy: &domain.WorkBuddyCredential{AccessToken: "t", UserID: "u"}}
 	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{}`))
 	recorder := httptest.NewRecorder()
-	status, _, _, err := gateway.executeWorkBuddyImage(recorder, request, provider, workBuddyImageGenerationsPath, []byte(`{}`))
+	status, _, _, err := gateway.executeWorkBuddyEndpoint(recorder, request, provider, workBuddyImageGenerationsPath, []byte(`{}`))
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -227,4 +227,47 @@ func TestNormalizeWorkBuddyImageEditBodyLeavesOtherShapesAlone(t *testing.T) {
 	if got := normalizeWorkBuddyImageEditBody([]byte("not json")); string(got) != "not json" {
 		t.Fatalf("garbage was rewritten: %s", string(got))
 	}
+}
+
+// Embeddings ride the same route family and the same head: the generic passthrough
+// would post to a doubled /v2 prefix with only the bearer.
+func TestExecuteWorkBuddyEndpointEmbeds(t *testing.T) {
+	var seenPath, seenUser, seenAccept string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		seenPath = request.URL.Path
+		seenUser = request.Header.Get("X-User-Id")
+		seenAccept = request.Header.Get("Accept")
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"data":[{"embedding":[0.1]}],"model":"bge-m3"}`))
+	}))
+	defer server.Close()
+	previousEndpoint := workBuddyCNEndpoint
+	workBuddyCNEndpoint = server.URL
+	defer func() { workBuddyCNEndpoint = previousEndpoint }()
+
+	gateway := &Server{}
+	provider := domain.Provider{ID: "wb-e", AuthType: domain.AuthTypeWorkBuddy,
+		WorkBuddy: &domain.WorkBuddyCredential{AccessToken: "t", UserID: "uid-e"}}
+	request := httptest.NewRequest(http.MethodPost, "/v1/embeddings", strings.NewReader(`{"model":"bge-m3","input":["x"]}`))
+	recorder := httptest.NewRecorder()
+	status, _, payload, err := gateway.executeWorkBuddyEndpoint(recorder, request, provider, workBuddyEmbeddingsPath, []byte(`{"model":"bge-m3","input":["x"]}`))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if status != http.StatusOK {
+		t.Fatalf("status = %d", status)
+	}
+	if seenPath != "/v2/embeddings" {
+		t.Fatalf("upstream path = %q, want /v2/embeddings", seenPath)
+	}
+	if seenUser != "uid-e" {
+		t.Fatalf("X-User-Id = %q", seenUser)
+	}
+	if seenAccept != "application/json" {
+		t.Fatalf("Accept = %q", seenAccept)
+	}
+	if !strings.Contains(recorder.Body.String(), "bge-m3") {
+		t.Fatalf("body not written: %q", recorder.Body.String())
+	}
+	_ = payload
 }

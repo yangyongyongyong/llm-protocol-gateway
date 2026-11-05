@@ -4804,6 +4804,21 @@ func (s *Server) serveOpenAIPassThrough(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 	}
+	// A WorkBuddy account answers this endpoint on its own route with the desktop
+	// header family; the generic path below would post to a doubled /v2 prefix and
+	// carry only the bearer (see workbuddy_endpoints.go).
+	if _, isWorkBuddyEndpoint := workBuddyRenderSite(provider); isWorkBuddyEndpoint && endpoint.upstreamPath == "/embeddings" {
+		status, usage, responseLog, err := s.executeWorkBuddyEndpoint(w, r, provider, workBuddyEmbeddingsPath, upstreamBody)
+		if err != nil {
+			s.logs.AddApp("error", endpoint.label+" request failed", err.Error())
+			s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, "pass_through", endpoint.label, r.URL.Path, http.StatusBadGateway, usage, body, []byte(err.Error()))
+			writeOpenAIError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, "pass_through", endpoint.label, r.URL.Path, status, usage, body, responseLog)
+		s.logs.AddApp("debug", "handled "+endpoint.label+" request", fmt.Sprintf("route=%s model=%s status=%d", route.ID, logModel, status))
+		return
+	}
 	upstreamURL := resolveProviderEndpointURL(provider, endpoint.upstreamPath)
 	status, usage, responseLog, err := s.proxyOpenAIImagesUpstream(w, r.Context(), upstreamURL, authValue, contentType, upstreamBody)
 	if err != nil {
@@ -6062,7 +6077,7 @@ func (s *Server) proxyOpenAIImages(w http.ResponseWriter, r *http.Request, provi
 	// bearer alone is not enough, and the generic path below posts to a doubled /v2
 	// prefix (see workbuddy_endpoints.go).
 	if _, isWorkBuddyRender := workBuddyRenderSite(provider); isWorkBuddyRender {
-		return s.executeWorkBuddyImage(w, r, provider, workBuddyImagePathFor(r.Context()), body)
+		return s.executeWorkBuddyEndpoint(w, r, provider, workBuddyImagePathFor(r.Context()), body)
 	}
 	// 只用 Provider 自己的凭证。以前这里会在 Provider 没有 Key 时把调用方的
 	// Authorization 原样转给厂商——那是网关自己的 Key，发给上游等于泄露。

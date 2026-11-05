@@ -124,9 +124,9 @@ func workBuddyRenderSite(provider domain.Provider) (workBuddySite, bool) {
 	return workBuddySiteForAuthType(provider.AuthType)
 }
 
-// executeWorkBuddyImage calls one of the image routes and answers like the generic
+// executeWorkBuddyEndpoint calls one of the image routes and answers like the generic
 // image executor does.
-func (s *Server) executeWorkBuddyImage(
+func (s *Server) executeWorkBuddyEndpoint(
 	w http.ResponseWriter,
 	r *http.Request,
 	provider domain.Provider,
