@@ -221,10 +221,16 @@ func (w workBuddySite) chatUserAgent() string {
 }
 
 // rpcUserAgent is the desktop RPC layer (refresh, plugin auth, …).
+//
+// The first segment is `WorkBuddy/<app>` on both builds, the same as chat: a
+// User-Agent that does not start with it is answered error 10085 (measured against
+// both builds, magpie-community/plugins packages/workbuddy README §Requests). Only
+// the middle segment names the build, so the intl build reads
+// `WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0` — starting the string with
+// `workbuddy-ai/` is the shape that gets refused.
 func (w workBuddySite) rpcUserAgent() string {
 	ver := w.clientVersion()
-	brand := w.uaBrand()
-	return brand + "/" + ver + " " + brand + "/" + ver + " CLI/" + workBuddyCLIVersionValue()
+	return "WorkBuddy/" + ver + " " + w.uaBrand() + "/" + ver + " CLI/" + workBuddyCLIVersionValue()
 }
 
 // v3ConfigUserAgent is what /v3/config model discovery sends.
@@ -512,8 +518,15 @@ func workBuddyCall(ctx context.Context, site workBuddySite, method, endpoint str
 // workBuddyDo sends an account request and reads its {code, msg, data} envelope.
 // It is the half of workBuddyCall that does not build the request, so the paths
 // whose body is not a map (the report channel's JSON array) decode the same way.
+//
+// The client is picked from the request's own account (see
+// workBuddyRequestClient): the account-facing surface used to go out on
+// http.DefaultClient, which meant every account on the box shared one connection
+// pool — two accounts on one TCP/TLS connection is exactly the correlation clue
+// the per-account chat pool exists to avoid.
 func workBuddyDo(request *http.Request, dst any) error {
-	response, err := http.DefaultClient.Do(request)
+	client := workBuddyRequestClient(request)
+	response, err := client.Do(workBuddyRequestExit(request))
 	if err != nil {
 		return err
 	}
@@ -1021,13 +1034,80 @@ var workBuddyFlagged = []struct {
 	{regexp.MustCompile(`(?i)You are Claude Code, Anthropic['’]s official CLI for Claude`), "You are Claude Code, Anthropic's CLI for Claude"},
 	{regexp.MustCompile(`(?i)Main branch \(you will usually use this for PRs\)`), "Main branch (usually the base for PRs)"},
 	{regexp.MustCompile(`(?i)(?:the )?Codex CLI is an open source project led by OpenAI\.`), "The Codex CLI is an open source project led by OpenAI."},
+	// The Codex system prompt's opening line. Distinct from the sentence above:
+	// that one introduces the project, this one introduces the agent, and the
+	// upstream refuses both.
+	{regexp.MustCompile(`(?i)You are a coding agent running in the Codex CLI, a terminal-based coding assistant\.`), "You are a coding agent running in the Codex CLI tool, a terminal-based coding assistant."},
+	// The feedback sentence carries an Anthropic repository link and is refused
+	// whole; one word is enough and the meaning survives.
+	{regexp.MustCompile(`(?i)To give feedback, users should report the issue at https://github\.com/anthropics/claude-code/issues`), "To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues"},
+	// The upstream refuses any body that contains its own refusal code as a
+	// literal, wherever it appears — a client debugging "code=11128" would
+	// otherwise never be able to ask about it. Hyphenating keeps the reference
+	// readable and breaks the literal match.
+	{regexp.MustCompile(`11128`), "11-128"},
 	// The harness identity line a coding agent opens with. A comma is the whole
 	// fix, and the agent still learns which harness it runs in.
+	//
+	// Measured on 2026-10-30 against copilot.tencent.com (magpie-community/plugins
+	// #279, and REFUSED.md beside this gateway's own notes): the line as DSH writes
+	// it answers 400 code 11128, the same line with the comma answers 200. Adding a
+	// word does not help — "…powered by DeepSeek Harness CLI." is still 400 — and
+	// neither case nor spacing changes are. So the fix is the comma, and the
+	// replacement has to keep saying which harness runs: dropping the name loses the
+	// one line the rest of the prompt refers back to.
 	{regexp.MustCompile(`(?i)You are an AI agent powered by ([^.]+)\.`), "You are an AI agent, powered by ${1}."},
 	{regexp.MustCompile(`(?i)You are a coding agent powered by ([^.]+)\.`), "You are a coding agent, powered by ${1}."},
+	{regexp.MustCompile(`(?i)You are an AI agent powered by DeepSeek Harness\b`), "You are an AI agent, powered by DeepSeek Harness"},
 	// One punctuation mark moved, nothing else: "You are X Agent, built by Y."
 	{regexp.MustCompile(`(?i)You are ([^.]+) Agent, built by ([^.]+)\.`), "You are ${1} Agent built by ${2}."},
+	// A DSH paragraph, not a sentence: the runtime-context description. Measured 400
+	// then 200 with this wording (magpie #291). The model can quote it back into an
+	// assistant turn, so it is reworded wherever it appears.
+	{regexp.MustCompile(`(?i)Web GUI whose URL the runtime context names\.\s+When the user refers`), "Web GUI whose URL the runtime context names. The interface, when the user refers"},
 }
+
+// workBuddyIdentitySentenceRe breaks the "who I am, and who made me" skeleton
+// with a comma, keeping every word the sentence carried.
+//
+// Two sources measured this from opposite directions and agree on the fix:
+//
+//   - the identity shape `You are … powered by <product>` is refused as a whole
+//     (magpie REFUSED.md: `powered by DeepSeek Harness.` is 400, the same with a
+//     comma is 200, and adding a word does not help either);
+//   - an implementation that swapped the brand for another word left the skeleton
+//     standing and kept drawing 400, which is why the skeleton — not just the
+//     product name — has to move.
+//
+// A comma moves the skeleton and changes nothing else: the agent still reads its
+// own name out of that line. An earlier version of this file replaced the whole
+// sentence with "You are a helpful AI assistant.", which took the harness's name
+// out of the only line that says which agent is running — the same mistake
+// REFUSED.md records, so it is not repeated here.
+//
+// The verb list has to stay complete: the upstream adding one more pairing would
+// put a single-verb implementation back to 400. The window is deliberately
+// bounded (0-3 adjectives, optional noun) so a sentence where the participle
+// modifies the object ("you are free to use tools built by …") is not caught.
+// The trailing group is captured and restored rather than looked ahead, because
+// RE2 has no lookahead and the whitespace after the period has to survive.
+var workBuddyIdentitySentenceRe = regexp.MustCompile(
+	`(?i)(You are\s+` +
+		`(?:an?\s+|the\s+)?(?:[\w.-]+\s+){0,3}?` +
+		`(?:agent|assistant|model|AI|LLM))[\s,]*` +
+		`(powered by|built on|built by|created by|developed by|made by|trained by)` +
+		`([^\n]*?)\.(\s|$)`)
+
+const workBuddyIdentitySentenceReplacement = "${1}, ${2}${3}.${4}"
+
+// workBuddyIdentityBrands is kept empty on purpose.
+//
+// It used to rename "DeepSeek Harness" to "DeepSeekRuntime". Two measurements say
+// not to: the comma above already passes the line (400 → 200, measured twice), and
+// a replacement that no longer names the harness costs the agent the only line
+// that tells it which harness it runs in. Renaming was doing more than the fix
+// needed, so it is not applied.
+var workBuddyIdentityBrands = [][2]string{}
 
 var (
 	workBuddyBareBillingHeader = regexp.MustCompile(`(?i)x-anthropic-billing-header`)
@@ -1058,8 +1138,24 @@ func workBuddyPromptRefused(status int, body []byte) bool {
 
 // unflagWorkBuddyText puts workBuddyFlagged's words in place in one text.
 func unflagWorkBuddyText(text string) string {
+	return unflagWorkBuddyTextFor(text, false)
+}
+
+// unflagWorkBuddyTextFor is unflagWorkBuddyText plus the identity rules, which
+// only apply to the turns that declare who the agent is.
+//
+// Order matters: the sentence regex has to see the brand's full name, so it runs
+// before the brand word is renamed — otherwise the pattern no longer matches the
+// text it exists to match.
+func unflagWorkBuddyTextFor(text string, brand bool) string {
 	for _, item := range workBuddyFlagged {
 		text = item.pattern.ReplaceAllString(text, item.replacement)
+	}
+	if brand {
+		text = workBuddyIdentitySentenceRe.ReplaceAllString(text, workBuddyIdentitySentenceReplacement)
+		for _, pair := range workBuddyIdentityBrands {
+			text = strings.ReplaceAll(text, pair[0], pair[1])
+		}
 	}
 	text = workBuddyBareBillingKV.ReplaceAllString(text, "")
 	text = workBuddyBareBillingHeader.ReplaceAllString(text, "x-anthropic-billing-hdr")
@@ -1133,9 +1229,25 @@ func sanitizeWorkBuddyContentParts(parts []any) ([]any, bool) {
 	return out, changed
 }
 
-// unflagWorkBuddyMessages clears channel-check fingerprints from system and
-// assistant turns (see workBuddyFlagged). sanitizeWorkBuddyAllMessages also
-// rewrites DSH @-path blocks in any role when present.
+// unflagWorkBuddyMessages clears channel-check fingerprints from every turn.
+//
+// Two scopes, because the upstream measures them differently:
+//
+//   - the global rules (billing header, the client template sentences, the
+//     literal refusal code) match the request body as a whole, so they apply to
+//     every role — a flagged line in a user turn is refused exactly like one in
+//     the system prompt;
+//   - the identity rules apply only to the turns that declare who the agent is
+//     (system / developer / assistant), because a user asking about a product
+//     was measured not to trigger the channel check.
+//
+// Reasoning traces and tool arguments are part of the body too, and both come
+// back to the upstream in later turns: a fingerprint written into tool
+// arguments (a filename, a command, a written file's contents) leaks exactly the
+// same way as one in a message. They used to be skipped entirely, which made
+// every tool-using conversation a hole in the sanitizer.
+// sanitizeWorkBuddyAllMessages also rewrites DSH @-path blocks in any role when
+// present.
 func unflagWorkBuddyMessages(messages []any) ([]any, bool) {
 	changed := false
 	out := make([]any, 0, len(messages))
@@ -1146,23 +1258,26 @@ func unflagWorkBuddyMessages(messages []any) ([]any, bool) {
 			continue
 		}
 		role, _ := message["role"].(string)
-		if role != "system" && role != "assistant" {
-			out = append(out, message)
-			continue
-		}
+		identity := role == "system" || role == "developer" || role == "assistant"
+		// Only a system turn that said nothing but a flagged line is dropped whole:
+		// it was filler, and WorkBuddy takes the two user turns that leaves side by
+		// side (measured: answers 200). Any other turn is kept even when empty — an
+		// empty assistant turn still holds the round's place, and dropping it would
+		// move the round onto a different message.
+		dropWhenEmpty := role == "system"
 		switch content := message["content"].(type) {
 		case string:
-			text := unflagWorkBuddyText(content)
+			text := unflagWorkBuddyTextFor(content, identity)
 			if text == content {
 				break
 			}
 			changed = true
-			if strings.TrimSpace(text) == "" {
+			if dropWhenEmpty && strings.TrimSpace(text) == "" {
 				continue
 			}
 			message["content"] = text
 		case []any:
-			parts, partsChanged := unflagWorkBuddyParts(content)
+			parts, partsChanged := unflagWorkBuddyPartsFor(content, identity)
 			if !partsChanged {
 				break
 			}
@@ -1172,7 +1287,7 @@ func unflagWorkBuddyMessages(messages []any) ([]any, bool) {
 				// text-only turn that said nothing but a flagged line is
 				// dropped whole. WorkBuddy takes the two user turns that
 				// leaves side by side (measured: answers 200).
-				if _, hasCalls := message["tool_calls"]; hasCalls {
+				if _, hasCalls := message["tool_calls"]; hasCalls || !dropWhenEmpty {
 					message["content"] = parts
 				} else {
 					continue
@@ -1181,12 +1296,97 @@ func unflagWorkBuddyMessages(messages []any) ([]any, bool) {
 				message["content"] = parts
 			}
 		}
+		for _, field := range []string{"reasoning_content", "reasoning"} {
+			text, isText := message[field].(string)
+			if !isText || text == "" {
+				continue
+			}
+			if replaced := unflagWorkBuddyTextFor(text, identity); replaced != text {
+				message[field] = replaced
+				changed = true
+			}
+		}
+		if calls, hasCalls := message["tool_calls"]; hasCalls {
+			if unflagWorkBuddyToolCalls(calls, identity) {
+				changed = true
+			}
+		}
 		out = append(out, message)
 	}
 	return out, changed
 }
 
+// unflagWorkBuddyToolCalls cleans one assistant turn's tool arguments.
+//
+// arguments is stringified JSON, not an object, so the global rules run over it
+// as text: whatever a model was told to write — a path, a command, a file's
+// contents — is in there verbatim.
+func unflagWorkBuddyToolCalls(calls any, identity bool) bool {
+	list, ok := calls.([]any)
+	if !ok {
+		return false
+	}
+	changed := false
+	for _, item := range list {
+		call, isCall := item.(map[string]any)
+		if !isCall {
+			continue
+		}
+		function, isFunction := call["function"].(map[string]any)
+		if !isFunction {
+			continue
+		}
+		arguments, isText := function["arguments"].(string)
+		if !isText || arguments == "" {
+			continue
+		}
+		if replaced := unflagWorkBuddyTextFor(arguments, identity); replaced != arguments {
+			function["arguments"] = replaced
+			changed = true
+		}
+	}
+	return changed
+}
+
+// sanitizeWorkBuddyToolDescriptions cleans the tools the client declared.
+//
+// A tool description is written by the client's author and can carry the same
+// identity sentences as its prompt (Claude Code and Codex both do). Cleaning only
+// the messages left the whole tools block going out untouched.
+func sanitizeWorkBuddyToolDescriptions(tools any) bool {
+	list, ok := tools.([]any)
+	if !ok {
+		return false
+	}
+	changed := false
+	for _, item := range list {
+		tool, isTool := item.(map[string]any)
+		if !isTool {
+			continue
+		}
+		function, isFunction := tool["function"].(map[string]any)
+		if !isFunction {
+			continue
+		}
+		description, isText := function["description"].(string)
+		if !isText || description == "" {
+			continue
+		}
+		// Identity scope: a tool declaration speaks for the agent.
+		if replaced := unflagWorkBuddyTextFor(description, true); replaced != description {
+			function["description"] = replaced
+			changed = true
+		}
+	}
+	return changed
+}
+
 func unflagWorkBuddyParts(parts []any) ([]any, bool) {
+	return unflagWorkBuddyPartsFor(parts, false)
+}
+
+// unflagWorkBuddyPartsFor is unflagWorkBuddyParts with the identity scope.
+func unflagWorkBuddyPartsFor(parts []any, identity bool) ([]any, bool) {
 	changed := false
 	out := make([]any, 0, len(parts))
 	for _, item := range parts {
@@ -1200,7 +1400,7 @@ func unflagWorkBuddyParts(parts []any) ([]any, bool) {
 			out = append(out, part)
 			continue
 		}
-		replaced := unflagWorkBuddyText(text)
+		replaced := unflagWorkBuddyTextFor(text, identity)
 		if replaced == text {
 			out = append(out, part)
 			continue
@@ -1306,6 +1506,12 @@ func shapeWorkBuddyChatBody(body []byte) ([]byte, map[string]string, bool) {
 	if fitted {
 		changed = true
 	}
+	// Tool descriptions are the client author's words, and they carry the same
+	// template sentences as its prompt — cleaning only the messages left the whole
+	// tools block going out untouched.
+	if sanitizeWorkBuddyToolDescriptions(payload["tools"]) {
+		changed = true
+	}
 	if normalizeWorkBuddyToolChoice(payload) {
 		changed = true
 	}
@@ -1374,6 +1580,13 @@ func (s *Server) sendWorkBuddyChat(provider domain.Provider, model string, body 
 			response.Body = io.NopCloser(bytes.NewReader(original))
 			response.ContentLength = int64(len(original))
 			return response, nil
+		}
+		// A model-level refusal rests that model on this account, apart from the
+		// account's own state: 6004/14003 and friends say "this model is limited",
+		// not "this account is out". Recording it here costs nothing — the body is
+		// already in hand and put back below.
+		if readErr == nil {
+			noteWorkBuddyModelRest(provider.ID, model, response.StatusCode, original, time.Now())
 		}
 		switch {
 		case readErr != nil:

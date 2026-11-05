@@ -665,13 +665,38 @@ func (s *Server) cachedClaudeFiveHourUtilization(providerID string) (float64, bo
 	return report.FiveHour.Utilization, true
 }
 
+// classifyProviderFailover is the provider-aware classifier: it adds what only
+// the provider row can say.
+//
+// WorkBuddy first: that upstream answers 400 for a dozen distinct conditions and
+// its own numeric code is the only thing that separates "this model is limited"
+// from "this account is out". A model-level code advances the chain without
+// painting the account 异常 — otherwise one busy model rests every account that
+// touches it.
 func (s *Server) classifyProviderFailover(providerID string, status int, body []byte, err error) (failoverClass, string) {
+	if err == nil && s.providerIsWorkBuddy(providerID) {
+		if class, reason, ok := classifyWorkBuddyFailure(status, body); ok {
+			return class, reason
+		}
+	}
 	var utilPtr *float64
 	if util, ok := s.cachedClaudeFiveHourUtilization(providerID); ok {
 		u := util
 		utilPtr = &u
 	}
 	return classifyProviderFailover(status, body, err, utilPtr)
+}
+
+// providerIsWorkBuddy reports whether this provider is a WorkBuddy account.
+func (s *Server) providerIsWorkBuddy(providerID string) bool {
+	if s.router == nil || strings.TrimSpace(providerID) == "" {
+		return false
+	}
+	provider, err := s.router.ProviderByID(providerID)
+	if err != nil {
+		return false
+	}
+	return isWorkBuddyProvider(provider)
 }
 
 const (

@@ -122,14 +122,23 @@ func TestPrepareWorkBuddyChatBody(t *testing.T) {
 			},
 		},
 		{
-			name: "改写只动 system 轮，用户说的原话照发",
-			body: `{"model":"glm-5.3","stream":true,"messages":[{"role":"system","content":"be nice"},{"role":"user","content":"You are Claude Code, Anthropic's official CLI for Claude."}]}`,
+			// The two scopes differ by design. The global rules (billing header,
+			// client template sentences, the literal refusal code) match the body
+			// as a whole, so they rewrite wherever the text appears — the upstream
+			// does not look at the role. The identity rules stay on the turns that
+			// declare who the agent is: a user asking about a brand was measured
+			// not to trigger the channel check, and rewriting their words would
+			// drop what they said.
+			name: "全局规则不分角色，身份规则只动声明身份的那轮",
+			body: `{"model":"glm-5.3","stream":true,"messages":[{"role":"system","content":"You are an AI agent powered by DeepSeek Harness."},{"role":"user","content":"You are Claude Code, Anthropic's official CLI for Claude. Both are DeepSeek Harness users."}]}`,
 			check: func(t *testing.T, payload map[string]any) {
-				if got := messageContent(t, payload, 1); got != "You are Claude Code, Anthropic's official CLI for Claude." {
-					t.Fatalf("user turn rewritten: %q", got)
+				if got := messageContent(t, payload, 1); got != "You are Claude Code, Anthropic's CLI for Claude. Both are DeepSeek Harness users." {
+					t.Fatalf("user turn: global rules must rewrite, identity rules must not: %q", got)
+				}
+				if got := messageContent(t, payload, 0); got != "You are an AI agent, powered by DeepSeek Harness." {
+					t.Fatalf("system turn identity sentence: %q", got)
 				}
 			},
-			wantSame: true,
 		},
 		{
 			name: "整条 system 只剩计费头：丢掉这一轮",
@@ -172,15 +181,28 @@ func TestPrepareWorkBuddyChatBody(t *testing.T) {
 			},
 		},
 		{
-			name: "assistant 轮只剩计费头又没有工具调用：整条丢掉",
+			// Only a system turn is dropped when nothing is left. An assistant turn
+			// keeps its place even empty: it holds the round's position, and removing
+			// it would move the round onto a different message. The reference WorkBuddy
+			// implementation draws the line the same way (magpie packages/workbuddy
+			// index.mjs `unflag`: `if (t.trim() || m.role !== "system") m.content = t`).
+			name: "assistant 轮只剩计费头又没有工具调用：保留这一轮，内容清空",
 			body: `{"model":"glm-5.3","stream":true,"messages":[{"role":"system","content":"be nice"},{"role":"user","content":"hi"},{"role":"assistant","content":"x-anthropic-billing-header: cc_version=2.1.280;"},{"role":"user","content":"继续"}]}`,
 			check: func(t *testing.T, payload map[string]any) {
 				messages, _ := payload["messages"].([]any)
+				assistantSeen := 0
 				for _, item := range messages {
 					message, _ := item.(map[string]any)
-					if message["role"] == "assistant" {
-						t.Fatalf("emptied assistant turn survived: %+v", message)
+					if message["role"] != "assistant" {
+						continue
 					}
+					assistantSeen++
+					if content, _ := message["content"].(string); strings.TrimSpace(content) != "" {
+						t.Fatalf("the billing header survived: %+v", message)
+					}
+				}
+				if assistantSeen != 1 {
+					t.Fatalf("assistant turns = %d, want the emptied one kept", assistantSeen)
 				}
 			},
 		},

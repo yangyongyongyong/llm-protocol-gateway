@@ -97,12 +97,12 @@ func workBuddySessionRootIDFrom(ctx context.Context) string {
 // a shape a real capture never shows, so the two families are produced
 // separately. Deriving from a seed rather than at random keeps the value stable
 // across the turns of one conversation, which is what the client does.
+//
+// The time bits come from workBuddyTimeOrderedUUID: hashing them straight into
+// place would decode to dates in the wrong century, which is its own tell (see
+// workbuddy_body_fields.go).
 func workBuddyStableUUID(seed string) string {
-	sum := sha256.Sum256([]byte("workbuddy:" + seed))
-	h := hex.EncodeToString(sum[:16])
-	// Version 7 nibble and the RFC 4122 variant, like a generated v7.
-	h = h[:12] + "7" + h[13:16] + "8" + h[17:]
-	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+	return workBuddyTimeOrderedUUID(seed)
 }
 
 // workBuddyStableHex derives a 32-hex id from a seed — the shape the client uses

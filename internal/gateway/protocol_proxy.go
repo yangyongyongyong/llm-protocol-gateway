@@ -113,6 +113,14 @@ func (s *Server) doOpenAIProviderRequest(ctx context.Context, r *http.Request, p
 		// body is unaffected. The aliases it returns name the model's calls
 		// back to the client's own names.
 		body, workBuddyAliases, _ = shapeWorkBuddyChatBody(body)
+		// The client writes the round id into the body as well as the head, and
+		// leans on the upstream prefix cache across a conversation's turns (see
+		// workbuddy_body_fields.go).
+		body = applyWorkBuddyBodyFields(body, workBuddyBodyFieldOptions{
+			userID:                workBuddyCredentialUserID(provider),
+			conversationID:        workBuddyConversationIDFrom(ctx),
+			conversationRequestID: workBuddyTurnRequestIDFrom(ctx),
+		})
 	}
 	if isOpenCodeZenProvider(provider) {
 		// Zen's free tier is served to a streaming request that offers OpenCode's

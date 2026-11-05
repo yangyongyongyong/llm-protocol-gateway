@@ -66,8 +66,8 @@ func TestWorkBuddyTransportsAreIsolatedPerAccount(t *testing.T) {
 	if a == http.DefaultTransport {
 		t.Fatal("the account was given the process-wide transport")
 	}
-	if a.MaxIdleConnsPerHost != workBuddyIdleConnsPerHost {
-		t.Fatalf("MaxIdleConnsPerHost = %d, want %d", a.MaxIdleConnsPerHost, workBuddyIdleConnsPerHost)
+	if a.MaxIdleConnsPerHost != workBuddyMaxIdleConnsPerHost {
+		t.Fatalf("MaxIdleConnsPerHost = %d, want %d", a.MaxIdleConnsPerHost, workBuddyMaxIdleConnsPerHost)
 	}
 }
 

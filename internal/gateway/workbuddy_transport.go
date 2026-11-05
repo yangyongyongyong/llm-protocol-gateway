@@ -42,59 +42,59 @@ const (
 	// primary was found unreachable. Long enough to stop paying a failed
 	// handshake on every turn, short enough to come back once a route is fixed.
 	workBuddyEndpointHoldOff = 30 * time.Minute
-
-	// The pool a per-account transport keeps. Two idle connections cover "one
-	// streaming, one just returned"; more only keeps sockets alive for nothing.
-	workBuddyIdleConnsPerHost = 2
-	workBuddyIdleConnTimeout  = 90 * time.Second
 )
 
 // workBuddyTransportCache holds one transport per account. A transport owns its
-// connection pool, so this cache is what keeps accounts apart.
+// connection pool, so this cache is what keeps accounts apart. The proxy and the
+// TLS profile are part of the key: either one changing changes the wire bytes,
+// so a pool built under the old setting must not be reused.
 var workBuddyTransportCache sync.Map // workBuddyTransportKey -> *http.Transport
 
 type workBuddyTransportKey struct {
 	providerID string
 	userID     string
+	proxyURL   string
+	mode       string
 }
 
-// workBuddyTransportFor returns the account's own transport, creating it on
-// first use.
-func workBuddyTransportFor(providerID, userID string) *http.Transport {
+// workBuddyAccountTransport returns the pool described by spec, creating it on
+// first use. The pool itself is built in workbuddy_exit.go, where the dial hooks
+// that carry the TLS fingerprint and the header order live.
+func workBuddyAccountTransport(spec workBuddyTransportSpec) *http.Transport {
 	key := workBuddyTransportKey{
-		providerID: strings.TrimSpace(providerID),
-		userID:     strings.TrimSpace(userID),
+		providerID: strings.TrimSpace(spec.providerID),
+		userID:     strings.TrimSpace(spec.userID),
+		proxyURL:   strings.TrimSpace(spec.proxyURL),
+		mode:       spec.mode,
 	}
 	if cached, ok := workBuddyTransportCache.Load(key); ok {
 		if transport, typed := cached.(*http.Transport); typed {
 			return transport
 		}
 	}
-	base, _ := http.DefaultTransport.(*http.Transport)
-	var transport *http.Transport
-	if base != nil {
-		transport = base.Clone()
-	} else {
-		transport = &http.Transport{Proxy: http.ProxyFromEnvironment}
-	}
-	transport.MaxIdleConns = workBuddyIdleConnsPerHost * 4
-	transport.MaxIdleConnsPerHost = workBuddyIdleConnsPerHost
-	transport.IdleConnTimeout = workBuddyIdleConnTimeout
-	actual, _ := workBuddyTransportCache.LoadOrStore(key, transport)
+	fresh := newWorkBuddyTransport(spec)
+	actual, _ := workBuddyTransportCache.LoadOrStore(key, fresh)
 	if existing, ok := actual.(*http.Transport); ok {
 		return existing
 	}
-	return transport
+	return fresh
+}
+
+// workBuddyTransportFor returns the account's own transport, creating it on
+// first use. Kept for the bare provider-id/user-id callers and the tests; the
+// chat path goes through workBuddyChatTransport so the provider's proxy is
+// honoured.
+func workBuddyTransportFor(providerID, userID string) *http.Transport {
+	return workBuddyAccountTransport(workBuddyTransportSpec{
+		providerID: providerID,
+		userID:     userID,
+	})
 }
 
 // workBuddyChatClient is the HTTP client a WorkBuddy chat goes out through: the
 // account's own connection pool, and the endpoint fallback described above.
 func workBuddyChatClient(provider domain.Provider) *http.Client {
-	userID := ""
-	if provider.WorkBuddy != nil {
-		userID = provider.WorkBuddy.UserID
-	}
-	transport := workBuddyTransportFor(provider.ID, userID)
+	transport := workBuddyChatTransport(provider)
 	return &http.Client{
 		Timeout: 0,
 		Transport: &workBuddyFailoverTransport{
@@ -147,10 +147,10 @@ func (t *workBuddyFailoverTransport) RoundTrip(request *http.Request) (*http.Res
 	if t.base == nil || request == nil || request.URL == nil {
 		return t.base.RoundTrip(request)
 	}
-	// Spelling first, on every path below: Go canonicalises header keys, while
-	// the client's wire bytes are its own literals (see
-	// officialWorkBuddyHeaderSpelling).
-	request = normalizeWorkBuddyHeaderSpelling(request)
+	// The single exit first, on every path below: header spelling and the
+	// explicit Connection header, which every WorkBuddy request carries. See
+	// workbuddy_exit.go.
+	request = workBuddyRequestExit(request)
 	if !workBuddyIsCNHost(request.URL.Host) {
 		return t.base.RoundTrip(request)
 	}
