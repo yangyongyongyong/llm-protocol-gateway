@@ -227,10 +227,13 @@ func (s *Server) allowedProviderChainForKey(key domain.APIKey, chain []string) [
 }
 
 // isDisabledOrDeletedProvider reports whether a provider lookup found one that
-// may not take traffic: disabled, or soft-deleted. ProviderByID reports a
-// deleted provider the same "not found" error as a purged one; the difference is
-// the trash listing, so a deleted row is recognised through the including-deleted
-// lookup and a truly missing id is not.
+// may not take traffic: disabled, or soft-deleted.
+//
+// A provider that is not found at all is deliberately *not* treated as unusable
+// here: the failover loop records such a candidate as skipped (the console shows
+// it as 「Provider 不存在」), which is how an operator learns that a key still
+// points at something that was purged. Dropping the id earlier would hide that.
+// The cost of keeping it is a local map lookup, not a request.
 func (s *Server) isDisabledOrDeletedProvider(providerID string, err error, provider domain.Provider) bool {
 	if err != nil {
 		deleted, deletedErr := s.router.ProviderByIDIncludingDeleted(providerID)

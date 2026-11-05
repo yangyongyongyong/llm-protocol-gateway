@@ -1119,7 +1119,9 @@ function RoutingTab({
           <button
             type="button"
             className="akc-soft-btn"
-            disabled={saving || !primaryProviderId || providers.length < 2}
+            // 首选还在时要两台以上才有「备选」可选；首选已被删除时只要还有一台
+            // 就能选——那时候这一台既是备选也是把这个密钥救回来的唯一办法。
+            disabled={saving || providers.length === 0 || (!!primaryProviderId && providers.length < 2)}
             onClick={onOpenFallbackModal}
           >
             <Icon path={ICONS.plus} size={13} />
@@ -1139,9 +1141,15 @@ function RoutingTab({
                 </button>
               </span>
             ) : null}
-            {fallbackIds.length === 0
-              ? '未配置备选：首选额度耗尽后，这个密钥不会自动换到别的 Provider。'
-              : '按住备选行拖动即可调整顺序，松手后保存；「设为首选」会交换绑定，其余备选顺序不变。'}
+            {!primaryProviderId ? (
+              <span className="akc-chain-foot-stale">
+                首选 Provider 已不存在：这个密钥当前没有首选节点，流量会落到下面的备选或直接失败。点「配置备选 Provider」选一台，再用「设为首选」把它提上来。
+              </span>
+            ) : fallbackIds.length === 0 ? (
+              '未配置备选：首选额度耗尽后，这个密钥不会自动换到别的 Provider。'
+            ) : (
+              '按住备选行拖动即可调整顺序，松手后保存；「设为首选」会交换绑定，其余备选顺序不变。'
+            )}
           </span>
         </div>
       </div>
