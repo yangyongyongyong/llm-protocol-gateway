@@ -298,3 +298,28 @@ func TestWorkBuddyAnyNumberAndBool(t *testing.T) {
 		t.Fatal("a falsy value was read as true")
 	}
 }
+
+// Measured live on 2026-11-05: `streak.next_tier` arrived as a string while its
+// neighbours were numbers, and a typed decode refused the whole answer. Every
+// numeric field is read tolerantly for exactly this reason.
+func TestWorkBuddyStreakNowAcceptsStringNumbers(t *testing.T) {
+	_, cleanup := newRewardsServer(t, func(method, path string) (int, string) {
+		return http.StatusOK, `{"code":0,"data":{
+			"streak":{"days":"14","month_total_days":"20","next_tier":"28","next_tier_remaining":"14"},
+			"makeup_cards":{"balance":"2","max":"3"},
+			"redemption_status":{"remaining_days":"0","tiers":[
+				{"tier":"14","days":"14","credit":"50","chances":"2","status":""}
+			]}}}`
+	})
+	defer cleanup()
+	streak, err := workBuddyStreakNow(context.Background(), workBuddyCNSite, domain.WorkBuddyCredential{AccessToken: "t"})
+	if err != nil {
+		t.Fatalf("string-numbered streak was refused: %v", err)
+	}
+	if streak.Days != 14 || streak.NextTier != 28 || streak.MakeupBalance != 2 {
+		t.Fatalf("streak = %+v", streak)
+	}
+	if len(streak.Tiers) != 1 || streak.Tiers[0].Tier != 14 || streak.Tiers[0].Credit != 50 {
+		t.Fatalf("tiers = %+v", streak.Tiers)
+	}
+}

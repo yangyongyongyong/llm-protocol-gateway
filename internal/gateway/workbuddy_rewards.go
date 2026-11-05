@@ -142,26 +142,31 @@ func workBuddyClaimGift(ctx context.Context, site workBuddySite, credential doma
 }
 
 // workBuddyStreakNow reads the streak oracle.
+//
+// Every numeric field goes through workBuddyAnyFloat instead of a typed int: the
+// upstream writes the same field as a number on one build and as a string on
+// another — measured live, `streak.next_tier` came back as a string, and a typed
+// decode refuses the whole answer over one field.
 func workBuddyStreakNow(ctx context.Context, site workBuddySite, credential domain.WorkBuddyCredential) (workBuddyStreak, error) {
 	var raw struct {
 		Streak struct {
-			Days           int `json:"days"`
-			MonthTotalDays int `json:"month_total_days"`
-			NextTier       int `json:"next_tier"`
-			NextTierRemain int `json:"next_tier_remaining"`
+			Days           any `json:"days"`
+			MonthTotalDays any `json:"month_total_days"`
+			NextTier       any `json:"next_tier"`
+			NextTierRemain any `json:"next_tier_remaining"`
 		} `json:"streak"`
 		MakeupCards struct {
-			Balance int `json:"balance"`
-			Max     int `json:"max"`
+			Balance any `json:"balance"`
+			Max     any `json:"max"`
 		} `json:"makeup_cards"`
 		Redemption struct {
-			RemainingDays int `json:"remaining_days"`
+			RemainingDays any `json:"remaining_days"`
 			Tiers         []struct {
-				Tier    int     `json:"tier"`
-				Days    int     `json:"days"`
-				Credit  float64 `json:"credit"`
-				Chances int     `json:"chances"`
-				Status  string  `json:"status"`
+				Tier    any    `json:"tier"`
+				Days    any    `json:"days"`
+				Credit  any    `json:"credit"`
+				Chances any    `json:"chances"`
+				Status  string `json:"status"`
 			} `json:"tiers"`
 		} `json:"redemption_status"`
 	}
@@ -170,18 +175,21 @@ func workBuddyStreakNow(ctx context.Context, site workBuddySite, credential doma
 		return workBuddyStreak{}, err
 	}
 	streak := workBuddyStreak{
-		Days:           raw.Streak.Days,
-		MonthTotalDays: raw.Streak.MonthTotalDays,
-		NextTier:       raw.Streak.NextTier,
-		NextTierRemain: raw.Streak.NextTierRemain,
-		MakeupBalance:  raw.MakeupCards.Balance,
-		MakeupMax:      raw.MakeupCards.Max,
-		RemainingDays:  raw.Redemption.RemainingDays,
+		Days:           int(workBuddyAnyFloat(raw.Streak.Days)),
+		MonthTotalDays: int(workBuddyAnyFloat(raw.Streak.MonthTotalDays)),
+		NextTier:       int(workBuddyAnyFloat(raw.Streak.NextTier)),
+		NextTierRemain: int(workBuddyAnyFloat(raw.Streak.NextTierRemain)),
+		MakeupBalance:  int(workBuddyAnyFloat(raw.MakeupCards.Balance)),
+		MakeupMax:      int(workBuddyAnyFloat(raw.MakeupCards.Max)),
+		RemainingDays:  int(workBuddyAnyFloat(raw.Redemption.RemainingDays)),
 	}
 	for _, tier := range raw.Redemption.Tiers {
 		streak.Tiers = append(streak.Tiers, workBuddyStreakTier{
-			Tier: tier.Tier, Days: tier.Days, Credit: tier.Credit,
-			Chances: tier.Chances, Status: strings.TrimSpace(tier.Status),
+			Tier:    int(workBuddyAnyFloat(tier.Tier)),
+			Days:    int(workBuddyAnyFloat(tier.Days)),
+			Credit:  workBuddyAnyFloat(tier.Credit),
+			Chances: int(workBuddyAnyFloat(tier.Chances)),
+			Status:  strings.TrimSpace(tier.Status),
 		})
 	}
 	return streak, nil
