@@ -609,6 +609,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/models/", s.handleGeminiGenerateContent)
 	mux.HandleFunc("POST /v1/images/generations", s.handleOpenAIImagesGenerations)
 	mux.HandleFunc("POST /v1/images/edits", s.handleOpenAIImagesEdits)
+	mux.HandleFunc("POST /v1/videos/generations", s.handleOpenAIVideosGenerations)
+	mux.HandleFunc("POST /v1/videos/tasks", s.handleOpenAIVideosTask)
+	mux.HandleFunc("GET /v1/videos/{taskID}", s.handleOpenAIVideoTaskByID)
 	mux.HandleFunc("POST /openai/v1/images/generations", s.handleOpenAIImagesGenerations)
 	mux.HandleFunc("POST /openai/v1/responses", s.handleOpenAIResponses)
 	// Real OpenAI Responses API endpoint Codex CLI calls for "remote
@@ -6077,6 +6080,11 @@ func (s *Server) proxyOpenAIImages(w http.ResponseWriter, r *http.Request, provi
 	// bearer alone is not enough, and the generic path below posts to a doubled /v2
 	// prefix (see workbuddy_endpoints.go).
 	if _, isWorkBuddyRender := workBuddyRenderSite(provider); isWorkBuddyRender {
+		// A media route carries its own upstream path and body (video submit, task
+		// poll); an image render does not, and decides by the edits marker.
+		if media, ok := workBuddyMediaRouteOf(r.Context()); ok {
+			return s.executeWorkBuddyEndpoint(w, r, provider, media.path, body)
+		}
 		return s.executeWorkBuddyEndpoint(w, r, provider, workBuddyImagePathFor(r.Context()), body)
 	}
 	// 只用 Provider 自己的凭证。以前这里会在 Provider 没有 Key 时把调用方的

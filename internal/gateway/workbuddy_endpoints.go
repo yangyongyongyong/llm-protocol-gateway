@@ -144,6 +144,12 @@ func (s *Server) executeWorkBuddyEndpoint(
 	if err != nil {
 		return 0, TokenUsage{}, nil, err
 	}
+	// A video submit answers with the task id the client will poll with, and a task can
+	// only be read by the account that submitted it — so the ledger is written where
+	// the account is known (see workbuddy_videos.go).
+	if path == workBuddyVideoGenerationsPath && status >= 200 && status < 300 {
+		recordWorkBuddyVideoTaskFromResponse(provider.ID, bodyModelOf(body), payload)
+	}
 	// The status and body go back as they came, refusal included: the vendor's own
 	// words are what let a client tell a bad prompt (400) from a dead account (401)
 	// from a busy one (429). Wrapping them into a gateway error turned every one of
@@ -215,4 +221,15 @@ func normalizeWorkBuddyImageEditBody(body []byte) []byte {
 		return body
 	}
 	return encoded
+}
+
+// bodyModelOf reads the model a JSON body names, for the task ledger.
+func bodyModelOf(body []byte) string {
+	var payload struct {
+		Model string `json:"model"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.Model)
 }
