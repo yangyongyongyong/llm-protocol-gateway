@@ -207,6 +207,19 @@ Provider 行上的 `proxyUrl` 现在对 WorkBuddy chat 生效（`http://`、`htt
 | 免费模型日窗 | `workbuddy_freewindow.go` | `429 usage exceeds frequency limit` 判为「账号健康、额度用完」，**不再罚整个 Provider**（此前按软限流会逐步判异常）；并从报文里解析 `reset at … UTC±N`，精确休息该模型到窗口重开，无时间戳退回短休息、上限 24h；只有带该措辞的 429 才走此分支 |
 | 积分保底 / 到期加权 | `workbuddy_credit_route.go` | 作为 mode 之后的偏好层（默认关闭，见上表） |
 
+
+### 第三次发布新增：积分任务域
+
+| 能力 | 落地 | 说明 |
+| --- | --- | --- |
+| 积分任务域 | `workbuddy_rewards.go` | 新手礼包（`check-gift-claimed` / `claim-gift`，**走裸 billing 根，带 `/v2` 会 404**）、连登兑换（`growth/streak` + `growth/redeem`）、抽奖（`lottery/summary` + `lottery/draw`）。三个域各自独立，一个被拒不影响其它；只认真实回执里的 `credit`，空回执按「已领」处理；redeem/draw 带 uuid-v4 形状的 `client_token` 做幂等 |
+| 接线 | `workbuddy_tasks_api.go` | 接入每日保活链，返回 `rewardsCredit` 与 `rewardsNotes` |
+
+线上实测（陌账号 `POST /__providers/{id}/workbuddy-oauth/keepalive`）：第一次返回 `refreshed/activity/checkin:done`，
+但 `rewardsNotes` 报 `streak: cannot unmarshal string into … next_tier of type int` —— **上游把 `next_tier` 写成字符串**，
+强类型 int 会让整条 streak 读取失败。修正后（数值字段全部容错 + 回归用例）同一调用不再报错，说明 streak 端点已被调用并解析成功；
+该账号当前无待领礼包、无可兑换档位、无抽奖次数，故本次积分为 0。
+
 ### 仍未对齐（下一轮）
 
 1. `/v1/messages` 直连路由：国内版 Claude 模型（`claude-opus-5.5` 等）走该路由才吃
