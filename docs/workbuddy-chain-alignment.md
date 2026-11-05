@@ -111,7 +111,9 @@ TLS（spec 形状与 JA3/JA4 锚点、真实握手 + 包装、档位选择）、
 13. **`X-Enterprise-Id` / `X-Tenant-Id`** 企业头未实现（上游也无，个人号无此头，属企业号场景）。
 14. **`/v2/chat/busy` 模型繁忙度观测**缺，无法在选号时避让繁忙模型。
 
-## 三、第二参考实现（magpie packages/workbuddy 0.2.21）带来的修正与新缺口magpie 的 WorkBuddy 插件是另一条独立实现路线，且带一手实测记录（`REFUSED.md`）。逐条比完之后，
+## 三、第二参考实现（magpie packages/workbuddy 0.2.21）带来的修正与新缺口
+
+magpie 的 WorkBuddy 插件是另一条独立实现路线，且带一手实测记录（`REFUSED.md`）。逐条比完之后，
 它推翻了我第一轮的两处「改过头」，并暴露了四个本仓完全没有的链路能力。
 
 ### 3.1 已按 magpie 证据修正（本轮第二次改动）
