@@ -12,6 +12,7 @@ import React from 'react';
 import {
     API_BASE
 } from '../lib';
+import { Modal } from './ui';
 import {
     WorkBuddyAutomation,
     WorkBuddyKeepaliveResult,
@@ -65,7 +66,7 @@ export function WorkBuddyTaskPanel({ providerId, connected, compact }: { provide
   const [busy, setBusy] = React.useState('');
   const [notice, setNotice] = React.useState('');
   const [error, setError] = React.useState('');
-  const [expanded, setExpanded] = React.useState(false);
+  const [listOpen, setListOpen] = React.useState(false);
 
   const load = React.useCallback(async () => {
     setLoading(true);
@@ -176,13 +177,11 @@ export function WorkBuddyTaskPanel({ providerId, connected, compact }: { provide
   }
   const automatable = tasks.filter((task) => task.automatable).length;
   const done = tasks.filter((task) => task.claimed).length;
-  // 卡片态（compact）默认只放按钮和开关：任务列表一张卡十几行会把同排其它卡
-  // 撑得一样高。要看明细就展开，展开后列表进流动布局。
-  const visibleTasks = expanded ? tasks : compact ? [] : tasks.slice(0, 8);
-  const recentEvents = expanded || !compact ? (view?.run?.events || []).slice(-4) : [];
+  // 明细进弹窗：一张卡里十几行任务会把同排其它卡一起撑到最高那张的高度。
+  const events = (view?.run?.events || []).slice(-6);
 
   return (
-    <div className="wb-task-panel" data-running={running ? 'true' : 'false'}>
+    <div className="wb-task-panel" data-running={running ? 'true' : 'false'} data-compact={compact ? 'true' : 'false'}>
       <div className="wb-task-head">
         <div className="wb-task-headline">
           <span className="wb-task-title">任务中心</span>
@@ -260,81 +259,97 @@ export function WorkBuddyTaskPanel({ providerId, connected, compact }: { provide
       {error ? <div className="wb-task-error">{error}</div> : null}
       {notice ? <div className="wb-task-notice">{notice}</div> : null}
 
-      {recentEvents.length > 0 ? (
-        <div className="wb-task-log">
-          {recentEvents.map((event, index) => {
-            const status = event.result?.status;
-            return (
-              <div key={`${event.taskCode || event.kind}-${index}`} className="wb-task-log-line" data-tone={TASK_STATUS_TONE[status || ''] || 'muted'}>
-                <span className="wb-task-log-code">{event.taskCode || event.kind}</span>
-                <span className="wb-task-log-text">
-                  {event.kind === 'task_start'
-                    ? '开始执行…'
-                    : event.message || event.result?.message || ''}
-                </span>
-              </div>
-            );
-          })}
-        </div>
-      ) : null}
-
-      {visibleTasks.length > 0 ? (
-        <div className="wb-task-list">
-          {visibleTasks.map((task) => {
-            const result = latestByTask.get(task.taskCode);
-            const percent = taskPercent(task);
-            return (
-              <div key={task.taskCode} className="wb-task-row" data-state={taskRowState(task)}>
-                <div className="wb-task-line">
-                  <span className="wb-task-name" title={task.action || task.description || task.title || task.taskCode}>
-                    {task.title || task.taskCode}
-                    {task.mp ? <i className="wb-task-tag">小程序</i> : null}
-                  </span>
-                  <span className="wb-task-reward">
-                    +{task.credit}{task.energy ? ` +${task.energy}e` : ''}
-                  </span>
-                  {result ? (
-                    <span className="wb-task-badge" data-tone={TASK_STATUS_TONE[result.status || ''] || 'muted'}>
-                      {taskStatusText(result.status)}
-                    </span>
-                  ) : task.claimed ? (
-                    <span className="wb-task-badge" data-tone="ok">已领取</span>
-                  ) : task.locked ? (
-                    <span className="wb-task-badge" data-tone="muted">未解锁</span>
-                  ) : null}
-                  {task.automatable && !task.claimed && !view?.readOnly ? (
-                    <button
-                      type="button"
-                      className="wb-task-run"
-                      disabled={Boolean(busy) || running}
-                      title={task.action || '执行这个任务的自动动作'}
-                      onClick={() => void runTasks([task.taskCode])}
-                    >
-                      执行
-                    </button>
-                  ) : null}
-                </div>
-                {task.progressKnown && (task.target || 0) > 0 ? (
-                  <div className="wb-task-progress">
-                    <div className="wb-task-bar">
-                      <i style={{ width: `${percent}%` }} />
-                    </div>
-                    <span className="wb-task-count">{task.current || 0}/{task.target || 0}</span>
-                  </div>
-                ) : null}
-                {result?.message ? (
-                  <div className="wb-task-result" title={result.message}>{result.message}</div>
-                ) : null}
-              </div>
-            );
-          })}
-        </div>
-      ) : null}
-
-      {tasks.length > visibleTasks.length || expanded ? (
-        <button type="button" className="wb-task-more" onClick={() => setExpanded((value) => !value)}>
-          {expanded ? '收起任务列表' : `展开全部 ${tasks.length} 个任务`}
+      {tasks.length > 0 ? (
+        <button
+          type="button"
+          className="wb-task-more"
+          onClick={(event) => { event.stopPropagation(); setListOpen(true); }}
+        >
+          任务列表 · {done}/{tasks.length} 已领取
         </button>
-      ) : null}    </div>
+      ) : null}
+
+      {listOpen ? (
+        <Modal
+          title={`任务列表 · ${done}/${tasks.length} 已领取`}
+          description="进度由厂商计数决定：跑过了但还没入账的会显示「待入账」。"
+          onClose={() => setListOpen(false)}
+          size="wide"
+        >
+          {events.length > 0 ? (
+            <div className="wb-task-log">
+              {events.map((event, index) => {
+                const status = event.result?.status;
+                return (
+                  <div key={`${event.taskCode || event.kind}-${index}`} className="wb-task-log-line" data-tone={TASK_STATUS_TONE[status || ''] || 'muted'}>
+                    <span className="wb-task-log-code">{event.taskCode || event.kind}</span>
+                    <span className="wb-task-log-text">
+                      {event.kind === 'task_start'
+                        ? '开始执行…'
+                        : event.message || event.result?.message || ''}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
+
+          {tasks.length === 0 ? (
+            <div className="empty-state">这个账号暂时没有可展示的任务。</div>
+          ) : (
+            <div className="wb-task-list">
+              {tasks.map((task) => {
+                const result = latestByTask.get(task.taskCode);
+                const percent = taskPercent(task);
+                return (
+                  <div key={task.taskCode} className="wb-task-row" data-state={taskRowState(task)}>
+                    <div className="wb-task-line">
+                      <span className="wb-task-name" title={task.action || task.description || task.title || task.taskCode}>
+                        {task.title || task.taskCode}
+                        {task.mp ? <i className="wb-task-tag">小程序</i> : null}
+                      </span>
+                      <span className="wb-task-reward">
+                        +{task.credit}{task.energy ? ` +${task.energy}e` : ''}
+                      </span>
+                      {result ? (
+                        <span className="wb-task-badge" data-tone={TASK_STATUS_TONE[result.status || ''] || 'muted'}>
+                          {taskStatusText(result.status)}
+                        </span>
+                      ) : task.claimed ? (
+                        <span className="wb-task-badge" data-tone="ok">已领取</span>
+                      ) : task.locked ? (
+                        <span className="wb-task-badge" data-tone="muted">未解锁</span>
+                      ) : null}
+                      {task.automatable && !task.claimed && !view?.readOnly ? (
+                        <button
+                          type="button"
+                          className="wb-task-run"
+                          disabled={Boolean(busy) || running}
+                          title={task.action || '执行这个任务的自动动作'}
+                          onClick={() => void runTasks([task.taskCode])}
+                        >
+                          执行
+                        </button>
+                      ) : null}
+                    </div>
+                    {task.progressKnown && (task.target || 0) > 0 ? (
+                      <div className="wb-task-progress">
+                        <div className="wb-task-bar">
+                          <i style={{ width: `${percent}%` }} />
+                        </div>
+                        <span className="wb-task-count">{task.current || 0}/{task.target || 0}</span>
+                      </div>
+                    ) : null}
+                    {result?.message ? (
+                      <div className="wb-task-result" title={result.message}>{result.message}</div>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </Modal>
+      ) : null}
+    </div>
   );
 }

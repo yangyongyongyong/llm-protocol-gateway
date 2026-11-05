@@ -887,6 +887,21 @@ function App() {
   }, [providersConnectFilter, state.providers]);
 
   const filteredProviders = useMemo(() => {
+    // 索引里除了名称/ID/协议，还放账号标签、创建者与它提供的模型：
+    // 「按账号找」「按创建人找」「按模型找」是同一张卡上真实的三个入口。
+    // consoleUsers 用于把 ownerUserId 解析成显示名（空 = 管理员自建）。
+    const ownerNames = new Map<string, string>();
+    for (const user of consoleUsers) ownerNames.set(user.id, user.username);
+    const modelsByProvider = new Map<string, string>();
+    for (const model of state.models) {
+      const current = modelsByProvider.get(model.providerId);
+      modelsByProvider.set(model.providerId, current ? `${current} ${model.id}` : model.id);
+    }
+    const ownerLabelOf = (provider: Provider): string => {
+      const ownerID = (provider.ownerUserId || '').trim();
+      if (!ownerID) return '管理员';
+      return ownerNames.get(ownerID) || ownerID;
+    };
     return sortedProviders.filter((provider) => {
       if (providersStatusFilter === 'healthy') {
         if (provider.disabled || provider.healthStatus === 'unavailable') return false;
@@ -909,10 +924,13 @@ function App() {
         provider.baseUrl || '',
         providerConnectLabel(providerConnectKind(provider)),
         protocolLabel(provider.protocol),
+        providerAccountLabel(provider) || '',
+        ownerLabelOf(provider),
+        modelsByProvider.get(provider.id) || '',
       ].join(' ');
       return providersSearch.matcher(haystack);
     });
-  }, [sortedProviders, providersStatusFilter, providersConnectFilter, providersSearch]);
+  }, [sortedProviders, providersStatusFilter, providersConnectFilter, providersSearch, consoleUsers, state.models]);
 
   const modelsMenuProviders = useMemo(() => {
     const providerIDs = new Set(state.models.map((model) => model.providerId));
@@ -5340,6 +5358,7 @@ function App() {
                         provider={provider}
                         cursorBridge={provider.authType === 'cursor_oauth' ? state.cursorBridge : undefined}
                         ownerName={authStatus?.scope === 'all' || canDo('usage.all') ? providerOwnerName(provider) : undefined}
+                        highlightQuery={providersSearchQuery}
                         onToggleSelect={() => toggleExportProviderSelection(provider.id)}
                         onClick={() => {
                           setSelectedProviderID(provider.id);

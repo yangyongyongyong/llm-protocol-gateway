@@ -2079,6 +2079,31 @@ export function providerMatchesQuery(provider: Provider, query: string): boolean
 }
 
 /**
+ * highlightSegments 把 text 按 query 切成「命中 / 未命中」的片段，供渲染层加高亮。
+ *
+ * 与 providersSearch 的口径保持一致：用户输入的是一段正则，命中部分是整个正则
+ * 的匹配而非每个字符。正则写坏时返回整段未命中——与筛选那边退回子串匹配不同，
+ * 这里没有可用的命中范围，宁可不标也不能标错。
+ */
+export function highlightSegments(text: string, query: string): { text: string; hit: boolean }[] {
+  const source = text || '';
+  const pattern = (query || '').trim();
+  if (!pattern || !source) return [{ text: source, hit: false }];
+  let re: RegExp;
+  try {
+    re = new RegExp(`(${pattern})`, 'gi');
+  } catch {
+    return [{ text: source, hit: false }];
+  }
+  const parts = source.split(re);
+  if (parts.length <= 1) return [{ text: source, hit: false }];
+  // split 带捕获组时，奇数下标就是命中片段；先按位取标记再丢掉空串，避免下标错位。
+  return parts
+    .map((part, index) => ({ text: part, hit: index % 2 === 1 }))
+    .filter((segment) => segment.text !== '');
+}
+
+/**
  * promoteApiKeyProvider 把一台备选提为首选，返回要一起提交的绑定字段。
  *
  * 「设为首选」是交换，不是删除：旧首选回到被提升者原来的位次，其余备选顺序不变。

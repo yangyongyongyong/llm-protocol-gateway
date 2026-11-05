@@ -12821,3 +12821,13 @@ html[data-theme="dark"] .wb-task-log-line[data-tone="ok"] { color: #6ee7b7; }
 html[data-theme="dark"] .wb-task-badge[data-tone="ok"] { color: #6ee7b7; border-color: #6ee7b7; }
 .wb-task-progress { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .wb-task-count { flex: none; font-size: 9.5px; color: var(--muted); }
+
+/* 搜索命中：Provider 卡的名称 / 账号 / 创建者里被筛中的那一段。
+   用固定半透明底色而不是主题变量：深浅两套主题下都要能看清，且不该抢图标色。 */
+.search-hit {
+  background: rgba(250, 204, 21, 0.32);
+  color: inherit;
+  border-radius: 3px;
+  padding: 0 1px;
+  box-shadow: 0 0 0 1px rgba(250, 204, 21, 0.35) inset;
+}

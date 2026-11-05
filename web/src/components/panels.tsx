@@ -10,6 +10,7 @@ import {
     flowBadgeTone,
     healthStatusLabel,
     healthTone,
+    highlightSegments,
     isQoderConnectKind,
     isTraeConnectKind,
     isZCodeConnectKind,
@@ -821,7 +822,28 @@ export function ChatGPTOAuthUsagePanel({ providerId, accountKey, connected, comp
   );
 }
 
-export function ProviderCard({ active, selected, name, providerId, protocol, tone, url, defaultModel, modelCount, usedCount, healthStatus, nextRetryAt, testing, chatTesting, readOnly, selectable, providerDisabled, onToggleEnabled, onToggleRTK, subtitle, icon, provider, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, isQoderPAT, qoderPATConnected, isWorkBuddy, workBuddyConnected, cursorBridge, ownerName, onToggleSelect, onClick, onTest, onChatTest, onConformance, onEdit, onClone, onDelete, layout = 'card' }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; defaultModel?: string; modelCount?: number; usedCount: number; healthStatus: string; nextRetryAt?: string; testing: boolean; chatTesting?: boolean; readOnly?: boolean; selectable?: boolean; providerDisabled?: boolean; onToggleEnabled?: () => void; onToggleRTK?: () => void; subtitle?: string; icon?: string; provider?: Provider; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; isQoderPAT?: boolean; qoderPATConnected?: boolean; isWorkBuddy?: boolean; workBuddyConnected?: boolean; cursorBridge?: CursorBridgeRuntime; ownerName?: string; onToggleSelect: () => void; onClick: () => void; onTest?: () => void; onChatTest?: () => void; onConformance?: () => void; onEdit?: () => void; onClone?: () => void; onDelete?: () => void; layout?: 'card' | 'list' }) {
+/**
+ * MatchText 按搜索词把一段文字里的命中部分标出来。
+ *
+ * 卡片上的名称、账号、创建者都是筛选会命中的字段，命中却看不出来等于没命中：
+ * 用户搜「4947」时得能一眼看到是哪个账号匹配上的。
+ */
+function MatchText({ text, query }: { text: string; query?: string }) {
+  if (!query || !query.trim() || !text) return <>{text}</>;
+  const segments = highlightSegments(text, query);
+  if (segments.length === 0) return <>{text}</>;
+  return (
+    <>
+      {segments.map((segment, index) => (
+        segment.hit
+          ? <mark key={index} className="search-hit">{segment.text}</mark>
+          : <React.Fragment key={index}>{segment.text}</React.Fragment>
+      ))}
+    </>
+  );
+}
+
+export function ProviderCard({ active, selected, name, providerId, protocol, tone, url, defaultModel, modelCount, usedCount, healthStatus, nextRetryAt, testing, chatTesting, readOnly, selectable, providerDisabled, onToggleEnabled, onToggleRTK, subtitle, icon, provider, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, isQoderPAT, qoderPATConnected, isWorkBuddy, workBuddyConnected, cursorBridge, ownerName, highlightQuery, onToggleSelect, onClick, onTest, onChatTest, onConformance, onEdit, onClone, onDelete, layout = 'card' }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; defaultModel?: string; modelCount?: number; usedCount: number; healthStatus: string; nextRetryAt?: string; testing: boolean; chatTesting?: boolean; readOnly?: boolean; selectable?: boolean; providerDisabled?: boolean; onToggleEnabled?: () => void; onToggleRTK?: () => void; subtitle?: string; icon?: string; provider?: Provider; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; isQoderPAT?: boolean; qoderPATConnected?: boolean; isWorkBuddy?: boolean; workBuddyConnected?: boolean; cursorBridge?: CursorBridgeRuntime; ownerName?: string; highlightQuery?: string; onToggleSelect: () => void; onClick: () => void; onTest?: () => void; onChatTest?: () => void; onConformance?: () => void; onEdit?: () => void; onClone?: () => void; onDelete?: () => void; layout?: 'card' | 'list' }) {
   // 订阅类（ZCode / Trae）由后端返回的凭证对象决定卡片显示什么：整张 Provider 传进来
   // 比再加六个布尔参数更省事，也不会漏掉以后新增的连接方式。
   const connectKind = provider ? providerConnectKind(provider) : 'api_key';
@@ -888,8 +910,8 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
         <span className="provider-list-icon"><BrandIcon icon={icon} name={name} size={18} /></span>
         <div className="provider-list-id">
           <div className="provider-list-title">
-            <span className="provider-list-name" title={name}>{name}</span>
-            <span className="provider-list-sub" title={subtitleText}>{subtitleText}</span>
+            <span className="provider-list-name" title={name}><MatchText text={name} query={highlightQuery} /></span>
+            <span className="provider-list-sub" title={subtitleText}><MatchText text={subtitleText} query={highlightQuery} /></span>
           </div>
           <div className="provider-list-badges">
             {providerDisabled ? <Badge tone="red">已禁用</Badge> : null}
@@ -927,9 +949,9 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
           <BrandIcon icon={icon} name={name} size={20} />
         </span>
         <div className="provider-title-block">
-          <div className="provider-name">{name}</div>
+          <div className="provider-name"><MatchText text={name} query={highlightQuery} /></div>
           {/* 副标题只放账号/ID：协议已由徽章表达，不再重复拼接 */}
-          <div className="provider-subtitle" title={subtitleText}>{subtitleText}</div>
+          <div className="provider-subtitle" title={subtitleText}><MatchText text={subtitleText} query={highlightQuery} /></div>
         </div>
         {selectable ? (
           <label className="provider-check" onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
@@ -981,7 +1003,7 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
       <div className="provider-foot" onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
         <div className="provider-foot-meta">
           <span><b>{usedCount}</b> 个 API Key</span>
-          {ownerName ? <span>创建者 <b>{ownerName}</b></span> : null}
+          {ownerName ? <span>创建者 <b><MatchText text={ownerName} query={highlightQuery} /></b></span> : null}
         </div>
         {/* 只读（管理员授权给普通用户的 Provider）也允许获取模型与对话测试；
             编辑/删除等管理操作保持隐藏。后端 requireProviderOwnerForUser 会对
