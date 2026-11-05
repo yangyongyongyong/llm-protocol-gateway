@@ -100,6 +100,11 @@ func (s *Server) failoverAttemptOrder(input scheduleInput) []string {
 	default:
 		ordered = rotateChainAt(chain, input.active)
 	}
+	// Credit preference, after the mode has decided the shape: the mode is the
+	// administrator's ranking, this only decides who among equals is asked first
+	// (drain the soonest-expiring, hold back the nearly-empty). Off by default —
+	// see workbuddy_credit_route.go.
+	ordered = s.applyWorkBuddyCreditOrder(ordered)
 	return s.healthyFirst(ordered)
 }
 
