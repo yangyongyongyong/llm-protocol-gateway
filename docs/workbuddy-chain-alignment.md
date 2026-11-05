@@ -111,9 +111,7 @@ TLS（spec 形状与 JA3/JA4 锚点、真实握手 + 包装、档位选择）、
 13. **`X-Enterprise-Id` / `X-Tenant-Id`** 企业头未实现（上游也无，个人号无此头，属企业号场景）。
 14. **`/v2/chat/busy` 模型繁忙度观测**缺，无法在选号时避让繁忙模型。
 
-## 三、第二参考实现（magpie packages/workbuddy 0.2.21）带来的修正与新缺口
-
-magpie 的 WorkBuddy 插件是另一条独立实现路线，且带一手实测记录（`REFUSED.md`）。逐条比完之后，
+## 三、第二参考实现（magpie packages/workbuddy 0.2.21）带来的修正与新缺口magpie 的 WorkBuddy 插件是另一条独立实现路线，且带一手实测记录（`REFUSED.md`）。逐条比完之后，
 它推翻了我第一轮的两处「改过头」，并暴露了四个本仓完全没有的链路能力。
 
 ### 3.1 已按 magpie 证据修正（本轮第二次改动）
@@ -190,6 +188,32 @@ bash/WSL，原脚本跑不了）：交叉编译 `linux/amd64` + `npm run build` 
 | 变量 | 取值 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `WORKBUDDY_TLS_FINGERPRINT` | `node` / `go` | `node` | `go` 退回 crypto/tls 原生 ClientHello（排障/回滚用），其余任何值都按 `node` |
+| `WORKBUDDY_PREFER_EXPIRING` | `1` / 空 | 关闭 | 开启后选号优先花掉**最早到期**的额度 |
+| `WORKBUDDY_CREDIT_FLOOR` | 数字（credits） | `0`（关闭） | 低于该值的账号在还有别的可选时排到最后；全链都低于阈值时不动顺序 |
+
+后两项只读缓存（`workBuddyPackagesCache`，10 分钟 TTL），未知账号保持原相对位置；
+排序稳定，`mode` 仍是管理员口径。**默认关闭是有意的**：现网 59 个 Provider 在跑，
+静默改变「哪个账号来回答这次请求」不该由一次发布决定。
 
 Provider 行上的 `proxyUrl` 现在对 WorkBuddy chat 生效（`http://`、`https://`、`socks5://`），
 并作为连接池 key 的一部分：换代理会换池，不会复用旧路由的连接。
+
+## 七、本轮（第二次发布）新增
+
+| 能力 | 落地 | 行为变化 |
+| --- | --- | --- |
+| 免费模型日窗 | `workbuddy_freewindow.go` | `429 usage exceeds frequency limit` 判为「账号健康、额度用完」，**不再罚整个 Provider**（此前按软限流会逐步判异常）；并从报文里解析 `reset at … UTC±N`，精确休息该模型到窗口重开，无时间戳退回短休息、上限 24h；只有带该措辞的 429 才走此分支 |
+| 积分保底 / 到期加权 | `workbuddy_credit_route.go` | 作为 mode 之后的偏好层（默认关闭，见上表） |
+
+### 仍未对齐（下一轮）
+
+1. `/v1/messages` 直连路由：国内版 Claude 模型（`claude-opus-5.5` 等）走该路由才吃
+   `output_config.effort`。**当前目标账号 `workbuddy-订阅-陌` 的 17 个模型里没有 Claude 系**，
+   这条路由在本账号上无法验证，需要一个有 Claude 模型的国内账号才能量出效果。
+2. 续写（continue）：空回复 / `finish_reason=length` 时续 3 段。
+3. 桌面埋点三元组的 realm 分档：缺国际版真机抓包的 `commit` / `releaseDate`，**不猜**，
+   维持现状并在拿到抓包后补。
+4. 成长任务域（旅行 / 连登兑换 / 抽奖 / 礼包 / 开学季券码 / 国际版 trial）与能力端点
+   （改图 / 出视频 / 联网检索 / webfetch / MCP / 去水印）。
+5. 上下文窗口四级查找链的后三级兜底（上游动态已有，缺 model.json / 静态种子 / models.dev）。
+6. 上报回读校验（上报后回读 `growth/streak` 判断是否真计分）。
