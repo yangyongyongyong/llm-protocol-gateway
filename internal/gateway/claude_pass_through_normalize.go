@@ -77,10 +77,12 @@ func normalizeClaudePassThroughPayload(payload map[string]any) {
 	// 实测模型可能不是 Claude：关闭 thinking 的写法按模型族改写（glm 不认识
 	// thinking.type，会把它当默认开启思考）。
 	normalizeClaudeThinkingOff(normalized, stringValue(normalized["model"]))
-	// 只能自适应思考的模型（opus-5-5 / fable / mythos）不接受 xhigh/max：被
-	// 拒绝还算好的，真发下去它会把输出预算全烧在思考上、正文一个字不出，客户端
-	// 收到的是一个「正常结束但什么都没说」的回合（thinking-only 空回合）。
-	// Key 把思考深度覆盖成 max 时，每一轮都会踩到。
+	// 客户端要的思考档位原样送到上游。magpie（本协议的参考实现）从不为
+	// opus-5-5 / fable / mythos 降低 effort：它的 thinkingOffAsTaken 只在
+	// thinking 已经是 disabled/between_tools 时才动 effort，对这类模型只去掉
+	// thinking 字段；真机档位表也把 opus-5-5 列为 low medium high xhigh max。
+	// clampClaudeAdaptiveEffort 因此默认不生效，仅 CLAUDE_CLAMP_ADAPTIVE_EFFORT=1
+	// 时恢复旧的降档行为（上游又开始返回空回合时的回滚杠杆）。
 	clampClaudeAdaptiveEffort(normalized, stringValue(normalized["model"]))
 	for key := range payload {
 		delete(payload, key)

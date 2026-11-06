@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"encoding/json"
+	"os"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -148,21 +149,31 @@ func normalizeClaudeThinkingOff(payload map[string]any, model string) bool {
 }
 
 // clampClaudeAdaptiveEffort lowers output_config.effort to what the model
-// accepts, for the models that can only think adaptively at all: opus-5-5,
-// fable and mythos (claudeOffNever) take any effort, but a request that asks for
-// xhigh or max through them spends its output budget on thinking and answers
-// nothing — which reaches the client as a finished turn with no visible output,
-// the thinking-only empty turn. A key whose thinking depth is overridden to
-// "max" (api_keys.thinking_depth_override) hits this on every single turn, which
-// is exactly what an opus-5-5 subscription was seen doing: output_tokens 47, 53,
-// 63 with thinking_tokens 45, 51, 61 and not one text block.
+// accepts — but only when the caller asked for it.
 //
-// Models that accept "disabled" up to a modest effort (claudeOffUpToHigh, opus-5
-// among them) are not this case: an adaptive request at xhigh is legal for them
-// and is left alone. Their only incompatibility is disabled + xhigh, which
-// sanitizeClaudePassThroughDisabledThinkingEffort already handles.
+// The gateway used to apply this unconditionally to the models that think only
+// adaptively (opus-5-5, fable, mythos), on the theory that xhigh/max makes them
+// spend the whole output budget on thinking and answer nothing. The evidence was
+// three short turns (output_tokens 47/53/63 with thinking 45/51/61) which is the
+// size of a classifier request, not of a real answer; and the same silence is
+// what a too-small max_tokens produces at any effort.
+//
+// magpie, which is the reference for this protocol, never lowers the effort for
+// these models: its thinkingOffAsTaken (internal/gateway/anthropic.go:626) only
+// touches a request whose thinking is already off, and for offNever it merely
+// drops the thinking field, leaving the asked effort in place. Its per-model
+// table (internal/agent/claude_effort_test.go:119) lists opus-5-5 as
+// "low medium high xhigh max", and adaptive_test.go pins
+// buildAnthropic({Thinking:true, Effort:"xhigh"}, "claude-opus-5-5") to
+// output_config {"effort":"xhigh"}.
+//
+// So the clamp is off by default and kept only as a rollback lever:
+// CLAUDE_CLAMP_ADAPTIVE_EFFORT=1 restores the old behaviour without a rebuild.
 func clampClaudeAdaptiveEffort(payload map[string]any, model string) bool {
 	if payload == nil {
+		return false
+	}
+	if strings.TrimSpace(os.Getenv(claudeClampAdaptiveEffortEnv)) != "1" {
 		return false
 	}
 	rule, known := claudeThinkingOffOf(model)
@@ -176,6 +187,11 @@ func clampClaudeAdaptiveEffort(payload map[string]any, model string) bool {
 	setOutputConfigEffort(payload, "high")
 	return true
 }
+
+// claudeClampAdaptiveEffortEnv re-enables the effort ceiling this gateway used to
+// impose on the always-adaptive Claude models. Off by default; see
+// clampClaudeAdaptiveEffort for why.
+const claudeClampAdaptiveEffortEnv = "CLAUDE_CLAMP_ADAPTIVE_EFFORT"
 
 // outputConfigEffort reads output_config.effort, the level a Messages request
 // asks the model to reason at.
