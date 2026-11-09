@@ -634,6 +634,14 @@ const (
 	// looks like OpenCode's own. No sign-in exists; the provider works as soon
 	// as it is added.
 	AuthTypeOpenCodeZenFree = "opencode_zen_free"
+	// AuthTypeSelfRegister is a Bearer provider whose baseUrl/apiKeySource are
+	// declared by its owner's own script through PATCH /__providers/{id}/
+	// self-register instead of being typed into the console form: the console
+	// only issues the provider-scoped token (see domain.ProviderSelfRegistration).
+	// It forwards exactly like AuthTypeAPIKey once a script has registered, so
+	// the forward path treats it as a Bearer provider; it exists as its own
+	// value because the console's create form has nothing to type for one.
+	AuthTypeSelfRegister = "self_register"
 )
 
 type Model struct {

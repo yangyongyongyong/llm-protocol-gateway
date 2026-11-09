@@ -100,6 +100,76 @@ func TestIsSelfRegisterPathVsTokenEndpoints(t *testing.T) {
 	}
 }
 
+// TestAddProviderAcceptsSelfRegisterWithoutBaseURL pins the create path the
+// console's catalog tile for 内网穿透自助注册 uses: the tile has no endpoint to
+// fill in, so it submits an empty baseUrl on purpose and the address arrives
+// later through the self-register endpoint. AddProvider must let it through
+// (previously it answered "provider baseUrl is required", which is exactly what
+// the console surfaced as 添加 Provider 失败).
+func TestAddProviderAcceptsSelfRegisterWithoutBaseURL(t *testing.T) {
+	t.Parallel()
+	router := NewRouter(domain.GatewayState{})
+
+	created, err := router.AddProvider(domain.Provider{
+		Name:     "内网穿透自助注册-luca-gpt6.1-sol",
+		Protocol: domain.ProtocolOpenAIChat,
+		AuthType: domain.AuthTypeSelfRegister,
+	})
+	if err != nil {
+		t.Fatalf("AddProvider(self_register, no baseUrl): %v", err)
+	}
+	if created.AuthType != domain.AuthTypeSelfRegister {
+		t.Fatalf("authType = %q want %q", created.AuthType, domain.AuthTypeSelfRegister)
+	}
+	if created.BaseURL != "" {
+		t.Fatalf("baseUrl = %q want empty until the script registers", created.BaseURL)
+	}
+
+	// The point of the empty create: the script then declares the address.
+	base := "https://xxxx.trycloudflare.com/v1/chat/completions"
+	updated, err := router.SelfRegisterProvider(created.ID, &base, nil, nil, nil, "seen-at")
+	if err != nil {
+		t.Fatalf("SelfRegisterProvider: %v", err)
+	}
+	if updated.BaseURL != base {
+		t.Fatalf("baseUrl = %q want %q", updated.BaseURL, base)
+	}
+}
+
+// TestAddProviderStillRequiresBaseURLForAPIKey keeps the relaxation above
+// narrow: a plain Bearer provider typed into the console still has to carry an
+// endpoint, otherwise the mistake only surfaces later as a failed request.
+func TestAddProviderStillRequiresBaseURLForAPIKey(t *testing.T) {
+	t.Parallel()
+	router := NewRouter(domain.GatewayState{})
+	_, err := router.AddProvider(domain.Provider{Name: "bare", Protocol: domain.ProtocolOpenAIChat, AuthType: domain.AuthTypeAPIKey})
+	if err == nil || !strings.Contains(err.Error(), "baseUrl is required") {
+		t.Fatalf("AddProvider(api_key, no baseUrl) err = %v want baseUrl required", err)
+	}
+}
+
+// TestImportAcceptsSelfRegisterWithoutBaseURL covers provider export/import:
+// before this, a bundle containing a self-register card (whose baseUrl may
+// still be empty) was rejected with `unsupported authType "self_register"`, so
+// that provider could not be moved between machines at all.
+func TestImportAcceptsSelfRegisterWithoutBaseURL(t *testing.T) {
+	t.Parallel()
+	router := NewRouter(domain.GatewayState{})
+	result := router.ImportProviders(ProvidersExportBundle{
+		Version: providersExportVersion,
+		Providers: []domain.Provider{{
+			ID: "sr", Name: "内网穿透自助注册", Protocol: domain.ProtocolOpenAIChat,
+			AuthType: domain.AuthTypeSelfRegister,
+		}},
+	})
+	if len(result.Errors) != 0 {
+		t.Fatalf("import rejected self_register: %v", result.Errors)
+	}
+	if len(result.Created) != 1 {
+		t.Fatalf("created %d of 1", len(result.Created))
+	}
+}
+
 func TestRouterSelfRegistrationLifecycle(t *testing.T) {
 	t.Parallel()
 	router := NewRouter(domain.GatewayState{

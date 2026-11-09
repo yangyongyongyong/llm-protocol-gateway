@@ -2895,14 +2895,19 @@ function App() {
   }
 
   // 目录里选中一个预设：把它的连接方式 / 协议 / 接入地址灌进草稿，再进表单。
-  // 订阅类的地址与协议由后端按连接方式固定，草稿不留占位地址。
+  // 订阅类的地址与协议由后端按连接方式固定，草稿不留占位地址；自助注册的地址
+  // 由脚本回填，这里放占位值（与下拉切到 self_register 时同一个值），否则表单
+  // 没有 Base URL 输入框可填，提交上去就是空的、被后端拒掉。
   function openProviderDraftForPreset(preset: ProviderPreset) {
     setProviderSheetOpen(false);
     setEditingProviderID('');
+    const protocol = (preset.protocol || 'openai_chat') as Protocol;
     setProviderDraft({
       name: preset.name,
-      protocol: (preset.protocol || 'openai_chat') as Protocol,
-      baseUrl: preset.authType === 'api_key' ? (preset.baseUrl || 'https://example.com/v1/chat/completions') : (preset.baseUrl || ''),
+      protocol,
+      baseUrl: preset.authType === 'self_register'
+        ? selfRegisterPlaceholderBaseURL(protocol)
+        : preset.authType === 'api_key' ? (preset.baseUrl || 'https://example.com/v1/chat/completions') : (preset.baseUrl || ''),
       apiKeySource: '',
       defaultModel: '',
       defaultThinkingDepth: '',
@@ -2957,14 +2962,17 @@ function App() {
     // Clone opens the create flow (no editingProviderID) pre-filled from an
     // existing provider so the user can tweak and save it as a new provider.
     setEditingProviderID('');
+    const cloneAuthType = resolveProviderAuthType(provider);
     setProviderDraft({
       name: `${provider.name} Copy`,
       protocol: provider.protocol,
-      baseUrl: provider.baseUrl,
+      // 自助注册类原本的 baseUrl 可能是脚本回填的真实地址（或尚未回填时的空值），
+      // 克隆出来的是一张全新的卡、还没有令牌，所以统一放占位值，等新脚本注册。
+      baseUrl: cloneAuthType === 'self_register' ? selfRegisterPlaceholderBaseURL(provider.protocol) : provider.baseUrl,
       apiKeySource: provider.apiKeySource,
       defaultModel: provider.defaultModel || '',
       defaultThinkingDepth: provider.defaultThinkingDepth || '',
-      authType: resolveProviderAuthType(provider),
+      authType: cloneAuthType,
       requestAdapterJSON: provider.requestAdapter ? JSON.stringify({
         urlTemplate: provider.requestAdapter.urlTemplate || '',
         headers: provider.requestAdapter.headers || {},
@@ -7253,9 +7261,9 @@ function App() {
               const connectHint = connectHints[providerDraft.authType] ?? '';
               // 自助注册类 Provider：协议只能由脚本通过 self-register 接口的
               // protocol 字段声明，控制台不提供选择/修改入口。
-              // resolveProviderAuthType 已根据 selfRegistration 回填 self_register。
+              // resolveProviderAuthType 已根据 authType / selfRegistration 回填 self_register。
               const editingProviderRecord = editingProviderID ? state.providers.find((item) => item.id === editingProviderID) : undefined;
-              const protocolManagedByAPI = providerDraft.authType === 'self_register' || !!editingProviderRecord?.selfRegistration;
+              const protocolManagedByAPI = providerDraft.authType === 'self_register' || editingProviderRecord?.authType === 'self_register' || !!editingProviderRecord?.selfRegistration;
               return (
                 <>
                   {/* 先选连接方式，协议由连接方式决定：OAuth 三选一时协议自动锁定，
@@ -7582,7 +7590,7 @@ function App() {
             // 连接方式切成了 self_register，要么该 Provider 后端已持久化 selfRegistration
             // 状态。纯 API Key Provider 不再显示「生成注册令牌」——连接方式是互斥的，
             // 生成注册令牌属于「内网穿透自助注册」这一种连接方式，不应出现在 API Key 下。
-            const isSelfRegisterProvider = providerDraft.authType === 'self_register' || !!editingProvider.selfRegistration;
+            const isSelfRegisterProvider = providerDraft.authType === 'self_register' || editingProvider.authType === 'self_register' || !!editingProvider.selfRegistration;
             if (!isSelfRegisterProvider) return null;
             const selfReg = editingProvider.selfRegistration;
             const promptText = buildSelfRegistrationPrompt(editingProvider, selfRegToken, window.location.origin);

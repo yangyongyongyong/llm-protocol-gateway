@@ -1619,7 +1619,10 @@ export function providerConnectKind(provider: Provider): ProviderConnectKind {
   if (provider.authType === 'trae_cn') return 'trae_cn';
   if (provider.authType === 'trae_global') return 'trae_global';
   if (provider.authType === 'opencode_zen_free') return 'opencode_zen_free';
-  if (provider.selfRegistration) return 'self_register';
+  // 后端已把 self_register 存成正式的 authType；selfRegistration 只在生成过
+  // 令牌后才非空，所以两种都要认——否则新建、还没生成令牌的那张卡会被当成
+  // API Key，编辑它时 Base URL 又会变回可填的真实地址。
+  if (provider.authType === 'self_register' || provider.selfRegistration) return 'self_register';
   return 'api_key';
 }
 

@@ -132,7 +132,7 @@ func prepareProviderForImport(provider domain.Provider) (domain.Provider, error)
 	case domain.AuthTypeAPIKey, domain.AuthTypeClaudeOAuth, domain.AuthTypeCursorOAuth, domain.AuthTypeChatGPTOAuth, domain.AuthTypeQoderPAT, domain.AuthTypeQoderCN,
 		domain.AuthTypeWorkBuddy, domain.AuthTypeWorkBuddyAI,
 		domain.AuthTypeZCode, domain.AuthTypeZCodeBigModel, domain.AuthTypeTraeCN, domain.AuthTypeTraeGlobal,
-		domain.AuthTypeOpenCodeZenFree:
+		domain.AuthTypeOpenCodeZenFree, domain.AuthTypeSelfRegister:
 	default:
 		return domain.Provider{}, fmt.Errorf("unsupported authType %q", provider.AuthType)
 	}
@@ -147,6 +147,7 @@ func prepareProviderForImport(provider domain.Provider) (domain.Provider, error)
 		provider.AuthType != domain.AuthTypeClaudeOAuth &&
 		provider.AuthType != domain.AuthTypeCursorOAuth &&
 		provider.AuthType != domain.AuthTypeChatGPTOAuth &&
+		provider.AuthType != domain.AuthTypeSelfRegister &&
 		!isQoderProvider(provider) &&
 		!isWorkBuddyAuthType(provider.AuthType) {
 		return domain.Provider{}, fmt.Errorf("provider baseUrl is required")

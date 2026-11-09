@@ -646,7 +646,7 @@ export type Provider = {
     createdAt?: string;
     lastSeenAt?: string;
   };
-  authType?: 'api_key' | 'claude_oauth' | 'cursor_oauth' | 'chatgpt_oauth' | 'qoder_pat' | 'qoder_cn' | 'workbuddy' | 'workbuddy_ai' | 'zcode' | 'zcode_bigmodel' | 'trae_cn' | 'trae_global' | 'opencode_zen_free';
+  authType?: 'api_key' | 'claude_oauth' | 'cursor_oauth' | 'chatgpt_oauth' | 'qoder_pat' | 'qoder_cn' | 'workbuddy' | 'workbuddy_ai' | 'zcode' | 'zcode_bigmodel' | 'trae_cn' | 'trae_global' | 'opencode_zen_free' | 'self_register';
   // 智谱（bigmodel / z.ai）编程套餐额度查询配置：团队版需要组织 + 项目 ID，
   // 两者都填时走团队版端点（?type=2 + bigmodel-organization/-project 请求头），
   // 否则走个人版端点。均为非敏感账号标识。

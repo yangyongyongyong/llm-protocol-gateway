@@ -356,7 +356,11 @@ func (r *Router) AddProvider(provider domain.Provider) (domain.Provider, error) 
 		provider.AuthType != domain.AuthTypeOpenCodeZenFree &&
 		!isZCodeAuthType(provider.AuthType) &&
 		!isTraeAuthType(provider.AuthType) &&
-		!isWorkBuddyAuthType(provider.AuthType) {
+		!isWorkBuddyAuthType(provider.AuthType) &&
+		// A self-register provider is created empty on purpose: its owner's
+		// script declares baseUrl (and protocol) through the self-register
+		// endpoint right after the console mints the token.
+		provider.AuthType != domain.AuthTypeSelfRegister {
 		return domain.Provider{}, fmt.Errorf("provider baseUrl is required")
 	}
 	if provider.ID == "" {
