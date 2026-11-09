@@ -128,6 +128,7 @@ import {
     resolveProviderTestModel,
     routeGatewayTestURL,
     selfRegisterPlaceholderBaseURL,
+    retargetSelfRegisterBaseURL,
     shortenAccountLabel,
     splitCustomDomain,
     statusTone,
@@ -7240,7 +7241,11 @@ function App() {
               const connectChoices = PROVIDER_CONNECT_CHOICES;
               const connectLocked = providerDraft.authType !== 'api_key' && providerDraft.authType !== 'self_register';
               const connectValue = providerDraft.authType;
-              const protocolHint = '该平台必须原生兼容这里选中的上游协议（本网关只实现了这三种）：OpenAI Chat 最常见（DeepSeek、智谱、多数中转站），Responses 用于 Codex 一类上游，Claude 用于 Anthropic 及兼容端点。自定义或私有协议请改用「内网穿透自助注册」。';
+              // 自助注册的协议是「你自己服务实际实现的格式」，网关按它原样透传；
+              // 其它连接方式的协议则由平台固定，选了也没得换。两句话不能共用。
+              const protocolHint = providerDraft.authType === 'self_register'
+                ? '选你的本地服务实际实现的那一种协议：网关按它原样透传、不做协议转换，客户端和你的服务说的是同一种格式。选 Claude 就实现 /v1/messages，选 Responses 就实现 /v1/responses，选 OpenAI Chat 就实现 /v1/chat/completions —— 与本地模型原生支持的格式对齐最稳。'
+                : '该平台必须原生兼容这里选中的上游协议（本网关只实现了这三种）：OpenAI Chat 最常见（DeepSeek、智谱、多数中转站），Responses 用于 Codex 一类上游，Claude 用于 Anthropic 及兼容端点。自定义或私有协议请改用「内网穿透自助注册」。';
               // 各连接方式的说明不再占表单行：按当前选择折成一句，挂到「连接方式」标签旁。
               const connectHints: Record<ProviderConnectKind, string> = {
                 api_key: "本网关只实现了 OpenAI Chat、OpenAI Responses、Claude 三种上游协议。密钥所属平台不限，但该平台必须原生兼容上面选中的协议（例如 DeepSeek、智谱、各类中转站多为 OpenAI Chat 兼容）。若上游是自定义或私有协议，请改用「内网穿透自助注册」，由你的脚本自行适配后再接入。",
@@ -7256,18 +7261,17 @@ function App() {
                 trae_cn: "Trae 走 IDE 自己的协议：登录、令牌续期、模型列表与额度都由网关代为完成，客户端看到的仍是 OpenAI Chat。Trae 的授权页只接受 127.0.0.1 的回调，所以请在运行网关的这台机器上点登录；网关会临时监听一个本地端口，拿到令牌后即关闭。",
                 trae_global: "与 Trae CN 同一套协议的国际部署（节点随账号走）：登录、令牌续期、模型列表与额度都由网关代为完成，客户端看到的仍是 OpenAI Chat。授权页只接受 127.0.0.1 的回调，请在运行网关的这台机器上点登录。",
                 opencode_zen_free: "OpenCode Zen 的免费模型（-free 结尾、big-pickle、grok-code）无需任何密钥：网关会按 OpenCode 自己的客户端形状发出，并改走它的推理入口。免费档只接受流式请求，客户端要求一次性返回时网关会在上游把流收回来拼成一条回复。付费模型在下方填入自己的 OpenCode 密钥即可，两种模型可共用这一个 Provider。",
-                self_register: "适合“用户自己内网穿透暴露服务”的场景：无需现在填写 Base URL / API Key Source / 协议，保存后会自动生成一个专属令牌 + 一段配置 Prompt，交给对方脚本使用——协议不限（chat/response/claude 任选，脚本已有哪种代码就用哪种），脚本调用接口时把实际用的 baseUrl / 协议一并声明即可。",
+                self_register: "适合“用户自己内网穿透暴露服务”的场景：先选好本地服务实际实现的协议（OpenAI Chat / OpenAI Responses / Claude），网关就按这个协议原样透传，不做协议转换——上游说什么、客户端就收到什么，最稳定也最省事。保存后会自动生成一个专属令牌 + 一段配置 Prompt，交给对方脚本使用。脚本注册时声明的 protocol 以此处选择为准；如果本地服务后来改了协议，让脚本在注册时改传新的 protocol 即可覆盖。",
               };
               const connectHint = connectHints[providerDraft.authType] ?? '';
-              // 自助注册类 Provider：协议只能由脚本通过 self-register 接口的
-              // protocol 字段声明，控制台不提供选择/修改入口。
-              // resolveProviderAuthType 已根据 authType / selfRegistration 回填 self_register。
+              // 每种连接方式各自锁定协议，但锁定的是「选定的那个」而不是写死值：
+              // 自助注册的协议由用户在下面显式选择，本地服务是什么协议就选什么，
+              // 网关按它原样透传，不做协议转换。
               const editingProviderRecord = editingProviderID ? state.providers.find((item) => item.id === editingProviderID) : undefined;
-              const protocolManagedByAPI = providerDraft.authType === 'self_register' || editingProviderRecord?.authType === 'self_register' || !!editingProviderRecord?.selfRegistration;
               return (
                 <>
                   {/* 先选连接方式，协议由连接方式决定：OAuth 三选一时协议自动锁定，
-                      自助注册协议交给脚本自己声明，只有 API Key 能自由选协议。 */}
+                      自助注册与 API Key 一样可选协议（透传，不做转换）。 */}
                   <IconSelect
                     fullWidth
                     label="连接方式"
@@ -7277,6 +7281,8 @@ function App() {
                     onChange={(value) => setProviderDraft((current) => {
                       const picked = value as ProviderConnectKind;
                       const authType = picked ?? 'api_key';
+                      // 自助注册不预设协议：沿用用户当前选中的那个，避免把已选好的
+                      // Claude 又悄悄改回 OpenAI Chat。切到别的连接方式时才按平台锁定。
                       const protocol = authType === 'claude_oauth' ? 'claude'
                         : authType === 'cursor_oauth' ? 'openai_chat'
                         : authType === 'chatgpt_oauth' ? 'openai_responses'
@@ -7284,37 +7290,50 @@ function App() {
                         : authType === 'workbuddy' || authType === 'workbuddy_ai' ? 'openai_chat'
                         : isZCodeConnectKind(authType) ? 'claude'
                         : isTraeConnectKind(authType) || authType === 'opencode_zen_free' ? 'openai_chat'
-                        // 自助注册：协议不在控制台选，这里只是内部占位默认值
-                        // （真实协议以脚本注册时声明的为准），固定用 openai_chat。
-                        : authType === 'self_register' ? 'openai_chat'
                         : current.protocol;
                       return {
                         ...current,
                         authType,
                         protocol,
-                        baseUrl: authType === 'self_register' ? selfRegisterPlaceholderBaseURL(protocol)
+                        // 切进自助注册：原来那条连接方式的 baseUrl 是别家的真实上游，
+                        // 不能当成本地服务地址带走，统一放占位值等脚本注册；本来就在
+                        // 自助注册里（只是换了协议）才保留脚本回填过的真实地址。
+                        baseUrl: authType === 'self_register'
+                          ? (current.authType === 'self_register'
+                            ? retargetSelfRegisterBaseURL(current.baseUrl, protocol)
+                            : selfRegisterPlaceholderBaseURL(protocol))
                           : isQoderConnectKind(authType) ? qoderDefaultBaseURL(authType)
                           : current.baseUrl,
                       };
                     })}
                   />
-                  {protocolManagedByAPI ? (
-                    <div className="field field-full">
-                      <div className="field-label-row">
-                        <label>协议</label>
-                        <InfoTip text="由脚本通过自助注册接口的 protocol 字段声明，控制台不提供协议选择/修改；要换协议请让脚本下次注册时改传新的 protocol。" />
-                      </div>
-                      <div className="static-field">当前：{protocolLabel(editingProviderRecord?.protocol ?? providerDraft.protocol)}</div>
-                    </div>
+                  {connectLocked ? (
+                    <IconSelect
+                      fullWidth
+                      label="协议"
+                      hint={protocolHint}
+                      disabled
+                      value={protocolLabel(providerDraft.protocol)}
+                      options={[protocolLabel(providerDraft.protocol)].map((label) => ({value: label, label, icon: protocolIcon(label)}))}
+                      onChange={() => undefined}
+                    />
                   ) : (
                     <IconSelect
                       fullWidth
                       label="协议"
                       hint={protocolHint}
-                      disabled={connectLocked}
                       value={protocolLabel(providerDraft.protocol)}
-                      options={(connectLocked ? [protocolLabel(providerDraft.protocol)] : fixedOutputLabels).map((label) => ({value: label, label, icon: protocolIcon(label)}))}
-                      onChange={(value) => setProviderDraft((current) => ({ ...current, protocol: protocolFromLabel(value) }))}
+                      options={fixedOutputLabels.map((label) => ({value: label, label, icon: protocolIcon(label)}))}
+                      onChange={(value) => setProviderDraft((current) => {
+                        const protocol = protocolFromLabel(value);
+                        return {
+                          ...current,
+                          protocol,
+                          // 自助注册的占位地址带着协议路径（/v1/messages 等），
+                          // 换协议时一起换；已经注册过的真实隧道地址原样不动。
+                          baseUrl: current.authType === 'self_register' ? retargetSelfRegisterBaseURL(current.baseUrl, protocol) : current.baseUrl,
+                        };
+                      })}
                     />
                   )}
                 </>

@@ -474,3 +474,48 @@ test('providerMatchesQuery：空格分词按 AND 收窄，账号也能搜到', (
   assert.equal(lib.providerMatchesQuery(provider, 'qoder 邓丽霞'), true, '多个词按 AND 收窄');
   assert.equal(lib.providerMatchesQuery(provider, 'qoder workbuddy'), false, '任一词不命中就过滤掉');
 });
+
+test('retargetSelfRegisterBaseURL：占位地址跟着协议走，真实隧道地址一个字不动', () => {
+  // 还没被脚本注册过：占位主机的地址要跟着协议换成对应的路径，
+  // 否则表单会带着一个跟协议对不上的占位值提交。
+  assert.equal(
+    lib.retargetSelfRegisterBaseURL('https://pending-self-registration.example/v1/chat/completions', 'claude'),
+    'https://pending-self-registration.example/v1/messages',
+  );
+  assert.equal(
+    lib.retargetSelfRegisterBaseURL('https://pending-self-registration.example/v1/messages', 'openai_responses'),
+    'https://pending-self-registration.example/v1/responses',
+  );
+  // 脚本已经回填过真实地址：改协议只是改网关对上游的预期，地址原样保留
+  // （真路径要等对方脚本下次注册时自己声明，这里拼一个只会把能用的地址改坏）。
+  const registered = 'https://quiet-river-1234.trycloudflare.com/v1/messages';
+  assert.equal(lib.retargetSelfRegisterBaseURL(registered, 'openai_chat'), registered);
+  // 克隆出来的空值：给新协议的占位地址。
+  assert.equal(
+    lib.retargetSelfRegisterBaseURL('', 'claude'),
+    'https://pending-self-registration.example/v1/messages',
+  );
+  // 解析不出主机的脏值按占位处理，不把脏值当真实地址留住。
+  assert.equal(
+    lib.retargetSelfRegisterBaseURL('not a url', 'claude'),
+    'https://pending-self-registration.example/v1/messages',
+  );
+});
+
+test('buildSelfRegistrationPrompt：以控制台选中的协议为主，不再让脚本四选一', () => {
+  const provider = {id: 'prov-sr', name: '内网穿透自助注册-x', protocol: 'claude'};
+  const text = lib.buildSelfRegistrationPrompt(provider, 'sr_token', 'https://gw.example.com');
+  assert.ok(text.includes('POST /v1/messages'), '主协议路径要出现');
+  // 别的协议只能出现在「手上已有现成实现」的备选清单里，主协议段落必须只讲 Claude。
+  const primary = text.slice(0, text.indexOf('接口路径'));
+  assert.ok(!primary.includes('openai_chat'), '主协议段不该提别的协议');
+  assert.ok(text.includes('protocol="openai_chat"'), '其它协议作为备选列出，但注明要回控制台改协议');
+  assert.ok(text.includes('x-api-key: <SHARED_SECRET>'), 'Claude 的鉴权头要按惯例推导');
+  assert.ok(text.includes('"protocol": "claude"'), '注册示例带上控制台选的那个协议');
+  assert.ok(text.includes('原样透传'), '要说明网关不做协议转换');
+
+  const chat = lib.buildSelfRegistrationPrompt({...provider, protocol: 'openai_chat'}, '', 'https://gw.example.com');
+  assert.ok(chat.includes('POST /v1/chat/completions'));
+  assert.ok(chat.includes('Authorization: Bearer <SHARED_SECRET>'));
+  assert.ok(chat.includes('生成注册令牌'), '没有原始令牌时用占位提示，不编一个');
+});

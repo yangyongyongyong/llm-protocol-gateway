@@ -180,6 +180,14 @@ func sanitizeClaudeCountTokensBody(body []byte) []byte {
 // 忽略 Claude Code 等客户端按「请求模型名」填的预算（模型覆盖场景会偏小截断）。
 // maxTokensOverride>0 时使用密钥级覆盖。
 func rewriteClaudeUpstreamMaxTokens(body []byte, provider domain.Provider, maxTokensOverride int) []byte {
+	// 自助注册的上游是用户自己的服务，不是 Anthropic，也不在网关的模型目录里：
+	// 按模型名猜一个 128000 预算、再把 thinking.budget_tokens 改写成 adaptive，
+	// 都是拿 Anthropic 的口径去改一个我们并不认识的实现。对方完全可能只接受
+	// 自己客户端发的那套字段，被这么改一下就 400 了。它的协议是控制台和脚本
+	// 事先约定好的，网关这边一个字都不动——这正是"透传"该有的样子。
+	if provider.AuthType == domain.AuthTypeSelfRegister {
+		return body
+	}
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil || payload == nil {
 		return body

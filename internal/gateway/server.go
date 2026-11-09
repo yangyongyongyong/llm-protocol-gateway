@@ -4953,6 +4953,10 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 	requestModel, _ := req["model"].(string)
 	model, logModel := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
 	r = attachAPIKeyMaxOutputTokens(r, matchedKey, gatewayKeyMatched)
+	// 自助注册的上游是用户自己的服务：它要什么思考档位，客户端的请求已经说清楚
+	// 了。网关拿自己的档位表（以及 budget<->effort 的反推）去改写，等于替一个
+	// 我们并不认识的上游改主意——见下面 applyClaudeEffort 处同一判断。
+	selfRegistered := s.router.providerIsSelfRegistered(route.ProviderID)
 	thinkingOverride := ""
 	if gatewayKeyMatched {
 		thinkingOverride = matchedKey.ThinkingDepthOverride
@@ -4968,7 +4972,7 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 	// Key 的思考深度与路由的 Provider 默认档位在 Claude 路径上同样要生效，
 	// 判定口径与 Chat 路径一致：Key 覆盖优先，否则用客户端要求的档位。
 	requestDepth := claudePayloadEffort(req)
-	if depth := s.router.ResolveThinkingDepth(route, thinkingOverride, requestDepth != "", requestDepth); depth != "" {
+	if depth := s.router.ResolveThinkingDepth(route, thinkingOverride, requestDepth != "", requestDepth); depth != "" && !selfRegistered {
 		if applyClaudeEffort(req, model, depth) {
 			r = withReasoningEffort(r, fitModelEffort(depth, model))
 		}

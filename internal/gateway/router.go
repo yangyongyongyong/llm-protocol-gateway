@@ -2240,6 +2240,23 @@ func (r *Router) providerLocked(providerID string) (domain.Provider, bool) {
 	return domain.Provider{}, false
 }
 
+// providerIsSelfRegistered 回答「这台上游是不是用户自建、只按约定透传的服务」。
+//
+// 它决定了网关要不要对请求自作主张：自助注册的上游既不在网关的模型目录里，也不
+// 是 Anthropic —— 按模型名猜 max_tokens、把 budget_tokens 反推成 effort，都是拿
+// Anthropic 的口径去改一个我们并不认识的实现，对方只认自己客户端那套字段时就会
+// 400。这类 Provider 一律原样透传。providerID 为空（故障转移落到别的上游之前的
+// 空档）按 false 处理，走原来的逻辑。
+func (r *Router) providerIsSelfRegistered(providerID string) bool {
+	if providerID == "" {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	provider, ok := r.providerLocked(providerID)
+	return ok && provider.AuthType == domain.AuthTypeSelfRegister
+}
+
 func (r *Router) endpointByProtocolLocked(protocol domain.Protocol) (domain.OutputEndpoint, bool) {
 	for _, endpoint := range r.state.Endpoints {
 		if endpoint.Protocol == protocol {

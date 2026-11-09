@@ -1318,6 +1318,29 @@ export function selfRegisterPlaceholderBaseURL(protocol: Protocol): string {
   return `https://pending-self-registration.example${selfRegistrationEndpointSpec(protocol).path}`;
 }
 
+// 自助注册的占位主机名：带着它说明这个 Provider 还没有被脚本注册过。
+const SELF_REGISTER_PLACEHOLDER_HOST = 'pending-self-registration.example';
+
+/**
+ * retargetSelfRegisterBaseURL 在协议变了之后重算自助注册 Provider 的 baseUrl。
+ *
+ * 还在占位主机上（脚本没注册过）：换成新协议对应的占位路径，创建表单才能带着
+ * 一个形状正确的地址提交。已经是脚本回填过的真实隧道地址：一个字都不动——改协议
+ * 只是改网关对上游的预期，真实路径要等对方脚本下次注册时自己声明；在这里顺手
+ * 拼路径反而会把一个当下可用的地址改坏。
+ */
+export function retargetSelfRegisterBaseURL(baseUrl: string, protocol: Protocol): string {
+  const trimmed = (baseUrl || '').trim();
+  if (!trimmed) return selfRegisterPlaceholderBaseURL(protocol);
+  let host = '';
+  try {
+    host = new URL(trimmed).host.toLowerCase();
+  } catch {
+    return selfRegisterPlaceholderBaseURL(protocol);
+  }
+  return host === SELF_REGISTER_PLACEHOLDER_HOST ? selfRegisterPlaceholderBaseURL(protocol) : trimmed;
+}
+
 export function selfRegistrationEndpointSpec(protocol: Protocol): { path: string; label: string; hint: string } {
   switch (protocol) {
     case 'openai_chat':
@@ -1354,25 +1377,47 @@ export function selfRegistrationEndpointSpec(protocol: Protocol): { path: string
 export function buildSelfRegistrationPrompt(provider: Provider, rawToken: string, originBase: string): string {
   const registerUrl = `${originBase}/__providers/${provider.id}/self-register`;
   const tokenLine = rawToken || '<在控制台点击"生成注册令牌"后粘贴到这里>';
-  // 三种协议逐条列出，供本地已有代码对号入座，不预设/不强制其中任何一种。
-  const protocolMenu = (['openai_chat', 'openai_responses', 'claude', 'gemini'] as Protocol[])
-    .map((protocol) => {
-      const spec = selfRegistrationEndpointSpec(protocol);
-      const header = protocol === 'claude' ? 'x-api-key: <SHARED_SECRET>' : protocol === 'gemini' ? 'x-goog-api-key: <SHARED_SECRET>' : 'Authorization: Bearer <SHARED_SECRET>';
-      return `  \u00b7 protocol="${protocol}"：POST ${spec.path}（${spec.label} 协议格式），鉴权头默认 ${header}\n    ${spec.hint}`;
+  // 协议以控制台里选的为准：网关按它原样透传，本地服务照它实现即可，
+  // 不再让脚本从四种协议里自己挑一种（那正是"要转换协议"的来源）。
+  const protocol = provider.protocol;
+  const spec = selfRegistrationEndpointSpec(protocol);
+  const secretHeader = protocol === 'claude' ? 'x-api-key'
+    : protocol === 'gemini' ? 'x-goog-api-key'
+    : 'Authorization';
+  const secretHeaderLine = secretHeader === 'Authorization'
+    ? 'Authorization: Bearer <SHARED_SECRET>'
+    : `${secretHeader}: <SHARED_SECRET>`;
+  // 其余协议只作为"手上已有现成实现"时的备选提示：真要换，必须回控制台把协议
+  // 改成对应项，否则透传会错位——这一点得在 Prompt 里说清楚。
+  // 只列控制台协议下拉里真能选到的那几项（fixedOutputLabels）——提示里让人
+  // "回控制台改协议"，就不能指向一个下拉里根本没有的选项。
+  const consoleProtocols: Protocol[] = ['openai_chat', 'openai_responses', 'claude'];
+  const alternatives = consoleProtocols
+    .filter((item) => item !== protocol)
+    .map((item) => {
+      const alt = selfRegistrationEndpointSpec(item);
+      return `  \u00b7 ${alt.label}（protocol="${item}"）：POST ${alt.path}`;
     })
     .join('\n');
   return `帮我实现一个本地服务 + 内网穿透 + 自动注册的完整方案，要求如下：
 
-【1. 本地服务 —— 四选一，选你已有代码 / 更顺手的那种，不强制】
-网关支持下面三种协议格式，你的本地服务只需要实现其中任意一种（哪怕你手头已经有
-现成的某种格式的代码，直接拿来用即可，不用为了迁就我而改写）：
-${protocolMenu}
+【1. 本地服务 —— 实现 ${spec.label} 协议（protocol="${protocol}"）】
+这个 Provider 在控制台里选的协议就是 ${spec.label}。网关按它**原样透传、不做协议
+转换**：客户端说什么格式，你的服务就收到什么格式；你的服务答什么格式，客户端就
+收到什么格式。所以照下面这个形状收发即可：
 
-- 无论选哪种，鉴权都要求请求带上面对应的头（SHARED_SECRET 由我自己设定，作为
-  "上游密钥"，和下面第 3 步注册接口用的令牌是两回事，不要混淆；如果你想用非标准
-  头名，第 3 步注册时可以用 authHeader 字段显式覆盖，不必强行匹配上面的默认值）
-- 内部对接我自己现有的模型/服务即可，只要出参符合你选定的那个协议格式
+  接口路径：POST ${spec.path}
+  鉴权头：  ${secretHeaderLine}
+  ${spec.hint}
+
+- SHARED_SECRET 由我自己设定，作为这个本地服务的"上游密钥"（和下面第 3 步注册
+  接口用的令牌是两回事，不要混淆）。用非标准头名也行，第 3 步注册时用 authHeader
+  字段显式覆盖，不必强行匹配上面的默认值
+- 内部对接我自己现有的模型/服务即可，只要出参符合 ${spec.label} 格式
+
+（如果你手头已经有现成的、别的协议格式的代码，不想为迁就我而改写：网关也支持下面
+这些协议，但要先在控制台把这个 Provider 的协议改成对应那一项，透传才对得上）
+${alternatives}
 
 【2. 内网穿透】
 - 用 cloudflared 快速隧道（免费、无需域名、无需登录）：
@@ -1380,24 +1425,22 @@ ${protocolMenu}
 - 该命令会在标准输出打印一个形如 https://xxxx.trycloudflare.com 的公网地址；
   注意：这个地址每次重启隧道都会变，脚本要能捕获它
 
-【3. 自动注册到网关平台 —— 必须声明你选的协议】
-- 每次拿到新的公网地址后（包括隧道意外重启），立刻调用（**protocol 字段必填，
-  取值必须跟你在第 1 步实际实现的协议一致**：openai_chat / openai_responses / claude
-  四选一；网关这边不会预先假定协议，完全以这次调用声明的为准）：
+【3. 自动注册到网关平台 —— 只声明地址（协议已在控制台定好）】
+- 每次拿到新的公网地址后（包括隧道意外重启），立刻调用：
   curl -X PATCH "${registerUrl}" \\
     -H "Authorization: Bearer ${tokenLine}" \\
     -H "Content-Type: application/json" \\
-    -d '{"baseUrl": "https://xxxx.trycloudflare.com/<你第1步实现的路径，比如 /v1/chat/completions>", "apiKeySource": "literal:<第1步里设定的 SHARED_SECRET>", "protocol": "<openai_chat|openai_responses|claude|gemini 四选一>"}'
+    -d '{"baseUrl": "https://xxxx.trycloudflare.com${spec.path}", "apiKeySource": "literal:<第1步里设定的 SHARED_SECRET>", "protocol": "${protocol}"}'
   （把 xxxx.trycloudflare.com 换成实际隧道打印出来的地址；这里 Bearer 后面跟的是
   第 3 步专用的"注册令牌"，跟第 1 步本地服务自己的 SHARED_SECRET 是两个不同的东西）
+- protocol 带的是 "${protocol}"，跟控制台选的一致；其实不传也行——不传就沿用控制台
+  里选的协议。只有本地服务后来改成了别的协议实现，才需要把这里换成新值覆盖它
+  （取值只能是 openai_chat / openai_responses / claude / gemini 之一，且必须跟第 1 步
+  实际实现的协议一致，否则透传会错位）
 - 这个注册接口只鉴权 Bearer 令牌本身，和登录账号无关；只允许改这一个 Provider 的
-  baseUrl / apiKeySource / protocol / authHeader 这几个字段，改不了别的东西；网关控制台
-  这边也不提供协议选择/修改的入口——协议只能通过这个接口声明，这是唯一的协议来源
-- 不传 authHeader 时，网关按第 1 步表格里的惯例自动推导鉴权头（claude -> x-api-key，
+  baseUrl / apiKeySource / protocol / authHeader 这几个字段，改不了别的东西
+- 不传 authHeader 时，网关按第 1 步的惯例自动推导鉴权头（claude -> x-api-key，
   其余 -> Authorization）；本地服务用了非标准头名时可以显式传 authHeader 覆盖
-- baseUrl 不能是内网地址（127.0.0.1 / 192.168.x.x / 10.x.x.x 等会被拒绝），必须是
-  隧道给的公网地址
-- 以后如果想换成另一种协议实现，不用回控制台改，下次注册时把 protocol 换成新值即可
 
 【4. 协议 conformance（注册成功后立刻跑，直到必过项全绿）】
 网关提供协议套件诊断（用第 3 步同一个注册令牌鉴权）：
@@ -1405,7 +1448,7 @@ ${protocolMenu}
     curl -X POST "${originBase}/__providers/${provider.id}/self-check/conformance" \\
       -H "Authorization: Bearer ${tokenLine}"
 
-按你声明的 protocol 自动跑：models 鉴权、非流式形状、流式 SSE、usage 字段、
+按这个 Provider 的协议（${spec.label}）自动跑：models 鉴权、非流式形状、流式 SSE、usage 字段、
 cache 命中（后两项为建议项）。返回 JSON：
   - success / passedRequired = true 表示必过项全部通过（可以认为协议合格）
   - passedAll = true 表示建议项也全过
@@ -1418,7 +1461,7 @@ cache 命中（后两项为建议项）。返回 JSON：
 （可选兼容）仍可用旧的 health×3 与 chat 自检，但新脚本优先只用 conformance。
 
 【5. 整合成一个常驻脚本】
-- 启动本地服务 -> 启动 cloudflared 隧道 -> 解析出公网 URL -> 调用注册接口（带上 protocol）
+- 启动本地服务 -> 启动 cloudflared 隧道 -> 解析出公网 URL -> 调用注册接口（带上 baseUrl + protocol）
   -> 注册成功后跑 conformance 直到 success=true -> 持续监控隧道进程，一旦断线/重启就重新走一遍
   解析+注册+conformance
 - 可以用 Python/Bash 都行，帮我把这五步串成一个可以后台常驻运行的脚本`;
