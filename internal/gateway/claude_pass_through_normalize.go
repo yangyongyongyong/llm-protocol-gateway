@@ -223,6 +223,7 @@ func normalizeClaudePassThroughSystem(system any) any {
 
 func normalizeClaudePassThroughMessages(raw []any) []any {
 	out := make([]any, 0, len(raw))
+	dropped := false
 	for _, item := range raw {
 		entry, ok := item.(map[string]any)
 		if !ok {
@@ -234,12 +235,26 @@ func normalizeClaudePassThroughMessages(raw []any) []any {
 		}
 		content := normalizeClaudePassThroughMessageContent(entry["content"])
 		if isEmptyClaudeContent(content) {
+			// A turn that was nothing but an unreadable block (an empty thinking
+			// placeholder, an empty text) carries nothing to send. Dropping it
+			// can leave two same-role messages next to each other, which
+			// Anthropic refuses — cleaned up below.
+			dropped = true
 			continue
 		}
 		out = append(out, map[string]any{
 			"role":    role,
 			"content": content,
 		})
+	}
+	if dropped {
+		out = mergeAdjacentClaudePassThroughMessages(out)
+	}
+	if len(out) == 0 && len(raw) > 0 {
+		// Every turn was unreadable. Sending no messages at all earns a different
+		// refusal ("at least one message is required"), so hand the history back
+		// as it came and let the upstream decide.
+		return raw
 	}
 	return out
 }
@@ -284,19 +299,20 @@ func dropTrailingClaudePassThroughThinking(messages []any) []any {
 				if trimmed < len(blocks) {
 					trimmedAny = true
 					if trimmed == 0 {
-						if !claudeBlocksHaveRedactedThinking(blocks) {
-							droppedAny = true
-							continue
-						}
-						message = map[string]any{
-							"role":    "assistant",
-							"content": []any{map[string]any{"type": "thinking", "thinking": ""}},
-						}
-					} else {
-						message = map[string]any{
-							"role":    "assistant",
-							"content": blocks[:trimmed],
-						}
+						// A turn that was nothing but reasoning. It is dropped,
+						// redacted or not: an assistant message may not end on a
+						// thinking block, and the placeholder this used to leave
+						// behind ({"type":"thinking","thinking":""}) is itself
+						// refused — "each thinking block must contain
+						// non-whitespace thinking". A signature cannot rescue an
+						// empty text, so keeping the ciphertext costs a 400 on
+						// every later turn of the conversation.
+						droppedAny = true
+						continue
+					}
+					message = map[string]any{
+						"role":    "assistant",
+						"content": blocks[:trimmed],
 					}
 				}
 			}
@@ -477,10 +493,20 @@ func normalizeClaudePassThroughContentBlock(block map[string]any) map[string]any
 		}
 		return out
 	case "thinking":
-		out := map[string]any{"type": "thinking"}
-		if thinking, ok := block["thinking"]; ok {
-			out["thinking"] = thinking
+		// Anthropic refuses a thinking block whose text is blank:
+		//   messages.N.content.M.thinking: each thinking block must contain
+		//   non-whitespace thinking
+		// Claude Code does replay such a block (measured: signature "" with
+		// thinking " ", i.e. a single space), and a signature cannot rescue it —
+		// the text itself is validated. Dropping it here means the turn goes out
+		// valid instead of paying a 400 and a rectified retry. A message left
+		// with no blocks at all is dropped by the caller
+		// (isEmptyClaudeContent), which is what such a placeholder turn deserves.
+		thinking := stringValue(block["thinking"])
+		if strings.TrimSpace(thinking) == "" {
+			return nil
 		}
+		out := map[string]any{"type": "thinking", "thinking": block["thinking"]}
 		if signature, ok := block["signature"]; ok {
 			out["signature"] = signature
 		}

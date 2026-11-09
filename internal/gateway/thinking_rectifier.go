@@ -96,11 +96,16 @@ func shouldRectifyThinkingSignature(body []byte) bool {
 		(strings.Contains(lower, "thinking") || strings.Contains(lower, "redacted_thinking")) {
 		return true
 	}
-	// 场景7：历史 thinking 块正文为空（thinking="" 且无有效 signature）。
-	// Claude Code / 客户端偶发把空 thinking 占位块写进多轮历史，上游 Anthropic
-	// 直接 400。剥离空块后重试即可（与签名类错误同一整流路径）。
-	// 例："messages.2.content.0.thinking: each thinking block must contain thinking"
-	if strings.Contains(lower, "each thinking block must contain thinking") {
+	// 场景7：历史 thinking 块正文为空。客户端偶发把空 thinking 占位块写进多轮
+	// 历史，上游 Anthropic 直接 400。剥离空块后重试即可（与签名类错误同一整流路径）。
+	//
+	// 上游的措辞有两个变体，靠中间的词区分，必须都认：
+	//   messages.2.content.0.thinking: each thinking block must contain thinking
+	//   messages.44.content.0.thinking: each thinking block must contain
+	//                                   non-whitespace thinking
+	// 早先只匹配前者，于是后者的每一次都原样抛给客户端（实测一次会话连撞 15 次
+	// 400）。这里只认前半句，两种措辞都能命中。
+	if strings.Contains(lower, "each thinking block must contain") {
 		return true
 	}
 	return false

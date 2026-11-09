@@ -66,12 +66,14 @@ func TestNormalizeClaudePassThroughDropsTrailingThinkingTurn(t *testing.T) {
 }
 
 // A thinking block that a tool_use follows is the shape Anthropic requires of a
-// tool loop, and the model re-reads it: it has to survive untouched.
+// tool loop, and the model re-reads it: it has to survive untouched. The text is
+// what the real client sends — a block with blank text is dropped instead (see
+// the blank-thinking tests), which is a different rule.
 func TestNormalizeClaudePassThroughKeepsThinkingBeforeToolUse(t *testing.T) {
 	messages := []any{
 		map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "read it"}}},
 		map[string]any{"role": "assistant", "content": []any{
-			map[string]any{"type": "thinking", "thinking": "", "signature": "sig-1"},
+			map[string]any{"type": "thinking", "thinking": "let me read it", "signature": "sig-1"},
 			map[string]any{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": map[string]any{"path": "a"}},
 		}},
 		map[string]any{"role": "user", "content": []any{
@@ -94,7 +96,7 @@ func TestNormalizeClaudePassThroughKeepsThinkingBeforeText(t *testing.T) {
 	messages := []any{
 		map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "hi"}}},
 		map[string]any{"role": "assistant", "content": []any{
-			map[string]any{"type": "thinking", "thinking": "", "signature": "sig-1"},
+			map[string]any{"type": "thinking", "thinking": "thinking it over", "signature": "sig-1"},
 			map[string]any{"type": "text", "text": "PONG"},
 		}},
 	}
@@ -109,9 +111,12 @@ func TestNormalizeClaudePassThroughKeepsThinkingBeforeText(t *testing.T) {
 	}
 }
 
-// redacted_thinking carries ciphertext a later turn replays: dropping the turn
-// would lose it, so one empty thinking placeholder keeps its place instead.
-func TestNormalizeClaudePassThroughKeepsRedactedThinkingPlaceholder(t *testing.T) {
+// A redacted_thinking block carries ciphertext a later turn replays, but a turn
+// made of nothing else still goes: an assistant message may not end on it, and
+// the empty-thinking placeholder this used to leave behind is refused outright
+// ("each thinking block must contain non-whitespace thinking"). Keeping the turn
+// would cost a 400 on every later message of the conversation.
+func TestNormalizeClaudePassThroughDropsRedactedThinkingOnlyTurn(t *testing.T) {
 	messages := []any{
 		map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "hi"}}},
 		map[string]any{"role": "assistant", "content": []any{
@@ -121,12 +126,16 @@ func TestNormalizeClaudePassThroughKeepsRedactedThinkingPlaceholder(t *testing.T
 	}
 
 	got := normalizeClaudePassThroughMessagesForTest(t, messages)
-	if len(got) != 3 {
-		t.Fatalf("messages = %#v, want the assistant turn kept as a placeholder", got)
+	if len(got) != 1 {
+		t.Fatalf("messages = %#v, want the redacted-only turn dropped and the user turns merged", got)
 	}
-	types := claudeTestBlockTypes(t, got[1])
-	if len(types) != 1 || types[0] != "thinking" {
-		t.Fatalf("assistant blocks = %v, want one empty thinking placeholder", types)
+	if role := stringValue(got[0].(map[string]any)["role"]); role != "user" {
+		t.Fatalf("role = %q, want user", role)
+	}
+	for _, block := range got[0].(map[string]any)["content"].([]any) {
+		if got := stringValue(block.(map[string]any)["type"]); got == "thinking" {
+			t.Fatal("a placeholder thinking block survived; upstream refuses an empty one")
+		}
 	}
 }
 
