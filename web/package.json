@@ -6,7 +6,7 @@
     "gateway": "bash ../scripts/ensure-gateway.sh",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 127.0.0.1 --port 4173",
-    "test:lib": "node --test src/lib.test.mjs"
+    "test:lib": "node --test src/lib.test.mjs && node --test src/dialogs.test.mjs"
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",

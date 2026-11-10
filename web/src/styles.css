@@ -3789,6 +3789,9 @@ details:not([open]) > *:not(summary) { display: none !important; }
 .modal-form .field-full { grid-column: 1 / -1; }
 .modal-actions { justify-content: flex-end; margin-top: 20px; }
 .modal-toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 10px; margin-bottom: 16px; }
+/* 应用内确认框的正文：原文里的换行要留住（删除 Provider 的提示是多行的），
+   长串 ID / 路径也要能断行，不然会把卡片撑出横向滚动。 */
+.dialog-message { margin: 0; color: var(--text); font-size: 13px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* ---- 对话测试弹窗 ------------------------------------------------------- */
 /* 一次运行有三个结果（主对话 / Cache / Thinking），全部收在这一个弹窗里用分段

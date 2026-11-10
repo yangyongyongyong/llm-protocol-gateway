@@ -1,6 +1,7 @@
 import React, {useCallback, useEffect, useMemo, useState} from 'react';
 import {API_BASE} from '../lib';
 import {Badge, Modal} from './ui';
+import {confirmDialog} from '../dialogs';
 import type {Role, RoleCatalog, RoleDraft, RoleOption, RoleScope} from './rbac_types';
 
 /** 错误文案：后端的 409 / 400 都是纯文本里带一句中文原因，直接透出给用户看。 */
@@ -117,7 +118,7 @@ export function RolesPage({ model, canManage, onToast }: {
   }
 
   async function deleteRole(role: Role) {
-    if (!window.confirm(`确定删除角色「${role.name}」？该操作不可撤销。`)) return;
+    if (!(await confirmDialog(`确定删除角色「${role.name}」？该操作不可撤销。`, {danger: true, confirmLabel: '删除'}))) return;
     setBusyId(role.id);
     try {
       await jsonRequest(`${API_BASE}/__roles/${encodeURIComponent(role.id)}`, { method: 'DELETE' });

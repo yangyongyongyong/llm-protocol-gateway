@@ -146,6 +146,9 @@ import {
     writeStoredSidebarCollapsed,
     writeUICache
 } from './lib';
+// 桌面 App 的 WKWebView 里 window.confirm 恒为 false、window.alert 静默丢弃，
+// 落在它们上面的按钮会变成「点了没反应」。一律走应用内弹窗。
+import {alertDialog, confirmDialog} from './dialogs';
 import {
     ChatGPTOAuthUsagePanel,
     ClaudeOAuthUsagePanel,
@@ -1731,7 +1734,7 @@ function App() {
   }
 
   async function logoutAdmin() {
-    if (!window.confirm('确定退出登录？')) return;
+    if (!(await confirmDialog('确定退出登录？'))) return;
     setAuthBusy(true);
     try {
       await fetch(`${API_BASE}/__auth/logout`, { method: 'POST', credentials: 'same-origin' });
@@ -2545,7 +2548,7 @@ function App() {
   }
 
   async function revokePublicControlToken() {
-    if (!window.confirm('确定撤销公网控制令牌？已发出的令牌会立即失效，脚本 / LLM 将无法再远程开关公网访问。')) return;
+    if (!(await confirmDialog('确定撤销公网控制令牌？已发出的令牌会立即失效，脚本 / LLM 将无法再远程开关公网访问。', {danger: true, confirmLabel: '撤销'}))) return;
     setPublicControlTokenBusy(true);
     try {
       const response = await fetch(`${API_BASE}/__public/control-token/revoke`, {
@@ -3745,7 +3748,7 @@ function App() {
   }
 
   async function revokeProviderSelfRegistration(providerID: string) {
-    if (!window.confirm('确定撤销自助注册？之前签发的令牌会立即失效，对方脚本将无法再更新地址。')) return;
+    if (!(await confirmDialog('确定撤销自助注册？之前签发的令牌会立即失效，对方脚本将无法再更新地址。', {danger: true, confirmLabel: '撤销'}))) return;
     setSelfRegBusy(true);
     try {
       const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(providerID)}/self-register-token/revoke`, {
@@ -3766,7 +3769,7 @@ function App() {
   async function deleteProvider(providerID: string, providerName: string) {
     if (denyAction('providers.delete')) return;
     const usedBy = state.routes.filter((route) => route.providerId === providerID);
-    if (!window.confirm(`确定删除输入 Provider：${providerName}？\n\n绑定到该 Provider 的 API 密钥引用（备选 / 故障转移 / 模型覆盖）将自动重置为空${usedBy.length > 0 ? `；使用它的 ${usedBy.length} 个路由（${usedBy.map((route) => route.name).join('、')}）将一并删除，绑定这些路由的密钥 RouteID 重置为空` : ''}。`)) return;
+    if (!(await confirmDialog(`确定删除输入 Provider：${providerName}？\n\n绑定到该 Provider 的 API 密钥引用（备选 / 故障转移 / 模型覆盖）将自动重置为空${usedBy.length > 0 ? `；使用它的 ${usedBy.length} 个路由（${usedBy.map((route) => route.name).join('、')}）将一并删除，绑定这些路由的密钥 RouteID 重置为空` : ''}。`, {danger: true, confirmLabel: '删除'}))) return;
     setSaving(true);
     try {
       const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(providerID)}`, { method: 'DELETE' });
@@ -3791,7 +3794,7 @@ function App() {
     const ids = selectedExportProviderIDs.filter((id) => (state.providers || []).some((provider) => provider.id === id));
     if (ids.length === 0) return;
     const names = ids.map((id) => (state.providers || []).find((provider) => provider.id === id)?.name || id);
-    if (!window.confirm(`确定删除选中的 ${ids.length} 个输入 Provider？\n\n${names.join('、')}\n\n绑定到这些 Provider 的 API 密钥引用（备选 / 故障转移 / 模型覆盖）将自动重置为空；使用这些 Provider 的路由将一并删除，绑定这些路由的密钥 RouteID 重置为空。`)) return;
+    if (!(await confirmDialog(`确定删除选中的 ${ids.length} 个输入 Provider？\n\n${names.join('、')}\n\n绑定到这些 Provider 的 API 密钥引用（备选 / 故障转移 / 模型覆盖）将自动重置为空；使用这些 Provider 的路由将一并删除，绑定这些路由的密钥 RouteID 重置为空。`, {danger: true, confirmLabel: '删除'}))) return;
     setSaving(true);
     try {
       const results = await Promise.allSettled(ids.map(async (id) => {
@@ -4358,7 +4361,7 @@ function App() {
 
   async function deleteApiKey(key: APIKey) {
     if (denyAction('keys.delete')) return;
-    if (!window.confirm(`确定删除 API 密钥：${key.name}？`)) return;
+    if (!(await confirmDialog(`确定删除 API 密钥：${key.name}？`, {danger: true, confirmLabel: '删除'}))) return;
     setSaving(true);
     try {
       const response = await fetch(`${API_BASE}/__apikeys/${encodeURIComponent(key.id)}`, { method: 'DELETE' });
@@ -4503,7 +4506,7 @@ function App() {
     if (denyAction('keys.delete')) return;
     const ids = checkedApiKeyIDs.filter((id) => (state.apiKeys || []).some((key) => key.id === id));
     if (ids.length === 0) return;
-    if (!window.confirm(`确定删除选中的 ${ids.length} 个 API 密钥？此操作不可恢复。`)) return;
+    if (!(await confirmDialog(`确定删除选中的 ${ids.length} 个 API 密钥？此操作不可恢复。`, {danger: true, confirmLabel: '删除'}))) return;
     setSaving(true);
     try {
       const results = await Promise.allSettled(ids.map(async (id) => {
@@ -4533,7 +4536,7 @@ function App() {
   }
 
   async function deleteRoute(routeID: string, routeName: string) {
-    if (!window.confirm(`确定删除路由：${routeName}？`)) return;
+    if (!(await confirmDialog(`确定删除路由：${routeName}？`, {danger: true, confirmLabel: '删除'}))) return;
     setSaving(true);
     try {
       const response = await fetch(`${API_BASE}/__routes/${encodeURIComponent(routeID)}`, { method: 'DELETE' });

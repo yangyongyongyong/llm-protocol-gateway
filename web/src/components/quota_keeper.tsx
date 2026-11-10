@@ -6,6 +6,7 @@ import { quotaWindowLabel } from '../monitoring/format';
 import { MultiSelectFilter } from './selects';
 import { ProviderLabel, ProviderRefLabel, providerIcon } from './provider_label';
 import { Badge, CheckboxField, Field, Modal, MoreMenu } from './ui';
+import { confirmDialog } from '../dialogs';
 
 /**
  * 额度保活面板。
@@ -284,7 +285,7 @@ export function QuotaKeeperPanel({ providers, showOwner, canManage }: { provider
   }
 
   async function remove(task: ScheduledTask) {
-    if (!window.confirm(`删除定时任务「${task.name}」？执行历史会一并删除。`)) return;
+    if (!(await confirmDialog(`删除定时任务「${task.name}」？执行历史会一并删除。`, {danger: true, confirmLabel: '删除'}))) return;
     const response = await fetch(`${API_BASE}/__quota-tasks/${encodeURIComponent(task.id)}`, { method: 'DELETE' });
     if (!response.ok) {
       setError(`删除失败：${await readError(response)}`);

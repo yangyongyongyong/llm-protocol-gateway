@@ -17,6 +17,7 @@ import {providerSelectOptions} from './provider_select';
 import {FilterPopoverSelect, type PopoverFilterOption} from './filter_popover';
 import {IconSelect, SearchableModelSelect} from './selects';
 import {Badge, BrandIcon, InfoTip, Switch} from './ui';
+import {alertDialog, confirmDialog} from '../dialogs';
 import {
   API_BASE,
   apiKeyClientBaseURL,
@@ -1391,8 +1392,9 @@ function SchemeActions({
           className="akc-soft-btn danger"
           disabled={saving}
           onClick={() => {
-            if (!window.confirm(`删除方案「${activeProfile.name}」？删除后将切换到其余方案之一。`)) return;
-            void onDelete(keyItem, activeProfile.id);
+            void confirmDialog(`删除方案「${activeProfile.name}」？删除后将切换到其余方案之一。`, {danger: true, confirmLabel: '删除'}).then((ok) => {
+              if (ok) void onDelete(keyItem, activeProfile.id);
+            });
           }}
         >
           <Icon path={ICONS.trash} size={13} />
@@ -1715,14 +1717,14 @@ function ClientTab({
         model: 'default[1m]',
       });
       if (!outcome.ok) {
-        window.alert(outcome.error || '写入失败');
+        void alertDialog(outcome.error || '写入失败');
         return;
       }
       onCopy('', '已写入本机 Claude Code CLI 与 Claude Desktop 配置', 'claude-local');
       const notes = (outcome.result?.notes || []).join('\n');
-      window.alert(`已写入本机配置：\n${outcome.result?.cliPath || ''}\n${outcome.result?.desktopPath || ''}${notes ? `\n\n${notes}` : ''}`);
+      void alertDialog(`已写入本机配置：\n${outcome.result?.cliPath || ''}\n${outcome.result?.desktopPath || ''}${notes ? `\n\n${notes}` : ''}`);
     } catch (error) {
-      window.alert(String(error));
+      void alertDialog(String(error));
     } finally {
       setApplyingClients(false);
     }

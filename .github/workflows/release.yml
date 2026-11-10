@@ -80,6 +80,7 @@ jobs:
           npm ci --no-audit --no-fund
           npm run build
           node --test src/lib.test.mjs
+          node --test src/dialogs.test.mjs
 
   # ------------------------------------------------------------------ 核心网关（7 个平台）
   cli:

@@ -41,6 +41,7 @@ import {
 } from '../types';
 import {SubscriptionUsagePanel} from './subscription';
 import {Badge, BrandIcon, MoreMenu} from './ui';
+import {confirmDialog} from '../dialogs';
 import {WorkBuddyTaskPanel} from './workbuddy_tasks';
 
 /** 最早到期的重置卡时间；无效时间为空串。 */
@@ -690,7 +691,7 @@ export function ChatGPTOAuthUsagePanel({ providerId, accountKey, connected, comp
       `账号：${subtitle || providerId}`,
       '重置后当前额度窗口会立即重新开始，操作不可撤销。',
     ].join('\n');
-    if (!window.confirm(prompt)) return;
+    if (!(await confirmDialog(prompt, {danger: true, confirmLabel: '使用'}))) return;
     setConsuming(true);
     setConsumeError('');
     try {

@@ -2,6 +2,7 @@ import React, {useCallback, useEffect, useMemo, useState} from 'react';
 import {API_BASE} from '../lib';
 import {Avatar, AvatarUploader} from './avatar';
 import {Badge, Modal, Switch} from './ui';
+import {confirmDialog} from '../dialogs';
 import {scopeLabel} from './roles_page';
 import type {ConsoleUser, GrantTarget, RoleOption, UserDraft} from './rbac_types';
 
@@ -134,7 +135,7 @@ export function UsersPage({ canManage, canView, onToast, onChanged, roleOptions,
   }
 
   async function deleteUser(user: ConsoleUser) {
-    if (!window.confirm(`确定删除用户「${user.displayName || user.username}」？其名下 Key 将归还管理员，该操作不可撤销。`)) return;
+    if (!(await confirmDialog(`确定删除用户「${user.displayName || user.username}」？其名下 Key 将归还管理员，该操作不可撤销。`, {danger: true, confirmLabel: '删除'}))) return;
     setBusyId(user.id);
     try {
       await jsonRequest(`${API_BASE}/__users/${encodeURIComponent(user.id)}`, { method: 'DELETE' });
