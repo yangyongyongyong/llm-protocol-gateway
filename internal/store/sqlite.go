@@ -365,6 +365,10 @@ func (s *Store) migrate() error {
 		{"role_id", "TEXT NOT NULL DEFAULT ''"},
 		{"display_name", "TEXT NOT NULL DEFAULT ''"},
 		{"avatar_url", "TEXT NOT NULL DEFAULT ''"},
+		// 下游网关账号（父子对接）。空 kind 由代码解释成 local，所以升级前的
+		// 所有行不需要回填。
+		{"kind", "TEXT NOT NULL DEFAULT ''"},
+		{"gateway_id", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		if err := addColumnIfMissing(tx, "users", column.name, column.definition); err != nil {
 			return fmt.Errorf("migrate users: %w", err)

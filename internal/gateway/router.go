@@ -136,6 +136,22 @@ func (r *Router) SetLog2xxBodies(enabled bool) {
 	r.state.Log2xxBodies = enabled
 }
 
+// SetPeerRegistrationAllowCIDRs 设置对端注册的来源白名单。空串恢复默认
+// （只允许本机与内网）。
+func (r *Router) SetPeerRegistrationAllowCIDRs(raw string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.PeerRegistrationAllowCIDRs = strings.TrimSpace(raw)
+}
+
+// PeerRegistrationAllowCIDRs 返回当前白名单。Go 不允许同一个类型上出现与
+// 字段同名的 Getter，所以字段是 PeerRegistrationAllowCIDRs、方法加前缀区分。
+func (r *Router) PeerRegistrationAllowCIDRs() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return strings.TrimSpace(r.state.PeerRegistrationAllowCIDRs)
+}
+
 func (r *Router) SetUsageBatchConfig(maxSize, maxWaitSeconds int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -731,6 +747,65 @@ func (r *Router) AddAPIKey(key domain.APIKey) (domain.APIKey, error) {
 
 	r.state.APIKeys = append(r.state.APIKeys, key)
 	return key, nil
+}
+
+// ReplacePeerKey 用一个对端的全部旧凭据换成新的一把。
+//
+// 换发（重装后重新注册）和吊销后重建在语义上是同一件事，共用这一条路径。
+// 整个过程在写锁内完成：请求线程看到的要么是旧凭据、要么是新凭据，绝不会
+// 出现"旧的已删、新的还没插上"的空档，否则下游会在那一刻被拒。
+//
+// 只动 kind=peer 账号名下的密钥；名字里带 peerTokenPrefix 但归属本地用户的
+// 行不会被碰——那种行只可能来自手工干预，留给管理员处理而不是悄悄删掉。
+func (r *Router) ReplacePeerKey(key domain.APIKey) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ownerID := strings.TrimSpace(key.OwnerUserID)
+	if ownerID == "" {
+		return fmt.Errorf("peer key must have an owner")
+	}
+	kept := make([]domain.APIKey, 0, len(r.state.APIKeys)+1)
+	for _, existing := range r.state.APIKeys {
+		if strings.TrimSpace(existing.OwnerUserID) == ownerID && strings.HasPrefix(existing.Key, peerTokenPrefix) {
+			continue
+		}
+		kept = append(kept, existing)
+	}
+	key.Name = strings.TrimSpace(key.Name)
+	if key.Name == "" {
+		key.Name = "网关"
+	}
+	// 对端密钥不绑 route：走哪个 provider 由上游按模型和授权集决定，不是
+	// 一把密钥对应一条固定路由。
+	key.RouteID = ""
+	key.Enabled = true
+	if key.CreatedAt == "" {
+		key.CreatedAt = nowRFC3339()
+	}
+	r.state.APIKeys = append(kept, key)
+	return nil
+}
+
+// RemovePeerKeys 删掉一个对端名下的全部对端凭据。吊销用它，返回删掉的条数。
+//
+// 只删带 peerTokenPrefix 的行：同一个 owner 名下如果还有手工建的普通密钥，
+// 那不属于对端这一侧，吊销网关不该顺手把它们删掉。
+func (r *Router) RemovePeerKeys(ownerUserID string) error {
+	ownerUserID = strings.TrimSpace(ownerUserID)
+	if ownerUserID == "" {
+		return fmt.Errorf("owner is required")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	kept := make([]domain.APIKey, 0, len(r.state.APIKeys))
+	for _, key := range r.state.APIKeys {
+		if strings.TrimSpace(key.OwnerUserID) == ownerUserID && strings.HasPrefix(key.Key, peerTokenPrefix) {
+			continue
+		}
+		kept = append(kept, key)
+	}
+	r.state.APIKeys = kept
+	return nil
 }
 
 // UpdateAPIKeyOwner reassigns a key to a console user ("" = admin-owned).

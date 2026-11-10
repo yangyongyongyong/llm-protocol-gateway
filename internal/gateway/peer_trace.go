@@ -95,19 +95,25 @@ func withIngressPeer(r *http.Request, peerGatewayID string) *http.Request {
 	return r.WithContext(withPeerTrace(r.Context(), trace))
 }
 
-// withEgressPeer 把"本机把请求转给了哪个对端网关"记到请求上。
+// peerTraceFor 汇总一条请求的全部链路标记。
 //
-// 和 withIngressPeer 不同，这个值来自本机自己的配置（对端定义），是可信的。
-func withEgressPeer(r *http.Request, peerGatewayID string) *http.Request {
-	if r == nil {
-		return r
+// Ingress 来自请求本身（校验过的对端凭据，见 withIngressPeer）；Egress 来自
+// requestTiming，因为它是「路上才知道」的：父网关的身份要到它的响应头回来时
+// 才拿得到（sendPeerDoor），而那时已经在每个协议各自的 send 闭包深处，换出去
+// 的 *http.Request 传不回最外层的写日志处。requestTiming 在 handler 入口挂好、
+// 写日志时再读，正是这种值该待的地方。两个来源都空就是纯本地请求。
+func peerTraceFor(r *http.Request, timing *requestTiming) peerTrace {
+	var trace peerTrace
+	if r != nil {
+		trace = peerTraceFrom(r.Context())
 	}
-	trace := peerTraceFrom(r.Context())
-	trace.Egress = strings.TrimSpace(peerGatewayID)
-	if trace.Origin == "" {
-		trace.Origin = strings.TrimSpace(r.Header.Get(headerGatewayOrigin))
+	if id := timing.peerEgressFrom(); id != "" {
+		trace.Egress = id
+		if trace.Origin == "" && r != nil {
+			trace.Origin = strings.TrimSpace(r.Header.Get(headerGatewayOrigin))
+		}
 	}
-	return r.WithContext(withPeerTrace(r.Context(), trace))
+	return trace
 }
 
 // applyPeerTrace 把链路标记填进日志条目。空 trace 是零操作，所以调用点不必

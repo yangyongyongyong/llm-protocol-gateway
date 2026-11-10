@@ -11,10 +11,11 @@ import (
 // scanUser reads a users row in SELECT column order.
 func scanUser(rows *sql.Rows) (domain.User, error) {
 	var user domain.User
-	var role, roleID string
+	var role, roleID, kind string
 	var enabled int
 	if err := rows.Scan(&user.ID, &user.Username, &user.PasswordHash, &role, &roleID,
-		&user.DisplayName, &user.AvatarURL, &enabled, &user.CreatedAt, &user.LastLoginAt, &user.LastActiveAt); err != nil {
+		&user.DisplayName, &user.AvatarURL, &enabled, &user.CreatedAt, &user.LastLoginAt, &user.LastActiveAt,
+		&kind, &user.GatewayID); err != nil {
 		return domain.User{}, err
 	}
 	user.Role = domain.UserRole(strings.TrimSpace(role))
@@ -25,11 +26,16 @@ func scanUser(rows *sql.Rows) (domain.User, error) {
 	if user.RoleID == "" {
 		user.RoleID = string(user.Role)
 	}
+	// 空 kind 是升级前的行：那个年代只存在本地控制台账号。
+	user.Kind = domain.UserKind(strings.TrimSpace(kind))
+	if user.Kind == "" {
+		user.Kind = domain.UserKindLocal
+	}
 	user.Enabled = enabled != 0
 	return user, nil
 }
 
-const userSelectColumns = `id, username, password_hash, role, role_id, display_name, avatar_url, enabled, created_at, last_login_at, last_active_at`
+const userSelectColumns = `id, username, password_hash, role, role_id, display_name, avatar_url, enabled, created_at, last_login_at, last_active_at, kind, gateway_id`
 
 // ListUsers returns all console users ordered by creation time.
 func (s *Store) ListUsers() ([]domain.User, error) {
@@ -59,8 +65,22 @@ func (s *Store) UserByUsername(username string) (domain.User, error) {
 	return s.queryOneUser(`SELECT `+userSelectColumns+` FROM users WHERE LOWER(username) = LOWER(?)`, strings.TrimSpace(username))
 }
 
-func (s *Store) queryOneUser(query string, arg any) (domain.User, error) {
-	rows, err := s.reader().Query(query, arg)
+// UserByGatewayID returns the peer account registered for a gateway identity.
+//
+// 注册以网关身份为准而不是用户名：下游改了网关名字（或者两个下游起了同名）
+// 时，靠用户名会认错人——要么给同一个网关建出第二个账号，要么把新网关塞进
+// 别人的授权里。网关身份是从机器标识派生的，重装也不变。
+func (s *Store) UserByGatewayID(gatewayID string) (domain.User, error) {
+	gatewayID = strings.TrimSpace(gatewayID)
+	if gatewayID == "" {
+		return domain.User{}, fmt.Errorf("user not found")
+	}
+	return s.queryOneUser(`SELECT `+userSelectColumns+` FROM users WHERE gateway_id = ? AND kind = ?`,
+		gatewayID, string(domain.UserKindPeer))
+}
+
+func (s *Store) queryOneUser(query string, args ...any) (domain.User, error) {
+	rows, err := s.reader().Query(query, args...)
 	if err != nil {
 		return domain.User{}, err
 	}
@@ -82,12 +102,16 @@ func (s *Store) CreateUser(user domain.User) error {
 	if user.RoleID == "" {
 		user.RoleID = string(user.Role)
 	}
+	kind := strings.TrimSpace(string(user.Kind))
+	if kind == "" {
+		kind = string(domain.UserKindLocal)
+	}
 	_, err := s.db.Exec(`INSERT INTO users
-		(id, username, password_hash, role, role_id, display_name, avatar_url, enabled, created_at, last_login_at, last_active_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		(id, username, password_hash, role, role_id, display_name, avatar_url, enabled, created_at, last_login_at, last_active_at, kind, gateway_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		user.ID, strings.TrimSpace(user.Username), user.PasswordHash, string(user.Role), user.RoleID,
 		strings.TrimSpace(user.DisplayName), strings.TrimSpace(user.AvatarURL), enabled,
-		user.CreatedAt, user.LastLoginAt, user.LastActiveAt)
+		user.CreatedAt, user.LastLoginAt, user.LastActiveAt, kind, strings.TrimSpace(user.GatewayID))
 	return err
 }
 
@@ -99,13 +123,17 @@ func (s *Store) UpdateUser(user domain.User) error {
 	if user.RoleID == "" {
 		user.RoleID = string(user.Role)
 	}
+	kind := strings.TrimSpace(string(user.Kind))
+	if kind == "" {
+		kind = string(domain.UserKindLocal)
+	}
 	_, err := s.db.Exec(`UPDATE users
 		SET username = ?, password_hash = ?, role = ?, role_id = ?, display_name = ?, avatar_url = ?,
-		    enabled = ?, last_login_at = ?, last_active_at = ?
+		    enabled = ?, last_login_at = ?, last_active_at = ?, kind = ?, gateway_id = ?
 		WHERE id = ?`,
 		strings.TrimSpace(user.Username), user.PasswordHash, string(user.Role), user.RoleID,
 		strings.TrimSpace(user.DisplayName), strings.TrimSpace(user.AvatarURL), enabled,
-		user.LastLoginAt, user.LastActiveAt, user.ID)
+		user.LastLoginAt, user.LastActiveAt, kind, strings.TrimSpace(user.GatewayID), user.ID)
 	return err
 }
 

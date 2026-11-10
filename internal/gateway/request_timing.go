@@ -57,6 +57,34 @@ type requestTiming struct {
 	// the request log is assembled.
 	scheduleMu sync.Mutex
 	schedule   *scheduleTrace
+
+	// peerEgress is the parent gateway this request was forwarded to, learned
+	// from its response header at send time (see peer_egress.go). Read once when
+	// the request log is assembled; the lock only guards the several retries that
+	// may each report it.
+	peerEgressMu sync.Mutex
+	peerEgress   string
+}
+
+// notePeerEgress records the parent gateway a forwarded request reached.
+func (t *requestTiming) notePeerEgress(gatewayID string) {
+	gatewayID = strings.TrimSpace(gatewayID)
+	if t == nil || gatewayID == "" {
+		return
+	}
+	t.peerEgressMu.Lock()
+	t.peerEgress = gatewayID
+	t.peerEgressMu.Unlock()
+}
+
+// peerEgressFrom returns the parent gateway recorded for this request, if any.
+func (t *requestTiming) peerEgressFrom() string {
+	if t == nil {
+		return ""
+	}
+	t.peerEgressMu.Lock()
+	defer t.peerEgressMu.Unlock()
+	return t.peerEgress
 }
 
 func newRequestTiming(started time.Time) *requestTiming {

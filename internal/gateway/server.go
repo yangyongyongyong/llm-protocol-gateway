@@ -589,6 +589,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /__users/{id}", s.handleUpdateUser)
 	mux.HandleFunc("DELETE /__users/{id}", s.handleDeleteUser)
 	mux.HandleFunc("POST /__users/{id}/reset-password", s.handleResetUserPassword)
+	// 对端网关（父子对接）。注册是唯一不需要已有凭据的入口，靠来源地址与
+	// 用户名密码把关；其余端点只认对端凭据。整段前缀在 admin_auth 里被旁路
+	// 掉会话鉴权，见 withAdminAuth。
+	mux.HandleFunc("POST /__peer/register", s.handlePeerRegister)
+	mux.HandleFunc("GET /__peer/me", s.handlePeerMe)
+	mux.HandleFunc("GET /__peer/providers", s.handlePeerProviders)
+	mux.HandleFunc("POST /__peer/chat/completions", s.handlePeerChatCompletions)
+	// 管理侧：列出/吊销已注册的下游网关。
+	mux.HandleFunc("GET /__peers", s.handleListPeers)
+	mux.HandleFunc("DELETE /__peers/{id}", s.handleRevokePeer)
+	mux.HandleFunc("PATCH /__settings/peer-registration-cidrs", s.handleSetPeerRegistrationCIDRs)
 	// RBAC: roles, the permission catalog, resource grant targets, and the
 	// signed-in user's own profile (display name + avatar).
 	mux.HandleFunc("GET /__roles", s.handleListRoles)
@@ -1606,7 +1617,7 @@ func (s *Server) recordRequestLogEx(r *http.Request, started time.Time, matchedK
 		scheduleTraceOf(r.Context()).applyTo(&entry.Analysis)
 		// 父子透传的位置标记：纯本地请求是零值，applyPeerTrace 直接返回，
 		// 所以这一段不会改变既有日志的任何一个字段。
-		applyPeerTrace(&entry, peerTraceFrom(r.Context()))
+		applyPeerTrace(&entry, peerTraceFor(r, timing))
 	}
 	if gatewayKeyMatched {
 		entry.APIKeyID = matchedKey.ID
@@ -3353,6 +3364,13 @@ func resolveProviderEndpointURL(provider domain.Provider, path string) string {
 }
 
 func resolveProviderChatURL(provider domain.Provider, model string) string {
+	if provider.AuthType == domain.AuthTypePeer {
+		// 父子透传的 provider 不是 provider，而是「上游网关的一扇门」：地址
+		// 固定是它的 /__peer/chat/completions，模型写在包体里。走通用的
+		// baseUrl + /chat/completions 拼接会打到上游的普通模型入口，那里不认
+		// 对端凭据。
+		return resolvePeerParentURL(provider) + peerEndpointPrefix + "chat/completions"
+	}
 	if isTraeProvider(provider) {
 		// Trae has one agent endpoint per realm and no OpenAI-style path to
 		// append to it.
@@ -6021,6 +6039,11 @@ func (s *Server) proxyOpenAIChat(w http.ResponseWriter, r *http.Request, provide
 		incomingAuth = r.Header.Get("Authorization")
 	}
 	send := func(requestBody []byte) (*http.Response, error) {
+		if provider.AuthType == domain.AuthTypePeer {
+			// 对端 provider 是父网关的一扇门：这条直通路径不经过
+			// doOpenAIProviderRequest，出口要自己接上。
+			return s.sendPeerDoor(r.Context(), r, provider, model, requestBody, r.Header.Get("Accept"))
+		}
 		request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(requestBody))
 		if err != nil {
 			return nil, err
@@ -6297,6 +6320,13 @@ func (s *Server) claudePassThroughInterrupter(r *http.Request, provider domain.P
 // resolved upstream (Anthropic for claude_oauth providers, provider.BaseURL for
 // regular Claude API-key providers), returning the raw response.
 func (s *Server) sendClaudeMessagesUpstream(r *http.Request, provider domain.Provider, body []byte) (*http.Response, error) {
+	if provider.AuthType == domain.AuthTypePeer {
+		// 对端 provider 是父网关的一扇门，不是某个具体的 Claude 兼容上游：
+		// 下面所有整流（stop_sequences 剪裁、thinking 关闭写法、被拒签名记忆）
+		// 都是围着某个真实上游的校验习惯转的，对门后面的真实上游一无所知。
+		// 报文原样进信封，由父网关按它自己选中的那个 provider 去整形。
+		return s.sendPeerDoor(r.Context(), r, provider, stringValue(claudeBodyField(body, "model")), body, r.Header.Get("Accept"))
+	}
 	isOAuth := provider.AuthType == domain.AuthTypeClaudeOAuth
 	// 这个上游拒过的 thinking 签名先剥掉：一次拒签之后，对话的后续每一轮都不必
 	// 再花一次 400 去重新学同一件事（对标 magpie thinking_bound.go 的记忆）。
@@ -6444,6 +6474,12 @@ func (s *Server) maybeRectifyClaudeThinkingResend(r *http.Request, provider doma
 }
 
 func (s *Server) doClaudeProviderRequest(ctx context.Context, r *http.Request, provider domain.Provider, body []byte, accept string) (*http.Response, error) {
+	if provider.AuthType == domain.AuthTypePeer {
+		// 对端 provider 是父网关的一扇门：报文进信封，由父网关交给它自己
+		// 选中的 provider（下面那些整流都是围着某个真实上游的校验习惯转的，
+		// 对门后面是谁一无所知）。
+		return s.sendPeerDoor(ctx, r, provider, stringValue(claudeBodyField(body, "model")), body, accept)
+	}
 	isOAuth := provider.AuthType == domain.AuthTypeClaudeOAuth
 	// 同上：这个上游拒过的 thinking 签名不再重复提交。
 	body = stripRefusedClaudeThinkingBody(body, provider)

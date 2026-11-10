@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/luca/llm-protocol-gateway/internal/monitor"
 )
@@ -14,7 +15,7 @@ import (
 func TestPeerTraceLeavesLocalRequestsClean(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 	entry := monitor.RequestLog{}
-	applyPeerTrace(&entry, peerTraceFrom(request.Context()))
+	applyPeerTrace(&entry, peerTraceFor(request, newRequestTiming(time.Now())))
 	if entry.Ingress != "" || entry.Egress != "" || entry.PeerGatewayID != "" ||
 		entry.PeerDirection != "" || entry.PeerOrigin != "" {
 		t.Fatalf("a local request must stay clean, got %+v", entry)
@@ -44,12 +45,16 @@ func TestPeerTraceMarksIngress(t *testing.T) {
 }
 
 // 下游方向：本机把请求转给父网关，PeerGatewayID 是那个父网关，方向是 egress。
+//
+// Egress 只在父网关回包头时才拿得到（见 sendPeerDoor），所以它挂在
+// requestTiming 上而不是请求的 context 上。
 func TestPeerTraceMarksEgress(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
-	request = withEgressPeer(request, otherID)
+	timing := newRequestTiming(time.Now())
+	timing.notePeerEgress(otherID)
 
 	entry := monitor.RequestLog{}
-	applyPeerTrace(&entry, peerTraceFrom(request.Context()))
+	applyPeerTrace(&entry, peerTraceFor(request, timing))
 	if entry.Egress != otherID || entry.Ingress != "" {
 		t.Fatalf("Ingress/Egress = %q/%q", entry.Ingress, entry.Egress)
 	}
@@ -68,10 +73,11 @@ func TestPeerTraceMarksEgress(t *testing.T) {
 func TestPeerTracePrefersIngressForAccounting(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 	request = withIngressPeer(request, "gw_1111111111111111")
-	request = withEgressPeer(request, "gw_2222222222222222")
+	timing := newRequestTiming(time.Now())
+	timing.notePeerEgress("gw_2222222222222222")
 
 	entry := monitor.RequestLog{}
-	applyPeerTrace(&entry, peerTraceFrom(request.Context()))
+	applyPeerTrace(&entry, peerTraceFor(request, timing))
 	if entry.Ingress != "gw_1111111111111111" || entry.Egress != "gw_2222222222222222" {
 		t.Fatalf("both sides must be kept, got %+v", entry)
 	}
@@ -85,11 +91,17 @@ func TestPeerTraceHelpersTolerateNil(t *testing.T) {
 	if withIngressPeer(nil, gwID) != nil {
 		t.Fatal("withIngressPeer(nil) must return nil")
 	}
-	if withEgressPeer(nil, gwID) != nil {
-		t.Fatal("withEgressPeer(nil) must return nil")
-	}
 	applyPeerTrace(nil, peerTrace{Ingress: gwID}) // 不 panic 即可
 	if got := peerTraceFrom(nil); !got.isEmpty() {
 		t.Fatalf("peerTraceFrom(nil) = %+v", got)
+	}
+	if got := peerTraceFor(nil, nil); !got.isEmpty() {
+		t.Fatalf("peerTraceFor(nil, nil) = %+v", got)
+	}
+	// timing 为 nil 时不能 panic：有些合成日志路径根本没有计时器。
+	var noTiming *requestTiming
+	noTiming.notePeerEgress(gwID)
+	if noTiming.peerEgressFrom() != "" {
+		t.Fatal("a nil timing must report no egress peer")
 	}
 }

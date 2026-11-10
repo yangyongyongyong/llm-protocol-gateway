@@ -68,6 +68,17 @@ func (m *memoryUserStore) UserByUsername(username string) (domain.User, error) {
 	return domain.User{}, http.ErrNoLocation
 }
 
+// UserByGatewayID 只认 kind=peer 的行，与真实存储的行为一致：本地账号没有
+// 网关身份，拿一个网关 ID 去查不该查到本地用户。
+func (m *memoryUserStore) UserByGatewayID(gatewayID string) (domain.User, error) {
+	for _, user := range m.users {
+		if user.IsPeer() && user.GatewayID == gatewayID {
+			return user, nil
+		}
+	}
+	return domain.User{}, http.ErrNoLocation
+}
+
 func (m *memoryUserStore) CreateUser(user domain.User) error {
 	m.users[user.ID] = user
 	return nil
