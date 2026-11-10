@@ -814,6 +814,21 @@ export type GatewayState = {
   webExposed?: boolean;
   dataPaths?: DataPaths;
   cursorBridge?: CursorBridgeRuntime;
+  /** 本网关的稳定身份；重装不变。父子对接靠它互相识别。 */
+  gatewayIdentity?: GatewayIdentity;
+};
+
+/**
+ * 本网关身份。ID 从机器标识派生，因此重装、清库都不变——下游注册记录
+ * 不会因为重装而全部失效。
+ */
+export type GatewayIdentity = {
+  id: string;
+  name?: string;
+  /** machine = 从机器标识派生；persisted = 库里存的随机值（读不到机器标识时）。 */
+  source?: string;
+  /** false 时重装会换身份，界面必须提示。 */
+  machineIdReadable: boolean;
 };
 
 /** 一次请求碰到过的每个 Provider：谁在服务、谁被跳过、为什么换下一个。 */

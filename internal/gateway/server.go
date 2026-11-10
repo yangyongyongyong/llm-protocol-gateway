@@ -247,6 +247,14 @@ type Server struct {
 	quotaProbeInFlight map[string]bool
 	quotaLastProbeAt   map[string]time.Time
 	quotaLastPruneAt   time.Time
+
+	// gatewayID 是本网关的稳定身份（见 internal/gatewayid）：父子透传用它判断
+	// "这次请求是不是已经过我自己"。启动时由 SetGatewayID 注入；空串表示尚未
+	// 初始化，此时环路检测放行而不是误拒所有透传流量。
+	gatewayID string
+	// gatewayIdentity 是同一身份的完整描述（来源、是否派生于机器标识），
+	// 只用于控制台展示；gatewayID 才是环路检测读的那个值。
+	gatewayIdentity *domain.GatewayIdentity
 }
 
 func NewServer(router *Router, logs *monitor.Store, stateSaver ...StateSaver) *Server {
@@ -634,6 +642,10 @@ func (s *Server) Handler() http.Handler {
 	api := withCORS(mux)
 	// 任何 POST 正文都有上限：限制在读取处（ReadAll 之前），超限时各协议自己回 413。
 	api = withBodyLimit(api)
+	// 环路闸门放在最内层（紧贴 mux）：它只需要看请求头，越早拒绝越省。
+	// 必须包在 mux 外层而不是塞进每个 handler——模型端点和控制台端点都会
+	// 经过这里，漏掉任何一个就等于留了一条能把自己绕死的路径。
+	api = s.withGatewayLoopGuard(api)
 	// 宿主分离必须在鉴权外层：API 域名上的控制台接口应当"不存在"（404），
 	// 而不是先被鉴权回 401——那等于告诉外面"这里有个管理接口，只是你没登录"。
 	// UI 域名上的模型协议同理，不该先走一遍管理鉴权。
@@ -695,6 +707,9 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	// 服务器自己的"今天"（API 密钥今日计数、定时任务、纯日期的日界）按 time.Local
 	// 算；控制台据此把「今日」换算到同一个时区，两个页面才不会各说一天。
 	state.ServerTimeZone = serverTimeZoneName()
+	// 身份对所有角色可见：普通用户配"父网关 ID"时也要能复制自己这一侧的 ID。
+	// 它不含机器标识本身，只有派生后的哈希，所以不存在泄漏问题。
+	state.GatewayIdentity = s.GatewayIdentityForConsole()
 	if p := s.requestPrincipal(r); p.scopeOf() != domain.ScopeAll {
 		writeJSON(w, http.StatusOK, s.stateForUser(identity, state))
 		return
@@ -1589,6 +1604,9 @@ func (s *Server) recordRequestLogEx(r *http.Request, started time.Time, matchedK
 	// scheduler to report.
 	if r != nil {
 		scheduleTraceOf(r.Context()).applyTo(&entry.Analysis)
+		// 父子透传的位置标记：纯本地请求是零值，applyPeerTrace 直接返回，
+		// 所以这一段不会改变既有日志的任何一个字段。
+		applyPeerTrace(&entry, peerTraceFrom(r.Context()))
 	}
 	if gatewayKeyMatched {
 		entry.APIKeyID = matchedKey.ID

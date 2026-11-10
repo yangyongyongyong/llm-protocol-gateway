@@ -1,0 +1,124 @@
+package gateway
+
+import (
+	"context"
+	"net/http"
+	"strings"
+
+	"github.com/luca/llm-protocol-gateway/internal/monitor"
+)
+
+// 父子网关透传在请求日志里的落点。
+//
+// 这三个值描述的是"这次请求在链路里的位置"：谁送进来的、本机又转给了谁。
+// 纯本地请求三者都为空，日志和引入父子功能之前一字不差。
+//
+// 它们随请求走 context 而不是穿进 recordRequestLogEx 的参数列表：那条签名
+// 已经有十几个参数，而且只在透传这一条路上才会有值——每加一个可选参数都
+// 要改十几处调用点，还容易把顺序搞错。
+type peerTraceKey struct{}
+
+// peerTrace 是一次请求的链路标记。
+type peerTrace struct {
+	// Ingress 是把请求送进来的对端网关 ID。
+	Ingress string
+	// Egress 是本机把请求转发出去的对端网关 ID。
+	Egress string
+	// Origin 是发起方网关 ID（X-Gateway-Origin 的值）。
+	Origin string
+}
+
+// peerGatewayID 返回这次请求要对账的那个对端网关。
+//
+// 有 Ingress 时优先用它：对上游（父）来说，关心的是"哪个子网关送来的流量"，
+// 即使这次请求最终又被本机转发给了另一个对端，那条链的起点仍然是 Ingress。
+// 两者都没有就是纯本地请求，返回空串。
+func (t peerTrace) peerGatewayID() string {
+	if id := strings.TrimSpace(t.Ingress); id != "" {
+		return id
+	}
+	return strings.TrimSpace(t.Egress)
+}
+
+// peerDirection 说明 PeerGatewayID 在这条请求里扮演什么角色。
+//
+// 上游看到的是 ingress（子网关把流量送进来），下游看到的是 egress（本机把
+// 流量送出去）。两级都各自记一条，"这个子网关用了多少"在上游算，而"我借道
+// 上游用了多少"在下游算。
+func (t peerTrace) peerDirection() string {
+	if strings.TrimSpace(t.Ingress) != "" {
+		return "ingress"
+	}
+	if strings.TrimSpace(t.Egress) != "" {
+		return "egress"
+	}
+	return ""
+}
+
+func (t peerTrace) isEmpty() bool {
+	return strings.TrimSpace(t.Ingress) == "" && strings.TrimSpace(t.Egress) == "" && strings.TrimSpace(t.Origin) == ""
+}
+
+func withPeerTrace(ctx context.Context, trace peerTrace) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, peerTraceKey{}, trace)
+}
+
+// peerTraceFrom 取回链路标记；没有就返回零值。
+func peerTraceFrom(ctx context.Context) peerTrace {
+	if ctx == nil {
+		return peerTrace{}
+	}
+	if trace, ok := ctx.Value(peerTraceKey{}).(peerTrace); ok {
+		return trace
+	}
+	return peerTrace{}
+}
+
+// withIngressPeer 把"这次请求来自哪个对端网关"记到请求上。
+//
+// 只在 /__peer/* 的对端鉴权通过之后调用：链路头是外部可写的，不能拿它当
+// 身份——那会让任何人都能把自己标成某个子网关，从而在上游的用量里冒充别人。
+// Ingress 必须来自校验过的 peer 凭据。
+func withIngressPeer(r *http.Request, peerGatewayID string) *http.Request {
+	if r == nil {
+		return r
+	}
+	trace := peerTraceFrom(r.Context())
+	trace.Ingress = strings.TrimSpace(peerGatewayID)
+	// Origin 已经由 extendGatewayHop 写在头里了，这里补的是"本机看到的值"。
+	if trace.Origin == "" {
+		trace.Origin = strings.TrimSpace(r.Header.Get(headerGatewayOrigin))
+	}
+	return r.WithContext(withPeerTrace(r.Context(), trace))
+}
+
+// withEgressPeer 把"本机把请求转给了哪个对端网关"记到请求上。
+//
+// 和 withIngressPeer 不同，这个值来自本机自己的配置（对端定义），是可信的。
+func withEgressPeer(r *http.Request, peerGatewayID string) *http.Request {
+	if r == nil {
+		return r
+	}
+	trace := peerTraceFrom(r.Context())
+	trace.Egress = strings.TrimSpace(peerGatewayID)
+	if trace.Origin == "" {
+		trace.Origin = strings.TrimSpace(r.Header.Get(headerGatewayOrigin))
+	}
+	return r.WithContext(withPeerTrace(r.Context(), trace))
+}
+
+// applyPeerTrace 把链路标记填进日志条目。空 trace 是零操作，所以调用点不必
+// 先判断——纯本地请求的路径和以前完全一致。
+func applyPeerTrace(entry *monitor.RequestLog, trace peerTrace) {
+	if entry == nil || trace.isEmpty() {
+		return
+	}
+	entry.Ingress = strings.TrimSpace(trace.Ingress)
+	entry.Egress = strings.TrimSpace(trace.Egress)
+	entry.PeerGatewayID = trace.peerGatewayID()
+	entry.PeerDirection = trace.peerDirection()
+	entry.PeerOrigin = strings.TrimSpace(trace.Origin)
+}

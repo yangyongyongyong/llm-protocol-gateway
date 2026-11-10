@@ -43,20 +43,37 @@ type RequestLog struct {
 	LatencyMillis int64 `json:"latencyMs"`
 	TTFTMillis    int64 `json:"ttftMs,omitempty"`
 	// Observational latency breakdown (ms). Zero means unset / unavailable.
-	PrepMillis            int64           `json:"prepMs,omitempty"`
-	PreUpstreamMillis     int64           `json:"preUpstreamMs,omitempty"`
-	UpstreamTTFBMillis    int64           `json:"upstreamTtfbMs,omitempty"`
-	GatewayOverheadMillis int64           `json:"gatewayOverheadMs,omitempty"`
-	ConvertOutMillis      int64           `json:"convertOutMs,omitempty"`
-	PostMillis            int64           `json:"postMs,omitempty"`
-	TimingFlags           string          `json:"timingFlags,omitempty"`
-	ClientHost            string          `json:"clientHost,omitempty"`
-	ClientIP              string          `json:"clientIp,omitempty"`
-	AccessSource          string          `json:"accessSource,omitempty"` // lan | public | local
-	ErrorDescription      string          `json:"errorDescription,omitempty"`
-	RequestBody           string          `json:"requestBody,omitempty"`
-	ResponseBody          string          `json:"responseBody,omitempty"`
-	Analysis              RequestAnalysis `json:"analysis"`
+	PrepMillis            int64  `json:"prepMs,omitempty"`
+	PreUpstreamMillis     int64  `json:"preUpstreamMs,omitempty"`
+	UpstreamTTFBMillis    int64  `json:"upstreamTtfbMs,omitempty"`
+	GatewayOverheadMillis int64  `json:"gatewayOverheadMs,omitempty"`
+	ConvertOutMillis      int64  `json:"convertOutMs,omitempty"`
+	PostMillis            int64  `json:"postMs,omitempty"`
+	TimingFlags           string `json:"timingFlags,omitempty"`
+	ClientHost            string `json:"clientHost,omitempty"`
+	ClientIP              string `json:"clientIp,omitempty"`
+	AccessSource          string `json:"accessSource,omitempty"` // lan | public | local
+	// 父子网关透传的链路标记。三者都空表示这是一次纯本地请求，和引入父子
+	// 功能之前完全一样——界面据此决定要不要画链路，老日志也就自然兼容。
+	//
+	// Ingress 是把这次请求送进来的对端网关 ID（空 = 客户端直连本机）。
+	Ingress string `json:"ingress,omitempty"`
+	// Egress 是本机把这次请求转发出去的对端网关 ID（空 = 本机直连 provider）。
+	Egress string `json:"egress,omitempty"`
+	// PeerGatewayID 是这次请求要对账的那个对端网关：有 Ingress 取 Ingress，
+	// 否则取 Egress。单独存一列是为了让"某个子网关上个月调了多少"是一条
+	// 带索引的 GROUP BY，而不是在两列上写 coalesce 扫全表。
+	PeerGatewayID string `json:"peerGatewayId,omitempty"`
+	// PeerDirection 是 ingress 或 egress。同一个对端既可能把流量送进来，也可能
+	// 接走流量，只凭 PeerGatewayID 分不清方向，而这两种用量要分开算。
+	PeerDirection string `json:"peerDirection,omitempty"`
+	// PeerOrigin 是这次透传的发起方网关 ID（X-Gateway-Origin）。三级链路里
+	// 中间那一跳的 Ingress/Egress 都只是"相邻方"，只有它能指向真正的起点。
+	PeerOrigin       string          `json:"peerOrigin,omitempty"`
+	ErrorDescription string          `json:"errorDescription,omitempty"`
+	RequestBody      string          `json:"requestBody,omitempty"`
+	ResponseBody     string          `json:"responseBody,omitempty"`
+	Analysis         RequestAnalysis `json:"analysis"`
 }
 
 const (

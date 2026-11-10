@@ -923,6 +923,24 @@ type GatewayState struct {
 	// day bounds of a bare date — all use it, so the console must build its
 	// "today" from the same zone instead of the browser's. Runtime-only.
 	ServerTimeZone string `json:"serverTimeZone,omitempty"`
+	// GatewayIdentity 是本网关的稳定身份，父子对接靠它互相识别。Runtime-only。
+	// 所有角色都能看到（普通用户也需要它来填"父网关 ID"），不含机器标识本身。
+	GatewayIdentity *GatewayIdentity `json:"gatewayIdentity,omitempty"`
+}
+
+// GatewayIdentity 是暴露给控制台的网关身份。
+//
+// ID 从机器标识派生，重装、清库都不变；它也是环路检测里判断"这是不是我自己"
+// 的那个值。这里只放派生后的哈希，机器标识本身绝不出现在这个结构里。
+type GatewayIdentity struct {
+	ID string `json:"id"`
+	// Name 是界面上显示的名字，默认取主机名，可改。
+	Name string `json:"name,omitempty"`
+	// Source 是 machine（从机器标识派生）或 persisted（库里存的随机值）。
+	Source string `json:"source"`
+	// MachineIDReadable 为 false 时重装会换身份，界面必须提示，否则运维会
+	// 在重装后发现下游全部失联却不知道为什么。
+	MachineIDReadable bool `json:"machineIdReadable"`
 }
 
 // CursorBridgeRuntime mirrors the local cursor-bridge subprocess for status responses.
