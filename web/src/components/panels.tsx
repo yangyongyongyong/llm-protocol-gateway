@@ -460,24 +460,32 @@ export function UsageBucketRow({ label, percent, note, reset, compact }: {
 }
 
 /**
- * claudeUsageLimitLabel 把 limits 里的一项翻成面板上的名字，措辞对齐官方 App：
- * session → 当前会话，weekly_all → 所有模型，带模型 scope 的 weekly_scoped →
- * 仅限 Fable（并标出它分到多少周额度）。
+ * claudeUsageLimitLabel 把 limits 里的一项翻成面板上的名字。
+ *
+ * 命名沿用面板原有的写法（5 小时额度 / 7 天额度 / 7 天 Sonnet），不照抄官方
+ * App 的「当前会话 / 所有模型」：这一栏横向只有三四个格子，长名字会把进度条
+ * 挤到卡片外。带模型 scope 的那条写成「7 天 Fable」，与既有的「7 天 Opus」
+ * 一致。占周额度的比例不进标题，放进 title（见 claudeUsageLimitNote）。
  */
 function claudeUsageLimitLabel(limit: ClaudeOAuthUsageLimit): string {
   const scope = (limit.label || '').trim();
   if (scope) {
-    const share = limit.allowancePercentOfWeekly ? `（占周额度 ${Math.round(limit.allowancePercentOfWeekly)}%）` : '';
-    return `仅限 ${scope}${share}`;
+    return `7 天 ${scope}`;
   }
   switch (limit.kind) {
     case 'session':
-      return '当前会话';
+      return '5 小时额度';
     case 'weekly_all':
-      return '所有模型';
+      return '7 天额度';
     default:
       return limit.kind || '额度';
   }
+}
+
+/** 该窗口的补充说明：按模型限定的周窗口会带出它分到的周额度占比。 */
+function claudeUsageLimitNote(limit: ClaudeOAuthUsageLimit): string {
+  if (!limit.label || !limit.allowancePercentOfWeekly) return '';
+  return `占周额度 ${Math.round(limit.allowancePercentOfWeekly)}%`;
 }
 
 export function ClaudeOAuthUsagePanel({ providerId, accountKey, connected, compact, subtitle }: { accountKey?: string; providerId: string; connected?: boolean; compact?: boolean; subtitle?: string }) {  const request = React.useMemo(() => usageAccountRequest(`/__providers/${encodeURIComponent(providerId)}/claude-oauth/usage`), [providerId, accountKey]);
@@ -492,10 +500,13 @@ export function ClaudeOAuthUsagePanel({ providerId, accountKey, connected, compa
   // 官方 App 现在把窗口放在 limits 数组里（session → weekly_all → weekly_scoped），
   // 其中 weekly_scoped 带模型 scope 的就是「仅限 Fable」。旧的 seven_day_opus /
   // seven_day_sonnet 在当前账号上返回 null，只认旧桶会少显示一条额度。
+  //
+  // 卡片态（compact）只有三四个窄格子，占比这类补充说明放 title 里，别再多占一行。
   const limitRows = (report?.limits || []).map((limit, index) => ({
     key: `limit-${limit.kind}-${limit.label || index}`,
     label: claudeUsageLimitLabel(limit),
     percent: limit.percent,
+    note: compact ? '' : claudeUsageLimitNote(limit),
     reset: resetHint(limit.resetsAt),
   }));
   const bucketRows = [
@@ -509,6 +520,7 @@ export function ClaudeOAuthUsagePanel({ providerId, accountKey, connected, compa
       key: item.key,
       label: item.label,
       percent: item.bucket?.utilization ?? 0,
+      note: '',
       reset: resetHint(item.bucket?.resets_at),
     }));
   // limits 是权威来源；仅当接口没给（老套餐/旧缓存）才退回按桶显示。
@@ -529,6 +541,7 @@ export function ClaudeOAuthUsagePanel({ providerId, accountKey, connected, compa
               key={row.key}
               label={row.label}
               percent={Math.min(100, Math.max(0, row.percent))}
+              note={row.note}
               reset={row.reset}
               compact={compact}
             />

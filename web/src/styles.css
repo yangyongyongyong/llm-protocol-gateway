@@ -1268,18 +1268,22 @@ html[data-theme="dark"] .badge.slate { color: #cbd5e1; }
 .provider-list-quota .claude-usage-panel.compact .claude-usage-row {
   display: inline-flex; align-items: baseline; gap: 5px;
   padding: 0; border: 0; border-radius: 0; background: transparent;
-  min-width: 0;
+  min-width: 0; max-width: 100%;
 }
 .provider-list-quota .claude-usage-panel.compact .claude-usage-head {
   display: inline-flex; flex-direction: row; align-items: baseline; justify-content: flex-start;
-  gap: 5px;
+  gap: 5px; min-width: 0;
   overflow: visible; white-space: nowrap;
 }
+/* 标签可以压缩并打省略号，百分比不动：这一栏只有「名称 + 数字」两个东西，
+   数字是运营真正要读的。原先标签是 overflow: visible + text-overflow: clip，
+   既不能换行也不能省略，「7 天 Fable」这类名字直接把内容顶出卡片。 */
 .provider-list-quota .claude-usage-panel.compact .claude-usage-head span:first-child {
   font-size: 10.5px; font-weight: 500; color: var(--muted);
-  overflow: visible; text-overflow: clip;
+  flex: 0 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis;
 }
-.provider-list-quota .claude-usage-panel.compact .claude-usage-head span:last-child { font-size: 13px; font-weight: 700; }
+.provider-list-quota .claude-usage-panel.compact .claude-usage-head span:last-child { font-size: 13px; font-weight: 700; flex: none; }
 .provider-list-quota .claude-usage-panel.compact .claude-usage-empty { font-size: 11px; color: var(--muted); }
 .provider-list-quota .claude-usage-panel.compact .claude-usage-state.warn {
   font-size: 10.5px;
@@ -3426,11 +3430,15 @@ html[data-theme="dark"] .usage-calendar-day.edge { background: var(--accent); co
 .claude-usage-panel.compact .claude-usage-title { font-size: 11.5px; font-weight: 600; min-width: 0; }
 /* 卡片上"更新于"时间戳最次要，隐藏换取标题/状态的空间（完整面板仍显示） */
 .claude-usage-panel.compact .claude-usage-status { display: none; }
-.claude-usage-panel.compact .claude-usage-grid { grid-template-columns: none; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 8px; }
+/* 卡片上的额度格子：auto-fit 让三四个窗口自然排开——放得下就一行，
+   放不下就换行。原先用 grid-auto-flow: column 强行排成一行，Claude 多出
+   「7 天 Fable」这第四个窗口时每格被挤到几十像素，标签和重置时间一起被裁到
+   卡片外。minmax 的 84px 是「7 天 Fable」不省略号的最小宽度。 */
+.claude-usage-panel.compact .claude-usage-grid { grid-template-columns: repeat(auto-fit, minmax(84px, 1fr)); gap: 8px; }
 .claude-usage-panel.compact .claude-usage-row { padding: 6px 0; gap: 4px; border: 0; border-radius: 0; background: transparent; }
 /* 紧凑单元格纵向堆叠：小标签在上、大数字百分比在下（额度是核心信息，数字放大加粗并随用量变色） */
 .claude-usage-panel.compact .claude-usage-head { flex-direction: column; align-items: flex-start; gap: 3px; white-space: normal; overflow: visible; }
-.claude-usage-panel.compact .claude-usage-head span:first-child { font-size: 10.5px; max-width: 100%; white-space: nowrap; }
+.claude-usage-panel.compact .claude-usage-head span:first-child { font-size: 10.5px; max-width: 100%; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* 额度百分比是卡片上最该一眼看到的运营数字：字号压过其它所有正文，
    tabular 数字保证同排卡片的小数位对齐。 */
 .claude-usage-panel.compact .claude-usage-head span:last-child { font-size: 19px; line-height: 1.2; font-weight: 700; letter-spacing: -0.01em; }
@@ -3503,7 +3511,7 @@ html[data-theme="dark"] .usage-calendar-day.edge { background: var(--accent); co
   .claude-usage-panel.compact .claude-usage-title { flex-wrap: wrap; row-gap: 4px; }
   .claude-usage-panel.compact .claude-usage-title > span:first-child { flex: 1 1 100%; }
   .claude-usage-panel.compact .claude-usage-actions { flex-wrap: wrap; }
-  .claude-usage-panel.compact .claude-usage-grid { grid-auto-columns: minmax(0, 1fr); }
+  .claude-usage-panel.compact .claude-usage-grid { grid-template-columns: repeat(auto-fit, minmax(84px, 1fr)); }
   .claude-usage-panel.compact .claude-usage-head span:first-child { white-space: normal; overflow-wrap: anywhere; }
 }
 html[data-theme="dark"] .claude-usage-state.ok { color: #6ee7b7; }
