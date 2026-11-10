@@ -10,6 +10,7 @@ import {
     normalizePromptTokenStats,
     pickUsageXTickIndexes,
     providerUsageLabel,
+    shortGatewayId,
 } from '../lib';
 import {
     DailyRequestPoint,
@@ -1779,6 +1780,22 @@ export function LogTimingWaterfall({ log }: { log: LogEntry }) {
           </div>
         ))}
       </div>
+      {/* 父子链路上这两段的含义会变，但网关没有单独测「跨网关那一段」的字段，
+          所以这里不画一个假的分段，只把口径说清楚——否则「上游等待 TTFB」
+          在下游看起来是个巨大的数字，会被误判成上游账号本身慢。 */}
+      {log.egress ? (
+        <p className="log-waterfall-note">
+          这条请求经上游网关 {shortGatewayId(log.egress)} 转发：「上游等待 TTFB」是
+          <b>整段父网关的耗时</b>（父网关自己的准备 + 它自己等上游 + 跨机网络），
+          不是某台上游账号单独的耗时。要拆开，请到那台网关的 API 日志里按同一时刻找这条请求。
+        </p>
+      ) : null}
+      {log.ingress ? (
+        <p className="log-waterfall-note">
+          这条请求由下游网关 {shortGatewayId(log.ingress)} 送进来：这里的总耗时正是
+          <b>它等本机的全部时间</b>，也就是它那条日志里的「上游等待 TTFB」。
+        </p>
+      ) : null}
     </div>
   );
 }

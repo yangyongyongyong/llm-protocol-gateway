@@ -63,7 +63,7 @@ export function emptyUserDraft(roleId: string): UserDraft {
   };
 }
 
-export function UsersPage({ canManage, canView, onToast, onChanged, roleOptions, refreshRoleOptions }: {
+export function UsersPage({ canManage, canView, onToast, onChanged, roleOptions, refreshRoleOptions, onOpenPeers }: {
   canManage: boolean;
   canView: boolean;
   onToast: (text: string) => void;
@@ -71,6 +71,8 @@ export function UsersPage({ canManage, canView, onToast, onChanged, roleOptions,
   onChanged: (deletedUser?: ConsoleUser) => Promise<void> | void;
   roleOptions: RoleOption[];
   refreshRoleOptions: () => Promise<void>;
+  /** 有网关互联权限时，子网关用户那一行的「去网关互联」才可点。 */
+  onOpenPeers?: () => void;
 }) {
   const [users, setUsers] = useState<ConsoleUser[]>([]);
   const [loading, setLoading] = useState(false);
@@ -108,7 +110,9 @@ export function UsersPage({ canManage, canView, onToast, onChanged, roleOptions,
       if (enabledFilter === 'on' && !user.enabled) return false;
       if (enabledFilter === 'off' && user.enabled) return false;
       if (!needle) return true;
-      return [user.username, user.displayName, user.roleName]
+      // gatewayId 一起进索引：要核对「上游那一行的 gw_… 是不是我」，是把 ID 贴进来搜，
+      // 而不是去翻每个子网关的昵称。
+      return [user.username, user.displayName, user.roleName, user.gatewayId]
         .filter(Boolean)
         .join(' ')
         .toLowerCase()
@@ -267,6 +271,17 @@ export function UsersPage({ canManage, canView, onToast, onChanged, roleOptions,
                       {user.roleName || user.role}
                     </Badge>
                     <Badge tone={scopeTone(user.roleScope)}>{scopeLabel(user.roleScope)}</Badge>
+                    {/* 子网关用户不是一个"人"，而是注册到本机的一台下层网关：
+                        它在用户表里只是一个持有对端凭据的身份。不标出来，运维会
+                        困惑为什么这个账号从不登录、密码重置也没人用。 */}
+                    {user.kind === 'peer' ? (
+                      <Badge
+                        tone="cyan"
+                        title={user.gatewayId ? `子网关身份：${user.gatewayId}` : '子网关'}
+                      >
+                        子网关
+                      </Badge>
+                    ) : null}
                     {user.role !== 'admin' && user.roleScope !== 'all' ? (
                       <button
                         type="button"
@@ -304,14 +319,29 @@ export function UsersPage({ canManage, canView, onToast, onChanged, roleOptions,
                     >
                       编辑
                     </button>
-                    <button
-                      type="button"
-                      className="mini-btn"
-                      disabled={!canManage || busyId === user.id}
-                      onClick={() => setResetUser(user)}
-                    >
-                      重置密码
-                    </button>
+                    {/* 子网关用户的凭据是注册时生成后交给下游的，它没有密码可重置：
+                        在这里点「重置密码」只会生成一个没人会用的密码，还会让人以为
+                        下游要改配置。要断它的连接就去「网关互联」页吊销。 */}
+                    {user.kind === 'peer' ? (
+                      <button
+                        type="button"
+                        className="mini-btn"
+                        disabled={!onOpenPeers}
+                        title={onOpenPeers ? '子网关的对端凭据在「网关互联」页管理' : '需要网关互联权限'}
+                        onClick={() => onOpenPeers?.()}
+                      >
+                        去网关互联
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="mini-btn"
+                        disabled={!canManage || busyId === user.id}
+                        onClick={() => setResetUser(user)}
+                      >
+                        重置密码
+                      </button>
+                    )}
                     <button
                       type="button"
                       className="mini-btn danger"

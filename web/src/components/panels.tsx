@@ -916,6 +916,9 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
           </div>
           <div className="provider-list-badges">
             {providerDisabled ? <Badge tone="red">已禁用</Badge> : null}
+            {/* 对端 provider 不是一台上游服务，而是父网关的一扇门：不标出来，
+                运维会拿它的 baseUrl 当真实上游地址去排障。 */}
+            {connectKind === 'peer' ? <Badge tone="cyan">上游网关</Badge> : null}
             {provider?.rtkCompress ? (
               <span title="RTK 工具输出压缩已开启：转发前过滤 tool_result 里的命令输出">
                 <Badge tone="green">RTK</Badge>
@@ -962,6 +965,9 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
       </div>
       <div className="provider-badges">
         {providerDisabled ? <Badge tone="red">已禁用</Badge> : null}
+        {/* 对端 provider 不是一台上游服务，而是父网关的一扇门：不标出来，
+            运维会拿它的 baseUrl 当真实上游地址去排障。 */}
+        {connectKind === 'peer' ? <Badge tone="cyan" title="本机注册到上游网关后自动创建：地址、凭据与模型由「网关互联」页维护">上游网关</Badge> : null}
         {provider?.rtkCompress ? (
           <span title="RTK 工具输出压缩已开启：转发前过滤 tool_result 里的命令输出">
             <Badge tone="green">RTK</Badge>

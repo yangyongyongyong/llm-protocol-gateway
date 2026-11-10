@@ -55,6 +55,10 @@ const (
 	PermUsersManage Permission = "users.manage"
 	PermRolesManage Permission = "roles.manage"
 
+	// 网关互联（父子网关）：查看已连接的上游与已注册的下游，以及注册/吊销。
+	PermPeersView   Permission = "peers.view"
+	PermPeersManage Permission = "peers.manage"
+
 	// 系统
 	PermMachineView  Permission = "system.machine"
 	PermSettingsView Permission = "system.settings"
@@ -151,6 +155,13 @@ func PermissionCatalog() []PermissionModule {
 				m(PermUsersView, "查看用户"),
 				m(PermUsersManage, "管理用户"),
 				m(PermRolesManage, "管理角色与权限"),
+			},
+		},
+		{
+			ID: "peers", Label: "网关互联", Description: "注册到上游网关，以及管理注册到本机的下游网关",
+			Permissions: []PermissionMeta{
+				m(PermPeersView, "查看互联网关"),
+				m(PermPeersManage, "注册/吊销互联网关"),
 			},
 		},
 		{

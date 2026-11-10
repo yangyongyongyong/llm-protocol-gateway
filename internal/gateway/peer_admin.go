@@ -38,7 +38,7 @@ type peerSummary struct {
 
 // handleListPeers 列出所有已注册的下游网关。
 func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requireAdmin(w, r); !ok {
+	if !s.requirePermission(w, r, domain.PermPeersView) {
 		return
 	}
 	if s.userStore == nil {
@@ -90,6 +90,9 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 	})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"peers": out,
+		// 本机身份：下游把它记在「我注册到了谁」旁边，两边对得上才说明
+		// 这条链路注册的是这台机器。
+		"gatewayId": s.GatewayID(),
 		// 让界面能把限额直接写在提示里，而不是写死一个数字。
 		"maxHops":                   maxGatewayHops,
 		"registrationAllowCidrs":    s.router.PeerRegistrationAllowCIDRs(),
@@ -130,7 +133,7 @@ func peerIngressQuery() monitor.RequestLogQuery {
 //
 // 想彻底清掉它就用 DELETE /__users/{id}——那是用户管理页已有的删除，语义明确。
 func (s *Server) handleRevokePeer(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requireAdmin(w, r); !ok {
+	if !s.requirePermission(w, r, domain.PermPeersManage) {
 		return
 	}
 	if s.userStore == nil {
@@ -168,7 +171,7 @@ func (s *Server) handleRevokePeer(w http.ResponseWriter, r *http.Request) {
 // 注册是唯一不需要已有凭据的入口，所以这条设置值得单独暴露出来：默认只允许
 // 本机与内网，公网部署时管理员必须显式写出允许的来源段。
 func (s *Server) handleSetPeerRegistrationCIDRs(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.requireAdmin(w, r); !ok {
+	if !s.requirePermission(w, r, domain.PermPeersManage) {
 		return
 	}
 	var payload struct {

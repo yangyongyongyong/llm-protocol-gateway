@@ -395,6 +395,7 @@ export const navItems = [
   { id: 'traffic-tokens', label: 'API 日志' },
   { id: 'monitoring', label: '监控中心' },
   { id: 'quota-keeper', label: '额度保活' },
+  { id: 'peers', label: '网关互联' },
   { id: 'users', label: '用户管理' },
   { id: 'roles', label: '角色管理' },
   { id: 'machine', label: '机器状态' },
@@ -419,7 +420,7 @@ export const navSections: NavSection[] = [
   { id: 'keys', label: '密钥与接入', children: [{ id: 'api-keys' }, { id: 'output-providers' }, { id: 'public-access' }] },
   { id: 'insights', label: '数据洞察', children: [{ id: 'usage-stats' }, { id: 'traffic-tokens' }] },
   { id: 'operations', label: '运维监控', children: [{ id: 'monitoring' }, { id: 'quota-keeper' }, { id: 'machine' }] },
-  { id: 'admin', label: '权限与账户', children: [{ id: 'users' }, { id: 'roles' }] },
+  { id: 'admin', label: '权限与账户', children: [{ id: 'users' }, { id: 'roles' }, { id: 'peers' }] },
   { id: 'system', label: '系统', children: [{ id: 'settings' }] },
 ];
 
@@ -443,6 +444,7 @@ export const navPermissions: Record<NavItemIDValue, string[]> = {
   'traffic-tokens': ['logs.view'],
   'monitoring': ['monitor.view', 'monitor.manage'],
   'quota-keeper': ['quota.view', 'quota.manage'],
+  'peers': ['peers.view', 'peers.manage'],
   'users': ['users.view', 'users.manage'],
   'roles': ['roles.manage'],
   'machine': ['system.machine'],
@@ -755,6 +757,47 @@ export function isTrafficLogError(log: LogEntry) {
   return log.status >= 400 || Boolean(log.errorDescription?.trim());
 }
 
+/**
+ * 网关 ID 是 gw_ + 16 位十六进制（19 字符），日志表那一格放不下全称。
+ * 只留末 6 位认人——同一台机器上两条下游撞这 6 位的概率是 1/1.6e7，
+ * 而完整 ID 在悬浮提示与详情弹窗里都有，抄下来照样能用。
+ */
+export function shortGatewayId(id: string): string {
+  const trimmed = (id || '').trim();
+  if (trimmed.length <= 9) return trimmed;
+  return `…${trimmed.slice(-6)}`;
+}
+
+/**
+ * API 日志「链路」一列：这条请求从哪来、往哪去。
+ *
+ * 设计稿原本要拆成「请求入口」「请求出口」两列，但绝大多数请求两头都空，两列
+ * 就是两块恒定的空白；而真实出现时又总是成对出现（A→B→C 的 B 两头都有）。合成
+ * 一格，宽度省一半，读起来还是同一句话。
+ *
+ * - 两头都空 → 直连。不给空白：空白会被读成「这一列没有数据」，可它其实一致有。
+ * - ingress  → 下游网关把请求送了进来，本机是它的上游。
+ * - egress   → 本机把请求转给了上游网关，本机是它的下游。
+ * 三级链路时两者同时出现，此时 peerOrigin 才是真正的起点。
+ */
+export function trafficLogPeerChain(log: LogEntry): { text: string; title: string; peered: boolean } {
+  const ingress = (log.ingress || '').trim();
+  const egress = (log.egress || '').trim();
+  const origin = (log.peerOrigin || '').trim();
+  if (!ingress && !egress) {
+    return { text: '直连', title: '客户端直连本机、本机直连 Provider：这条请求没有经过任何对端网关', peered: false };
+  }
+  const text = [
+    ingress ? `←${shortGatewayId(ingress)}` : '',
+    egress ? `→${shortGatewayId(egress)}` : '',
+  ].filter(Boolean).join(' ');
+  const lines: string[] = [];
+  if (ingress) lines.push(`来自下游网关 ${ingress}`);
+  if (egress) lines.push(`转发至上游网关 ${egress}`);
+  if (origin && origin !== ingress) lines.push(`链路起点：${origin}`);
+  return { text, title: lines.join('\n'), peered: true };
+}
+
 export function parseSSEStreamContent(raw: string): string {
   if (!raw || typeof raw !== 'string') return '';
   const lines = raw.split(/\r?\n/);
@@ -1007,6 +1050,16 @@ export function formatTrafficLogJSON(log: LogEntry, providers: Provider[] = []):
       host: log.clientHost,
       source: log.accessSource,
     },
+    // 父子网关链路：三者都空时整块不写，别让普通日志多出一堆 null。
+    peer: (log.ingress || log.egress)
+      ? {
+          ingress: log.ingress || undefined,
+          egress: log.egress || undefined,
+          gatewayId: log.peerGatewayId || undefined,
+          direction: log.peerDirection || undefined,
+          origin: log.peerOrigin || undefined,
+        }
+      : undefined,
     timing: {
       prepMs: log.prepMs,
       preUpstreamMs: log.preUpstreamMs,
@@ -1047,6 +1100,10 @@ export function formatTrafficLogDetail(log: LogEntry, providers: Provider[] = []
     `timingFlags: ${log.timingFlags || '-'}`,
     `tokens: in=${log.inputTokens} out=${log.outputTokens}${log.cacheTokens ? ` cache=${log.cacheTokens}` : ''}`,
   ];
+  // 父子网关链路：没有对端就不写这行，普通日志的简报保持原样。
+  if (log.ingress || log.egress) {
+    lines.push(`peer: ingress=${log.ingress || '-'} egress=${log.egress || '-'} origin=${log.peerOrigin || '-'}`);
+  }
   if (log.errorDescription) lines.push(`error: ${log.errorDescription}`);
   if (log.requestBody) lines.push('', '--- Request Body ---', formatJsonDisplay(log.requestBody));
   if (log.responseBody) lines.push('', '--- Response Body ---', formatJsonDisplay(log.responseBody));
@@ -1666,6 +1723,10 @@ export function providerConnectKind(provider: Provider): ProviderConnectKind {
   // 令牌后才非空，所以两种都要认——否则新建、还没生成令牌的那张卡会被当成
   // API Key，编辑它时 Base URL 又会变回可填的真实地址。
   if (provider.authType === 'self_register' || provider.selfRegistration) return 'self_register';
+  // 对端 provider 是本机注册到某个上游网关后落下的那一条：它的地址、凭据、
+  // 模型都由「网关互联」页维护，在 Provider 列表里只该被认出来并标来源，
+  // 不该落进 api_key 那一栏被人当成一个普通上游去编辑。
+  if (provider.authType === 'peer') return 'peer';
   return 'api_key';
 }
 
@@ -1958,6 +2019,7 @@ export function providerConnectLabel(kind: ProviderConnectKind): string {
     case 'trae_global': return '登录 Trae 国际版账号';
     case 'opencode_zen_free': return 'OpenCode Zen 免费档（无需密钥）';
     case 'self_register': return '内网穿透自助注册（Bearer 令牌）';
+    case 'peer': return '上游网关（父子透传）';
     default: return 'API Key';
   }
 }
@@ -1966,6 +2028,7 @@ export const PROVIDER_CONNECT_FILTERS: Array<{ id: '' | ProviderConnectKind; lab
   { id: '', label: '全部连接方式' },
   { id: 'api_key', label: 'API Key' },
   { id: 'self_register', label: '内网穿透自助注册' },
+  { id: 'peer', label: '上游网关（父子透传）' },
   { id: 'claude_oauth', label: 'Claude OAuth' },
   { id: 'cursor_oauth', label: 'Cursor OAuth' },
   { id: 'chatgpt_oauth', label: 'ChatGPT OAuth' },

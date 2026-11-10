@@ -600,6 +600,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /__peers", s.handleListPeers)
 	mux.HandleFunc("DELETE /__peers/{id}", s.handleRevokePeer)
 	mux.HandleFunc("PATCH /__settings/peer-registration-cidrs", s.handleSetPeerRegistrationCIDRs)
+	// 下游侧：本机注册到上游网关，与上面那组是同一张页面的两半——上半是
+	// "谁连到我"，下半是"我连到谁"。凭据（gwpeer-…）落在 provider 的
+	// apiKeySource 上，所以这一组本质是普通的 provider 管理动作，只是包一层，
+	// 免得运维要在"输入 Provider"里手填一个 /__peer 地址。
+	mux.HandleFunc("GET /__peer-upstreams", s.handleListPeerUpstreams)
+	mux.HandleFunc("POST /__peer-upstreams", s.handleRegisterPeerUpstream)
+	mux.HandleFunc("POST /__peer-upstreams/{id}/refresh", s.handleRefreshPeerUpstream)
+	mux.HandleFunc("POST /__peer-upstreams/{id}/reconnect", s.handleReconnectPeerUpstream)
 	// RBAC: roles, the permission catalog, resource grant targets, and the
 	// signed-in user's own profile (display name + avatar).
 	mux.HandleFunc("GET /__roles", s.handleListRoles)
@@ -2454,6 +2462,14 @@ func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid provider json: "+err.Error())
 		return
 	}
+	// 对端 provider 的地址与凭据是一体的：baseUrl 是父网关根地址，凭据是注册
+	// 那一刻签发的 gwpeer- 令牌，两者只能由「网关互联」的注册流程一起写下来。
+	// 在这里放行一条手写的 authType=peer 只会得到一条既没有凭据、也找不到门的
+	// 记录——它在请求路径上以 401 失败，而看到的人只会以为"上游拒绝"。
+	if provider.AuthType == domain.AuthTypePeer {
+		writeOpenAIError(w, http.StatusBadRequest, "authType=peer 不能手工创建：请在「网关互联」页注册到上游网关，网关会自动生成这条记录")
+		return
+	}
 	if p := s.requestPrincipal(r); p.scopeOf() != domain.ScopeAll {
 		// Restricted users own the providers they create (including clones),
 		// while every other account's provider is labelled with its own
@@ -2550,6 +2566,17 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&provider); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid provider json: "+err.Error())
 		return
+	}
+	// 编辑一张已有的对端记录时，控制台会把 authType=peer 原样回传（见 frontend
+	// 的 providerConnectKind）。那不是"创建一个 peer"，只是"还是那条记录"，
+	// 所以这里不能一刀切拒绝；真正要拦的是「把一条普通 provider 改成 peer」，
+	// 那会得到一条手工伪造的对端门，凭据与地址都对不上。
+	if provider.AuthType == domain.AuthTypePeer {
+		existing, err := s.router.ProviderByID(r.PathValue("id"))
+		if err != nil || existing.AuthType != domain.AuthTypePeer {
+			writeOpenAIError(w, http.StatusBadRequest, "只有「网关互联」注册生成的对端记录才能是 authType=peer；请到该页面重新注册，不要手改连接方式")
+			return
+		}
 	}
 	updated, err := s.router.UpdateProvider(r.PathValue("id"), provider)
 	if err != nil {
@@ -5246,6 +5273,13 @@ type providerTestResult struct {
 }
 
 func (s *Server) fetchProviderModels(r *http.Request, provider domain.Provider, started time.Time) providerTestResult {
+	if provider.AuthType == domain.AuthTypePeer {
+		// 对端 provider 不是一台"上游服务"，而是父网关的一扇门：它的模型清单
+		// 来自 /__peer/providers，父网关根本不提供 baseUrl + /models 这个端点。
+		// 走下面通用的模型发现只会打到父网关的一个 404，然后把这个本来完全
+		// 正常的 provider 标成"异常"、清空它可用的模型清单。
+		return s.fetchPeerUpstreamModels(r, provider, started)
+	}
 	if provider.AuthType == domain.AuthTypeCursorOAuth {
 		baseURL, refreshed, err := s.resolveCursorBridgeBaseURL(r.Context(), provider)
 		if err != nil {

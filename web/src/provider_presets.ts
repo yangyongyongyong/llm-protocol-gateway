@@ -97,9 +97,10 @@ export function resolveProviderIcon(provider: Provider): string {
  * 连接方式（订阅账号类）的品牌图标：从订阅预设里反查，和目录弹窗、Provider 卡
  * 共用同一张表，避免"同一个厂商在三个地方是三个图标"。
  * API Key 与自助注册没有厂商可指（前者是任意端点），返回空即纯文字胶囊。
+ * peer 同理：它指向的是另一台本网关，不是某个服务商。
  */
 export function providerConnectIcon(kind: '' | ProviderConnectKind): string {
-  if (kind === '' || kind === 'api_key' || kind === 'self_register') return '';
+  if (kind === '' || kind === 'api_key' || kind === 'self_register' || kind === 'peer') return '';
   return PROVIDER_PRESETS.find((preset) => preset.section === 'subscription' && preset.authType === kind)?.icon || '';
 }
 

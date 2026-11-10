@@ -225,6 +225,7 @@ import {
 import {TerminalAuthGate} from './components/terminal_auth';
 import {RolesPage, useRoles} from './components/roles_page';
 import {ProfileModal, UsersPage} from './components/users_page';
+import {PeersPage} from './components/peers_page';
 import {
     CURRENT_APP_VERSION,
     dismissUpgrade,
@@ -457,6 +458,10 @@ function App() {
       (log.errorDescription && log.errorDescription.toLowerCase().includes(kw)) ||
       (log.userName && log.userName.toLowerCase().includes(kw)) ||
       (log.accessSource && log.accessSource.toLowerCase().includes(kw)) ||
+      // 搜「gw_」前缀就能把某条链路两头的日志都捞出来，排障时最先要做的就是这件事。
+      (log.ingress && log.ingress.toLowerCase().includes(kw)) ||
+      (log.egress && log.egress.toLowerCase().includes(kw)) ||
+      (log.peerOrigin && log.peerOrigin.toLowerCase().includes(kw)) ||
       (log.providerId && log.providerId.toLowerCase().includes(kw))
     );
   }, [logs, logsKeyword]);
@@ -6549,11 +6554,22 @@ function App() {
               refreshRoleOptions={rolesModel.refresh}
               onToast={showToast}
               onChanged={() => { void refreshConsoleUsers(); void refreshState(false); }}
+              onOpenPeers={canDo('peers.view') || canDo('peers.manage') ? () => goToPage('peers') : undefined}
             />
           )}
 
           {activeNav === 'roles' && navVisibleFor(permissions, 'roles', legacyUser) && (
             <RolesPage model={rolesModel} canManage={canDo('roles.manage')} onToast={showToast} />
+          )}
+
+          {/* 网关互联：上半是"我连到谁"，下半是"谁连到我"。注册上游会新建
+              provider 与路由，所以 onChanged 顺手刷一次全局状态。 */}
+          {activeNav === 'peers' && navVisibleFor(permissions, 'peers', legacyUser) && (
+            <PeersPage
+              canView={canDo('peers.view') || canDo('peers.manage')}
+              canManage={canDo('peers.manage')}
+              onChanged={() => { void refreshState(false); }}
+            />
           )}
 
           {activeNav === 'machine' && navVisibleFor(permissions, 'machine', legacyUser) && (
@@ -7163,6 +7179,17 @@ function App() {
                     <div className="troubleshoot-row"><span>客户端 IP (Client IP)</span><code>{trafficLogDetail.clientIp || '—'}</code></div>
                     <div className="troubleshoot-row"><span>代理域名 (Host)</span><span>{trafficLogDetail.clientHost || '—'}</span></div>
                     <div className="troubleshoot-row"><span>网络类型 (Source)</span><Badge tone="slate">{trafficLogDetail.accessSource || 'local'}</Badge></div>
+                    {/* 父子网关的链路：三行都空就是一次纯本地请求，整段不出现，
+                        免得每一条普通日志下面都挂两行「—」。 */}
+                    {trafficLogDetail.ingress ? (
+                      <div className="troubleshoot-row"><span>来自下游网关</span><code>{trafficLogDetail.ingress}</code></div>
+                    ) : null}
+                    {trafficLogDetail.egress ? (
+                      <div className="troubleshoot-row"><span>转发至上游网关</span><code>{trafficLogDetail.egress}</code></div>
+                    ) : null}
+                    {trafficLogDetail.peerOrigin && trafficLogDetail.peerOrigin !== trafficLogDetail.ingress ? (
+                      <div className="troubleshoot-row"><span>链路起点网关</span><code>{trafficLogDetail.peerOrigin}</code></div>
+                    ) : null}
                   </div>
 
                   {/* 分组 2: 鉴权与身份 */}
@@ -7265,6 +7292,10 @@ function App() {
                 trae_global: "与 Trae CN 同一套协议的国际部署（节点随账号走）：登录、令牌续期、模型列表与额度都由网关代为完成，客户端看到的仍是 OpenAI Chat。授权页只接受 127.0.0.1 的回调，请在运行网关的这台机器上点登录。",
                 opencode_zen_free: "OpenCode Zen 的免费模型（-free 结尾、big-pickle、grok-code）无需任何密钥：网关会按 OpenCode 自己的客户端形状发出，并改走它的推理入口。免费档只接受流式请求，客户端要求一次性返回时网关会在上游把流收回来拼成一条回复。付费模型在下方填入自己的 OpenCode 密钥即可，两种模型可共用这一个 Provider。",
                 self_register: "适合“用户自己内网穿透暴露服务”的场景：先选好本地服务实际实现的协议（OpenAI Chat / OpenAI Responses / Claude），网关就按这个协议原样透传，不做协议转换——上游说什么、客户端就收到什么，最稳定也最省事。保存后会自动生成一个专属令牌 + 一段配置 Prompt，交给对方脚本使用。脚本注册时声明的 protocol 以此处选择为准；如果本地服务后来改了协议，让脚本在注册时改传新的 protocol 即可覆盖。",
+                // 这一条在创建表单里选不到（PROVIDER_CONNECT_CHOICES 不含 peer）：
+                // 它只会由「网关互联」页注册上游时自动落下，这里给文案只是为了让
+                // 编辑既有记录时下拉框有个能对上的标签，不至于空白。
+                peer: "这一条不是手填出来的 Provider，而是本机注册到某个上游网关后由「网关互联」页自动创建的那扇门：地址、凭据（gwpeer-…）与可用模型都由那边维护。要换上游或刷新模型，请回「网关互联」页操作——在这里手改地址会绕过上游的授权校验。",
               };
               const connectHint = connectHints[providerDraft.authType] ?? '';
               // 每种连接方式各自锁定协议，但锁定的是「选定的那个」而不是写死值：
