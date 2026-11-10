@@ -19,6 +19,25 @@ func (s *Server) requestIdentity(r *http.Request) sessionIdentity {
 	return adminIdentity()
 }
 
+// keyOwnerDisabled reports whether the API key's owner account exists but is
+// disabled. Admin-owned and legacy keys have no owner row and are never
+// "disabled" this way.
+//
+// It exists so the refusal can say what actually happened. Without it a paused
+// account's traffic fails as "provider not assigned to your account", which
+// sends the operator looking at grants that are perfectly fine.
+func (s *Server) keyOwnerDisabled(key domain.APIKey) bool {
+	ownerID := strings.TrimSpace(key.OwnerUserID)
+	if ownerID == "" || ownerID == legacyAdminUserID || s.userStore == nil {
+		return false
+	}
+	user, err := s.userStore.UserByID(ownerID)
+	if err != nil {
+		return false
+	}
+	return !user.Enabled
+}
+
 // allowedProviderIDsForUser returns the providers a non-admin user may access:
 // the ones it created plus the ones an admin assigned on the users page. Roles
 // with the "all" scope see every enabled provider. Grants are additive, so
@@ -32,6 +51,14 @@ func (s *Server) allowedProviderIDsForUser(userID string) map[string]bool {
 
 // principalForUserID resolves a stored user's principal (used by request-time
 // checks that only hold the key owner's id).
+//
+// A disabled account resolves to an empty scope: it keeps none of its providers.
+// That is what makes 禁用 stop traffic, not just console logins — before this,
+// Enabled was only read on the two console login paths, so disabling a user in
+// 用户管理 left every API key they had already issued working indefinitely.
+// The gate lives here rather than in each caller because every request-time
+// authorization question (providerAllowedForKeyOwner, allowedProviderChainForKey,
+// keysVisibleTo, resolveUserName's callers) funnels through this one function.
 func (s *Server) principalForUserID(userID string) principal {
 	userID = strings.TrimSpace(userID)
 	if userID == "" {
@@ -45,6 +72,19 @@ func (s *Server) principalForUserID(userID string) principal {
 		if user, err := s.userStore.UserByID(userID); err == nil {
 			identity.Username = user.Username
 			identity.Role = user.Role
+			if !user.Enabled {
+				return principal{
+					UserID:   userID,
+					Username: user.Username,
+					Role:     user.Role,
+					RoleID:   user.RoleID,
+					// ScopeOwn with no grants: allowedProviderIDsForPrincipal
+					// then returns an empty set, so every provider on the key's
+					// chain is filtered out and the request is refused rather
+					// than quietly falling back to another account.
+					scope: domain.ScopeOwn,
+				}
+			}
 		}
 	}
 	return s.principalFor(identity)
