@@ -263,24 +263,32 @@ func TestQoderCheckinUsesAPatAccountJobToken(t *testing.T) {
 	}
 }
 
-// The international site checks the machine identity of the Qoder install, which
-// only its native helper can produce. Without one the check-in must say so in
-// terms the user can act on — not send a request that would be refused anyway.
-func TestQoderGlobalCheckinNeedsTheLocalRuntime(t *testing.T) {
+// A headless server has no Qoder desktop install to read a machine identity
+// from. The request still goes out — the vendor answers one without the machine
+// headers — and if the list comes back empty the result says why, instead of
+// reporting a plain "nothing to claim" the operator cannot act on.
+func TestQoderGlobalCheckinAsksWithoutTheLocalRuntime(t *testing.T) {
 	t.Setenv("GATEWAY_QODER_RUNTIME_INFO", filepath.Join(t.TempDir(), "not-here"))
 	server, seen := qoderCampaignServer(t, qoderCampaignHandler(`{"campaigns":[]}`, "", 0))
 	site := qoderCheckinSite(server)
 	site.AuthType = domain.AuthTypeQoderPAT
 	result, _ := qoderCheckin(context.Background(), nil, domain.Provider{ID: "q1"}, site,
 		domain.QoderCredential{UID: "u", DeviceToken: "dt"}, time.Now())
-	if result.Outcome != domain.CheckinFailed {
+	if len(*seen) == 0 {
+		t.Fatal("the request must still be made: the vendor answers one without a machine identity")
+	}
+	call := (*seen)[0]
+	if got := call.sent.Get("Cosy-ClientType"); got != qoderClientTypeDesktop {
+		t.Fatalf("Cosy-ClientType = %q", got)
+	}
+	if got := call.sent.Get("Cosy-MachineToken"); got != "" {
+		t.Fatalf("no machine identity exists here, so none may be invented: %q", got)
+	}
+	if result.Outcome != domain.CheckinInactive {
 		t.Fatalf("outcome = %q", result.Outcome)
 	}
-	if !strings.Contains(result.Message, "QODER_RUNTIME_INFO") {
-		t.Fatalf("the message should name what to do: %q", result.Message)
-	}
-	if len(*seen) != 0 {
-		t.Fatalf("no request may go out without the device identity, saw %d", len(*seen))
+	if !strings.Contains(result.Message, "设备身份") {
+		t.Fatalf("an empty list must explain itself: %q", result.Message)
 	}
 }
 

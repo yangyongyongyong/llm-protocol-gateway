@@ -287,7 +287,79 @@
 
 > 说明：`cache-test` 端点对 Qoder 按既有设计跳过（返回 `skipped=true`），缓存效果以 `cached_tokens` 为准，见上表。
 
-## 11. 附录：可直接落代码的常量表（参考实现口径）
+## 11. 2026-11-10 排查：签到领不到权益 / 模型只剩一两个
+
+对照参考库最新 `origin/main`（v1.9.4）。**结论：领取权益的地址没有变，模型变少也不是解析问题。**
+
+### 11.1 地址没变（实测）
+
+参考库 v1.9.4 仍然用：
+
+```
+PATH_CAMPAIGNS        = "/sash/api/v1/me/campaigns"
+PATH_CAMPAIGN_REWARD  = "/sash/api/v1/me/campaigns/%s/reward"
+PATH_CAMPAIGN_CLAIM   = "/sash/api/v1/me/campaigns/%s/claim"
+COSY_VERSION          = "1.1.75"     # 与我们一致
+```
+
+线上直连上游实测（CN 账号 `https://openapi.qoder.com.cn`）：
+
+| 请求头 | HTTP | showCampaign | campaigns |
+|---|---|---|---|
+| 桌面头（clienttype 10 + version 0.4.8） | 200 | true | **2** |
+| 桌面头（不带 version） | 200 | true | 2 |
+| **纯账号头（无 cosy）** | 200 | true | **0**（被静默过滤） |
+
+国际站同理：桌面头、**不带任何机器头** → 200、`showCampaign=true`、1 条活动。
+
+### 11.2 签到失败的真因：硬失败，不是地址
+
+`check-in: failed` 每天每账号都在报，原因是 **intl 站点在「读不到本机设备身份」时直接拒绝发送**：
+
+```
+Qoder 国际版签到要用本机 Qoder 客户端读设备身份，这台机器上没找到它…
+```
+
+GC 是台 Linux 服务器，`/opt/Qoder/resources/umid/runtime-info` 与 `~/.qoder/.bin` 都不存在 —— **永远读不到**。而上面的实测证明：不带机器头，上游照样返回活动列表。所以「必须先有原生身份」这个前提是错的。
+
+> 时间线核对：11-03～11-04（本次对齐改动之前）已有 **494 次** `check-in: failed`，所以这不是本轮引入的回归，是这台无桌面环境的机器从一开始就撞上的设计缺陷。
+
+**已修**（`qoder_checkin.go`）：
+
+- 读不到原生身份 → **照常发请求**，只是不带六个机器头（不发假身份，参考库也警告派生头会被整条过滤）。
+- 列表为空且本次没带上身份 → 结果里写明原因和解决办法，而不是一句「今天没活动」。
+- 顺序仍是「先轮换设备令牌，后回退账号身份」，与参考一致。
+- 回归测试从「必须报错且不发请求」改写为「必须发请求、且空列表要解释自己」。
+
+线上验证（版本 `20261110.024915`）：
+
+| 账号 | 结果 |
+|---|---|
+| CN `qoder-cn-账号` / `-2` | `done`（今日已领，领取链路正常） |
+| INTL `qoder-账号-5` | `inactive` + 明确原因（该账号只有 `VIEW_DETAILS` 活动，无 `CLAIM_BENEFIT`） |
+
+### 11.3 模型变少的真因：上游把 `enable` 置 false
+
+逐个账号读 `oauth_json.models.app`：
+
+| 账号区 | app 条目 | `enable: true` | 说明 |
+|---|---|---|---|
+| CN（12 个账号） | 13 | **13** | 全部可用 |
+| INTL（多数） | 16 | **1**（仅 `lmodel` = QoDuck，`is_free: true`, `tags:["free"]`） | 其余 15 个被禁用 |
+| INTL `qoder-auto-yd1ykc` | 16 | **16** | 唯一仍全开的国际账号 |
+
+条目里**没有任何 `disable_reason` 字段**，字段集为：`key/display_name/enable/status/is_lite_plan/is_free/tags/is_sensitive/price_factor/is_editable/context_config/format/is_default/is_reasoning/is_vl/max_input_tokens/source/strategies`。
+
+同一份代码、同一条 COSY 身份下，`qoder-auto-yd1ykc` 仍 16/16，CN 全部 13/13 —— 所以**不是客户端版本或身份被降级**，是这些国际账号的套餐/额度不在了，上游只留免费模型。
+
+> 附带结论：这些「只剩 1～2 个模型」的账号，与「活动列表里没有 CLAIM_BENEFIT」的账号高度重合 —— 同一个事实的两种表现：**账号权益已失效**。
+
+### 11.4 顺带发现（未处理）
+
+- **HEAD 上有既有红灯**：`TestWorkBuddyQuotaAsksThePackageDoorOnlyWhenItCounts/personal` 稳定失败（断言 `RunsOut == 18.04`，实际窗口是 `Credits Used: 33.3%`）。工作区未触碰 WorkBuddy，属其他提交遗留，与本轮无关。
+- 参考库新增 `/credits/probe` 自动探测与「老网关 404 提示」，暗示**额度**端点可能有过变动；我们的 `/sash/api/v2/me/usage` 尚未验证是否受影响（本次未纳入）。
+
+## 12. 附录：可直接落代码的常量表（参考实现口径）
 
 ```go
 // 排队
