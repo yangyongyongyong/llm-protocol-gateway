@@ -367,6 +367,21 @@ func claudeQuotaWindows(report ClaudeOAuthUsageReport) []monitoring.QuotaWindow 
 			ResetsAt:    parseClaudeResetsAt(item.bucket.ResetsAt),
 		})
 	}
+	// The per-model weekly allowance the app shows as 「仅限 Fable」 lives only in
+	// the limits array. Appended under its own keys: the five_hour / seven_day
+	// keys above drive keepalive and cooldown decisions, so they keep meaning
+	// exactly what they meant before.
+	for _, limit := range report.Limits {
+		key := "limit_" + limit.Kind
+		if limit.Label != "" {
+			key = "limit_" + limit.Kind + "_" + strings.ToLower(limit.Label)
+		}
+		windows = append(windows, monitoring.QuotaWindow{
+			Key:         key,
+			UsedPercent: math.Min(100, math.Max(0, limit.Percent)),
+			ResetsAt:    parseClaudeResetsAt(limit.ResetsAt),
+		})
+	}
 	return windows
 }
 

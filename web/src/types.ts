@@ -484,6 +484,22 @@ export type ClaudeOAuthUsageBucket = {
   resets_at?: string;
 };
 
+/**
+ * ClaudeOAuthUsageLimit 是用量响应 limits 数组的一项。
+ *
+ * 官方 App 的「当前会话 / 所有模型 / 仅限 Fable」三条就是它：kind 为 session、
+ * weekly_all、weekly_scoped，带 model scope 的那条即「仅限 X」。
+ */
+export type ClaudeOAuthUsageLimit = {
+  kind: string;
+  group?: string;
+  percent: number;
+  resetsAt?: string;
+  label?: string;
+  allowancePercentOfWeekly?: number;
+  active?: boolean;
+};
+
 export type ClaudeOAuthUsageReport = {
   available: boolean;
   error?: string;
@@ -492,6 +508,7 @@ export type ClaudeOAuthUsageReport = {
   seven_day?: ClaudeOAuthUsageBucket;
   seven_day_opus?: ClaudeOAuthUsageBucket;
   seven_day_sonnet?: ClaudeOAuthUsageBucket;
+  limits?: ClaudeOAuthUsageLimit[];
   extra_usage?: Record<string, unknown>;
 };
 

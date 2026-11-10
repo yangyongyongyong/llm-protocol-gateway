@@ -28,6 +28,7 @@ import {
     ChatGPTResetConsumeResult,
     ChatGPTResetCredit,
     ClaudeOAuthUsageBucket,
+    ClaudeOAuthUsageLimit,
     ClaudeOAuthUsageReport,
     CursorBridgeRuntime,
     CursorOAuthUsageReport,
@@ -458,8 +459,28 @@ export function UsageBucketRow({ label, percent, note, reset, compact }: {
   );
 }
 
-export function ClaudeOAuthUsagePanel({ providerId, accountKey, connected, compact, subtitle }: { accountKey?: string; providerId: string; connected?: boolean; compact?: boolean; subtitle?: string }) {
-  const request = React.useMemo(() => usageAccountRequest(`/__providers/${encodeURIComponent(providerId)}/claude-oauth/usage`), [providerId, accountKey]);
+/**
+ * claudeUsageLimitLabel 把 limits 里的一项翻成面板上的名字，措辞对齐官方 App：
+ * session → 当前会话，weekly_all → 所有模型，带模型 scope 的 weekly_scoped →
+ * 仅限 Fable（并标出它分到多少周额度）。
+ */
+function claudeUsageLimitLabel(limit: ClaudeOAuthUsageLimit): string {
+  const scope = (limit.label || '').trim();
+  if (scope) {
+    const share = limit.allowancePercentOfWeekly ? `（占周额度 ${Math.round(limit.allowancePercentOfWeekly)}%）` : '';
+    return `仅限 ${scope}${share}`;
+  }
+  switch (limit.kind) {
+    case 'session':
+      return '当前会话';
+    case 'weekly_all':
+      return '所有模型';
+    default:
+      return limit.kind || '额度';
+  }
+}
+
+export function ClaudeOAuthUsagePanel({ providerId, accountKey, connected, compact, subtitle }: { accountKey?: string; providerId: string; connected?: boolean; compact?: boolean; subtitle?: string }) {  const request = React.useMemo(() => usageAccountRequest(`/__providers/${encodeURIComponent(providerId)}/claude-oauth/usage`), [providerId, accountKey]);
   const { report, loading, refresh } = useAccountUsageReport<ClaudeOAuthUsageReport>(
     Boolean(connected),
     accountUsageKey('claude-oauth', accountKey, providerId),
@@ -468,12 +489,30 @@ export function ClaudeOAuthUsagePanel({ providerId, accountKey, connected, compa
 
   if (!connected) return null;
 
-  const buckets: Array<{ key: string; label: string; bucket?: ClaudeOAuthUsageBucket }> = [
+  // 官方 App 现在把窗口放在 limits 数组里（session → weekly_all → weekly_scoped），
+  // 其中 weekly_scoped 带模型 scope 的就是「仅限 Fable」。旧的 seven_day_opus /
+  // seven_day_sonnet 在当前账号上返回 null，只认旧桶会少显示一条额度。
+  const limitRows = (report?.limits || []).map((limit, index) => ({
+    key: `limit-${limit.kind}-${limit.label || index}`,
+    label: claudeUsageLimitLabel(limit),
+    percent: limit.percent,
+    reset: resetHint(limit.resetsAt),
+  }));
+  const bucketRows = [
     { key: 'five_hour', label: '5 小时额度', bucket: report?.five_hour },
     { key: 'seven_day', label: '7 天额度', bucket: report?.seven_day },
     { key: 'seven_day_sonnet', label: '7 天 Sonnet', bucket: report?.seven_day_sonnet },
     { key: 'seven_day_opus', label: '7 天 Opus', bucket: report?.seven_day_opus },
-  ].filter((item) => item.bucket);
+  ]
+    .filter((item) => item.bucket)
+    .map((item) => ({
+      key: item.key,
+      label: item.label,
+      percent: item.bucket?.utilization ?? 0,
+      reset: resetHint(item.bucket?.resets_at),
+    }));
+  // limits 是权威来源；仅当接口没给（老套餐/旧缓存）才退回按桶显示。
+  const rows = limitRows.length > 0 ? limitRows : bucketRows;
 
   return (
     <UsagePanelShell compact={compact} subtitle={subtitle} title="Claude 订阅额度" loading={loading} fetchedAt={report?.fetchedAt} onRefresh={refresh}>
@@ -481,16 +520,16 @@ export function ClaudeOAuthUsagePanel({ providerId, accountKey, connected, compa
         <div className="claude-usage-empty">{loading ? '正在拉取额度…' : '暂无额度数据'}</div>
       ) : !report.available ? (
         <div className="claude-usage-empty error">{report.error || '额度不可用'}</div>
-      ) : buckets.length === 0 ? (
-        <div className="claude-usage-empty">未返回额度桶数据</div>
+      ) : rows.length === 0 ? (
+        <div className="claude-usage-empty">未返回额度数据</div>
       ) : (
         <div className="claude-usage-grid">
-          {buckets.map(({ key, label, bucket }) => (
+          {rows.map((row) => (
             <UsageBucketRow
-              key={key}
-              label={label}
-              percent={Math.min(100, Math.max(0, bucket?.utilization ?? 0))}
-              reset={resetHint(bucket?.resets_at)}
+              key={row.key}
+              label={row.label}
+              percent={Math.min(100, Math.max(0, row.percent))}
+              reset={row.reset}
               compact={compact}
             />
           ))}
