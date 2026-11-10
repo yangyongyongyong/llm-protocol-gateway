@@ -573,6 +573,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /__apikeys/{id}/profiles/{pid}", s.handleUpdateKeyProfile)
 	mux.HandleFunc("DELETE /__apikeys/{id}/profiles/{pid}", s.handleDeleteKeyProfile)
 	mux.HandleFunc("POST /__apikeys/{id}/active-profile", s.handleSwitchKeyProfile)
+	// 把运行网关的这台机器上的 Claude Code CLI / Claude Desktop 指向本网关。
+	// 桌面 App 与管理页共用这一条：只有本机请求才会落盘（见 handleSetupClients）。
+	mux.HandleFunc("POST /__clients/setup", s.handleSetupClients)
 	mux.HandleFunc("GET /__users", s.handleListUsers)
 	mux.HandleFunc("POST /__users", s.handleCreateUser)
 	mux.HandleFunc("PATCH /__users/{id}", s.handleUpdateUser)
@@ -4137,7 +4140,7 @@ func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleClaudeModels(w http.ResponseWriter, r *http.Request) {
 	models := s.modelsForRequest(r)
-	data := make([]map[string]any, 0, len(models)+len(claudeModelAliases))
+	data := make([]map[string]any, 0, len(models)+len(claudeModelAliases)+2)
 	seen := map[string]bool{}
 	for _, entry := range claudeModelAliasEntries() {
 		id := stringValue(entry["id"])
@@ -4148,6 +4151,16 @@ func (s *Server) handleClaudeModels(w http.ResponseWriter, r *http.Request) {
 		if entry["created_at"] == "" {
 			entry["created_at"] = time.Now().UTC().Format(time.RFC3339)
 		}
+		data = append(data, entry)
+	}
+	// The reserved "default" alias, so a client that pins ANTHROPIC_MODEL once
+	// finds it in model discovery too. Two spellings, matching Claude Code's
+	// own extended-context convention: the bare one and the 1M variant.
+	for _, entry := range reservedDefaultModelEntries() {
+		if seen[entry["id"].(string)] {
+			continue
+		}
+		seen[entry["id"].(string)] = true
 		data = append(data, entry)
 	}
 	for _, model := range models {

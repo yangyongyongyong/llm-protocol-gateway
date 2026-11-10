@@ -519,3 +519,43 @@ test('buildSelfRegistrationPrompt：以控制台选中的协议为主，不再�
   assert.ok(chat.includes('Authorization: Bearer <SHARED_SECRET>'));
   assert.ok(chat.includes('生成注册令牌'), '没有原始令牌时用占位提示，不编一个');
 });
+
+test('Claude Code 一键接入：模型钉死 default，四个档位与子 agent 全部跟随', () => {
+  const env = lib.buildClaudeCodeSwitcherEnv({baseURL: 'https://gw.example.com/anthropic', token: 'sk-gw-x'});
+  assert.equal(env.ANTHROPIC_MODEL, 'default[1m]', '默认要 1M 变体（客户端按 1M 算窗口）');
+  // 内置子 agent 的模型是硬编码的（claude-code-guide→haiku、statusline-setup→sonnet），
+  // 只钉 ANTHROPIC_MODEL 它们仍会带着 haiku/sonnet 打上来。
+  for (const tier of ['ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_FABLE_MODEL']) {
+    assert.equal(env[tier], 'default[1m]', `${tier} 必须一起钉死`);
+  }
+  assert.equal(env.ANTHROPIC_DEFAULT_HAIKU_MODEL, 'default', 'haiku 档不带 1M：只做摘要分类');
+  assert.equal(env.ANTHROPIC_SMALL_FAST_MODEL, 'default');
+  assert.equal(env.CLAUDE_CODE_SUBAGENT_MODEL, 'default', '自定义子 agent 也要跟随');
+  assert.equal(env.ANTHROPIC_BASE_URL, 'https://gw.example.com/anthropic');
+  assert.equal(env.ANTHROPIC_AUTH_TOKEN, 'sk-gw-x');
+
+  // 关掉 1M 时所有档位都退回不带后缀的 default。
+  const plain = lib.buildClaudeCodeSwitcherEnv({baseURL: 'https://x/anthropic', token: 't', oneMillionContext: false});
+  assert.equal(plain.ANTHROPIC_MODEL, 'default');
+  assert.equal(plain.ANTHROPIC_DEFAULT_OPUS_MODEL, 'default');
+});
+
+test('Claude Code 一键接入脚本：只动 env、先备份、不覆盖用户自己选的 model', () => {
+  const key = {id: 'k1', name: 'k', key: 'sk-gw-x', enabled: true};
+  const endpoints = [{id: 'e2', name: 'Claude', protocol: 'claude', basePath: '/anthropic', listenHost: '127.0.0.1', listenPort: 18093, publicAccessEnabled: false}];
+
+  const text = lib.buildClaudeCodeSwitcherConfig(key, endpoints, '');
+  const parsed = JSON.parse(text);
+  assert.equal(parsed.env.ANTHROPIC_MODEL, 'default[1m]');
+  assert.equal(parsed.model, 'default[1m]', '顶层 model 同步，/config 里显示的就是它');
+
+  const script = lib.buildClaudeCodeSwitcherScript(key, endpoints, '');
+  assert.ok(script.includes('.claude" / "settings.json'), script);
+  assert.ok(script.includes('_backup(FILE)'), '必须先备份');
+  assert.ok(script.includes('setdefault("model"'), '用户自己在 /config 里选的模型不能被覆盖');
+  assert.ok(script.includes('重开一次'), '要提示 env 只在启动时读取');
+  const b64 = script.match(/_b64\("([A-Za-z0-9+/=]+)"\)/);
+  assert.ok(b64, '配置正文要 base64 内嵌，避免引号坑');
+  const embedded = JSON.parse(Buffer.from(b64[1], 'base64').toString('utf8'));
+  assert.equal(embedded.env.CLAUDE_CODE_SUBAGENT_MODEL, 'default');
+});

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/luca/llm-protocol-gateway/internal/app"
+	"github.com/luca/llm-protocol-gateway/internal/clidesktop"
 	"github.com/luca/llm-protocol-gateway/internal/gateway"
 	"github.com/luca/llm-protocol-gateway/internal/packaged"
 	"github.com/wailsapp/wails/v2/pkg/menu"
@@ -425,6 +426,43 @@ func (a *App) OpenDataDirectory() {
 // StopLaunchAgent boots out the headless LaunchAgent so the App can own the port.
 func (a *App) StopLaunchAgent() (string, error) {
 	return stopLaunchAgent(launchAgentLabel)
+}
+
+// ClientSetupInput 是前端传进来的连接信息。前端已经知道网关地址与密钥，
+// 这里只负责写入，不再解析一遍。
+type ClientSetupInput struct {
+	// BaseURL 是 Claude Code CLI 用的地址（含 /anthropic 前缀）。
+	BaseURL string `json:"baseUrl"`
+	// GatewayURL 是 Claude Desktop 的 3p 模式用的地址（不含 /anthropic）。
+	GatewayURL string `json:"gatewayUrl"`
+	Token      string `json:"token"`
+	// Model 固定为 default 或 default[1m]，留空按 default 处理。
+	Model string `json:"model"`
+}
+
+// ClientSetupResult 是写入结果，直接回给界面展示。
+type ClientSetupResult struct {
+	OK     bool              `json:"ok"`
+	Error  string            `json:"error,omitempty"`
+	Result clidesktop.Result `json:"result"`
+}
+
+// SetupClaudeClients 把本机的 Claude Code CLI 与 Claude Desktop 都指向本网关。
+//
+// CLI 与 Desktop 是两套完全不同的配置：CLI 读 ~/.claude/settings.json 的
+// env，Desktop 的第三方网关模式读自己的 Claude-3p 目录。两边都写，用户不必
+// 关心自己在哪个客户端里用。写入前都会备份，且只改各自负责的键。
+func (a *App) SetupClaudeClients(input ClientSetupInput) ClientSetupResult {
+	res, err := clidesktop.Apply(clidesktop.Endpoint{
+		BaseURL:    strings.TrimSpace(input.BaseURL),
+		GatewayURL: strings.TrimSpace(input.GatewayURL),
+		Token:      strings.TrimSpace(input.Token),
+		Model:      strings.TrimSpace(input.Model),
+	})
+	if err != nil {
+		return ClientSetupResult{OK: false, Error: err.Error(), Result: res}
+	}
+	return ClientSetupResult{OK: true, Result: res}
 }
 
 // ensurePackagedWebDistEnv points the gateway at Contents/Resources when running

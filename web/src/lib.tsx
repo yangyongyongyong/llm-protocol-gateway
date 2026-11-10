@@ -2506,6 +2506,151 @@ export function buildApiKeyClaudeConfig(key: APIKey, route: Route | undefined, e
   return `${JSON.stringify(config, null, 2)}\n`;
 }
 
+/**
+ * Claude Code「一次配置、平台换模型」的环境变量。
+ *
+ * 思路：客户端只认一个保留模型名 `default`，真正用哪个模型由网关按这把 Key 的
+ * 配置解析。于是换 Provider / 换模型 / 换协议全在平台上完成，客户端配置一个字
+ * 都不用改，也就不用像 ccswitch / magpie 那样每次改完重启客户端。
+ *
+ * `[1m]` 是 Claude Code 的「扩展上下文」标记，不是模型名的一部分：客户端发出前
+ * 会把它去掉（2.1.322 实测），改成请求头 `anthropic-beta: context-1m-2025-08-07`。
+ * 所以 `default` 与 `default[1m]` 在网关上解析到同一个真实模型，区别只是客户端
+ * 自己按 200k 还是 1M 算窗口（日志里也拿得到要没要 1M）。
+ *
+ * 为什么要连 tier 变量一起钉死：Claude Code 内置子 agent 的模型是硬编码的
+ * （`claude-code-guide` 用 haiku、`statusline-setup` 用 sonnet），只设
+ * ANTHROPIC_MODEL 时这些子 agent 仍会带着 haiku/sonnet 打上来，上游没有这个模型
+ * 就直接失败。把 opus/sonnet/haiku/fable 四个档位一起指到 default，子 agent 才会
+ * 跟着平台配置走。CLAUDE_CODE_SUBAGENT_MODEL 再兜一层自定义子 agent。
+ *
+ * haiku / small-fast 故意不带 [1m]：这两档只做摘要与分类，带上 1M beta 没有收益。
+ */
+export function buildClaudeCodeSwitcherEnv(options: {
+  baseURL: string;
+  token: string;
+  oneMillionContext?: boolean;
+}) {
+  const suffix = options.oneMillionContext === false ? '' : '[1m]';
+  return {
+    ANTHROPIC_BASE_URL: options.baseURL,
+    ANTHROPIC_AUTH_TOKEN: options.token,
+    ANTHROPIC_MODEL: `default${suffix}`,
+    ANTHROPIC_DEFAULT_OPUS_MODEL: `default${suffix}`,
+    ANTHROPIC_DEFAULT_SONNET_MODEL: `default${suffix}`,
+    ANTHROPIC_DEFAULT_FABLE_MODEL: `default${suffix}`,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'default',
+    ANTHROPIC_SMALL_FAST_MODEL: 'default',
+    CLAUDE_CODE_SUBAGENT_MODEL: 'default',
+  } as Record<string, string>;
+}
+
+/** `~/.claude/settings.json` 的 env 片段（完整版，含子 agent 档位）。 */
+export function buildClaudeCodeSwitcherConfig(key: APIKey, endpoints: OutputEndpoint[], publicBase: string, oneMillionContext = true) {
+  const baseURL = `${apiKeyGatewayRoot(endpoints, publicBase)}/anthropic`;
+  const env = buildClaudeCodeSwitcherEnv({baseURL, token: key.key, oneMillionContext});
+  return `${JSON.stringify({env, model: env.ANTHROPIC_MODEL}, null, 2)}\n`;
+}
+
+/**
+ * 一键写入脚本：增量合并进 ~/.claude/settings.json 的 env。
+ *
+ * 只改 env 里本工具管理的那几个键，permissions / hooks / statusLine / mcpServers
+ * 等用户自己的配置原样保留（和「复制 Claude 配置」用的是同一套 merge）。
+ * 不复用 buildApiKeyClientConfigInstallScript 是因为文案要讲清「以后换模型不用再
+ * 回来点一次」，而且这里必须提示重开一次客户端——env 只在进程启动时读。
+ */
+export function buildClaudeCodeSwitcherScript(
+  key: APIKey,
+  endpoints: OutputEndpoint[],
+  publicBase: string,
+  oneMillionContext = true,
+) {
+  const configText = buildClaudeCodeSwitcherConfig(key, endpoints, publicBase, oneMillionContext);
+  const jsonB64 = utf8ToBase64(configText.endsWith('\n') ? configText : `${configText}\n`);
+  const py = [
+    PY_HELPERS,
+    'import json',
+    'HOME = pathlib.Path.home()',
+    'FILE = HOME / ".claude" / "settings.json"',
+    `NEW = json.loads(_b64(${JSON.stringify(jsonB64)}))`,
+    '',
+    'FILE.parent.mkdir(parents=True, exist_ok=True)',
+    'data = {}',
+    'if FILE.exists():',
+    '    _backup(FILE)',
+    '    try:',
+    '        loaded = json.loads(FILE.read_text(encoding="utf-8") or "{}")',
+    '        if isinstance(loaded, dict):',
+    '            data = loaded',
+    '    except Exception:',
+    '        data = {}',
+    'env = data.get("env")',
+    'if not isinstance(env, dict):',
+    '    env = {}',
+    'env.update(NEW["env"])',
+    'data["env"] = env',
+    '# 顶层 model 只在本工具写过时才覆盖：用户自己在 /config 里选的模型更该保留。',
+    'data.setdefault("model", NEW["model"])',
+    'FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")',
+    'print(f"已写入: {FILE}")',
+    'print("模型已固定为 default，之后在网关平台换模型 / 换 Provider 都不用改这里。")',
+    'print("环境变量只在客户端启动时读取：请重开一次 claude（或桌面端）。")',
+  ].join('\n');
+  return wrapMacPythonScript(py, '修改脚本（把 Claude Code 接到本网关；只更新 env 里本工具管理的键，保留你其它配置）');
+}
+
+/**
+ * 在「运行网关的这台机器」上直接写入 Claude Code CLI 与 Claude Desktop 的配置。
+ *
+ * 和上面那个脚本的区别只是执行者不同：脚本要用户自己粘贴到终端，这条路由界面
+ * 直接调后端落盘，适合桌面 App 里点一下就配好的场景。两端都写是因为它们读的
+ * 根本不是同一份文件——CLI 读 ~/.claude/settings.json 的 env，Desktop 的第三方
+ * 网关模式读自己的 Claude-3p 目录。
+ *
+ * 后端只接受本机请求（反代过来的公网管理员会被拒绝）：它写的是那台机器的文件，
+ * 里面带 API 密钥。
+ */
+export type ClientSetupOutcome = {
+  ok: boolean;
+  error?: string;
+  result?: {
+    cliPath?: string;
+    cliChanged?: boolean;
+    cliUnchanged?: boolean;
+    desktopPath?: string;
+    desktopChange?: boolean;
+    backups?: string[];
+    notes?: string[];
+  };
+};
+
+export async function applyClaudeClientSetup(options: {
+  baseURL: string;
+  gatewayURL: string;
+  token: string;
+  model: string;
+}): Promise<ClientSetupOutcome> {
+  const response = await fetch(`${API_BASE}/__clients/setup`, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      baseUrl: options.baseURL,
+      gatewayUrl: options.gatewayURL,
+      token: options.token,
+      model: options.model,
+    }),
+  });
+  if (response.status === 403) {
+    return {ok: false, error: '只能在运行网关的这台机器上操作（浏览器需通过本机地址打开管理页）。'};
+  }
+  if (!response.ok) {
+    return {ok: false, error: `写入失败：HTTP ${response.status}`};
+  }
+  return (await response.json()) as ClientSetupOutcome;
+}
+
 export function clientConfigFilePath(client: 'opencode' | 'codex' | 'claude') {
   if (client === 'opencode') return '~/.config/opencode/opencode.json';
   if (client === 'codex') return '~/.codex/config.toml';

@@ -42,6 +42,63 @@ func resolveAPIKeyModelAlias(aliases map[string]string, requestModel string) (st
 	return requestModel, false
 }
 
+// defaultModelAlias is the reserved model name a client sends when it wants the
+// platform to pick the model. It exists so a Claude Code session can pin
+// ANTHROPIC_MODEL=default once and never touch its config again: the client
+// stops naming a model, and switching the model on the gateway (per API key, or
+// per provider) takes effect on the next request without a client restart.
+//
+// "default" is not a model id any provider serves, so it can never collide with
+// a real one. Claude Code also spells it "default[1m]" when the user wants the
+// 1M-context variant; see resolveReservedModelAlias.
+const defaultModelAlias = "default"
+
+// resolveReservedModelAlias answers whether the client asked for the reserved
+// "default" alias and, if so, which model should serve it.
+//
+// The trailing "[1m]" is Claude Code's extended-context marker, not part of any
+// model id: the client strips it before sending (byte-verified against 2.1.322)
+// and signals the same thing with the anthropic-beta: context-1m-2025-08-07
+// header. Both spellings therefore resolve to the same upstream model — the
+// marker only decides which candidate is allowed to serve the request.
+//
+// A provider that has a DefaultModel gets it. A provider without one is left
+// alone: the request goes upstream naming "default" and the provider's own
+// error reaches the client. That is deliberate — configuring a default model is
+// optional on this gateway, because naming the model in the client is a
+// supported way to use it, and inventing a substitute (catalog order, first
+// entry) would silently run a model the user never chose.
+func resolveReservedModelAlias(provider domain.Provider, requestModel string) (model string, mapped bool) {
+	if !isReservedDefaultModel(requestModel) {
+		return "", false
+	}
+	if defaultModel := strings.TrimSpace(provider.DefaultModel); defaultModel != "" {
+		return defaultModel, true
+	}
+	return "", false
+}
+
+// isReservedDefaultModel reports whether a model name is (any spelling of) the
+// reserved "default" alias, including Claude Code's "[1m]" extended-context tag.
+func isReservedDefaultModel(model string) bool {
+	return strings.EqualFold(stripClaudeContextTag(model), defaultModelAlias)
+}
+
+// stripClaudeContextTag removes the trailing extended-context markers Claude
+// Code appends to a model name ("[1m]", "[2m]"). Mirrors the client's own
+// normalization: other bracketed text is left alone so a real model id that
+// happens to contain brackets survives.
+func stripClaudeContextTag(model string) string {
+	trimmed := strings.TrimSpace(model)
+	lower := strings.ToLower(trimmed)
+	for _, tag := range []string{"[1m]", "[2m]"} {
+		if strings.HasSuffix(lower, tag) {
+			return strings.TrimSpace(trimmed[:len(trimmed)-len(tag)])
+		}
+	}
+	return trimmed
+}
+
 func resolveConsumerModel(router *Router, route domain.Route, key domain.APIKey, gatewayKeyMatched bool, rawRequestModel string) (model string, logModel string) {
 	provider, err := router.ProviderForRoute(route)
 	if err != nil {
@@ -84,6 +141,16 @@ func resolveConsumerModelOnProvider(provider domain.Provider, key domain.APIKey,
 			}
 		} else {
 			model = applyProviderModelMapping(provider, model)
+		}
+		// Reserved "default" (and Claude Code's "default[1m]"): the client asked
+		// the platform to choose. Resolved against this provider only, because a
+		// failover target may carry a different default model than the route's
+		// preferred provider. Skipped when an alias or mapping already chose.
+		if !mapped {
+			if resolved, ok := resolveReservedModelAlias(provider, model); ok {
+				model = resolved
+				mapped = true
+			}
 		}
 		model = stripProviderModelPrefix(provider, model)
 		model = applyProviderModelFallback(provider, model)
