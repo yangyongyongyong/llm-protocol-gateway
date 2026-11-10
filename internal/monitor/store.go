@@ -69,7 +69,11 @@ type RequestLog struct {
 	PeerDirection string `json:"peerDirection,omitempty"`
 	// PeerOrigin 是这次透传的发起方网关 ID（X-Gateway-Origin）。三级链路里
 	// 中间那一跳的 Ingress/Egress 都只是"相邻方"，只有它能指向真正的起点。
-	PeerOrigin       string          `json:"peerOrigin,omitempty"`
+	PeerOrigin string `json:"peerOrigin,omitempty"`
+	// PeerPath 是这次请求已经过的网关 ID 链（X-Gateway-Path 的值，逗号分隔，
+	// 从发起方开始，不含本机）。两级链路里 Ingress/PeerOrigin 已经足够；三级
+	// 及以上只有它能回答"请求到底绕了几道"。界面的链路提示用它拼完整链。
+	PeerPath         string          `json:"peerPath,omitempty"`
 	ErrorDescription string          `json:"errorDescription,omitempty"`
 	RequestBody      string          `json:"requestBody,omitempty"`
 	ResponseBody     string          `json:"responseBody,omitempty"`

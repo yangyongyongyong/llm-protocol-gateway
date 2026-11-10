@@ -94,7 +94,7 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 		// 这条链路注册的是这台机器。
 		"gatewayId": s.GatewayID(),
 		// 让界面能把限额直接写在提示里，而不是写死一个数字。
-		"maxHops":                   maxGatewayHops,
+		"maxHops":                   s.maxGatewayHopsConfigured(),
 		"registrationAllowCidrs":    s.router.PeerRegistrationAllowCIDRs(),
 		"registrationAllowsPrivate": strings.TrimSpace(s.router.PeerRegistrationAllowCIDRs()) == "",
 	})
@@ -201,4 +201,85 @@ func (s *Server) handleSetPeerRegistrationCIDRs(w http.ResponseWriter, r *http.R
 	}
 	s.logs.AddApp("info", "peer registration cidrs updated", raw)
 	writeJSON(w, http.StatusOK, map[string]any{"cidrs": s.router.PeerRegistrationAllowCIDRs()})
+}
+
+// handleSetPeerMaxHops 设置链路跳数上限（1..8，0 恢复默认 3）。
+//
+// 环检测每台网关都按自己的配置做：把上限调大是让"内网 → 公网 → 公网"这种
+// 真实的多级链路能走通，调小则是在自己这一段更早拦住被伪造/误配的长链。
+// 现有会话不受影响——判定发生在每个新请求上。
+func (s *Server) handleSetPeerMaxHops(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePermission(w, r, domain.PermPeersManage) {
+		return
+	}
+	var payload struct {
+		Hops *int `json:"hops"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	if payload.Hops == nil {
+		writeOpenAIError(w, http.StatusBadRequest, "hops is required (0 restores the default of 3)")
+		return
+	}
+	s.router.SetMaxGatewayHops(*payload.Hops)
+	if err := s.saveState(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+		return
+	}
+	effective := s.router.MaxGatewayHops()
+	s.logs.AddApp("info", "peer max hops updated", fmt.Sprintf("%d（生效上限 %d）", *payload.Hops, effective))
+	writeJSON(w, http.StatusOK, map[string]any{"hops": effective})
+}
+
+// handleSetPeerGrants 修改一个已注册下游网关的授权。
+//
+// 注册时的预置授权（applyPeerRequestedGrants）只是一次快照；上游的授权应当
+// 随时可以调整——新增、收回都立即生效，不需要下游重新注册。校验规则与注册
+// 时一致：只接受真实存在、未删除的 provider；传空列表等于收回全部授权，
+// 下游下一次请求就会拿不到任何 provider。
+//
+// 权限走 /__peers/ 前缀已有的 PermPeersManage（rbac routePermission）。
+func (s *Server) handleSetPeerGrants(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePermission(w, r, domain.PermPeersManage) {
+		return
+	}
+	if s.userStore == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "user store is not configured")
+		return
+	}
+	user, err := s.userStore.UserByID(r.PathValue("id"))
+	if err != nil {
+		writeOpenAIError(w, http.StatusNotFound, "peer not found")
+		return
+	}
+	if !user.IsPeer() {
+		writeOpenAIError(w, http.StatusBadRequest, "this account is not a peer gateway")
+		return
+	}
+	var payload struct {
+		ProviderIDs *[]string `json:"providerIds"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	if payload.ProviderIDs == nil {
+		writeOpenAIError(w, http.StatusBadRequest, "providerIds is required (an empty list revokes all grants)")
+		return
+	}
+	// 与注册预置同一套校验：不存在的 ID 静默丢弃而不是整单拒绝——授权列表
+	// 本来就不可信（可能来自旧控制台页面缓存），删掉的 provider 不该让管理员
+	// 连合法的部分都存不进去。空列表在这里是"收回全部"，与注册的"不动"区分。
+	if err := s.setPeerGrants(user.ID, *payload.ProviderIDs); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	granted := s.resourceGrants()[user.ID]
+	if granted == nil {
+		granted = []string{}
+	}
+	s.logs.AddApp("info", "peer grants updated", fmt.Sprintf("%s (%s) → %d 个 provider", user.Username, user.GatewayID, len(granted)))
+	writeJSON(w, http.StatusOK, map[string]any{"userId": user.ID, "grantedProviderIds": granted})
 }

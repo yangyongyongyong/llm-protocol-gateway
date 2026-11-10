@@ -275,12 +275,118 @@ func TestPeerRegistrationCIDRsValidation(t *testing.T) {
 	}
 }
 
+// 跳数上限可配置：默认 3，写 0 恢复默认，写超天花板的收敛到天花板。
+// 一条端到端链也在这里验：调大后原本会被 508 的 3 跳链路放行。
+func TestPeerMaxHopsConfigurable(t *testing.T) {
+	server := newPeerTestServer(t)
+	recorder := adminCall(t, server.handleSetPeerMaxHops, http.MethodPatch, "/__settings/peer-max-hops",
+		map[string]any{"hops": 5}, nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if server.router.MaxGatewayHops() != 5 {
+		t.Fatalf("max hops = %d, want 5", server.router.MaxGatewayHops())
+	}
+	// 缺 hops 字段必须报错，而不是被当成 0 悄悄改回默认。
+	recorder = adminCall(t, server.handleSetPeerMaxHops, http.MethodPatch, "/__settings/peer-max-hops",
+		map[string]any{}, nil)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("missing hops status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	// 0 恢复默认。
+	recorder = adminCall(t, server.handleSetPeerMaxHops, http.MethodPatch, "/__settings/peer-max-hops",
+		map[string]any{"hops": 0}, nil)
+	if recorder.Code != http.StatusOK || server.router.MaxGatewayHops() != maxGatewayHops {
+		t.Fatalf("reset status=%d hops=%d, want the default", recorder.Code, server.router.MaxGatewayHops())
+	}
+
+	// 端到端：3 跳的链在默认配置下被 508，调到 5 后放行到 handler。
+	loopServer := newHopTestServer(t, gwID)
+	atDefault := httptest.NewRequest(http.MethodPost, peerEndpointPrefix+"chat/completions", nil)
+	atDefault.Header.Set(headerGatewayPath, "gw_0000000000000001,gw_0000000000000002,gw_0000000000000003")
+	recorder2 := httptest.NewRecorder()
+	loopServer.Handler().ServeHTTP(recorder2, atDefault)
+	if recorder2.Code != http.StatusLoopDetected {
+		t.Fatalf("a 3-hop chain must be refused at the default limit, got %d", recorder2.Code)
+	}
+	loopServer.router.SetMaxGatewayHops(5)
+	polled := httptest.NewRequest(http.MethodPost, peerEndpointPrefix+"chat/completions", nil)
+	polled.Header.Set(headerGatewayPath, "gw_0000000000000001,gw_0000000000000002,gw_0000000000000003")
+	recorder2 = httptest.NewRecorder()
+	loopServer.Handler().ServeHTTP(recorder2, polled)
+	if recorder2.Code == http.StatusLoopDetected {
+		t.Fatal("a 3-hop chain must pass once the limit is raised to 5")
+	}
+}
+
+// 按层授权的编辑入口：注册只是预置授权的快照，上游随时可以改，改动立即生效
+// 且不需要下游重新注册。这里验三件事——改授权真的写进 role store、不存在的
+// provider 被静默丢弃、空列表收回全部。
+func TestPeerGrantsEditableAfterRegistration(t *testing.T) {
+	server := newPeerTestServer(t,
+		domain.Provider{ID: "hj-claude", Name: "hj-claude", Protocol: domain.ProtocolClaude, BaseURL: "https://hj.example.com"},
+		domain.Provider{ID: "new-one", Name: "new-one", Protocol: domain.ProtocolOpenAIChat, BaseURL: "https://n.example.com"},
+		domain.Provider{ID: "gone-provider", Name: "deleted", Protocol: domain.ProtocolOpenAIChat, BaseURL: "https://x.example.com", Deleted: true},
+	)
+	_, response := peerRegister(t, server, peerRegisterPayload(map[string]any{
+		"requestedProviderIds": []string{"hj-claude"},
+	}))
+
+	// 新增授权 + 夹带一个不存在的 provider：有效的那部分必须落库，坏的静默丢弃。
+	recorder := adminCall(t, server.handleSetPeerGrants, http.MethodPatch, "/__peers/{id}/grants",
+		map[string]any{"providerIds": []string{"hj-claude", "new-one", "gone-provider"}}, map[string]string{"id": response.UserID})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("grants status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	grants, err := server.roles.ListResourceGrants()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids := grants[response.UserID]; len(ids) != 2 {
+		t.Fatalf("grants = %v, want hj-claude + new-one (deleted/unknown dropped)", ids)
+	}
+
+	// 空列表 = 收回全部；下一个请求当场拿不到任何 provider。
+	recorder = adminCall(t, server.handleSetPeerGrants, http.MethodPatch, "/__peers/{id}/grants",
+		map[string]any{"providerIds": []string{}}, map[string]string{"id": response.UserID})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("empty grants status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	grants, err = server.roles.ListResourceGrants()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids := grants[response.UserID]; len(ids) != 0 {
+		t.Fatalf("grants after revoke-all = %v, want empty", ids)
+	}
+
+	// 缺 providerIds 字段必须报错，而不是被当成"清空"悄悄把授权抹掉。
+	recorder = adminCall(t, server.handleSetPeerGrants, http.MethodPatch, "/__peers/{id}/grants",
+		map[string]any{}, map[string]string{"id": response.UserID})
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("missing providerIds status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	grants, err = server.roles.ListResourceGrants()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids := grants[response.UserID]; len(ids) != 0 {
+		t.Fatalf("grants must be untouched by the rejected write, got %v", ids)
+	}
+
+	// 只对真正的对端账号有效。
+	recorder = adminCall(t, server.handleSetPeerGrants, http.MethodPatch, "/__peers/{id}/grants",
+		map[string]any{"providerIds": []string{"hj-claude"}}, map[string]string{"id": "not-a-user"})
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("unknown peer status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
 // adminCall 直接调 handler 并注入管理员身份（withAdminAuth 正是这样注入的）。
 //
 // 不走 Handler()：那一层还要求先设好管理密码，而这里要验的是 handler 自己
 // 的行为。整条链路上的鉴权由 TestNormalUserIsRefusedOnAdminEndpoints 覆盖。
 func adminCall(t *testing.T, handler http.HandlerFunc, method, target string, body any, values map[string]string) *httptest.ResponseRecorder {
-	t.Helper()
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)

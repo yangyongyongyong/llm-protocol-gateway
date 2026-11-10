@@ -36,7 +36,7 @@ func TestGatewayLoopDetectionCatchesSelfInPath(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, looped := checkGatewayHop(tc.hop, gwID); !looped {
+			if _, looped := checkGatewayHop(tc.hop, gwID, maxGatewayHops); !looped {
 				t.Fatalf("hop %+v must be refused as a loop", tc.hop)
 			}
 		})
@@ -47,7 +47,7 @@ func TestGatewayLoopDetectionCatchesSelfInPath(t *testing.T) {
 // 漏判等于放行一个环。
 func TestGatewayLoopDetectionIgnoresCase(t *testing.T) {
 	hop := gatewayHop{Path: []string{strings.ToUpper(gwID)}, Count: 1}
-	if _, looped := checkGatewayHop(hop, gwID); !looped {
+	if _, looped := checkGatewayHop(hop, gwID, maxGatewayHops); !looped {
 		t.Fatal("a case-changed id is still the same gateway")
 	}
 }
@@ -55,7 +55,7 @@ func TestGatewayLoopDetectionIgnoresCase(t *testing.T) {
 // 别人的链路要放行：这是正常的多级转发。
 func TestGatewayLoopDetectionAllowsOtherGateways(t *testing.T) {
 	hop := gatewayHop{Path: []string{otherID}, Count: 1}
-	if refusal, looped := checkGatewayHop(hop, gwID); looped {
+	if refusal, looped := checkGatewayHop(hop, gwID, maxGatewayHops); looped {
 		t.Fatalf("a foreign path must pass, got %+v", refusal)
 	}
 }
@@ -63,7 +63,7 @@ func TestGatewayLoopDetectionAllowsOtherGateways(t *testing.T) {
 // 跳数上限：用不同 ID 无限对转时靠它兜底，也是被伪造的链路头的最后一道闸。
 func TestGatewayLoopDetectionCapsHopCount(t *testing.T) {
 	atLimit := gatewayHop{Path: []string{"gw_0000000000000001", "gw_0000000000000002", "gw_0000000000000003"}, Count: maxGatewayHops}
-	refusal, looped := checkGatewayHop(atLimit, gwID)
+	refusal, looped := checkGatewayHop(atLimit, gwID, maxGatewayHops)
 	if !looped {
 		t.Fatalf("a chain at %d hops must be refused", maxGatewayHops)
 	}
@@ -71,15 +71,58 @@ func TestGatewayLoopDetectionCapsHopCount(t *testing.T) {
 		t.Fatalf("refusal must name the hop limit, got %q", refusal.Reason)
 	}
 	below := gatewayHop{Path: []string{"gw_0000000000000001"}, Count: maxGatewayHops - 1}
-	if _, looped := checkGatewayHop(below, gwID); looped {
+	if _, looped := checkGatewayHop(below, gwID, maxGatewayHops); looped {
 		t.Fatal("a chain below the limit must pass")
+	}
+}
+
+// 上限可配置后：同一跳数在不同配置下的判定要跟着配置走，且上限收在天花板内。
+func TestGatewayLoopDetectionFollowsConfiguredLimit(t *testing.T) {
+	// 配成 5：3 跳的链路（默认配置下的 508）现在放行。
+	if _, looped := checkGatewayHop(gatewayHop{Path: []string{"gw_0000000000000001", "gw_0000000000000002", "gw_0000000000000003"}, Count: 3}, gwID, 5); looped {
+		t.Fatal("a 3-hop chain must pass when the limit is raised to 5")
+	}
+	// 配成 2：2 跳的链路被拒，且报文报的是新上限。
+	refusal, looped := checkGatewayHop(gatewayHop{Path: []string{"gw_0000000000000001", "gw_0000000000000002"}, Count: 2}, gwID, 2)
+	if !looped {
+		t.Fatal("a 2-hop chain must be refused when the limit is 2")
+	}
+	if !strings.Contains(refusal.Reason, "2 跳上限") {
+		t.Fatalf("refusal must name the configured limit, got %q", refusal.Reason)
+	}
+	// clamp：0 回默认，超过天花板的收进天花板。
+	if got := clampMaxGatewayHops(0); got != maxGatewayHops {
+		t.Fatalf("clamp(0) = %d, want the default %d", got, maxGatewayHops)
+	}
+	if got := clampMaxGatewayHops(-2); got != maxGatewayHops {
+		t.Fatalf("clamp(-2) = %d, want the default %d", got, maxGatewayHops)
+	}
+	if got := clampMaxGatewayHops(99); got != maxGatewayHopsCeiling {
+		t.Fatalf("clamp(99) = %d, want the ceiling %d", got, maxGatewayHopsCeiling)
+	}
+	// Router 的读写对：存进去的值经 clamp 收敛，读出来一致。
+	router := NewRouter(domain.GatewayState{})
+	if got := router.MaxGatewayHops(); got != maxGatewayHops {
+		t.Fatalf("fresh router MaxGatewayHops = %d, want %d", got, maxGatewayHops)
+	}
+	router.SetMaxGatewayHops(5)
+	if got := router.MaxGatewayHops(); got != 5 {
+		t.Fatalf("MaxGatewayHops after set(5) = %d, want 5", got)
+	}
+	router.SetMaxGatewayHops(99)
+	if got := router.MaxGatewayHops(); got != maxGatewayHopsCeiling {
+		t.Fatalf("MaxGatewayHops after set(99) = %d, want the ceiling", got)
+	}
+	router.SetMaxGatewayHops(0)
+	if got := router.MaxGatewayHops(); got != maxGatewayHops {
+		t.Fatalf("MaxGatewayHops after set(0) = %d, want the default", got)
 	}
 }
 
 // 身份未知时一律放行：初始化失败不该让所有透传流量都挂掉。
 func TestGatewayLoopDetectionPassesWhenIdentityUnknown(t *testing.T) {
 	hop := gatewayHop{Path: []string{gwID}, Count: 1}
-	if _, looped := checkGatewayHop(hop, ""); looped {
+	if _, looped := checkGatewayHop(hop, "", maxGatewayHops); looped {
 		t.Fatal("without a self id there is nothing to compare against")
 	}
 }

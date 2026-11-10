@@ -30,6 +30,7 @@ func TestRequestLogPeerColumnsRoundTrip(t *testing.T) {
 		PeerGatewayID: "gw_aaaaaaaaaaaaaaaa",
 		PeerDirection: "ingress",
 		PeerOrigin:    "gw_aaaaaaaaaaaaaaaa",
+		PeerPath:      "gw_aaaaaaaaaaaaaaaa,gw_mmmmmmmmmmmmmmmm",
 		Analysis:      monitor.RequestAnalysis{SessionID: "sess-peer"},
 		RequestBody:   `{"model":"claude-3"}`,
 		ResponseBody:  `{"ok":true}`,
@@ -51,12 +52,12 @@ func TestRequestLogPeerColumnsRoundTrip(t *testing.T) {
 	}
 	// 按时间倒序：第一条是本地请求，第二条是透传请求。
 	local, peer := page.Items[0], page.Items[1]
-	if local.Ingress != "" || local.Egress != "" || local.PeerGatewayID != "" {
+	if local.Ingress != "" || local.Egress != "" || local.PeerGatewayID != "" || local.PeerPath != "" {
 		t.Fatalf("a local request must leave the peer columns empty, got %+v", local)
 	}
 	if peer.Ingress != peerLog.Ingress || peer.Egress != peerLog.Egress ||
 		peer.PeerGatewayID != peerLog.PeerGatewayID || peer.PeerDirection != peerLog.PeerDirection ||
-		peer.PeerOrigin != peerLog.PeerOrigin {
+		peer.PeerOrigin != peerLog.PeerOrigin || peer.PeerPath != peerLog.PeerPath {
 		t.Fatalf("summary scan lost peer columns: %+v", peer)
 	}
 
@@ -66,7 +67,8 @@ func TestRequestLogPeerColumnsRoundTrip(t *testing.T) {
 		t.Fatalf("query with bodies: %v", err)
 	}
 	if got := withBodies.Items[1]; got.Ingress != peerLog.Ingress || got.PeerGatewayID != peerLog.PeerGatewayID ||
-		got.PeerDirection != peerLog.PeerDirection || got.PeerOrigin != peerLog.PeerOrigin {
+		got.PeerDirection != peerLog.PeerDirection || got.PeerOrigin != peerLog.PeerOrigin ||
+		got.PeerPath != peerLog.PeerPath {
 		t.Fatalf("body scan lost peer columns: %+v", got)
 	}
 	if withBodies.Items[1].RequestBody == "" {
@@ -83,7 +85,7 @@ func TestRequestLogPeerColumnsRoundTrip(t *testing.T) {
 	}
 	if detail.Ingress != peerLog.Ingress || detail.Egress != peerLog.Egress ||
 		detail.PeerGatewayID != peerLog.PeerGatewayID || detail.PeerDirection != peerLog.PeerDirection ||
-		detail.PeerOrigin != peerLog.PeerOrigin {
+		detail.PeerOrigin != peerLog.PeerOrigin || detail.PeerPath != peerLog.PeerPath {
 		t.Fatalf("detail scan lost peer columns: %+v", detail)
 	}
 	if detail.ResponseBody != peerLog.ResponseBody {
@@ -155,7 +157,7 @@ func TestRequestLogPeerColumnsAddedToExistingDatabase(t *testing.T) {
 		t.Fatalf("got %d rows, want the 1 legacy row", len(page.Items))
 	}
 	if item := page.Items[0]; item.Ingress != "" || item.Egress != "" || item.PeerGatewayID != "" ||
-		item.PeerDirection != "" || item.PeerOrigin != "" {
+		item.PeerDirection != "" || item.PeerOrigin != "" || item.PeerPath != "" {
 		t.Fatalf("a legacy row must read back as empty, got %+v", item)
 	}
 

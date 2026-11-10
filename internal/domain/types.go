@@ -947,6 +947,10 @@ type GatewayState struct {
 	// 空 = 只允许本机与内网来源。注册是唯一不需要已有凭据的入口，所以它是整条
 	// 链路上最该收紧的地方；显式配置后只认白名单，内网默认值不再生效。
 	PeerRegistrationAllowCIDRs string `json:"peerRegistrationAllowCidrs,omitempty"`
+	// MaxGatewayHops 是一条链路允许经过的网关数量上限（1..8）。0 = 默认 3。
+	// 链路上的每台网关都按自己这份配置判断，超限的透传在 508 被拒；
+	// 想组更长的多级链路（内网 → 公网 → 公网）就把它调大。
+	MaxGatewayHops int `json:"maxGatewayHops,omitempty"`
 	// UsageBatchMaxSize / UsageBatchMaxWaitSeconds tune how the async usage
 	// worker batches usage_daily_buckets commits. Larger values mean fewer,
 	// bigger commits (less disk wear) at the cost of a longer window whose

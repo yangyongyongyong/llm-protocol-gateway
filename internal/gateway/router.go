@@ -152,6 +152,34 @@ func (r *Router) PeerRegistrationAllowCIDRs() string {
 	return strings.TrimSpace(r.state.PeerRegistrationAllowCIDRs)
 }
 
+// SetMaxGatewayHops 设置链路跳数上限（1..8）。0 恢复默认 3。
+func (r *Router) SetMaxGatewayHops(hops int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.MaxGatewayHops = clampMaxGatewayHops(hops)
+}
+
+// MaxGatewayHops 返回当前跳数上限。配置缺失（0）时用默认值。
+func (r *Router) MaxGatewayHops() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return clampMaxGatewayHops(r.state.MaxGatewayHops)
+}
+
+// clampMaxGatewayHops 把配置收进合法区间。0 表示"没配过"而不是"0 跳"：
+// 没有哪个部署真的想要 0 跳（那会拒掉一切透传），所以它回到默认值。
+// 上限 8 是刻意的：与旧版共用常量上限之外，更大只是给配置错误留出更长的
+// 等待窗口，每跳都占着两边的连接。
+func clampMaxGatewayHops(hops int) int {
+	if hops <= 0 {
+		return maxGatewayHops
+	}
+	if hops > maxGatewayHopsCeiling {
+		return maxGatewayHopsCeiling
+	}
+	return hops
+}
+
 func (r *Router) SetUsageBatchConfig(maxSize, maxWaitSeconds int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

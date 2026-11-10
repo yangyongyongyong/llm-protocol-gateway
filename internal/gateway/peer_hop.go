@@ -28,12 +28,16 @@ const (
 	headerGatewayOrigin = "X-Gateway-Origin"
 )
 
-// maxGatewayHops 是一条链路允许经过的网关数量上限。
+// maxGatewayHops 是一条链路允许经过的网关数量的默认上限。
 //
 // 3 是刻意的：真实场景是"内网网关 → 一个公网网关"，再往上就是少见的多级
 // 中转了。给到 8 会让一个配置错误在超时前跑很久，而且每跳都占着两边的连接。
 // 这个值也写进界面提示，运维配错时能直接看到限制在哪。
 const maxGatewayHops = 3
+
+// maxGatewayHopsCeiling 是跳数上限的配置天花板。可配置（1..8）是为了放行
+// 真实的多级链路；超过 8 只是给配置错误留出更长的等待窗口，没有部署需要。
+const maxGatewayHopsCeiling = 8
 
 // peerEndpointPrefix 是对端网关专用的接口前缀。
 //
@@ -88,8 +92,9 @@ type loopRefusal struct {
 // checkGatewayHop 判断这次请求是否构成环或超出跳数上限。
 //
 // selfID 是本网关身份；为空时（身份还没初始化）放行——宁可漏掉一次环路
-// 检测，也不要在身份未知时拒绝所有透传流量。
-func checkGatewayHop(hop gatewayHop, selfID string) (loopRefusal, bool) {
+// 检测，也不要在身份未知时拒绝所有透传流量。limit 是本机的跳数上限（可配），
+// 每台网关按自己的配置判断。
+func checkGatewayHop(hop gatewayHop, selfID string, limit int) (loopRefusal, bool) {
 	selfID = strings.TrimSpace(selfID)
 	if selfID != "" {
 		for _, id := range hop.Path {
@@ -101,13 +106,13 @@ func checkGatewayHop(hop gatewayHop, selfID string) (loopRefusal, bool) {
 			}
 		}
 	}
-	if hop.Count >= maxGatewayHops {
+	if hop.Count >= limit {
 		chain := strings.Join(hop.Path, " → ")
 		if chain == "" {
 			chain = fmt.Sprintf("%d 跳", hop.Count)
 		}
 		return loopRefusal{
-			Reason: fmt.Sprintf("网关链路超过 %d 跳上限", maxGatewayHops),
+			Reason: fmt.Sprintf("网关链路超过 %d 跳上限", limit),
 			Chain:  chain,
 		}, true
 	}
@@ -172,12 +177,21 @@ func (s *Server) withGatewayLoopGuard(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if refusal, looped := checkGatewayHop(hop, s.gatewayIdentityFromR(r)); looped {
+		if refusal, looped := checkGatewayHop(hop, s.gatewayIdentityFromR(r), s.maxGatewayHopsConfigured()); looped {
 			s.rejectGatewayLoop(w, r, refusal)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// maxGatewayHopsConfigured 返回当前生效的跳数上限（可配置，默认 3）。
+// Router 为 nil（极端的测试场景）时退回默认值，而不是 panic。
+func (s *Server) maxGatewayHopsConfigured() int {
+	if s == nil || s.router == nil {
+		return maxGatewayHops
+	}
+	return s.router.MaxGatewayHops()
 }
 
 // carriesModelTraffic 判断这条路径是否承载模型请求——只有这些路径需要做环

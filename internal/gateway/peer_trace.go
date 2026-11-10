@@ -26,6 +26,10 @@ type peerTrace struct {
 	Egress string
 	// Origin 是发起方网关 ID（X-Gateway-Origin 的值）。
 	Origin string
+	// Path 是这次请求已经过的网关 ID 链（X-Gateway-Path，从发起方开始，不含
+	// 本机）。Origin 只指向起点，Path 能回答"中间到底绕了几道"——三级及
+	// 以上链路里它才是排障时真正要看的。
+	Path []string
 }
 
 // peerGatewayID 返回这次请求要对账的那个对端网关。
@@ -56,7 +60,8 @@ func (t peerTrace) peerDirection() string {
 }
 
 func (t peerTrace) isEmpty() bool {
-	return strings.TrimSpace(t.Ingress) == "" && strings.TrimSpace(t.Egress) == "" && strings.TrimSpace(t.Origin) == ""
+	return strings.TrimSpace(t.Ingress) == "" && strings.TrimSpace(t.Egress) == "" &&
+		strings.TrimSpace(t.Origin) == "" && len(t.Path) == 0
 }
 
 func withPeerTrace(ctx context.Context, trace peerTrace) context.Context {
@@ -102,6 +107,12 @@ func withIngressPeer(r *http.Request, peerGatewayID string) *http.Request {
 // 才拿得到（sendPeerDoor），而那时已经在每个协议各自的 send 闭包深处，换出去
 // 的 *http.Request 传不回最外层的写日志处。requestTiming 在 handler 入口挂好、
 // 写日志时再读，正是这种值该待的地方。两个来源都空就是纯本地请求。
+//
+// Path 直接从请求头解析而不是走 context：链路头随请求到达，写日志时 r 还在
+// 手边，没必要再多一层传递。但它只在确认是透传流量（有校验过的 ingress 或
+// egress）时才记——链路头是外部可写的，本地请求随手带一个同名头（浏览器插件
+// 就干得出来）不能凭空造出一条链路日志。两级链路里 Ingress/Origin 已经足够，
+// Path 是给三级及以上的排障看的。
 func peerTraceFor(r *http.Request, timing *requestTiming) peerTrace {
 	var trace peerTrace
 	if r != nil {
@@ -112,6 +123,9 @@ func peerTraceFor(r *http.Request, timing *requestTiming) peerTrace {
 		if trace.Origin == "" && r != nil {
 			trace.Origin = strings.TrimSpace(r.Header.Get(headerGatewayOrigin))
 		}
+	}
+	if r != nil && (trace.Ingress != "" || trace.Egress != "") && len(trace.Path) == 0 {
+		trace.Path = parseGatewayHop(r).Path
 	}
 	return trace
 }
@@ -127,4 +141,7 @@ func applyPeerTrace(entry *monitor.RequestLog, trace peerTrace) {
 	entry.PeerGatewayID = trace.peerGatewayID()
 	entry.PeerDirection = trace.peerDirection()
 	entry.PeerOrigin = strings.TrimSpace(trace.Origin)
+	if len(trace.Path) > 0 {
+		entry.PeerPath = strings.Join(trace.Path, ",")
+	}
 }

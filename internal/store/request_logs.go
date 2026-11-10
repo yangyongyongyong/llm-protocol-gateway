@@ -72,9 +72,9 @@ const requestLogInsertSQL = `INSERT INTO request_logs (
 	status, input_tokens, output_tokens, cache_tokens, cache_write_tokens, cost_micros, priced, latency_ms, ttft_ms,
 	prep_ms, pre_upstream_ms, upstream_ttfb_ms, gateway_overhead_ms, convert_out_ms, post_ms, timing_flags,
 	client_host, client_ip, access_source, reasoning_effort,
-	ingress, egress, peer_gateway_id, peer_direction, peer_origin,
+	ingress, egress, peer_gateway_id, peer_direction, peer_origin, peer_path,
 	error_description, request_body, response_body, analysis_json
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 func requestLogInsertArgs(log monitor.RequestLog) []any {
 	analysis, _ := json.Marshal(log.Analysis)
@@ -113,6 +113,7 @@ func requestLogInsertArgs(log monitor.RequestLog) []any {
 		log.PeerGatewayID,
 		log.PeerDirection,
 		log.PeerOrigin,
+		log.PeerPath,
 		log.ErrorDescription,
 		log.RequestBody,
 		log.ResponseBody,
@@ -449,7 +450,7 @@ func (s *Store) QueryRequestLogs(query monitor.RequestLogQuery) (monitor.Request
 		status, input_tokens, output_tokens, cache_tokens, cache_write_tokens, cost_micros, priced, latency_ms, ttft_ms,
 		prep_ms, pre_upstream_ms, upstream_ttfb_ms, gateway_overhead_ms, convert_out_ms, post_ms, timing_flags,
 		client_host, client_ip, access_source, reasoning_effort,
-		ingress, egress, peer_gateway_id, peer_direction, peer_origin,
+		ingress, egress, peer_gateway_id, peer_direction, peer_origin, peer_path,
 		error_description, analysis_json`
 	if query.IncludeBodies {
 		selectCols += `, request_body, response_body`
@@ -488,7 +489,7 @@ func (s *Store) RequestLogByID(id int64) (monitor.RequestLog, bool, error) {
 		status, input_tokens, output_tokens, cache_tokens, cache_write_tokens, cost_micros, priced, latency_ms, ttft_ms,
 		prep_ms, pre_upstream_ms, upstream_ttfb_ms, gateway_overhead_ms, convert_out_ms, post_ms, timing_flags,
 		client_host, client_ip, access_source, reasoning_effort,
-		ingress, egress, peer_gateway_id, peer_direction, peer_origin,
+		ingress, egress, peer_gateway_id, peer_direction, peer_origin, peer_path,
 		error_description, analysis_json, request_body, response_body
 		FROM request_logs WHERE id = ?`, id)
 	item, err := scanRequestLog(row)
@@ -505,7 +506,7 @@ func scanRequestLog(rows rowScanner) (monitor.RequestLog, error) {
 	var item monitor.RequestLog
 	var timeValue, analysis string
 	var ttft, prep, preUp, upTTFB, overhead, convertOut, post sql.NullInt64
-	var timingFlags, clientHost, clientIP, accessSource, reasoning, ingress, egress, peerGateway, peerDirection, peerOrigin sql.NullString
+	var timingFlags, clientHost, clientIP, accessSource, reasoning, ingress, egress, peerGateway, peerDirection, peerOrigin, peerPath sql.NullString
 	var pricedValue int
 	if err := rows.Scan(
 		&item.ID,
@@ -543,6 +544,7 @@ func scanRequestLog(rows rowScanner) (monitor.RequestLog, error) {
 		&peerGateway,
 		&peerDirection,
 		&peerOrigin,
+		&peerPath,
 		&item.ErrorDescription,
 		&analysis,
 		&item.RequestBody,
@@ -554,7 +556,7 @@ func scanRequestLog(rows rowScanner) (monitor.RequestLog, error) {
 		return monitor.RequestLog{}, fmt.Errorf("decode request analysis: %w", err)
 	}
 	item.Priced = pricedValue != 0
-	applyRequestLogScan(&item, timeValue, ttft, prep, preUp, upTTFB, overhead, convertOut, post, timingFlags, clientHost, clientIP, accessSource, reasoning, ingress, egress, peerGateway, peerDirection, peerOrigin)
+	applyRequestLogScan(&item, timeValue, ttft, prep, preUp, upTTFB, overhead, convertOut, post, timingFlags, clientHost, clientIP, accessSource, reasoning, ingress, egress, peerGateway, peerDirection, peerOrigin, peerPath)
 	return item, nil
 }
 
@@ -562,7 +564,7 @@ func scanRequestLogSummary(rows rowScanner) (monitor.RequestLog, error) {
 	var item monitor.RequestLog
 	var timeValue, analysis string
 	var ttft, prep, preUp, upTTFB, overhead, convertOut, post sql.NullInt64
-	var timingFlags, clientHost, clientIP, accessSource, reasoning, ingress, egress, peerGateway, peerDirection, peerOrigin sql.NullString
+	var timingFlags, clientHost, clientIP, accessSource, reasoning, ingress, egress, peerGateway, peerDirection, peerOrigin, peerPath sql.NullString
 	var pricedValue int
 	if err := rows.Scan(
 		&item.ID,
@@ -600,6 +602,7 @@ func scanRequestLogSummary(rows rowScanner) (monitor.RequestLog, error) {
 		&peerGateway,
 		&peerDirection,
 		&peerOrigin,
+		&peerPath,
 		&item.ErrorDescription,
 		&analysis,
 	); err != nil {
@@ -609,7 +612,7 @@ func scanRequestLogSummary(rows rowScanner) (monitor.RequestLog, error) {
 		return monitor.RequestLog{}, fmt.Errorf("decode request analysis: %w", err)
 	}
 	item.Priced = pricedValue != 0
-	applyRequestLogScan(&item, timeValue, ttft, prep, preUp, upTTFB, overhead, convertOut, post, timingFlags, clientHost, clientIP, accessSource, reasoning, ingress, egress, peerGateway, peerDirection, peerOrigin)
+	applyRequestLogScan(&item, timeValue, ttft, prep, preUp, upTTFB, overhead, convertOut, post, timingFlags, clientHost, clientIP, accessSource, reasoning, ingress, egress, peerGateway, peerDirection, peerOrigin, peerPath)
 	return item, nil
 }
 
@@ -617,7 +620,7 @@ func applyRequestLogScan(
 	item *monitor.RequestLog,
 	timeValue string,
 	ttft, prep, preUp, upTTFB, overhead, convertOut, post sql.NullInt64,
-	timingFlags, clientHost, clientIP, accessSource, reasoning, ingress, egress, peerGateway, peerDirection, peerOrigin sql.NullString,
+	timingFlags, clientHost, clientIP, accessSource, reasoning, ingress, egress, peerGateway, peerDirection, peerOrigin, peerPath sql.NullString,
 ) {
 	parsed, parseErr := time.Parse(time.RFC3339Nano, timeValue)
 	if parseErr != nil {
@@ -677,6 +680,9 @@ func applyRequestLogScan(
 	if peerOrigin.Valid {
 		item.PeerOrigin = peerOrigin.String
 	}
+	if peerPath.Valid {
+		item.PeerPath = peerPath.String
+	}
 }
 
 func ensureRequestLogsTable(tx *sql.Tx) error {
@@ -708,6 +714,7 @@ func ensureRequestLogsTable(tx *sql.Tx) error {
 		peer_gateway_id TEXT NOT NULL DEFAULT '',
 		peer_direction TEXT NOT NULL DEFAULT '',
 		peer_origin TEXT NOT NULL DEFAULT '',
+		peer_path TEXT NOT NULL DEFAULT '',
 		error_description TEXT NOT NULL DEFAULT '',
 		request_body TEXT NOT NULL DEFAULT '',
 		response_body TEXT NOT NULL DEFAULT ''
@@ -740,6 +747,7 @@ func ensureRequestLogsTable(tx *sql.Tx) error {
 		{"peer_gateway_id", "TEXT NOT NULL DEFAULT ''"},
 		{"peer_direction", "TEXT NOT NULL DEFAULT ''"},
 		{"peer_origin", "TEXT NOT NULL DEFAULT ''"},
+		{"peer_path", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		if err := addColumnIfMissing(tx, "request_logs", col.name, col.def); err != nil {
 			return fmt.Errorf("request_logs.%s: %w", col.name, err)

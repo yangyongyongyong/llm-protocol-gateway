@@ -3,6 +3,7 @@ import {API_BASE, protocolLabel} from '../lib';
 import {Badge, Field, Modal} from './ui';
 import {confirmDialog} from '../dialogs';
 import {IconSelect, IconSelectOption} from './selects';
+import type {GrantTarget} from './rbac_types';
 import type {PeerGateway, PeerUpstream, PeerUpstreamsResponse, PeersResponse, Protocol} from '../types';
 
 async function errorTextFrom(response: Response): Promise<string> {
@@ -111,10 +112,14 @@ export function PeersPage({
   const [peers, setPeers] = useState<PeerGateway[]>([]);
   const [localGatewayId, setLocalGatewayId] = useState('');
   const [maxHops, setMaxHops] = useState(0);
+  const [maxHopsDraft, setMaxHopsDraft] = useState('');
+  const [maxHopsSaving, setMaxHopsSaving] = useState(false);
   const [allowCidrs, setAllowCidrs] = useState('');
   const [allowsPrivate, setAllowsPrivate] = useState(true);
   const [peersLoading, setPeersLoading] = useState(true);
   const [peersError, setPeersError] = useState('');
+  /** 正在调授权的下游网关；null = 关闭。 */
+  const [grantsPeer, setGrantsPeer] = useState<PeerGateway | null>(null);
 
   const [draft, setDraft] = useState<UpstreamDraft | null>(null);
   const [draftError, setDraftError] = useState('');
@@ -146,6 +151,7 @@ export function PeersPage({
       setPeers(payload.peers || []);
       setLocalGatewayId(payload.gatewayId || '');
       setMaxHops(payload.maxHops || 0);
+      setMaxHopsDraft(String(payload.maxHops || 0));
       setAllowCidrs(payload.registrationAllowCidrs || '');
       setAllowsPrivate(payload.registrationAllowsPrivate ?? true);
       setPeersError('');
@@ -259,6 +265,31 @@ export function PeersPage({
       setPeersError('');
     } catch (error) {
       setPeersError((error as Error).message);
+    }
+  };
+
+  // 跳数上限：0（空）= 恢复默认 3。后端 clamp 到 1..8，界面上不需要再拦一遍。
+  const saveMaxHops = async () => {
+    const trimmed = maxHopsDraft.trim();
+    const hops = trimmed === '' ? 0 : Number(trimmed);
+    if (Number.isNaN(hops) || hops < 0) {
+      setPeersError('跳数上限要是一个数字（1–8，留空恢复默认 3）');
+      return;
+    }
+    setMaxHopsSaving(true);
+    try {
+      const payload = await jsonRequest<{ hops: number }>(`${API_BASE}/__settings/peer-max-hops`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hops }),
+      });
+      setMaxHops(payload.hops || 0);
+      setMaxHopsDraft(String(payload.hops || 0));
+      setPeersError('');
+    } catch (error) {
+      setPeersError((error as Error).message);
+    } finally {
+      setMaxHopsSaving(false);
     }
   };
 
@@ -423,6 +454,15 @@ export function PeersPage({
                     <div className="hint-text">最近 {formatTime(peer.lastSeenAt)}</div>
                   </div>
                   <div className="peer-upstream-actions">
+                    {canManage ? (
+                      <button
+                        className="mini-btn"
+                        type="button"
+                        onClick={() => setGrantsPeer(peer)}
+                      >
+                        调授权
+                      </button>
+                    ) : null}
                     {canManage && peer.keyEnabled ? (
                       <button
                         className="mini-btn danger"
@@ -451,13 +491,41 @@ export function PeersPage({
                 rows={2}
                 onChange={(value) => setAllowCidrs(value)}
               />
+              <Field
+                fullWidth
+                label="链路跳数上限"
+                hint={`透传请求最多经过多少台网关（1–8，留空恢复默认 ${maxHops || 3}）。真实的多级链路（内网 → 公网 → 公网）走不通时可以调大；调小则在本机这一段更早拦住被伪造或误配的长链。`}
+                value={maxHopsDraft}
+                placeholder="3"
+                onChange={(value) => setMaxHopsDraft(value.replace(/[^\d]/g, ''))}
+              />
               <div className="peer-cidr-actions">
                 <span className="hint-text">链路最多经过 {maxHops || 3} 跳；再有下一跳会被拒绝，避免父子互相绕成环。</span>
                 <button className="btn" type="button" onClick={() => void saveCidrs(allowCidrs)}>保存来源限制</button>
+                <button
+                  className="btn"
+                  type="button"
+                  disabled={maxHopsSaving || maxHopsDraft.trim() === String(maxHops || 0)}
+                  onClick={() => void saveMaxHops()}
+                >
+                  {maxHopsSaving ? '保存中…' : '保存跳数上限'}
+                </button>
               </div>
             </div>
           ) : null}
         </div>
+      ) : null}
+
+      {grantsPeer ? (
+        <PeerGrantsModal
+          peer={grantsPeer}
+          onClose={() => setGrantsPeer(null)}
+          onSaved={async () => {
+            setGrantsPeer(null);
+            await loadPeers();
+          }}
+          onToast={(text) => setPeersError(text)}
+        />
       ) : null}
 
       {draft ? (
@@ -548,6 +616,158 @@ function UpstreamDraftModal({
         <button className="btn" type="button" onClick={onClose} disabled={saving}>取消</button>
         <button className="btn primary" type="button" onClick={onSubmit} disabled={saving}>
           {saving ? '注册中…' : editing ? '重新注册' : '注册'}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+/**
+ * 调整一个已注册下游网关的授权（按层授权的编辑入口）。
+ *
+ * 注册时的预置授权只是一次快照；上游随时可以新增或收回，立即生效、不需要
+ * 下游重新注册。清单与用户管理页的「分配 Provider」同一份来源
+ * （/__roles/grant-targets），交互样式也保持一致，管理员两边看到的是同一件事。
+ * 空列表 = 收回全部授权，下游下一次请求就拿不到任何 provider，弹窗里明说。
+ */
+function PeerGrantsModal({ peer, onClose, onSaved, onToast }: {
+  peer: PeerGateway;
+  onClose: () => void;
+  onSaved: () => Promise<void>;
+  onToast: (text: string) => void;
+}) {
+  const [granted, setGranted] = useState<string[]>(peer.grantedProviderIds || []);
+  const [targets, setTargets] = useState<GrantTarget[]>([]);
+  const [keyword, setKeyword] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
+  const [saving, setSaving] = useState(false);
+  const label = peer.name?.trim() || peer.username;
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setLoadError('');
+    jsonRequest<GrantTarget[]>(`${API_BASE}/__roles/grant-targets`)
+      .then((list) => { if (!cancelled) setTargets(list || []); })
+      .catch((error) => { if (!cancelled) setLoadError((error as Error).message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const grantedSet = useMemo(() => new Set(granted), [granted]);
+  const visibleTargets = useMemo(() => {
+    const word = keyword.trim().toLowerCase();
+    if (!word) return targets;
+    return targets.filter((target) =>
+      target.name.toLowerCase().includes(word) || target.ownerName.toLowerCase().includes(word));
+  }, [targets, keyword]);
+  const allVisibleSelected = visibleTargets.length > 0 && visibleTargets.every((target) => grantedSet.has(target.id));
+
+  function toggleGrant(id: string, on: boolean) {
+    setGranted((current) => on
+      ? Array.from(new Set([...current, id]))
+      : current.filter((item) => item !== id));
+  }
+
+  function toggleAllVisible(on: boolean) {
+    const ids = visibleTargets.map((target) => target.id);
+    setGranted((current) => (on
+      ? Array.from(new Set([...current, ...ids]))
+      : current.filter((id) => !ids.includes(id))));
+  }
+
+  async function submit() {
+    setSaving(true);
+    try {
+      await jsonRequest(`${API_BASE}/__peers/${encodeURIComponent(peer.userId)}/grants`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ providerIds: granted }),
+      });
+      await onSaved();
+    } catch (error) {
+      onToast((error as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Modal
+      title={`调整下游网关授权：${label}`}
+      description="勾选它能透传到哪些 Provider，取消勾选立即收回。改动立即生效，不需要它重新注册。"
+      size="wide"
+      onClose={onClose}
+    >
+      {loading ? <div className="empty-state compact">加载中…</div> : null}
+      {loadError ? <div className="rbac-form-error">{loadError}</div> : null}
+      {!loading && !loadError && targets.length === 0 ? (
+        <div className="empty-state compact">本机还没有可授权的输入 Provider。</div>
+      ) : null}
+      {targets.length > 0 ? (
+        <>
+          <div className="rbac-grant-toolbar">
+            <div className="rbac-search">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <circle cx="11" cy="11" r="8" />
+                <line x1="21" y1="21" x2="16.65" y2="16.65" />
+              </svg>
+              <input
+                type="search"
+                value={keyword}
+                placeholder="搜索名称或归属账号…"
+                aria-label="搜索可授权的输入 Provider"
+                autoComplete="off"
+                onChange={(event) => setKeyword(event.target.value)}
+              />
+              {keyword ? (
+                <button type="button" className="rbac-search-clear" title="清空搜索" onClick={() => setKeyword('')}>×</button>
+              ) : null}
+            </div>
+            <button
+              type="button"
+              className="btn secondary rbac-grant-all"
+              disabled={visibleTargets.length === 0}
+              title={keyword.trim() ? '只作用于当前搜索到的结果' : '勾选全部可授权的 Provider'}
+              onClick={() => toggleAllVisible(!allVisibleSelected)}
+            >
+              {allVisibleSelected ? '取消全选' : '全选'}
+              {keyword.trim() ? `（${visibleTargets.length}）` : ''}
+            </button>
+          </div>
+          {visibleTargets.length === 0 ? (
+            <div className="empty-state compact">没有匹配「{keyword.trim()}」的 Provider。</div>
+          ) : (
+            <div className="rbac-grant-list">
+              {visibleTargets.map((target) => {
+                const checked = grantedSet.has(target.id);
+                return (
+                  <button
+                    key={target.id}
+                    type="button"
+                    role="checkbox"
+                    aria-checked={checked}
+                    className={`rbac-grant-item${checked ? ' checked' : ''}`}
+                    onClick={() => toggleGrant(target.id, !checked)}
+                  >
+                    <span className={`provider-checklist-box${checked ? ' on' : ''}`} aria-hidden="true">{checked ? '✓' : ''}</span>
+                    <span className="rbac-grant-name" title={target.name}>{target.name}</span>
+                    <span className="rbac-grant-owner" title={`归属：${target.ownerName}`}>归属 {target.ownerName}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+          {granted.length === 0 ? (
+            <div className="hint-text">不勾选任何 Provider 并保存 = 收回全部授权：它送来的透传请求将拿不到任何 Provider。</div>
+          ) : null}
+        </>
+      ) : null}
+      <div className="actions modal-actions">
+        <button type="button" className="btn" disabled={saving} onClick={onClose}>取消</button>
+        <button type="button" className="btn primary" disabled={saving || loading} onClick={() => void submit()}>
+          {saving ? '保存中…' : '保存授权'}
         </button>
       </div>
     </Modal>

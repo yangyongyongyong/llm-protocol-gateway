@@ -960,6 +960,8 @@ export type LogEntry = {
   peerDirection?: 'ingress' | 'egress' | string;
   /** 三级链路里真正的起点网关（X-Gateway-Origin 一路带过来的）。 */
   peerOrigin?: string;
+  /** 请求已经过的网关 ID 链（发起方开始、不含本机）。三级及以上排障用。 */
+  peerPath?: string;
   errorDescription?: string;
   requestBody?: string;
   responseBody?: string;

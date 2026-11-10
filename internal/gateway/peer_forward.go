@@ -30,7 +30,7 @@ func (s *Server) handlePeerMe(w http.ResponseWriter, r *http.Request) {
 		"userId":             account.User.ID,
 		"username":           account.User.Username,
 		"grantedProviderIds": granted,
-		"maxHops":            maxGatewayHops,
+		"maxHops":            s.maxGatewayHopsConfigured(),
 	})
 }
 

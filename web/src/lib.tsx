@@ -779,6 +779,9 @@ export function shortGatewayId(id: string): string {
  * - ingress  → 下游网关把请求送了进来，本机是它的上游。
  * - egress   → 本机把请求转给了上游网关，本机是它的下游。
  * 三级链路时两者同时出现，此时 peerOrigin 才是真正的起点。
+ *
+ * 超过两级（peerPath 里的网关数 > 1）时悬浮提示给出完整链路：一两级用相邻方
+ * 就能说清，更多级只有完整链能回答"请求到底绕了几道"。
  */
 export function trafficLogPeerChain(log: LogEntry): { text: string; title: string; peered: boolean } {
   const ingress = (log.ingress || '').trim();
@@ -795,6 +798,12 @@ export function trafficLogPeerChain(log: LogEntry): { text: string; title: strin
   if (ingress) lines.push(`来自下游网关 ${ingress}`);
   if (egress) lines.push(`转发至上游网关 ${egress}`);
   if (origin && origin !== ingress) lines.push(`链路起点：${origin}`);
+  // peerPath 是请求已经过的网关（发起方开始、不含本机）。两级链路相邻方已经
+  // 说清，只有更长才需要把它拼成一条完整链展示。
+  const path = (log.peerPath || '').split(',').map((id) => id.trim()).filter(Boolean);
+  if (path.length > 1) {
+    lines.push(`完整链路：${path.join(' → ')} → 本机`);
+  }
   return { text, title: lines.join('\n'), peered: true };
 }
 
@@ -1058,6 +1067,7 @@ export function formatTrafficLogJSON(log: LogEntry, providers: Provider[] = []):
           gatewayId: log.peerGatewayId || undefined,
           direction: log.peerDirection || undefined,
           origin: log.peerOrigin || undefined,
+          path: log.peerPath || undefined,
         }
       : undefined,
     timing: {
@@ -1102,7 +1112,9 @@ export function formatTrafficLogDetail(log: LogEntry, providers: Provider[] = []
   ];
   // 父子网关链路：没有对端就不写这行，普通日志的简报保持原样。
   if (log.ingress || log.egress) {
-    lines.push(`peer: ingress=${log.ingress || '-'} egress=${log.egress || '-'} origin=${log.peerOrigin || '-'}`);
+    const chain = (log.peerPath || '').split(',').map((id) => id.trim()).filter(Boolean);
+    const chainText = chain.length > 1 ? ` path=${chain.join('→')}` : '';
+    lines.push(`peer: ingress=${log.ingress || '-'} egress=${log.egress || '-'} origin=${log.peerOrigin || '-'}${chainText}`);
   }
   if (log.errorDescription) lines.push(`error: ${log.errorDescription}`);
   if (log.requestBody) lines.push('', '--- Request Body ---', formatJsonDisplay(log.requestBody));

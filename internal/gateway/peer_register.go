@@ -261,16 +261,10 @@ func peerKeyName(user domain.User) string {
 	return "网关 " + label
 }
 
-// applyPeerRequestedGrants 首次注册时按请求预置授权，只接受真实存在的、
-// 未删除的 provider，其余静默丢弃（列表本身不可信，也不该让注册失败）。
-func (s *Server) applyPeerRequestedGrants(userID string, requested []string) error {
-	if len(requested) == 0 {
-		return nil
-	}
-	roleStore, ok := s.roleStoreRef()
-	if !ok {
-		return fmt.Errorf("role store is not configured")
-	}
+// validatedPeerGrants 把请求的 provider 列表过滤成真实存在、未删除的那部分。
+// 列表本身不可信（可能来自旧控制台页面缓存），所以不存在的 ID 静默丢弃，
+// 而不是让整单失败。
+func (s *Server) validatedPeerGrants(requested []string) []string {
 	valid := map[string]bool{}
 	for _, provider := range s.router.State().Providers {
 		if provider.Deleted {
@@ -285,7 +279,32 @@ func (s *Server) applyPeerRequestedGrants(userID string, requested []string) err
 			grants = append(grants, id)
 		}
 	}
-	return roleStore.SetResourceGrants(userID, grants)
+	return grants
+}
+
+// applyPeerRequestedGrants 首次注册时按请求预置授权，只接受真实存在的、
+// 未删除的 provider，其余静默丢弃（列表本身不可信，也不该让注册失败）。
+// 空列表意味着"没请求"，保持现状不动——这是注册语义；授权编辑的"清空"
+// 语义在 setPeerGrants。
+func (s *Server) applyPeerRequestedGrants(userID string, requested []string) error {
+	if len(requested) == 0 {
+		return nil
+	}
+	roleStore, ok := s.roleStoreRef()
+	if !ok {
+		return fmt.Errorf("role store is not configured")
+	}
+	return roleStore.SetResourceGrants(userID, s.validatedPeerGrants(requested))
+}
+
+// setPeerGrants 无条件写一个账号的授权：空列表就是收回全部。
+// 授权编辑入口（handleSetPeerGrants）用它，与注册预置的"不动"语义区分开。
+func (s *Server) setPeerGrants(userID string, requested []string) error {
+	roleStore, ok := s.roleStoreRef()
+	if !ok {
+		return fmt.Errorf("role store is not configured")
+	}
+	return roleStore.SetResourceGrants(userID, s.validatedPeerGrants(requested))
 }
 
 // peerRegistrationAllowed 判断这个来源是否允许注册。

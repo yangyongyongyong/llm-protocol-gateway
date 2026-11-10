@@ -7190,6 +7190,11 @@ function App() {
                     {trafficLogDetail.peerOrigin && trafficLogDetail.peerOrigin !== trafficLogDetail.ingress ? (
                       <div className="troubleshoot-row"><span>链路起点网关</span><code>{trafficLogDetail.peerOrigin}</code></div>
                     ) : null}
+                    {/* 三级及以上链路才有意义的完整链：相邻方已经能说清两级，
+                        别让普通两级链路多出一行重复信息。 */}
+                    {(trafficLogDetail.peerPath || '').split(',').map((id) => id.trim()).filter(Boolean).length > 1 ? (
+                      <div className="troubleshoot-row"><span>完整链路</span><code>{(trafficLogDetail.peerPath || '').split(',').map((id) => id.trim()).filter(Boolean).join(' → ')} → 本机</code></div>
+                    ) : null}
                   </div>
 
                   {/* 分组 2: 鉴权与身份 */}

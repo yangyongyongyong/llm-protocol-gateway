@@ -17,8 +17,21 @@ func TestPeerTraceLeavesLocalRequestsClean(t *testing.T) {
 	entry := monitor.RequestLog{}
 	applyPeerTrace(&entry, peerTraceFor(request, newRequestTiming(time.Now())))
 	if entry.Ingress != "" || entry.Egress != "" || entry.PeerGatewayID != "" ||
-		entry.PeerDirection != "" || entry.PeerOrigin != "" {
+		entry.PeerDirection != "" || entry.PeerOrigin != "" || entry.PeerPath != "" {
 		t.Fatalf("a local request must stay clean, got %+v", entry)
+	}
+}
+
+// 链路头是外部可写的（浏览器插件塞同名头是真实发生过的事），本地请求带着它
+// 也不能凭空造出一条链路日志——PeerPath 必须和其它链路字段一样，
+// 只在确认过对端身份的流量上才有值。
+func TestPeerTraceIgnoresSpoofedPathOnLocalTraffic(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	request.Header.Set(headerGatewayPath, otherID+",gw_9999999999999999")
+	entry := monitor.RequestLog{}
+	applyPeerTrace(&entry, peerTraceFor(request, newRequestTiming(time.Now())))
+	if entry.PeerPath != "" {
+		t.Fatalf("a spoofed path on local traffic must not be logged, got %q", entry.PeerPath)
 	}
 }
 
@@ -83,6 +96,33 @@ func TestPeerTracePrefersIngressForAccounting(t *testing.T) {
 	}
 	if entry.PeerGatewayID != "gw_1111111111111111" || entry.PeerDirection != "ingress" {
 		t.Fatalf("accounting must point at the ingress side, got %q/%q", entry.PeerGatewayID, entry.PeerDirection)
+	}
+}
+
+// 三级链路的中间跳要留下完整路径：只有 Ingress/Origin 时排障的人只知道两端，
+// 不知道中间还绕了几道。Path 来自 X-Gateway-Path（发起方开始、不含本机），
+// ingress 与 egress 方向都要记。
+func TestPeerTraceRecordsFullPath(t *testing.T) {
+	// ingress 方向：请求已经过 origin → middle，中间跳在本机看到这条头。
+	in := httptest.NewRequest(http.MethodPost, "/__peer/chat/completions", nil)
+	in.Header.Set(headerGatewayPath, otherID+",gw_mmmmmmmmmmmmmmmm")
+	in.Header.Set(headerGatewayOrigin, otherID)
+	in = withIngressPeer(in, gwID)
+	entry := monitor.RequestLog{}
+	applyPeerTrace(&entry, peerTraceFor(in, newRequestTiming(time.Now())))
+	if entry.PeerPath != otherID+",gw_mmmmmmmmmmmmmmmm" {
+		t.Fatalf("ingress PeerPath = %q, want the full chain", entry.PeerPath)
+	}
+
+	// egress 方向：本机是发起方，头里只有自己；转给父网关后路径同样要留。
+	out := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	out.Header.Set(headerGatewayPath, gwID)
+	timing := newRequestTiming(time.Now())
+	timing.notePeerEgress(otherID)
+	entry = monitor.RequestLog{}
+	applyPeerTrace(&entry, peerTraceFor(out, timing))
+	if entry.PeerPath != gwID {
+		t.Fatalf("egress PeerPath = %q, want the self path", entry.PeerPath)
 	}
 }
 

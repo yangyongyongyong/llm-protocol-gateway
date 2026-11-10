@@ -600,6 +600,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /__peers", s.handleListPeers)
 	mux.HandleFunc("DELETE /__peers/{id}", s.handleRevokePeer)
 	mux.HandleFunc("PATCH /__settings/peer-registration-cidrs", s.handleSetPeerRegistrationCIDRs)
+	mux.HandleFunc("PATCH /__settings/peer-max-hops", s.handleSetPeerMaxHops)
+	// 修改一个已注册下游的授权（按层授权的编辑入口）：注册时的预置授权只是一次
+	// 快照，之后上游随时可以改，立即生效。
+	mux.HandleFunc("PATCH /__peers/{id}/grants", s.handleSetPeerGrants)
 	// 下游侧：本机注册到上游网关，与上面那组是同一张页面的两半——上半是
 	// "谁连到我"，下半是"我连到谁"。凭据（gwpeer-…）落在 provider 的
 	// apiKeySource 上，所以这一组本质是普通的 provider 管理动作，只是包一层，
