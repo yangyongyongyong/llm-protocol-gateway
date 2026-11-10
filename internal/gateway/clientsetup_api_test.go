@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -21,9 +22,15 @@ import (
 func newSetupServer(t *testing.T) *Server {
 	t.Helper()
 	home := t.TempDir()
+	// 用宿主真实的 GOOS，并把各平台的配置根都指进临时目录：这样无论 CI 在
+	// Linux / macOS / Windows 上跑，写出来的都是宿主能真跑的路径，而不是把
+	// macOS 的路径硬套到 Windows 上。
+	for _, key := range []string{"XDG_CONFIG_HOME", "APPDATA", "LOCALAPPDATA"} {
+		t.Setenv(key, filepath.Join(home, ".env", strings.ToLower(key)))
+	}
 	oldHome, oldGOOS := clidesktop.Home, clidesktop.GOOS
 	clidesktop.Home = func() (string, error) { return home, nil }
-	clidesktop.GOOS = "darwin"
+	clidesktop.GOOS = runtime.GOOS
 	t.Cleanup(func() { clidesktop.Home, clidesktop.GOOS = oldHome, oldGOOS })
 
 	router := NewRouter(domain.GatewayState{
@@ -104,8 +111,12 @@ func TestSetupClientsWritesBothClientsForLocalAdmin(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
 	var payload struct {
-		OK    bool   `json:"ok"`
-		Error string `json:"error"`
+		OK     bool   `json:"ok"`
+		Error  string `json:"error"`
+		Result struct {
+			CLIPath     string `json:"cliPath"`
+			DesktopPath string `json:"desktopPath"`
+		} `json:"result"`
 	}
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -114,12 +125,10 @@ func TestSetupClientsWritesBothClientsForLocalAdmin(t *testing.T) {
 		t.Fatalf("ok = false: %s", payload.Error)
 	}
 
-	home, _ := clidesktop.Home()
-
-	// CLI 侧
-	raw, err := os.ReadFile(filepath.Join(home, ".claude", "settings.json"))
+	// CLI 侧：路径由服务自己报出来，测试不去猜宿主的分隔符。
+	raw, err := os.ReadFile(payload.Result.CLIPath)
 	if err != nil {
-		t.Fatalf("CLI settings not written: %v", err)
+		t.Fatalf("CLI settings not written at %q: %v", payload.Result.CLIPath, err)
 	}
 	var cli map[string]any
 	if err := json.Unmarshal(raw, &cli); err != nil {
@@ -133,8 +142,11 @@ func TestSetupClientsWritesBothClientsForLocalAdmin(t *testing.T) {
 		t.Errorf("CLI model = %v", env["ANTHROPIC_MODEL"])
 	}
 
-	// Desktop 侧：profile 与 _meta.json
-	library := filepath.Join(home, "Library", "Application Support", "Claude-3p", "configLibrary")
+	// Desktop 侧：profile 与 _meta.json 都落在服务报告的 3p 目录下。
+	library := filepath.Join(payload.Result.DesktopPath, "configLibrary")
+	if _, err := os.Stat(filepath.Join(library, "_meta.json")); err != nil {
+		t.Fatalf("desktop _meta.json not written under %q: %v", library, err)
+	}
 	entries, err := os.ReadDir(library)
 	if err != nil {
 		t.Fatalf("desktop profile dir not written: %v", err)

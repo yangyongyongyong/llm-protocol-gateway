@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -66,28 +67,41 @@ func claudeSettingsPath(home string) string {
 // ~/Library/Application Support/Claude 与 Claude-3p；Linux 是
 // $XDG_CONFIG_HOME/Claude 与 Claude-3p；Windows 是
 // %APPDATA%\Claude 与 %LOCALAPPDATA%\Claude-3p。
+//
+// 拼接按 goos 走而不是按宿主走：CI 在 Windows 上跑着 darwin 的用例，
+// 用 filepath.Join 会把 macOS 的路径拼成 \Users\luca\Library\...。
 func desktopDirs(goos, home string) (mode, threeP string) {
 	switch goos {
 	case "darwin":
-		base := filepath.Join(home, "Library", "Application Support")
-		return filepath.Join(base, "Claude"), filepath.Join(base, "Claude-3p")
+		base := joinFor(goos, home, "Library", "Application Support")
+		return joinFor(goos, base, "Claude"), joinFor(goos, base, "Claude-3p")
 	case "windows":
 		appData := os.Getenv("APPDATA")
 		if appData == "" {
-			appData = filepath.Join(home, "AppData", "Roaming")
+			appData = joinFor(goos, home, "AppData", "Roaming")
 		}
 		local := os.Getenv("LOCALAPPDATA")
 		if local == "" {
-			local = filepath.Join(home, "AppData", "Local")
+			local = joinFor(goos, home, "AppData", "Local")
 		}
-		return filepath.Join(appData, "Claude"), filepath.Join(local, "Claude-3p")
+		return joinFor(goos, appData, "Claude"), joinFor(goos, local, "Claude-3p")
 	default:
 		cfg := os.Getenv("XDG_CONFIG_HOME")
 		if cfg == "" {
-			cfg = filepath.Join(home, ".config")
+			cfg = joinFor(goos, home, ".config")
 		}
-		return filepath.Join(cfg, "Claude"), filepath.Join(cfg, "Claude-3p")
+		return joinFor(goos, cfg, "Claude"), joinFor(goos, cfg, "Claude-3p")
 	}
+}
+
+// joinFor 按目标系统的分隔符拼路径。生产里 goos 就是宿主，等价于
+// filepath.Join；差别只在测试会在非目标系统上模拟另一套路径。
+func joinFor(goos string, parts ...string) string {
+	joined := path.Join(parts...)
+	if goos == "windows" {
+		return strings.ReplaceAll(joined, "/", `\`)
+	}
+	return joined
 }
 
 // profileID 是我们在 Desktop configLibrary 里的固定 profile id。固定值意味着
@@ -238,13 +252,15 @@ type deskResult struct {
 func applyDesktop(goos, home string, e Endpoint) (deskResult, error) {
 	modeDir, threeP := desktopDirs(goos, home)
 	res := deskResult{path: threeP}
-	res.appPresent = dirExists(filepath.Join(filepath.Dir(modeDir), "Claude"))
+	// 目录已经在了，就说明这台机器装过 Desktop；不在则写出来的配置要等它
+	// 装好并重启才生效，Result.Notes 里会提示。
+	res.appPresent = dirExists(modeDir)
 
-	modeConfig := filepath.Join(modeDir, "claude_desktop_config.json")
-	threePConfig := filepath.Join(threeP, "claude_desktop_config.json")
-	library := filepath.Join(threeP, "configLibrary")
-	meta := filepath.Join(library, "_meta.json")
-	profile := filepath.Join(library, profileID+".json")
+	modeConfig := joinFor(goos, modeDir, "claude_desktop_config.json")
+	threePConfig := joinFor(goos, threeP, "claude_desktop_config.json")
+	library := joinFor(goos, threeP, "configLibrary")
+	meta := joinFor(goos, library, "_meta.json")
+	profile := joinFor(goos, library, profileID+".json")
 
 	// 先确认每个文件都能解析，再动手写：半路失败会留下一个连 Desktop
 	// 自己都打不开的配置。
@@ -260,12 +276,14 @@ func applyDesktop(goos, home string, e Endpoint) (deskResult, error) {
 		if mode, _ := root["deploymentMode"].(string); mode == "3p" && fileExists(f) {
 			continue
 		}
+		// 先记下「原来没有」，再写：写完再问就一定存在了。
+		existed := fileExists(f)
 		root["deploymentMode"] = "3p"
 		backup, err := writeJSONObject(f, root)
 		if err != nil {
 			return res, err
 		}
-		res.made = res.made || !fileExists(f)
+		res.made = res.made || !existed
 		res.changed = true
 		res.backups = append(res.backups, backup)
 	}

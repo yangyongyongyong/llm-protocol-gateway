@@ -15,6 +15,13 @@ import (
 //  2. Desktop：Claude-3p 下 deploymentMode=3p、gateway profile、appliedId；
 //  3. 两端都只碰自己负责的键，其余原样保留，且写前有备份。
 
+// desktop3pDir 用被测函数自己算出来的 macOS 3p 目录：这条测试固定 GOOS=darwin，
+// 期望值也必须走同一套拼接，才能在 Windows 的 CI 上跑出 / 而不是 \。
+func desktop3pDir(home string) string {
+	_, threeP := desktopDirs("darwin", home)
+	return threeP
+}
+
 func withHome(t *testing.T) string {
 	t.Helper()
 	home := t.TempDir()
@@ -166,18 +173,18 @@ func TestApplyDesktopWritesThirdPartyMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	base := filepath.Join(home, "Library", "Application Support")
+	base, threeP := desktopDirs("darwin", home)
 
 	// 两个 config 文件都要有 deploymentMode=3p：Desktop 各家版本读的位置不同。
-	for _, dir := range []string{"Claude", "Claude-3p"} {
-		path := filepath.Join(base, dir, "claude_desktop_config.json")
+	for _, dir := range []string{base, threeP} {
+		path := filepath.Join(dir, "claude_desktop_config.json")
 		root := readJSON(t, path)
 		if root["deploymentMode"] != "3p" {
 			t.Errorf("%s deploymentMode = %v, want 3p", dir, root["deploymentMode"])
 		}
 	}
 
-	profile := readJSON(t, filepath.Join(base, "Claude-3p", "configLibrary", profileID+".json"))
+	profile := readJSON(t, filepath.Join(threeP, "configLibrary", profileID+".json"))
 	want := map[string]any{
 		"inferenceProvider":            "gateway",
 		"inferenceGatewayBaseUrl":      "https://gw.example.com",
@@ -191,7 +198,7 @@ func TestApplyDesktopWritesThirdPartyMode(t *testing.T) {
 		}
 	}
 
-	meta := readJSON(t, filepath.Join(base, "Claude-3p", "configLibrary", "_meta.json"))
+	meta := readJSON(t, filepath.Join(threeP, "configLibrary", "_meta.json"))
 	if meta["appliedId"] != profileID {
 		t.Errorf("appliedId = %v, want %s", meta["appliedId"], profileID)
 	}
@@ -207,7 +214,7 @@ func TestApplyDesktopWritesThirdPartyMode(t *testing.T) {
 // Desktop 目录里已有的 profile 与条目不能丢：用户可能从别的机器导入过配置。
 func TestApplyDesktopKeepsExistingProfiles(t *testing.T) {
 	home := withHome(t)
-	library := filepath.Join(home, "Library", "Application Support", "Claude-3p", "configLibrary")
+	library := filepath.Join(desktop3pDir(home), "configLibrary")
 	if err := os.MkdirAll(library, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -280,21 +287,44 @@ func TestApplyRefusesNonObjectEnv(t *testing.T) {
 }
 
 func TestDesktopDirsPerOS(t *testing.T) {
-	home := "/Users/luca"
+	// 期望值按各自系统的分隔符写死：这条测试的意义正是「拼出来的路要走目标
+	// 系统的分隔符」，不能在 Windows 上跑 darwin 用例时拼出反斜杠。
 	cases := []struct {
 		goos  string
+		home  string
+		env   map[string]string
 		mode  string
 		three string
 	}{
-		{"darwin",
+		{
+			"darwin", "/Users/luca", nil,
 			"/Users/luca/Library/Application Support/Claude",
-			"/Users/luca/Library/Application Support/Claude-3p"},
+			"/Users/luca/Library/Application Support/Claude-3p",
+		},
+		{
+			"linux", "/home/luca", map[string]string{"XDG_CONFIG_HOME": "/home/luca/.config"},
+			"/home/luca/.config/Claude",
+			"/home/luca/.config/Claude-3p",
+		},
+		{
+			"windows", `C:\Users\luca`, map[string]string{
+				"APPDATA":      `C:\Users\luca\AppData\Roaming`,
+				"LOCALAPPDATA": `C:\Users\luca\AppData\Local`,
+			},
+			`C:\Users\luca\AppData\Roaming\Claude`,
+			`C:\Users\luca\AppData\Local\Claude-3p`,
+		},
 	}
 	for _, tc := range cases {
-		mode, three := desktopDirs(tc.goos, home)
-		if mode != tc.mode || three != tc.three {
-			t.Errorf("%s: got (%q, %q), want (%q, %q)", tc.goos, mode, three, tc.mode, tc.three)
-		}
+		t.Run(tc.goos, func(t *testing.T) {
+			for key, value := range tc.env {
+				t.Setenv(key, value)
+			}
+			mode, three := desktopDirs(tc.goos, tc.home)
+			if mode != tc.mode || three != tc.three {
+				t.Errorf("%s: got (%q, %q), want (%q, %q)", tc.goos, mode, three, tc.mode, tc.three)
+			}
+		})
 	}
 }
 
