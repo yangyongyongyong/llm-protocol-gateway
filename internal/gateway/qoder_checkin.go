@@ -154,6 +154,12 @@ func qoderCheckin(ctx context.Context, server *Server, provider domain.Provider,
 	}
 	if len(daily) == 0 {
 		result.Outcome = domain.CheckinInactive
+		// An empty list on a request that could not carry this machine's identity
+		// is the vendor filtering the account, not a day with nothing on offer.
+		if sender.identityNote != "" {
+			result.Message = "活动列表是空的，并且这次请求没能带上本机设备身份（" + sender.identityNote +
+				"）：Qoder 会把无法识别的客户端整条过滤掉。装一次 Qoder 桌面版或用 QODER_RUNTIME_INFO 指到 runtime-info 可执行文件后重试。"
+		}
 		return result, sender.credential
 	}
 
@@ -228,13 +234,21 @@ func qoderCheckin(ctx context.Context, server *Server, provider domain.Provider,
 // token is rotated once and the request made again — the same way the quota read
 // handles it — because Qoder records no lifetime for that token.
 type qoderCampaignSender struct {
-	server       *Server
-	providerID   string
-	site         qoderSite
-	credential   domain.QoderCredential
-	token        string
-	rotatable    bool
+	server     *Server
+	providerID string
+	site       qoderSite
+	credential domain.QoderCredential
+	token      string
+	rotatable  bool
+	// rotationUsed is the one device-token rotation a sender is allowed: the
+	// refresh token it spends is single-use, so a second refusal is the answer.
 	rotationUsed bool
+	// identityNote is why this machine's identity could not be sent, if it could
+	// not: an empty campaign list is the vendor filtering an account it cannot
+	// recognise, and the operator needs to know that rather than think the day's
+	// credits were all claimed.
+	identityNote string
+	headers      map[string]string
 }
 
 func newQoderCampaignSender(server *Server, providerID string, site qoderSite, credential domain.QoderCredential) *qoderCampaignSender {
@@ -243,7 +257,7 @@ func newQoderCampaignSender(server *Server, providerID string, site qoderSite, c
 }
 
 func (sender *qoderCampaignSender) call(ctx context.Context, method, endpoint string, dst any) error {
-	status, err := qoderCampaignCall(ctx, sender.site, method, endpoint, sender.token, sender.credential, dst)
+	status, err := sender.ask(ctx, method, endpoint, dst)
 	if err == nil {
 		return nil
 	}
@@ -253,10 +267,11 @@ func (sender *qoderCampaignSender) call(ctx context.Context, method, endpoint st
 		rotated, refreshErr := sender.server.rotateQoderDeviceTokenFor(ctx, sender.providerID, sender.site, sender.credential)
 		if refreshErr == nil {
 			sender.credential = rotated
+			sender.headers = nil // the identity note may change with the account
 			if token, _ := qoderCampaignToken(rotated); token != "" {
 				sender.token = token
 			}
-			if _, retryErr := qoderCampaignCall(ctx, sender.site, method, endpoint, sender.token, sender.credential, dst); retryErr == nil {
+			if _, retryErr := sender.ask(ctx, method, endpoint, dst); retryErr == nil {
 				return nil
 			}
 		}
@@ -270,6 +285,17 @@ func (sender *qoderCampaignSender) call(ctx context.Context, method, endpoint st
 		}
 	}
 	return err
+}
+
+// ask sends one request with this machine's identity resolved once per sender,
+// keeping the reason when there is none to send.
+func (sender *qoderCampaignSender) ask(ctx context.Context, method, endpoint string, dst any) (int, error) {
+	if sender.headers == nil {
+		machine, note := qoderCampaignMachineIdentity(ctx, sender.site, sender.credential)
+		sender.identityNote = note
+		sender.headers = qoderCampaignHeaders(sender.site, machine)
+	}
+	return qoderCampaignDo(ctx, method, endpoint, sender.headers, sender.token, dst)
 }
 
 func (sender *qoderCampaignSender) failure(err error) checkinResult {
@@ -296,16 +322,12 @@ func qoderCampaignToken(credential domain.QoderCredential) (string, bool) {
 
 // qoderCampaignCall asks one campaigns URL as the account's desktop client.
 //
-// The machine headers are the important part and the easy part to get wrong: the
-// vendor filters the whole campaign list for an account whose request carries a
-// derived machine identity rather than this machine's real one. So the six
-// machine headers go out only when the native helper answered — and on the site
-// that needs them, a request without them is not sent at all.
+// The six machine headers go out when the native helper can name this machine,
+// and are left off when it cannot: a request without them is answered, while a
+// request carrying a made-up identity is filtered. The site that does not ask for
+// them is asked without them.
 func qoderCampaignCall(ctx context.Context, site qoderSite, method, endpoint, bearer string, credential domain.QoderCredential, dst any) (int, error) {
-	machine, err := qoderCampaignMachineIdentity(ctx, site, credential)
-	if err != nil {
-		return 0, err
-	}
+	machine, _ := qoderCampaignMachineIdentity(ctx, site, credential)
 	return qoderCampaignDo(ctx, method, endpoint, qoderCampaignHeaders(site, machine), bearer, dst)
 }
 
@@ -418,14 +440,21 @@ var printableHeaderValue = regexp.MustCompile(`^[\x20-\x7e]+$`)
 // qoderCampaignMachineIdentity is this machine's identity headers for the site
 // the account belongs to, or nothing at all on the site that does not ask.
 //
-// Qoder CN's campaign pages are served without a machine identity; the
-// international site checks it, and a request that cannot carry it is refused
-// before it leaves here rather than answered with a filtered list.
-func qoderCampaignMachineIdentity(ctx context.Context, site qoderSite, credential domain.QoderCredential) (map[string]string, error) {
+// Qoder CN's campaign pages are served without a machine identity. The
+// international site prefers one, but a request without it is answered too — a
+// headless server has no Qoder desktop install to read one from, and refusing to
+// ask at all is how check-in used to fail on every Linux box. The second return
+// says why the identity is missing, so an empty campaign list can explain itself
+// instead of looking like an account with nothing to claim.
+func qoderCampaignMachineIdentity(ctx context.Context, site qoderSite, credential domain.QoderCredential) (map[string]string, string) {
 	if site.AuthType != domain.AuthTypeQoderPAT {
-		return nil, nil
+		return nil, ""
 	}
-	return qoderMachineIdentity(ctx, strings.TrimSpace(credential.UID))
+	headers, err := qoderMachineIdentity(ctx, strings.TrimSpace(credential.UID))
+	if err != nil {
+		return nil, err.Error()
+	}
+	return headers, ""
 }
 
 // qoderMachineIdentity is this machine's identity as Qoder's native helper reads
