@@ -155,6 +155,19 @@ func (s *Server) handleRevokePeer(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// 库里的那一行也要删：对端凭据是逐条 CRUD 落的，不走 saveState。只清内存
+	// 的话进程一重启那把已经吊销的凭据又会回来，等于吊销没发生过。
+	if s.apiKeyStore != nil {
+		for _, key := range s.apiKeyStoreKeys() {
+			if strings.TrimSpace(key.OwnerUserID) != user.ID {
+				continue
+			}
+			if err := s.apiKeyStore.DeleteAPIKey(key.ID); err != nil {
+				writeOpenAIError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
+	}
 	user.Enabled = false
 	if err := s.userStore.UpdateUser(user); err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, err.Error())

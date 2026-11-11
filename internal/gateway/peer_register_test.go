@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/luca/llm-protocol-gateway/internal/domain"
 	"github.com/luca/llm-protocol-gateway/internal/monitor"
+	"github.com/luca/llm-protocol-gateway/internal/store"
 )
 
 // newPeerTestServer 起一个能接受对端注册与透传的最小网关。
@@ -336,6 +338,98 @@ func TestRevokedPeerTokenStopsWorking(t *testing.T) {
 	}
 	if _, err := server.userStore.UserByID(response.UserID); err != nil {
 		t.Fatalf("the account must survive revocation: %v", err)
+	}
+}
+
+// 吊销之后重新注册要能把账号重新启用：界面上「吊销」明说了"重新注册一次就能
+// 恢复"，但注册路径以前只换凭据、从来不碰 Enabled。于是一个被吊销过的下游带着
+// 正确密码重新注册、拿到新凭据，下一次请求仍然被拒——而且它没有任何办法自己
+// 恢复，只能上游管理员去用户管理页手动勾回来。
+func TestPeerReregistrationRestoresRevokedAccount(t *testing.T) {
+	server := newPeerTestServer(t)
+	_, first := peerRegister(t, server, peerRegisterPayload(nil))
+	user, err := server.userStore.UserByID(first.UserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	user.Enabled = false
+	if err := server.userStore.UpdateUser(user); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.router.RemovePeerKeys(first.UserID); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder, second := peerRegister(t, server, peerRegisterPayload(nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("重新注册应当成功：status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if second.Token == first.Token {
+		t.Fatal("重新注册必须换一把新凭据")
+	}
+	me := httptest.NewRequest(http.MethodGet, peerEndpointPrefix+"me", nil)
+	me.Header.Set("Authorization", "Bearer "+second.Token)
+	me.RemoteAddr = "127.0.0.1:40000"
+	meRecorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(meRecorder, me)
+	if meRecorder.Code != http.StatusOK {
+		t.Fatalf("恢复之后新凭据必须能用：status=%d body=%s", meRecorder.Code, meRecorder.Body.String())
+	}
+}
+
+// 对端凭据必须真的落进 api_keys 表，而且只留一把。
+//
+// 这一条盯的是一个"重启才发作"的 bug：换发凭据只改了内存再调 saveState，
+// 而 Store.Save 只重写 providers / models / routes，从不碰 api_keys（密钥页
+// 那些行是逐条 CRUD 的）。于是凭据活在内存里、进程一重启就没了——下游在界面上
+// 看到的是"网关连上了、上游却还没授权任何模型"，只能靠重新注册把自己接回来。
+func TestPeerTokenPersistedToAPIKeyStore(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	server := NewServer(NewRouter(domain.GatewayState{}), monitor.NewStore(), db)
+	server.SetGatewayID(gwID)
+	server.userStore = db
+	server.roles = db
+
+	_, first := peerRegister(t, server, peerRegisterPayload(nil))
+	persisted, err := db.APIKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerKeys := 0
+	for _, key := range persisted {
+		if strings.HasPrefix(key.Key, peerTokenPrefix) {
+			peerKeys++
+			if key.Key != first.Token {
+				t.Fatalf("库里存的凭据必须是发给下游的那一把：got %q", key.Key)
+			}
+			if key.OwnerUserID != first.UserID {
+				t.Fatalf("凭据必须归属对端账号：owner=%q want %q", key.OwnerUserID, first.UserID)
+			}
+		}
+	}
+	if peerKeys != 1 {
+		t.Fatalf("库里应当恰好有一把对端凭据，实际 %d 把", peerKeys)
+	}
+
+	// 重新注册换发之后，库里还是只有一把，而且是新的那把。
+	_, second := peerRegister(t, server, peerRegisterPayload(nil))
+	persisted, err = db.APIKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens := make([]string, 0, 2)
+	for _, key := range persisted {
+		if strings.HasPrefix(key.Key, peerTokenPrefix) {
+			tokens = append(tokens, key.Key)
+		}
+	}
+	if len(tokens) != 1 || tokens[0] != second.Token {
+		t.Fatalf("换发之后库里应当只剩新凭据，实际 %v", tokens)
 	}
 }
 

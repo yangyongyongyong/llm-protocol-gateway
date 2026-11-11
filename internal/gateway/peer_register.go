@@ -140,6 +140,17 @@ func (s *Server) handlePeerRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	s.clearPeerRegisterFailures(r)
 
+	// 吊销过的账号：重新注册就是它的恢复路径（界面上「吊销」写明了这一点），
+	// 所以这里要把它重新启用。凭据还没换发就已经验过用户名密码了，所以这不
+	// 是一条绕过吊销的口子——能走到这里的人本来就知道那组密码。
+	if !account.User.Enabled {
+		account.User.Enabled = true
+		if err := s.userStore.UpdateUser(account.User); err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+
 	// 换发凭据：旧的立刻失效。同一次调用里完成，避免中途失败留下两把有效凭据。
 	token, err := generatePeerToken()
 	if err != nil {
@@ -246,6 +257,11 @@ func (s *Server) createPeerAccount(gatewayID, username, password, displayName st
 // token 以明文写进 api_keys.key——和普通密钥同一列、同一套读写口径（鉴权时
 // 现算摘要比较）。控制台的密钥页本来就靠这一列展示密钥，对端凭据能在这里看到
 // 反而有用：管理员可以对着它确认「这个下游用的还是不是那一把」。
+//
+// 落库必须走 apiKeyStore，不能只改内存再 saveState：Save 只重写 providers /
+// models / routes，从来不碰 api_keys（密钥页那些行是逐条 CRUD 的）。只靠
+// saveState 的话这把凭据活在内存里、进程一重启就没了——下游看到的是"上游账号
+// 还在、但凭据没了"，只能重新注册，而它自己并不知道为什么被踢下线。
 func (s *Server) rotatePeerToken(account peerAccount, token string) (domain.APIKey, error) {
 	name := peerKeyName(account.User)
 	key := domain.APIKey{
@@ -259,10 +275,61 @@ func (s *Server) rotatePeerToken(account peerAccount, token string) (domain.APIK
 	if err := s.router.ReplacePeerKey(key); err != nil {
 		return domain.APIKey{}, err
 	}
-	if err := s.saveState(); err != nil {
-		return domain.APIKey{}, fmt.Errorf("failed to save configuration: %w", err)
+	if err := s.persistPeerKey(account.User.ID, key); err != nil {
+		return domain.APIKey{}, err
 	}
 	return key, nil
+}
+
+// persistPeerKey 把刚刚换发的那把对端凭据写进库，并删掉这个 owner 名下其余
+// 的对端密钥行。
+//
+// 删旧行和写内存是同一步的两半：只删不写会让下游立刻被拒，只写不删会留下
+// 上一条（已经不该再有效的）凭据。这里按 owner 先清后插，所以重复注册、吊销
+// 后重注册都会收敛到"一把有效凭据"。
+//
+// 没有任何 APIKeyStore（测试里的最小 Server）时退化成只写内存：那是调用方
+// 自己决定不落库，不是这条路径的失败。
+func (s *Server) persistPeerKey(ownerUserID string, key domain.APIKey) error {
+	if s.apiKeyStore == nil {
+		return nil
+	}
+	ownerUserID = strings.TrimSpace(ownerUserID)
+	if ownerUserID == "" {
+		return nil
+	}
+	// 先清掉同一 owner 下的每一行（含同 ID 的旧行），再插新的：Store.UpdateAPIKey
+	// 刻意不改 key 那一列（普通密钥创建后就不再变），所以"更新成新凭据"根本
+	// 落不了库，只能删了重插。清干净也顺带处理了升级前注册留下的残行。
+	for _, existing := range s.apiKeyStoreKeys() {
+		if strings.TrimSpace(existing.OwnerUserID) != ownerUserID {
+			continue
+		}
+		if err := s.apiKeyStore.DeleteAPIKey(existing.ID); err != nil {
+			return fmt.Errorf("failed to drop stale peer credential: %w", err)
+		}
+	}
+	if err := s.apiKeyStore.CreateAPIKey(key); err != nil {
+		return fmt.Errorf("failed to persist peer credential: %w", err)
+	}
+	return nil
+}
+
+// apiKeyStoreKeys 取库里现存的密钥行。取不到时返回空——清理旧行是个尽力而为
+// 的动作，不该因为它挡住换发本身。
+func (s *Server) apiKeyStoreKeys() []domain.APIKey {
+	if s.apiKeyStore == nil {
+		return nil
+	}
+	reader, ok := s.stateSaver.(APIKeyReader)
+	if !ok {
+		return nil
+	}
+	keys, err := reader.APIKeys()
+	if err != nil {
+		return nil
+	}
+	return keys
 }
 
 // peerKeyID 由账号 ID 派生，保证一个对端只有一把凭据。

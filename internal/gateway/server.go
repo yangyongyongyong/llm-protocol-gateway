@@ -69,6 +69,13 @@ type APIKeyStore interface {
 	TouchAPIKey(id string, lastUsedAt string) error
 }
 
+// APIKeyReader 读库里现存的密钥行。网关互联换发对端凭据时要先看清这个 owner
+// 名下还有没有别的行（旧凭据、中断留下的残行），好一并清掉——一个对端只能有
+// 一把有效凭据。
+type APIKeyReader interface {
+	APIKeys() ([]domain.APIKey, error)
+}
+
 // ProviderOAuthSaver persists just the OAuth token columns of one provider,
 // avoiding a full-state rewrite on every token refresh. authJSON carries the
 // extra credential fields a newer subscription needs (a ZCode minted key with
