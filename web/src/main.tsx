@@ -88,6 +88,7 @@ import {
     logLevelValues,
     LOGS_PAGE_SIZE,
     mapFromTrafficRanks,
+    declaredModelWindow,
     modelAlias,
     navIDFromPath,
     navItems,
@@ -169,6 +170,7 @@ import {QuotaKeeperPanel} from './components/quota_keeper';
 import {ReplayPanel, ScheduleTracePanel, trafficLogRowKey, TrafficLogTable} from './components/traffic_log';
 import {IconSelect} from './components/selects';
 import {ProviderCatalogDialog} from './components/provider_catalog';
+import {ModelContextCell, ModelContextDialog} from './components/model_context';
 import {PROVIDER_CONNECT_CHOICES, providerConnectIcon, resolveProviderIcon} from './provider_presets';
 import {
     AdminAuthStatus,
@@ -603,6 +605,10 @@ function App() {
   const [thinkingTestResult, setThinkingTestResult] = useState<ProviderThinkingTestResult | null>(null);
 
   const [providerModelsOpen, setProviderModelsOpen] = useState(false);
+  // 「模型上下文窗口」弹窗：一次只编一个模型（providerId + modelId），窗口是
+  // 「这个上游的这个模型能装多少」，不能跨模型批量说。
+  const [modelContextTarget, setModelContextTarget] = useState<{providerId: string; modelId: string} | null>(null);
+  const [modelContextSaving, setModelContextSaving] = useState(false);
   const [providerModelsLoading, setProviderModelsLoading] = useState(false);
   const [providerModelsResult, setProviderModelsResult] = useState<ProviderTestResult | null>(null);
   const [providerModelsName, setProviderModelsName] = useState('');
@@ -1037,7 +1043,7 @@ function App() {
             return isVisionModel(model.id);
           }
           if (modelsCapabilityFilter === 'context') {
-            return (model.contextLength || 0) >= 128000;
+            return declaredModelWindow(model) >= 128000;
           }
           if (modelsCapabilityFilter === 'free') {
             return isFreeModel(model);
@@ -1082,7 +1088,7 @@ function App() {
     for (const m of matched) {
       if (isThinkingModel(m.id)) thinking++;
       if (isVisionModel(m.id)) vision++;
-      if ((m.contextLength || 0) >= 128000) context++;
+      if (declaredModelWindow(m) >= 128000) context++;
       if (isFreeModel(m)) free++;
     }
     return { all: matched.length, thinking, vision, context, free };
@@ -3731,6 +3737,32 @@ function App() {
     }
   }
 
+  // 给一个模型定上下文窗口；0 = 退回自动（按厂商公开规格或上游声明值算）。
+  //
+  // 走专用接口而不是 Provider 全量保存：那条路径是增量 PATCH，int 的零值分不清
+  // 「没传」和「清空」，而清空恰恰是这里必须能表达的一件事。
+  async function saveModelContext(providerID: string, modelId: string, contextLength: number) {
+    setModelContextSaving(true);
+    try {
+      const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(providerID)}/model-context`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: modelId, contextLength }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      showToast(contextLength > 0
+        ? `已把 ${modelId} 的上下文窗口设为 ${contextLength.toLocaleString()}`
+        : `已把 ${modelId} 的上下文窗口改回自动`);
+      setModelContextTarget(null);
+      await refreshState(false);
+    } catch (error) {
+      showToast(`保存上下文窗口失败：${String(error)}`);
+    } finally {
+      setModelContextSaving(false);
+    }
+  }
+
   // 生成/重置该 Provider 的自助注册令牌；原始令牌只在这次响应里出现一次，
   // 之后只能看到掩码预览（tokenPreview）。
   async function generateProviderSelfRegToken(providerID: string) {
@@ -6067,7 +6099,7 @@ function App() {
                         const provider = state.providers.find((item) => item.id === model.providerId);
                         const isThinking = isThinkingModel(model.id);
                         const isVision = isVisionModel(model.id);
-                        const isLongContext = (model.contextLength || 0) >= 128000;
+                        const isLongContext = declaredModelWindow(model) >= 128000;
                         return (
                           <tr key={`${model.providerId}-${model.id}`}>
                             <td className="model-id-cell">
@@ -6096,7 +6128,12 @@ function App() {
                               </div>
                             </td>
                             <td><Badge tone="slate">{protocolLabel(model.protocol)}</Badge></td>
-                            <td className="model-ctx-cell">{model.contextLength.toLocaleString()}</td>
+                            <td className="model-ctx-cell">
+                              <ModelContextCell
+                                model={model}
+                                onEdit={canDo('providers.edit') ? () => setModelContextTarget({providerId: model.providerId, modelId: model.id}) : undefined}
+                              />
+                            </td>
                             <td><Badge tone="slate">{model.inMenu ? '菜单' : '隐藏'}</Badge></td>
                             <td style={{ textAlign: 'right' }}>
                               <CopyButton
@@ -6119,7 +6156,7 @@ function App() {
                       const provider = state.providers.find((item) => item.id === model.providerId);
                       const isThinking = isThinkingModel(model.id);
                       const isVision = isVisionModel(model.id);
-                      const isLongContext = (model.contextLength || 0) >= 128000;
+                      const isLongContext = declaredModelWindow(model) >= 128000;
                       return (
                         <div className="model-card compact" key={`${model.providerId}-${model.id}`}>
                           {(() => {
@@ -6166,7 +6203,12 @@ function App() {
                             <ModelPriceTags model={model} />
                           </div>
                           <div className="model-card-stats">
-                            <span>上下文 {model.contextLength.toLocaleString()}</span>
+                            <span>
+                              上下文 <ModelContextCell
+                                model={model}
+                                onEdit={canDo('providers.edit') ? () => setModelContextTarget({providerId: model.providerId, modelId: model.id}) : undefined}
+                              />
+                            </span>
                             <span>{protocolLabel(model.protocol)}</span>
                           </div>
                         </div>
@@ -7898,6 +7940,21 @@ function App() {
           results={{ main: chatTestResult, cache: cacheTestResult, thinking: thinkingTestResult }}
         />
       )}
+
+      {modelContextTarget && (() => {
+        const model = state.models.find((item) => item.providerId === modelContextTarget.providerId && item.id === modelContextTarget.modelId);
+        // 模型可能在弹窗打开期间被同步掉了：直接关掉，不要对着一条不存在的模型保存。
+        if (!model) return null;
+        return (
+          <ModelContextDialog
+            provider={state.providers.find((item) => item.id === modelContextTarget.providerId)}
+            model={model}
+            busy={modelContextSaving}
+            onSave={(contextLength) => void saveModelContext(modelContextTarget.providerId, modelContextTarget.modelId, contextLength)}
+            onClose={() => setModelContextTarget(null)}
+          />
+        );
+      })()}
 
       {providerModelsOpen && (
         <Modal size="wide" title={`获取模型 · ${providerModelsName}`} description="从 Provider 上游 /models 接口拉取可用模型列表，并更新健康状态。" onClose={() => setProviderModelsOpen(false)}>

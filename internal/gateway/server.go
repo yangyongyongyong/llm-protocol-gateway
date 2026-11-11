@@ -490,6 +490,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /__providers/{id}/rtk", s.handleSetProviderRTK)
 	mux.HandleFunc("POST /__providers/{id}/first-packet-timeout", s.handleSetProviderFirstPacketTimeout)
 	mux.HandleFunc("POST /__providers/{id}/concurrency", s.handleSetProviderConcurrency)
+	mux.HandleFunc("POST /__providers/{id}/model-context", s.handleSetProviderModelContext)
 	mux.HandleFunc("GET /__prices", s.handleListPrices)
 	mux.HandleFunc("POST /__prices", s.handleSavePrice)
 	mux.HandleFunc("DELETE /__prices/{providerID}/{modelID}", s.handleDeletePrice)
@@ -4199,32 +4200,24 @@ func (s *Server) persistProviderOAuth(provider domain.Provider) error {
 // Claude Desktop 也读这个接口，但它只保留读起来像 Anthropic 的 id——只提供
 // m1/m2 的网关在它眼里就是"没有任何模型"。所以对 Desktop 的请求单独出一份
 // 清单：本来就被它接受的 id 原样给，其余换成 anthropic/gw-<哈希> 别名并在
-// display_name 里保留真名（见 desktop_models.go）。请求回来时再把别名反查
-// 回真实模型，两边靠同一份模型集合保证一致。
+// display_name 里保留真名；上下文窗口按它判 1M 用的 max_input_tokens 一起发，
+// 够 1M 的模型按 "[1m]" 的 id 列出去（见 desktop_models.go）。请求回来时再把
+// 别名与 "[1m]" 反查回真实模型，两边靠同一份模型集合保证一致。
 func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 	models := s.modelsForRequest(r)
-	desktop := isClaudeDesktopRequest(r.Header.Get("User-Agent"))
-	if desktop {
-		models = desktopModelView(models)
+	if isClaudeDesktopRequest(r.Header.Get("User-Agent")) {
+		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": desktopModelList(models)})
+		return
 	}
 	data := make([]map[string]any, 0, len(models))
 	for _, model := range models {
-		contextLen := resolveModelContextLength(model.ID, model.ContextLength)
+		contextLen := modelWindow(model)
 		entry := map[string]any{
 			"id":             model.ID,
 			"object":         "model",
 			"created":        0,
 			"owned_by":       model.ProviderID,
 			"context_length": contextLen,
-		}
-		if desktop {
-			// Desktop 的菜单显示 display_name，不显示 id；别名不给名字的话
-			// 用户看到的就是一串 anthropic/gw-1234567890。
-			name := strings.TrimSpace(model.Name)
-			if name == "" {
-				name = model.ID
-			}
-			entry["display_name"] = name
 		}
 		data = append(data, entry)
 	}
@@ -4267,7 +4260,7 @@ func (s *Server) handleClaudeModels(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		seen[model.ID] = true
-		contextLen := resolveModelContextLength(model.ID, model.ContextLength)
+		contextLen := modelWindow(model)
 		data = append(data, map[string]any{
 			"id":               model.ID,
 			"type":             "model",
@@ -5574,10 +5567,17 @@ func deriveModelsURL(provider domain.Provider) (string, error) {
 }
 
 func parseModelsResponse(body []byte, provider domain.Provider) ([]domain.Model, error) {
+	// 窗口有四个名字在流通：OpenAI 习惯的 context_length、Anthropic 风格的
+	// max_input_tokens、magpie/Crush 那套的 context_window，以及个别上游的
+	// context_length 缺席。只认第一个的话，一条「上游是另一个网关」的链路
+	// （对端按 max_input_tokens 说自己有 1M）会把 1M 整个丢掉，下游看到的
+	// 就只剩默认值。都读到，取最大的那个当声明值。
 	var payload struct {
 		Data []struct {
-			ID            string `json:"id"`
-			ContextLength int    `json:"context_length"`
+			ID             string `json:"id"`
+			ContextLength  int    `json:"context_length"`
+			ContextWindow  int    `json:"context_window"`
+			MaxInputTokens int    `json:"max_input_tokens"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -5591,7 +5591,8 @@ func parseModelsResponse(body []byte, provider domain.Provider) ([]domain.Model,
 			continue
 		}
 		seen[id] = true
-		contextLength := resolveModelContextLength(id, item.ContextLength)
+		reported := max(item.ContextLength, max(item.ContextWindow, item.MaxInputTokens))
+		contextLength := resolveModelContextLength(id, reported)
 		models = append(models, domain.Model{ID: id, ProviderID: provider.ID, Protocol: provider.Protocol, ContextLength: contextLength, InMenu: true})
 	}
 	if len(models) == 0 {

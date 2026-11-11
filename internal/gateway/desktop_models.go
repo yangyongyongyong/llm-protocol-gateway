@@ -129,27 +129,99 @@ func desktopModelForAlias(requestModel string, candidates []string) string {
 	return trimmed
 }
 
+// desktop1M 是 Desktop 认作「长窗口」的上下文门槛。它的 app.asar（2.7032）在
+// 读 /v1/models 时按这个数判：id 带 "[1m]" 的行它不再补一条，其余行
+// max_input_tokens >= 1e6 时它会在旁边自己加一条「1M context window」。
+const desktop1M = 1_000_000
+
+// desktop1MSaid 是 Desktop 给它自己补的那条 1M 菜单项写的说明。
+//
+// 我们只列一条（id 直接带 "[1m]"），所以「这条是 1M 的」得自己说出口：不写
+// 这句话，Desktop 就按普通模型显示它，用户看不出区别——magpie 的
+// DesktopLongest 就是这么被反馈「开关像是反的」的。
+const desktop1MSaid = "1M context window"
+
+// desktopModelEntry 是 /v1/models 里给 Desktop 的一行：模型本体，加上它是不是
+// 按 1M 的 id 列出去的（那一行要多一句说明）。
+type desktopModelEntry struct {
+	Model domain.Model
+	OneM  bool
+}
+
 // desktopModelView 把一份真实模型清单转成 Desktop 能认的样子：本来就被它
 // 接受的 id 原样保留（官方 Claude 模型在 Desktop 里有名字和图标），其余换成
 // 别名，真实名字放进 Name 供菜单显示。
-func desktopModelView(catalog []domain.Model) []domain.Model {
-	out := make([]domain.Model, 0, len(catalog))
+//
+// 窗口够 1M 的模型按 "[1m]" 的 id 列出去：Desktop 的 Code 页把选中的 id 交给
+// Claude Code，带 "[1m]" 的那个才会跑 1M 窗口。反过来说，不带 "[1m]" 的 1M
+// 模型会被 Desktop 在菜单里额外补一条「1M context window」，于是同一个模型
+// 出现两次（magpie #1272：21 个模型变成 34 条）。带 "[1m]" 的 id 它不再补，
+// 一个模型就只有一条。
+//
+// 旧会话里存的是不带 "[1m]" 的那条 id，照样能用：反查只按真实模型算别名，
+// 与列出去的形态无关（desktopModelForAlias），而 "[1m]" 在模型解析时会被去掉
+// （见 resolveConsumerModelOnProvider）。
+func desktopModelView(catalog []domain.Model) []desktopModelEntry {
+	out := make([]desktopModelEntry, 0, len(catalog))
 	for _, model := range catalog {
 		realID := strings.TrimSpace(model.ID)
 		if realID == "" {
 			continue
 		}
 		view := model
+		// 窗口先按真实 id 定下来，再换 id：换成 anthropic/gw-<哈希> 之后就再也
+		// 查不到厂商了，那时候再 resolve 只会得到默认的 128K。运维给这个模型
+		// 设过窗口时按他设的算（见 modelWindow）。
+		view.ContextLength = modelWindow(view)
+		if strings.TrimSpace(view.Name) == "" {
+			// 菜单显示的是这个名字。我们后来才给 id 加 "[1m]"，所以它天然不带
+			// 标记；上游自己把标记写进 id 的（有的中转站这么卖），那标记就是
+			// 名字的一部分，照抄。
+			view.Name = realID
+		}
 		if !desktopAcceptsModelID(realID) {
 			view.ID = desktopModelAlias(realID)
-			if strings.TrimSpace(view.Name) == "" {
-				view.Name = realID
+		}
+		entry := desktopModelEntry{Model: view}
+		if view.ContextLength >= desktop1M {
+			entry.OneM = true
+			// 上游自己就把 id 写成 "[1m]" 的不要再叠一层。
+			if !strings.HasSuffix(strings.ToLower(view.ID), claudeContextTag1M) {
+				entry.Model.ID += claudeContextTag1M
 			}
 		}
-		out = append(out, view)
+		out = append(out, entry)
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Model.ID < out[j].Model.ID })
 	return out
+}
+
+// desktopModelList 是 /v1/models 给 Claude Desktop 的那一份。
+//
+// 上下文窗口按客户端认的三个名字一起给：Desktop 判 1M 看的是
+// max_input_tokens（magpie 的 modelObject 也是三个名字一起发），而我们以前只发
+// context_length，于是它把每个模型都当成短窗口，Code 页永远跑 200K。
+func desktopModelList(catalog []domain.Model) []map[string]any {
+	entries := desktopModelView(catalog)
+	data := make([]map[string]any, 0, len(entries))
+	for _, entry := range entries {
+		contextLen := entry.Model.ContextLength
+		item := map[string]any{
+			"id":               entry.Model.ID,
+			"object":           "model",
+			"created":          0,
+			"owned_by":         entry.Model.ProviderID,
+			"context_length":   contextLen,
+			"context_window":   contextLen,
+			"max_input_tokens": contextLen,
+			"display_name":     entry.Model.Name,
+		}
+		if entry.OneM {
+			item["description"] = desktop1MSaid
+		}
+		data = append(data, item)
+	}
+	return data
 }
 
 // isClaudeDesktopRequest 认出 Claude Desktop 自己的请求：Electron 会话的

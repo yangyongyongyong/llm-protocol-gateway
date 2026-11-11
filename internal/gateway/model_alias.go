@@ -84,6 +84,11 @@ func isReservedDefaultModel(model string) bool {
 	return strings.EqualFold(stripClaudeContextTag(model), defaultModelAlias)
 }
 
+// claudeContextTag1M 是 Claude Code / Claude Desktop 用来标记「要 1M 窗口」的
+// 后缀。它是窗口标记而不是模型名的一部分：本方对 Desktop 列 1M 模型时也用它
+// （见 desktopModelView），请求回来时必须能去掉。
+const claudeContextTag1M = "[1m]"
+
 // stripClaudeContextTag removes the trailing extended-context markers Claude
 // Code appends to a model name ("[1m]", "[2m]"). Mirrors the client's own
 // normalization: other bracketed text is left alone so a real model id that
@@ -91,7 +96,7 @@ func isReservedDefaultModel(model string) bool {
 func stripClaudeContextTag(model string) string {
 	trimmed := strings.TrimSpace(model)
 	lower := strings.ToLower(trimmed)
-	for _, tag := range []string{"[1m]", "[2m]"} {
+	for _, tag := range []string{claudeContextTag1M, "[2m]"} {
 		if strings.HasSuffix(lower, tag) {
 			return strings.TrimSpace(trimmed[:len(trimmed)-len(tag)])
 		}
@@ -113,12 +118,23 @@ func resolveConsumerModel(router *Router, route domain.Route, key domain.APIKey,
 // rather than from the route's preferred provider.
 func resolveConsumerModelOnProvider(provider domain.Provider, key domain.APIKey, gatewayKeyMatched bool, rawRequestModel string) (model string, logModel string) {
 	clientModel := strings.TrimSpace(rawRequestModel)
+	// 日志左侧写的是请求体里字面的值，下面几步会改写 clientModel（别名反查、
+	// 去 [1m] 标记），所以先把原话留一份。
+	saidModel := clientModel
 	// Claude Desktop 只能列出读起来像 Anthropic 的模型 id，其余模型它拿到的是
 	// anthropic/gw-<哈希> 别名（见 desktop_models.go）。这里把别名换回真实
 	// 模型，后续的映射/默认值/上游请求就都按真实 id 走。
 	// 反查依据是这次请求能看到的模型集合，所以撤销授权后别名自动失效。
 	if resolved := desktopModelForAlias(clientModel, desktopAliasCandidates(provider, key, gatewayKeyMatched)); resolved != clientModel {
 		clientModel = resolved
+	}
+	// "[1m]" 是「要 1M 窗口」的标记，不是模型名的一部分：我们对 Desktop 列 1M
+	// 模型时就用它（见 desktopModelView），Claude Code 发请求时也带着它。目录里
+	// 没有这个带标记的 id 时按去掉标记的那一个走——否则 applyProviderModelFallback
+	// 认不出来，会把请求悄悄换成默认模型。目录里真有这个带标记的 id（有的中转站
+	// 就这么卖）时保留原样，那是一个真实的模型名。
+	if trimmed := stripClaudeContextTag(clientModel); trimmed != clientModel && !providerHasModel(provider, clientModel) {
+		clientModel = trimmed
 	}
 	working := resolveClaudeModelAlias(clientModel)
 	mapped := false
@@ -171,8 +187,14 @@ func resolveConsumerModelOnProvider(provider domain.Provider, key domain.APIKey,
 	// a provider mapping does, and dropping the left side there left the log
 	// claiming the client had asked for the override, which it never did.
 	logModel = model
-	if clientModel != "" && clientModel != model {
-		logModel = clientModel + " -> " + model
+	if saidModel != "" && saidModel != model {
+		// 只有 "[1m]" 之差不算映射：那是同一个模型的窗口标记（见上面去标记那一
+		// 段），记成 "m1[1m] -> m1" 会让人以为这里做了一次模型替换。
+		if strings.EqualFold(stripClaudeContextTag(saidModel), model) {
+			logModel = model
+		} else {
+			logModel = saidModel + " -> " + model
+		}
 	}
 	return model, logModel
 }

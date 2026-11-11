@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -103,6 +105,69 @@ func resolveModelContextLength(modelID string, reported int) int {
 		return reported
 	}
 	return contextLengthDefault
+}
+
+// maxModelContextOverride 是运维能声明的窗口上限。它只用来挡明显的手滑
+// （把 1000000 打成 1000000000），不是一个有依据的容量上限。
+const maxModelContextOverride = 10_000_000
+
+// modelWindow 是一个模型最终对外宣称的上下文窗口：运维显式设过就按他的，
+// 否则按厂商已知值 / 上游声明值算。
+//
+// 显式值压过一切，连「厂商已知是 1M」也压过去，不只是抬高：一个标称 1M 的
+// 模型实际被套餐限到 200K（或者走的是会截断的中转）时同样要说得出 200K，
+// 而 resolveModelContextLength 的规则是「已知值和报告值取大的那个」，说不出
+// 更小的数。这就是 magpie 的 provider.Contexts 那条「用户的话最优先」。
+//
+// 覆盖值不写进 ContextLength：后者留着「自动值」，清空设置时靠它原样退回去。
+func modelWindow(model domain.Model) int {
+	if model.ContextOverride > 0 {
+		return model.ContextOverride
+	}
+	return resolveModelContextLength(model.ID, model.ContextLength)
+}
+
+// handleSetProviderModelContext 是「这个模型的上下文窗口是多大」这一个旋钮。
+//
+// 它存在的理由：网关对窗口的判断只有两条腿——厂商已知的那几个（Claude / GLM /
+// GPT 的公开规格）和上游 /models 自己报的数。中转站这两条都不占的时候（自建
+// 服务、改了名字的镜像、上游干脆不报），一个真的能跑 1M 的模型在网关眼里就是
+// 默认的 128K，于是 Claude Desktop / Claude Code 那边也永远按 128K 压缩上下文。
+// 这里让运维直接说一句话把这件事定下来（magpie 的 provider.SetContext 同一个
+// 意思），定完窗口就按它算，目录同步也不会冲掉。
+func (s *Server) handleSetProviderModelContext(w http.ResponseWriter, r *http.Request) {
+	if !s.requireProviderOwnerForUser(w, r, r.PathValue("id")) {
+		return
+	}
+	var payload struct {
+		Model string `json:"model"`
+		// ContextLength 是新的窗口；0 = 退回自动（按厂商/上游算）。
+		ContextLength *int `json:"contextLength"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.ContextLength == nil {
+		writeOpenAIError(w, http.StatusBadRequest, `body must be {"model": "id", "contextLength": N}`)
+		return
+	}
+	updated, err := s.router.SetProviderModelContext(r.PathValue("id"), payload.Model, *payload.ContextLength)
+	if err != nil {
+		status := http.StatusBadRequest
+		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "has no model") {
+			status = http.StatusNotFound
+		}
+		writeOpenAIError(w, status, err.Error())
+		return
+	}
+	if err := s.saveState(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+		return
+	}
+	model := strings.TrimSpace(payload.Model)
+	if *payload.ContextLength > 0 {
+		s.logs.AddApp("info", "model context window set", fmt.Sprintf("provider=%s model=%s window=%d", updated.ID, model, *payload.ContextLength))
+	} else {
+		s.logs.AddApp("info", "model context window cleared", fmt.Sprintf("provider=%s model=%s", updated.ID, model))
+	}
+	writeJSON(w, http.StatusOK, redactProviderForClient(updated))
 }
 
 func knownModelContextLength(modelID string) (int, bool) {
@@ -316,11 +381,20 @@ func normalizeMaxOutputTokens(n int) int {
 	return n
 }
 
-// fillModelTokenBudgets sets ContextLength / MaxOutputTokens display fields for UI.
+// fillModelTokenBudgets sets MaxOutputTokens for the UI, and ContextLength when
+// nobody has overridden the window.
+//
+// ContextLength is deliberately left alone while an override is set: it is the
+// automatic value ("what the vendor's spec or the upstream's /models says"), and
+// that is what clearing the override has to fall back to. Writing the override
+// over it would make the setting permanent in effect — it survives the database
+// round trip, so a later "clear" could only restore the override itself.
 func fillModelTokenBudgets(model *domain.Model) {
 	if model == nil {
 		return
 	}
-	model.ContextLength = resolveModelContextLength(model.ID, model.ContextLength)
-	model.MaxOutputTokens = resolveModelMaxOutputTokens(model.ID, model.ContextLength)
+	if model.ContextOverride <= 0 {
+		model.ContextLength = resolveModelContextLength(model.ID, model.ContextLength)
+	}
+	model.MaxOutputTokens = resolveModelMaxOutputTokens(model.ID, modelWindow(*model))
 }

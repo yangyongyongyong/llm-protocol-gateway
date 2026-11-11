@@ -770,6 +770,9 @@ export type Model = {
   name?: string;
   protocol: Protocol;
   contextLength: number;
+  /** 运维给这个模型单独定的上下文窗口；0/缺省 = 按厂商已知值或上游声明值算。
+   *  和 contextLength 分开存：后者记录「上游怎么说」，每次目录同步都会重写它。 */
+  contextOverride?: number;
   maxOutputTokens?: number;
   inMenu: boolean;
   /** 上游标出的价格：free = 该套餐下不消耗积分；rate = 每次请求的积分倍率；

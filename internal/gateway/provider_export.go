@@ -394,7 +394,9 @@ func mergeProviderImport(existing, incoming domain.Provider) domain.Provider {
 		updated.HealthStatus = incoming.HealthStatus
 	}
 	if incoming.Models != nil {
-		updated.Models = cloneModels(incoming.Models)
+		// 导入包自己带了窗口设置，就以它为谁；没带的（升级前导出的包）沿用本机
+		// 已有的那份，别让一次恢复把运维手动设的窗口悄悄抹掉。
+		updated.Models = carryModelContextOverrides(cloneModels(incoming.Models), existing.Models)
 	}
 	updated.RequestAdapter = cloneRequestAdapter(incoming.RequestAdapter)
 	updated.ClaudeOAuth = mergeClaudeOAuthImport(existing.ClaudeOAuth, incoming.ClaudeOAuth)
