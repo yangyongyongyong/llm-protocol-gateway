@@ -93,13 +93,14 @@ func TestModelContextOverrideReachesEveryCatalog(t *testing.T) {
 
 	// Claude Desktop 那一份：1M 是它决定「要不要给 Code 页 1M 窗口」的依据。
 	desktopData := getModels(t, server, "sk-gw", claudeDesktopUA)
-	if len(desktopData) != 1 {
-		t.Fatalf("Desktop list = %v, want one entry", desktopData)
+	if len(desktopData) != 3 {
+		t.Fatalf("Desktop list = %v, want two defaults and m1", desktopData)
 	}
-	if said, _ := desktopData[0]["max_input_tokens"].(float64); said < desktop1M {
+	entry := desktopEntryByName(t, desktopData, "m1")
+	if said, _ := entry["max_input_tokens"].(float64); said < desktop1M {
 		t.Fatalf("Desktop max_input_tokens = %v, want >= %d", said, desktop1M)
 	}
-	if id, _ := desktopData[0]["id"].(string); !strings.HasSuffix(id, claudeContextTag1M) {
+	if id, _ := entry["id"].(string); !strings.HasSuffix(id, claudeContextTag1M) {
 		t.Fatalf("listed as %q, want a [1m] id", id)
 	}
 
@@ -144,7 +145,8 @@ func TestModelContextOverrideClearsBackToTheVendor(t *testing.T) {
 	}
 	// 设了 200K 就不再是 1M，Desktop 那一侧也不该再拿 1M 的 id 去骗它。
 	data := getModels(t, server, "sk-gw", claudeDesktopUA)
-	if id, _ := data[0]["id"].(string); strings.HasSuffix(id, claudeContextTag1M) {
+	entry := desktopEntryByName(t, data, "claude-opus-5")
+	if id, _ := entry["id"].(string); strings.HasSuffix(id, claudeContextTag1M) {
 		t.Fatalf("listed as %q, but the operator cut it to 200K", id)
 	}
 

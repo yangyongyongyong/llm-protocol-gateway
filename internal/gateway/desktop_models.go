@@ -93,12 +93,16 @@ func desktopModelAlias(modelID string) string {
 //
 // 反查只认这份集合：已删除或撤销授权的模型不会因为别名被别人猜中就重新可达。
 func desktopAliasCandidates(provider domain.Provider, key domain.APIKey, gatewayKeyMatched bool) []string {
-	ids := make([]string, 0, len(provider.Models)+1+len(key.ModelAliases))
+	ids := make([]string, 0, len(provider.Models)+2+len(key.ModelAliases))
 	for _, model := range provider.Models {
 		if id := strings.TrimSpace(model.ID); id != "" {
 			ids = append(ids, id)
 		}
 	}
+	// 保留别名 default / default[1m] 也作为两行列给 Desktop
+	// （desktopReservedDefaultCatalog），所以反查必须认得它们：否则用户选中那两行，
+	// 上游收到的是一串 anthropic/gw- 哈希。
+	ids = append(ids, defaultModelAlias, defaultModelAlias+claudeContextTag1M)
 	if gatewayKeyMatched {
 		if override := strings.TrimSpace(key.ModelOverride); override != "" {
 			ids = append(ids, override)
@@ -198,11 +202,32 @@ func desktopModelView(catalog []domain.Model) []desktopModelEntry {
 
 // desktopModelList 是 /v1/models 给 Claude Desktop 的那一份。
 //
+// 开头两行是保留别名 default / default[1m]（见 desktopReservedDefaultCatalog），
+// 后面才是这份目录里的真实模型。顺序有意义：Desktop 的菜单按列表顺序排，把
+// 「默认模型」放在最前面，日常用不着在几十个模型里找它。
+//
 // 上下文窗口按客户端认的三个名字一起给：Desktop 判 1M 看的是
 // max_input_tokens（magpie 的 modelObject 也是三个名字一起发），而我们以前只发
 // context_length，于是它把每个模型都当成短窗口，Code 页永远跑 200K。
 func desktopModelList(catalog []domain.Model) []map[string]any {
-	entries := desktopModelView(catalog)
+	reserved := desktopModelView(desktopReservedDefaultCatalog())
+	entries := make([]desktopModelEntry, 0, len(reserved)+len(catalog))
+	entries = append(entries, reserved...)
+	models := make([]domain.Model, 0, len(catalog))
+	for _, model := range catalog {
+		// 保留名统一由网关发布，避免上游目录里的同名项重复或改变窗口。
+		id := strings.TrimSpace(model.ID)
+		if strings.EqualFold(id, defaultModelAlias) || strings.EqualFold(id, defaultModelAlias+claudeContextTag1M) {
+			continue
+		}
+		models = append(models, model)
+	}
+	entries = append(entries, desktopModelView(models)...)
+	return desktopModelRows(entries)
+}
+
+// desktopModelRows 把投影好的一行行模型变成 /v1/models 的 JSON。
+func desktopModelRows(entries []desktopModelEntry) []map[string]any {
 	data := make([]map[string]any, 0, len(entries))
 	for _, entry := range entries {
 		contextLen := entry.Model.ContextLength
@@ -222,6 +247,17 @@ func desktopModelList(catalog []domain.Model) []map[string]any {
 		data = append(data, item)
 	}
 	return data
+}
+
+// desktopReservedDefaultCatalog 发布稳定的 default / default[1m] 菜单项。
+// 普通项用通用短窗口，显式 1M 项固定报 1M；都不依赖目录的窗口推断。
+// 请求反查后沿用现有默认模型解析，平台换默认模型不需要客户端重新选。
+// 默认模型仍是可选配置，API key 的 ModelOverride 优先级不变。
+func desktopReservedDefaultCatalog() []domain.Model {
+	return []domain.Model{
+		{ID: defaultModelAlias, Name: defaultModelAlias, ProviderID: "gateway", ContextLength: contextLengthDefault, InMenu: true},
+		{ID: defaultModelAlias + claudeContextTag1M, Name: defaultModelAlias + claudeContextTag1M, ProviderID: "gateway", ContextLength: contextLength1M, InMenu: true},
+	}
 }
 
 // isClaudeDesktopRequest 认出 Claude Desktop 自己的请求：Electron 会话的

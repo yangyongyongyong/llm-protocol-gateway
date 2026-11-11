@@ -82,10 +82,10 @@ func TestOpenAIModelsKeepsRealIDsForOtherClients(t *testing.T) {
 func TestOpenAIModelsGivesClaudeDesktopUsableIDs(t *testing.T) {
 	server, token := desktopCatalogServer(t)
 	data := getModels(t, server, token, claudeDesktopUA)
-	if len(data) != 2 {
-		t.Fatalf("got %d entries, want both models listed: %v", len(data), data)
+	if len(data) != 4 {
+		t.Fatalf("got %d entries, want two defaults and both models: %v", len(data), data)
 	}
-	wantNames := map[string]bool{"m1": false, "m2": false}
+	wantNames := map[string]bool{"default": false, "default[1m]": false, "m1": false, "m2": false}
 	for _, entry := range data {
 		id, _ := entry["id"].(string)
 		name, _ := entry["display_name"].(string)
@@ -265,8 +265,8 @@ func desktop1MServer(t *testing.T) (*Server, string) {
 func TestOpenAIModelsGivesClaudeDesktopA1MWindow(t *testing.T) {
 	server, token := desktop1MServer(t)
 	data := getModels(t, server, token, claudeDesktopUA)
-	if len(data) != 6 {
-		t.Fatalf("got %d entries, want one per model (no duplicates): %v", len(data), data)
+	if len(data) != 8 {
+		t.Fatalf("got %d entries, want two defaults and one per model: %v", len(data), data)
 	}
 	// 真实模型 id -> 它在 Desktop 清单里的那一行。菜单显示的是 display_name，
 	// 我们给 id 加的 "[1m]" 不进名字，所以它正好就是真实 id。
