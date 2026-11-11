@@ -158,10 +158,13 @@ func resolveConsumerModelOnProvider(provider domain.Provider, key domain.APIKey,
 	if model == "" {
 		model = "request-model-not-set"
 	}
+	// The log keeps both halves whenever they differ: the left side is literally
+	// what the request body named, the right side is what went upstream. That has
+	// to hold for an API key's ModelOverride too — it replaces the model just as
+	// a provider mapping does, and dropping the left side there left the log
+	// claiming the client had asked for the override, which it never did.
 	logModel = model
-	if mapped && clientModel != "" && clientModel != model {
-		logModel = clientModel + " -> " + model
-	} else if clientModel != "" && clientModel != model && override == "" {
+	if clientModel != "" && clientModel != model {
 		logModel = clientModel + " -> " + model
 	}
 	return model, logModel

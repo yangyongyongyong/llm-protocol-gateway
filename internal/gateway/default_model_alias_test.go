@@ -435,3 +435,38 @@ func TestClaudeTierAliasResolvesWithoutBeingListed(t *testing.T) {
 		t.Fatalf("model = %q, want the alias to keep rewriting to claude-sonnet-5", model)
 	}
 }
+
+// An API key's ModelOverride replaces the model just like a provider mapping
+// does, and the API log has to keep saying so. The left half of the logged
+// value is what the request body named — the log must never report the
+// override's model as the client's request model.
+func TestModelOverrideIsLoggedAgainstTheClientModel(t *testing.T) {
+	provider := domain.Provider{
+		ID: "p1", Protocol: domain.ProtocolClaude,
+		Models: []domain.Model{
+			{ID: "m1", ProviderID: "p1", Protocol: domain.ProtocolClaude},
+			{ID: "m2", ProviderID: "p1", Protocol: domain.ProtocolClaude},
+		},
+	}
+	key := domain.APIKey{ID: "k1", ModelOverride: "m2"}
+
+	model, logModel := resolveConsumerModelOnProvider(provider, key, true, "m1")
+	if model != "m2" {
+		t.Fatalf("model = %q, want the key override to win", model)
+	}
+	if logModel != "m1 -> m2" {
+		t.Fatalf("logModel = %q, want the client's m1 preserved on the left", logModel)
+	}
+
+	// An override equal to what the client asked for is not a rewrite; the log
+	// shows one name, not "m2 -> m2".
+	if _, logModel := resolveConsumerModelOnProvider(provider, key, true, "m2"); logModel != "m2" {
+		t.Fatalf("logModel = %q, want a single name when nothing changed", logModel)
+	}
+
+	// Failover re-resolves the model against the provider that actually serves
+	// it; the client's original name must survive that too.
+	if got := finalizeRequestLogModel("m1 -> m2", "m2", "m2"); got != "m1 -> m2" {
+		t.Fatalf("finalize = %q, want the client model kept through failover", got)
+	}
+}
