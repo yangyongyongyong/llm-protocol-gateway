@@ -3109,12 +3109,17 @@ export function localGatewayLoopbackRoot(endpoints: OutputEndpoint[]) {
 }
 
 /**
- * Claude Desktop 的 3p 托管配置只接受 https，或回环地址上的 http
- * （`must use https (or http on loopback)`）。这比 CLI 的 ANTHROPIC_BASE_URL
- * 严——后者填局域网地址照常能连。所以两者不能共用同一个地址：公网 https
- * 优先，否则退到 127.0.0.1，绝不把内网 http 地址写进 Desktop 的配置。
+ * 「写进本机配置」的网关根地址——Claude Code CLI 与 Claude Desktop 共用这一个。
+ *
+ * 本机配置指向的是跑网关的这台机器，所以默认用 127.0.0.1：网卡 IP 会随 Wi-Fi
+ * 切换、网线插拔、DHCP 续租而变，写死进去的地址过几天就不通了。选了公网域名
+ * （且是 https）才用公网地址——那时客户端可能不在本机。
+ *
+ * Desktop 的 3p 托管配置还额外只接受 https 或回环 http
+ * （`must use https (or http on loopback)`），内网 http 会被它判定为 malformed
+ * 并整条丢弃。这个选择规则同时满足两边。
  */
-export function desktopGatewayRoot(endpoints: OutputEndpoint[], publicBase: string) {
+export function localAgentGatewayRoot(endpoints: OutputEndpoint[], publicBase: string) {
   const base = (publicBase || '').trim().replace(/\/$/, '');
   if (base && base.toLowerCase().startsWith('https://')) return base;
   return localGatewayLoopbackRoot(endpoints);

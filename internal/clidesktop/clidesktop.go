@@ -139,7 +139,7 @@ func desktopGatewayURLRefusal(value string) string {
 	case "https":
 		return ""
 	case "http":
-		if !isLoopbackHost(parsed.Hostname()) {
+		if !desktopLoopbackHost(parsed.Hostname()) {
 			return fmt.Sprintf("Claude Desktop 只接受 https，或本机回环地址上的 http；%q 是内网地址，请填入公网 https 地址", value)
 		}
 		return ""
@@ -148,10 +148,10 @@ func desktopGatewayURLRefusal(value string) string {
 	}
 }
 
-// isLoopbackHost 判断主机名是不是本机回环（localhost / 127.0.0.0-8 / ::1）。
+// desktopLoopbackHost 判断主机名是不是本机回环（localhost / 127.0.0.0-8 / ::1）。
 // 只看字面量：这里判断的是写进配置文件、由 Desktop 自己去连的那个地址，
 // 不做 DNS 解析。
-func isLoopbackHost(host string) bool {
+func desktopLoopbackHost(host string) bool {
 	host = strings.ToLower(strings.Trim(strings.TrimSpace(host), "[]"))
 	if host == "localhost" || host == "::1" {
 		return true

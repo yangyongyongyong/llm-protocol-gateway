@@ -113,6 +113,13 @@ func resolveConsumerModel(router *Router, route domain.Route, key domain.APIKey,
 // rather than from the route's preferred provider.
 func resolveConsumerModelOnProvider(provider domain.Provider, key domain.APIKey, gatewayKeyMatched bool, rawRequestModel string) (model string, logModel string) {
 	clientModel := strings.TrimSpace(rawRequestModel)
+	// Claude Desktop 只能列出读起来像 Anthropic 的模型 id，其余模型它拿到的是
+	// anthropic/gw-<哈希> 别名（见 desktop_models.go）。这里把别名换回真实
+	// 模型，后续的映射/默认值/上游请求就都按真实 id 走。
+	// 反查依据是这次请求能看到的模型集合，所以撤销授权后别名自动失效。
+	if resolved := desktopModelForAlias(clientModel, desktopAliasCandidates(provider, key, gatewayKeyMatched)); resolved != clientModel {
+		clientModel = resolved
+	}
 	working := resolveClaudeModelAlias(clientModel)
 	mapped := false
 	if gatewayKeyMatched {

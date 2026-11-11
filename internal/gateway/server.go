@@ -662,6 +662,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /openai/v1/responses/compact", s.handleOpenAIResponsesCompact)
 	mux.HandleFunc("POST /anthropic/v1/messages", s.handleClaudeMessages)
 	mux.HandleFunc("POST /anthropic/v1/messages/count_tokens", s.handleClaudeCountTokens)
+	// Claude Desktop 把 /v1/messages 直接拼在 inferenceGatewayBaseUrl 后面，
+	// 它写进配置的地址不带 /anthropic（3p 模式的约定，magpie 也是在根路径上
+	// 提供这个端点）。少了这两条，桌面端能列出模型却一发消息就 404。
+	mux.HandleFunc("POST /v1/messages", s.handleClaudeMessages)
+	mux.HandleFunc("POST /v1/messages/count_tokens", s.handleClaudeCountTokens)
 	api := withCORS(mux)
 	// 任何 POST 正文都有上限：限制在读取处（ReadAll 之前），超限时各协议自己回 413。
 	api = withBodyLimit(api)
@@ -4189,18 +4194,39 @@ func (s *Server) persistProviderOAuth(provider domain.Provider) error {
 	return s.saveState()
 }
 
+// handleOpenAIModels 是 OpenAI 形态的模型目录。
+//
+// Claude Desktop 也读这个接口，但它只保留读起来像 Anthropic 的 id——只提供
+// m1/m2 的网关在它眼里就是"没有任何模型"。所以对 Desktop 的请求单独出一份
+// 清单：本来就被它接受的 id 原样给，其余换成 anthropic/gw-<哈希> 别名并在
+// display_name 里保留真名（见 desktop_models.go）。请求回来时再把别名反查
+// 回真实模型，两边靠同一份模型集合保证一致。
 func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 	models := s.modelsForRequest(r)
+	desktop := isClaudeDesktopRequest(r.Header.Get("User-Agent"))
+	if desktop {
+		models = desktopModelView(models)
+	}
 	data := make([]map[string]any, 0, len(models))
 	for _, model := range models {
 		contextLen := resolveModelContextLength(model.ID, model.ContextLength)
-		data = append(data, map[string]any{
+		entry := map[string]any{
 			"id":             model.ID,
 			"object":         "model",
 			"created":        0,
 			"owned_by":       model.ProviderID,
 			"context_length": contextLen,
-		})
+		}
+		if desktop {
+			// Desktop 的菜单显示 display_name，不显示 id；别名不给名字的话
+			// 用户看到的就是一串 anthropic/gw-1234567890。
+			name := strings.TrimSpace(model.Name)
+			if name == "" {
+				name = model.ID
+			}
+			entry["display_name"] = name
+		}
+		data = append(data, entry)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }

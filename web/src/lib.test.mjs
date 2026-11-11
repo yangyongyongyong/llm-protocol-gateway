@@ -560,20 +560,23 @@ test('Claude Code 一键接入脚本：只动 env、先备份、不覆盖用户�
   assert.equal(embedded.env.CLAUDE_CODE_SUBAGENT_MODEL, 'default');
 });
 
-test('Claude Desktop 的网关地址：https 或回环 http，绝不写内网 http', () => {
-  // Desktop 的 3p 托管配置校验是 "must use https (or http on loopback)"，
-  // 比 CLI 的 ANTHROPIC_BASE_URL 严。写内网 http 进去不会当场报错，Desktop
-  // 会在启动时丢掉整条配置并说「Couldn't load your organization's model list」。
+test('写进本机配置的网关地址：回环 http 或公网 https，绝不写内网 http', () => {
+  // 两个理由叠在一起：
+  //   1. 本机配置指向的是跑网关的这台机器，网卡 IP 会随 Wi-Fi 切换 / DHCP 续租
+  //      而变，写死进去过几天就不通了；127.0.0.1 永远通。
+  //   2. Desktop 的 3p 托管配置校验是 "must use https (or http on loopback)"，
+  //      写内网 http 进去不会当场报错，它会在启动时丢掉整条配置并说
+  //      「Couldn't load your organization's model list」。
   const lan = [{id: 'e1', protocol: 'openai_chat', basePath: '/v1', listenHost: '192.168.1.10', listenPort: 18093}];
-  assert.equal(lib.desktopGatewayRoot(lan, ''), 'http://127.0.0.1:18093', '没有公网地址时退回回环，不能写内网 IP');
+  assert.equal(lib.localAgentGatewayRoot(lan, ''), 'http://127.0.0.1:18093', '没有公网地址时退回回环，不能写内网 IP');
 
   const loopback = [{id: 'e1', protocol: 'openai_chat', basePath: '/v1', listenHost: '127.0.0.1', listenPort: 18093}];
-  assert.equal(lib.desktopGatewayRoot(loopback, ''), 'http://127.0.0.1:18093');
+  assert.equal(lib.localAgentGatewayRoot(loopback, ''), 'http://127.0.0.1:18093');
 
   // 公网 https 优先。
-  assert.equal(lib.desktopGatewayRoot(lan, 'https://gw.example.com'), 'https://gw.example.com');
-  assert.equal(lib.desktopGatewayRoot(lan, 'https://gw.example.com/'), 'https://gw.example.com', '去掉尾部斜杠');
+  assert.equal(lib.localAgentGatewayRoot(lan, 'https://gw.example.com'), 'https://gw.example.com');
+  assert.equal(lib.localAgentGatewayRoot(lan, 'https://gw.example.com/'), 'https://gw.example.com', '去掉尾部斜杠');
 
   // 公网但只有 http：Desktop 不接受，仍退回回环，而不是把一个会被拒的地址写进去。
-  assert.equal(lib.desktopGatewayRoot(lan, 'http://gw.example.com'), 'http://127.0.0.1:18093');
+  assert.equal(lib.localAgentGatewayRoot(lan, 'http://gw.example.com'), 'http://127.0.0.1:18093');
 });

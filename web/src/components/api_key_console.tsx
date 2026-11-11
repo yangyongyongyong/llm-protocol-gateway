@@ -26,7 +26,7 @@ import {
   buildClaudeCodeSwitcherScript,
   clientConfigsForProtocol,
   copyToClipboard,
-  desktopGatewayRoot,
+  localAgentGatewayRoot,
   protocolLabel,
   protocolFromLabel,
   ScheduleModeOptions,
@@ -691,7 +691,13 @@ export function ApiKeyDetailWorkspace(props: ApiKeyWorkspaceProps) {
   }, [publicAvailable, publicPreview]);
 
   function copy(text: string, message: string, token = 'plain') {
-    if (!text) return;
+    if (!text) {
+      // 空文本不是复制，而是"动作完成"的反馈：一键写入本机写完配置后走这条
+      // 路（它没有要复制的东西）。以前这里直接 return，写入成功什么都不弹。
+      flashCopied(token);
+      if (message) onToast(message);
+      return;
+    }
     // 局域网 HTTP 下 navigator.clipboard 不存在，必须走带 execCommand 降级的
     // copyToClipboard；直接调 clipboard 会让点击静默失败。
     void copyToClipboard(text).then((ok) => {
@@ -1705,9 +1711,11 @@ function ClientTab({
   const [applyingClients, setApplyingClients] = React.useState(false);
   const gatewayURL = apiKeyGatewayRoot(endpoints, publicPreview && publicAvailable ? livePublicURL : '').replace(/\/$/, '');
   const publicBase = publicPreview && publicAvailable ? livePublicURL : '';
-  // Desktop 的 3p 配置只收 https 或回环 http，和 CLI 用的 gatewayURL 不是
-  // 同一个值：内网 IP 的 http 地址会被 Desktop 判定为 malformed 而整条丢弃。
-  const desktopGatewayURL = desktopGatewayRoot(endpoints, publicBase);
+  // 「一键写入本机」写的是跑网关这台机器上的配置：CLI 与桌面端共用同一个地址。
+  // 本机走 127.0.0.1，选了公网 https 域名才用公网。以前 CLI 那半写的是网卡
+  // IP，换网络、换网卡、拔掉 Wi-Fi 都会失效，而 127.0.0.1 永远通。
+  // （Desktop 的 3p 配置还额外要求 https 或回环 http，这条规则同时满足它。）
+  const localAgentURL = localAgentGatewayRoot(endpoints, publicBase);
 
   // 直接调后端把本机配置写好：CLI 与桌面端读的是两套文件，后端一次都写。
   const applyLocally = async () => {
@@ -1715,8 +1723,8 @@ function ClientTab({
     setApplyingClients(true);
     try {
       const outcome = await applyClaudeClientSetup({
-        baseURL: `${gatewayURL}/anthropic`,
-        gatewayURL: desktopGatewayURL,
+        baseURL: `${localAgentURL}/anthropic`,
+        gatewayURL: localAgentURL,
         token: keyItem.key,
         model: 'default[1m]',
       });
@@ -1724,6 +1732,8 @@ function ClientTab({
         void alertDialog(outcome.error || '写入失败');
         return;
       }
+      // 没有文本可复制，这里要的是"写入成功"的反馈：copy() 对空文本只弹
+      // 提示、不碰剪贴板（早期它直接 return，导致写入成功后毫无反应）。
       onCopy('', '已写入本机 Claude Code CLI 与 Claude Desktop 配置', 'claude-local');
       const notes = (outcome.result?.notes || []).join('\n');
       void alertDialog(`已写入本机配置：\n${outcome.result?.cliPath || ''}\n${outcome.result?.desktopPath || ''}${notes ? `\n\n${notes}` : ''}`);

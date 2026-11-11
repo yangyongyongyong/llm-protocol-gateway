@@ -255,6 +255,11 @@ func isModelProtocolPath(path string) bool {
 	switch {
 	case path == "/v1/models",
 		strings.HasPrefix(path, "/v1/chat/completions"),
+		// Claude Desktop 的 3p 模式把 /v1/messages 拼在网关根地址后面（见
+		// server.go 的路由注册）。它不是控制台路径：漏了这一条，请求在本地 /
+		// 局域网主机上不会进 mux，桌面端拿到的是 SPA 的 404。
+		path == "/v1/messages",
+		path == "/v1/messages/count_tokens",
 		strings.HasPrefix(path, "/v1/images/"),
 		// Video submit and poll are model calls too: without this prefix the local/LAN
 		// host path never forwards them to the mux, and they answer a plain 404
