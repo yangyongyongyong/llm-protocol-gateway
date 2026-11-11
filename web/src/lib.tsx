@@ -3103,6 +3103,23 @@ export function localGatewayRoot(endpoints: OutputEndpoint[]) {
   return endpoint ? `http://${endpoint.listenHost}:${endpoint.listenPort}` : 'http://127.0.0.1:18093';
 }
 
+export function localGatewayLoopbackRoot(endpoints: OutputEndpoint[]) {
+  const endpoint = endpoints[0];
+  return endpoint ? `http://127.0.0.1:${endpoint.listenPort}` : 'http://127.0.0.1:18093';
+}
+
+/**
+ * Claude Desktop 的 3p 托管配置只接受 https，或回环地址上的 http
+ * （`must use https (or http on loopback)`）。这比 CLI 的 ANTHROPIC_BASE_URL
+ * 严——后者填局域网地址照常能连。所以两者不能共用同一个地址：公网 https
+ * 优先，否则退到 127.0.0.1，绝不把内网 http 地址写进 Desktop 的配置。
+ */
+export function desktopGatewayRoot(endpoints: OutputEndpoint[], publicBase: string) {
+  const base = (publicBase || '').trim().replace(/\/$/, '');
+  if (base && base.toLowerCase().startsWith('https://')) return base;
+  return localGatewayLoopbackRoot(endpoints);
+}
+
 /**
  * 浏览器是从哪个地址打开控制台的，那也就是客户端真正能连通的地址：域名反代
  * （Caddy/Nginx）后面，网关自报的网卡 IP 可能已经不对公网开放。loopback 打开

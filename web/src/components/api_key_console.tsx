@@ -26,6 +26,7 @@ import {
   buildClaudeCodeSwitcherScript,
   clientConfigsForProtocol,
   copyToClipboard,
+  desktopGatewayRoot,
   protocolLabel,
   protocolFromLabel,
   ScheduleModeOptions,
@@ -1704,6 +1705,9 @@ function ClientTab({
   const [applyingClients, setApplyingClients] = React.useState(false);
   const gatewayURL = apiKeyGatewayRoot(endpoints, publicPreview && publicAvailable ? livePublicURL : '').replace(/\/$/, '');
   const publicBase = publicPreview && publicAvailable ? livePublicURL : '';
+  // Desktop 的 3p 配置只收 https 或回环 http，和 CLI 用的 gatewayURL 不是
+  // 同一个值：内网 IP 的 http 地址会被 Desktop 判定为 malformed 而整条丢弃。
+  const desktopGatewayURL = desktopGatewayRoot(endpoints, publicBase);
 
   // 直接调后端把本机配置写好：CLI 与桌面端读的是两套文件，后端一次都写。
   const applyLocally = async () => {
@@ -1712,7 +1716,7 @@ function ClientTab({
     try {
       const outcome = await applyClaudeClientSetup({
         baseURL: `${gatewayURL}/anthropic`,
-        gatewayURL,
+        gatewayURL: desktopGatewayURL,
         token: keyItem.key,
         model: 'default[1m]',
       });

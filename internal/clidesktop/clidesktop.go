@@ -15,6 +15,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -111,9 +113,59 @@ func joinFor(goos string, parts ...string) string {
 // 同一个套路：UUID 形状合法，又能一眼看出是谁写的。
 const profileID = "00000000-0000-4000-8000-6c6c6d000001"
 
+// desktopGatewayURLRefusal reports why value cannot be written to
+// inferenceGatewayBaseUrl, or "" when it is acceptable.
+//
+// Claude Desktop's managed-config validator accepts a gateway URL only over
+// https, or over http when the host is loopback. That is stricter than Claude
+// Code CLI, whose ANTHROPIC_BASE_URL happily takes a LAN address — so the two
+// clients cannot share one value. Writing a LAN http URL anyway does not fail
+// here; Desktop drops the whole field on load and reports "Couldn't load your
+// organization's model list", which looks like a model problem rather than a
+// URL problem. Refusing up front keeps the two distinguishable.
+func desktopGatewayURLRefusal(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "缺少 Claude Desktop 的网关地址"
+	}
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return fmt.Sprintf("Claude Desktop 的网关地址无法解析: %v", err)
+	}
+	if parsed.Host == "" {
+		return fmt.Sprintf("Claude Desktop 的网关地址缺少主机名: %q", value)
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "https":
+		return ""
+	case "http":
+		if !isLoopbackHost(parsed.Hostname()) {
+			return fmt.Sprintf("Claude Desktop 只接受 https，或本机回环地址上的 http；%q 是内网地址，请填入公网 https 地址", value)
+		}
+		return ""
+	default:
+		return fmt.Sprintf("Claude Desktop 的网关地址必须以 https:// 或 http:// 开头，收到 %q", value)
+	}
+}
+
+// isLoopbackHost 判断主机名是不是本机回环（localhost / 127.0.0.0-8 / ::1）。
+// 只看字面量：这里判断的是写进配置文件、由 Desktop 自己去连的那个地址，
+// 不做 DNS 解析。
+func isLoopbackHost(host string) bool {
+	host = strings.ToLower(strings.Trim(strings.TrimSpace(host), "[]"))
+	if host == "localhost" || host == "::1" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // Apply 把 CLI 与 Desktop 都指向 e。两者互相独立：一边失败不影响另一边，
 // 错误用 errors.Join 汇总返回，调用方仍可从 Result 看出哪些成功。
 func Apply(e Endpoint) (Result, error) {
+	if refusal := desktopGatewayURLRefusal(e.GatewayURL); refusal != "" {
+		return Result{}, errors.New(refusal)
+	}
 	home, err := Home()
 	if err != nil {
 		return Result{}, fmt.Errorf("定位用户主目录失败: %w", err)

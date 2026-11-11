@@ -559,3 +559,21 @@ test('Claude Code 一键接入脚本：只动 env、先备份、不覆盖用户�
   const embedded = JSON.parse(Buffer.from(b64[1], 'base64').toString('utf8'));
   assert.equal(embedded.env.CLAUDE_CODE_SUBAGENT_MODEL, 'default');
 });
+
+test('Claude Desktop 的网关地址：https 或回环 http，绝不写内网 http', () => {
+  // Desktop 的 3p 托管配置校验是 "must use https (or http on loopback)"，
+  // 比 CLI 的 ANTHROPIC_BASE_URL 严。写内网 http 进去不会当场报错，Desktop
+  // 会在启动时丢掉整条配置并说「Couldn't load your organization's model list」。
+  const lan = [{id: 'e1', protocol: 'openai_chat', basePath: '/v1', listenHost: '192.168.1.10', listenPort: 18093}];
+  assert.equal(lib.desktopGatewayRoot(lan, ''), 'http://127.0.0.1:18093', '没有公网地址时退回回环，不能写内网 IP');
+
+  const loopback = [{id: 'e1', protocol: 'openai_chat', basePath: '/v1', listenHost: '127.0.0.1', listenPort: 18093}];
+  assert.equal(lib.desktopGatewayRoot(loopback, ''), 'http://127.0.0.1:18093');
+
+  // 公网 https 优先。
+  assert.equal(lib.desktopGatewayRoot(lan, 'https://gw.example.com'), 'https://gw.example.com');
+  assert.equal(lib.desktopGatewayRoot(lan, 'https://gw.example.com/'), 'https://gw.example.com', '去掉尾部斜杠');
+
+  // 公网但只有 http：Desktop 不接受，仍退回回环，而不是把一个会被拒的地址写进去。
+  assert.equal(lib.desktopGatewayRoot(lan, 'http://gw.example.com'), 'http://127.0.0.1:18093');
+});

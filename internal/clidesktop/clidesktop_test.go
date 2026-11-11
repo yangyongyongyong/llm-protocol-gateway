@@ -375,3 +375,71 @@ func TestBackupKeepsOriginal(t *testing.T) {
 		t.Fatalf("backup content = %q, want the original", raw)
 	}
 }
+
+// Desktop 的托管配置只收 https 或回环 http："must use https (or http on
+// loopback)"。内网 IP 的 http 地址必须当场拒掉，而不是写进去让 Desktop 在
+// 下次启动时报「Couldn't load your organization's model list」——那条报错
+// 指向的是模型，看不出真正错在地址。
+func TestApplyRefusesGatewayURLDesktopCannotParse(t *testing.T) {
+	cases := []struct {
+		name    string
+		gateway string
+		wantErr bool
+	}{
+		{"公网 https", "https://gw.example.com", false},
+		{"回环 http", "http://127.0.0.1:18093", false},
+		{"回环 localhost", "http://localhost:18093", false},
+		{"回环 IPv6", "http://[::1]:18093", false},
+		{"内网 http 被拒", "http://192.168.1.10:18093", true},
+		{"内网 10 段被拒", "http://10.0.0.5:18093", true},
+		{"空值被拒", "", true},
+		{"缺主机被拒", "https://", true},
+		{"非 http scheme 被拒", "ftp://gw.example.com", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			withHome(t)
+			e := endpoint()
+			e.GatewayURL = tc.gateway
+			_, err := Apply(e)
+			if tc.wantErr && err == nil {
+				t.Fatalf("Apply(%q) must be refused", tc.gateway)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("Apply(%q): %v", tc.gateway, err)
+			}
+		})
+	}
+}
+
+// 被拒之前不能写任何文件：否则 CLI 那边已经改了、Desktop 那边留着坏值，
+// 用户看到的是"一半生效"。
+func TestRefusedGatewayURLWritesNothing(t *testing.T) {
+	home := withHome(t)
+	e := endpoint()
+	e.GatewayURL = "http://192.168.1.10:18093"
+	if _, err := Apply(e); err == nil {
+		t.Fatal("a LAN http address must be refused")
+	}
+	if _, err := os.Stat(filepath.Join(home, ".claude", "settings.json")); !os.IsNotExist(err) {
+		t.Fatalf("CLI settings must not be written when the desktop URL is refused, stat err = %v", err)
+	}
+	if _, err := os.Stat(desktop3pDir(home)); !os.IsNotExist(err) {
+		t.Fatalf("desktop config must not be written, stat err = %v", err)
+	}
+}
+
+// 回环地址要真的写进 profile，而不是被当成"不安全"略过。
+func TestApplyWritesLoopbackGatewayURL(t *testing.T) {
+	home := withHome(t)
+	e := endpoint()
+	e.GatewayURL = "http://127.0.0.1:18093"
+	if _, err := Apply(e); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	library := filepath.Join(desktop3pDir(home), "configLibrary")
+	profile := readJSON(t, filepath.Join(library, profileID+".json"))
+	if got, _ := profile["inferenceGatewayBaseUrl"].(string); got != "http://127.0.0.1:18093" {
+		t.Fatalf("inferenceGatewayBaseUrl = %q, want the loopback address", got)
+	}
+}
