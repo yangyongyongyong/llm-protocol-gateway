@@ -24,7 +24,8 @@ import (
 type peerUpstreamRegisterRequest struct {
 	// ParentURL 是上游网关地址，允许只填主机名（见 normalizePeerParentURL）。
 	ParentURL string `json:"parentUrl"`
-	// Username / Password 是上游给本机开的账号。密码不落本机：它只在注册
+	// Username / Password 是本机在上游的账号——由本机运维自己定，第一次注册
+	// 时上游原样建成账号，之后重新注册必须填同一个。密码不落本机：它只在注册
 	// 这一刻用来换凭据，换回来的 token 才是长期保存的东西。
 	Username string `json:"username"`
 	Password string `json:"password"`
@@ -182,7 +183,7 @@ func (s *Server) handleRegisterPeerUpstream(w http.ResponseWriter, r *http.Reque
 	username := strings.TrimSpace(payload.Username)
 	password := strings.TrimSpace(payload.Password)
 	if username == "" || password == "" {
-		writeOpenAIError(w, http.StatusBadRequest, "上游给本机开的用户名和密码都必须填写")
+		writeOpenAIError(w, http.StatusBadRequest, "用户名和密码都必须填写（第一次注册时由你自己设定，之后每次填同一个）")
 		return
 	}
 	name := strings.TrimSpace(payload.Name)
@@ -432,7 +433,7 @@ func (s *Server) handleReconnectPeerUpstream(w http.ResponseWriter, r *http.Requ
 	username := strings.TrimSpace(payload.Username)
 	password := strings.TrimSpace(payload.Password)
 	if username == "" || password == "" {
-		writeOpenAIError(w, http.StatusBadRequest, "上游给本机开的用户名和密码都必须填写")
+		writeOpenAIError(w, http.StatusBadRequest, "用户名和密码都必须填写，且与第一次注册时填的完全一样")
 		return
 	}
 	// 协议与名字都沿用这条 provider 现有的：换协议等于换一条链路，该新建一条。
@@ -474,6 +475,54 @@ func (s *Server) handleReconnectPeerUpstream(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, map[string]any{
 		"upstream": s.peerUpstreamSummaryOf(provider.ID),
 		"username": registration.Username,
+	})
+}
+
+// handleProbePeerUpstream 是「连接到上游网关」表单上的「测试连接」。
+//
+// 它只回答一个问题：这个地址现在能不能注册。因此它不创建账号、不换发凭据、
+// 不落任何状态——表单还没提交，用户名密码可能都还没填。注册失败的原因有很多
+// 种（账号名被占用、密码长度不够、上游没授权的 provider……），这些都不在这里
+// 拦，留给真正的注册去说。
+func (s *Server) handleProbePeerUpstream(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePermission(w, r, domain.PermPeersManage) {
+		return
+	}
+	var payload struct {
+		ParentURL string `json:"parentUrl"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&payload); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	parentURL := strings.TrimSpace(payload.ParentURL)
+	if parentURL == "" {
+		writeOpenAIError(w, http.StatusBadRequest, "请填写上游网关地址")
+		return
+	}
+	root, ok := trimPeerParentURL(parentURL)
+	if !ok {
+		writeOpenAIError(w, http.StatusBadRequest, "上游网关地址不能为空")
+		return
+	}
+	result, err := newPeerClient().probe(r.Context(), root)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, fmt.Sprintf("连不上 %s：%v", root, err))
+		return
+	}
+	message := strings.TrimSpace(result.Message)
+	if message == "" {
+		message = "上游网关可以访问，注册入口正常"
+	}
+	s.logs.AddApp("info", "peer upstream probe", fmt.Sprintf("parent=%s allowed=%t", root, result.RegistrationAllowed))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"parentUrl": root,
+		// GatewayID 是上游自己的身份：连对机器比"能连上"更重要，尤其是同一个
+		// 域名后面换过机器的时候。
+		"gatewayId":              result.GatewayID,
+		"registrationAllowed":    result.RegistrationAllowed,
+		"registrationAllowCidrs": result.RegistrationAllowCIDRs,
+		"message":                message,
 	})
 }
 

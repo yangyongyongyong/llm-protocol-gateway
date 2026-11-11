@@ -241,6 +241,7 @@ func TestNormalizePeerParentURL(t *testing.T) {
 		"vps1.example.com":                                  "https://vps1.example.com",
 		"http://10.0.0.5:8080/":                             "http://10.0.0.5:8080",
 		"https://vps1.example.com/__peer/register":          "https://vps1.example.com",
+		"https://vps1.example.com/__peer/probe":             "https://vps1.example.com",
 		"https://vps1.example.com/__peer/chat/completions/": "https://vps1.example.com",
 	}
 	for input, want := range cases {

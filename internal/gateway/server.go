@@ -594,6 +594,9 @@ func (s *Server) Handler() http.Handler {
 	// 用户名密码把关；其余端点只认对端凭据。整段前缀在 admin_auth 里被旁路
 	// 掉会话鉴权，见 withAdminAuth。
 	mux.HandleFunc("POST /__peer/register", s.handlePeerRegister)
+	// 注册前的连通性探测：表单上「测试连接」问的就是它。不需要凭据，也不写
+	// 任何状态——此刻还没有账号可言。
+	mux.HandleFunc("GET /__peer/probe", s.handlePeerProbe)
 	mux.HandleFunc("GET /__peer/me", s.handlePeerMe)
 	mux.HandleFunc("GET /__peer/providers", s.handlePeerProviders)
 	mux.HandleFunc("POST /__peer/chat/completions", s.handlePeerChatCompletions)
@@ -610,6 +613,8 @@ func (s *Server) Handler() http.Handler {
 	// apiKeySource 上，所以这一组本质是普通的 provider 管理动作，只是包一层，
 	// 免得运维要在"输入 Provider"里手填一个 /__peer 地址。
 	mux.HandleFunc("GET /__peer-upstreams", s.handleListPeerUpstreams)
+	// 表单上的「测试连接」：只探连通性与注册来源限制，不建账号、不换凭据。
+	mux.HandleFunc("POST /__peer-upstreams/probe", s.handleProbePeerUpstream)
 	mux.HandleFunc("POST /__peer-upstreams", s.handleRegisterPeerUpstream)
 	mux.HandleFunc("POST /__peer-upstreams/{id}/refresh", s.handleRefreshPeerUpstream)
 	mux.HandleFunc("POST /__peer-upstreams/{id}/reconnect", s.handleReconnectPeerUpstream)

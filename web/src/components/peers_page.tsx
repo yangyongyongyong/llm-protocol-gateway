@@ -1,4 +1,4 @@
-import React, {useCallback, useEffect, useMemo, useState} from 'react';
+import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {API_BASE, protocolLabel} from '../lib';
 import {Badge, Field, Modal} from './ui';
 import {confirmDialog} from '../dialogs';
@@ -115,7 +115,7 @@ export function PeersPage({
   const [maxHopsDraft, setMaxHopsDraft] = useState('');
   const [maxHopsSaving, setMaxHopsSaving] = useState(false);
   const [allowCidrs, setAllowCidrs] = useState('');
-  const [allowsPrivate, setAllowsPrivate] = useState(true);
+  const [registrationOpen, setRegistrationOpen] = useState(true);
   const [peersLoading, setPeersLoading] = useState(true);
   const [peersError, setPeersError] = useState('');
   /** 正在调授权的下游网关；null = 关闭。 */
@@ -153,7 +153,7 @@ export function PeersPage({
       setMaxHops(payload.maxHops || 0);
       setMaxHopsDraft(String(payload.maxHops || 0));
       setAllowCidrs(payload.registrationAllowCidrs || '');
-      setAllowsPrivate(payload.registrationAllowsPrivate ?? true);
+      setRegistrationOpen(payload.registrationOpen ?? true);
       setPeersError('');
     } catch (error) {
       setPeersError((error as Error).message);
@@ -181,7 +181,7 @@ export function PeersPage({
       return;
     }
     if (!draft.username.trim() || !draft.password.trim()) {
-      setDraftError('请填写上游给本机开的用户名和密码');
+      setDraftError('用户名和密码都要填：第一次由你自己设定，之后每次注册填同一个');
       return;
     }
     setDraftSaving(true);
@@ -261,7 +261,7 @@ export function PeersPage({
         body: JSON.stringify({ cidrs: value }),
       });
       setAllowCidrs(payload.cidrs || '');
-      setAllowsPrivate(!(payload.cidrs || '').trim());
+      setRegistrationOpen(!(payload.cidrs || '').trim());
       setPeersError('');
     } catch (error) {
       setPeersError((error as Error).message);
@@ -325,7 +325,7 @@ export function PeersPage({
         {upstreamsLoading && upstreams.length === 0 ? <div className="empty-state">加载中…</div> : null}
         {!upstreamsLoading && upstreams.length === 0 && !upstreamsError ? (
           <div className="empty-state">
-            还没有连接任何上游网关。{canManage ? '点「连接到上游网关」，用上游那边给本机开的用户名和密码注册即可。' : ''}
+            还没有连接任何上游网关。{canManage ? '点「连接到上游网关」，填上游地址加一组你自己定的用户名和密码即可。' : ''}
           </div>
         ) : null}
 
@@ -500,9 +500,9 @@ export function PeersPage({
               <Field
                 fullWidth
                 label="允许注册的来源"
-                hint="留空 = 只允许本机与内网（默认）。公网部署时必须在这里写出允许的来源网段，否则注册会被拒。多个网段用逗号或换行分隔。"
+                hint="留空 = 不限制来源（默认，公网下游可以直接注册）。填了网段就只放行这些来源，其它一律拒绝。注册本身靠的是下游自己定的用户名和密码，这里只是额外的收紧手段。多个网段用逗号或换行分隔。"
                 value={allowCidrs}
-                placeholder={allowsPrivate ? '留空：仅本机 / 内网' : '例如 203.0.113.0/24'}
+                placeholder={registrationOpen ? '留空：不限制来源' : '例如 203.0.113.0/24'}
                 multiline
                 rows={2}
                 onChange={(value) => setAllowCidrs(value)}
@@ -577,35 +577,107 @@ function UpstreamDraftModal({
     PROTOCOL_OPTIONS.map((option): IconSelectOption => ({ value: option.value, label: option.label })));
   const protocolValue = useMemo(() => draft.protocol, [draft.protocol]);
   const editing = Boolean(draft.providerId);
+  // 「测试连接」：只问上游能不能连通、允不允许本机注册，不建账号、不换凭据。
+  const [probing, setProbing] = useState(false);
+  const [probeResult, setProbeResult] = useState<{ ok: boolean; text: string } | null>(null);
+  // 每次探测递增；回来的结果不是最新那一次就丢弃，避免改了地址后旧结果盖上来。
+  const probeSeq = useRef(0);
+  // 弹窗关闭（含测试进行中）之后结果不能再写进已经卸载的组件。
+  const mounted = useRef(true);
+  useEffect(() => () => { mounted.current = false; }, []);
+
+  const parentUrl = draft.parentUrl.trim();
+  const busy = saving || probing;
+
+  const runProbe = async () => {
+    if (!parentUrl) {
+      setProbeResult({ ok: false, text: '请先填写上游网关地址' });
+      return;
+    }
+    const seq = ++probeSeq.current;
+    setProbing(true);
+    setProbeResult(null);
+    try {
+      const payload = await jsonRequest<{
+        parentUrl?: string;
+        gatewayId?: string;
+        registrationAllowed?: boolean;
+        message?: string;
+      }>(`${API_BASE}/__peer-upstreams/probe`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ parentUrl }),
+      });
+      if (!mounted.current || seq !== probeSeq.current) return;
+      const parts = [payload.message || '连接正常'];
+      if (payload.gatewayId) parts.push(`上游身份 ${payload.gatewayId}`);
+      setProbeResult({
+        ok: payload.registrationAllowed !== false,
+        text: parts.join('；'),
+      });
+    } catch (probeError) {
+      if (!mounted.current || seq !== probeSeq.current) return;
+      setProbeResult({ ok: false, text: (probeError as Error).message });
+    } finally {
+      if (mounted.current && seq === probeSeq.current) setProbing(false);
+    }
+  };
+
   return (
     <Modal
       title={editing ? '重新注册上游网关' : '连接到上游网关'}
       description={editing
-        ? '用上游给本机开的用户名和密码重新注册。会换发一把新凭据，上游那边旧的立刻失效；模型清单按上游最新授权更新。'
-        : '用上游那边给本机开的用户名和密码注册。注册成功后本机会多一条 Provider（authType=peer）和一条同协议的路由，密钥绑定到那条路由就能用。'}
-      onClose={onClose}
+        ? '用第一次注册时填的那组用户名和密码重新注册。用户名和密码都是你自己定的，不是上游发给你的。'
+        : '用户名和密码由你自己定，上游会照此给本机建一个账号。'}
+      onClose={busy ? () => {} : onClose}
     >
       <div className="form-grid">
         {editing ? null : (
           <Field
             fullWidth
             label="上游网关地址"
-            hint="只填主机名也可以，默认按 https。粘进来的 /__peer/... 路径会被去掉。"
+            hint="公网地址直接填即可（例如网关的独立 API 域名）：只填主机名时默认按 https。粘进来的 /__peer/... 路径会被去掉。"
             value={draft.parentUrl}
             placeholder="vps1.example.com"
-            onChange={(value) => onChange({ ...draft, parentUrl: value })}
+            onChange={(value) => {
+              // 换了地址，上一次的探测结果就不再对应这个地址了。
+              probeSeq.current += 1;
+              setProbing(false);
+              setProbeResult(null);
+              onChange({ ...draft, parentUrl: value });
+            }}
           />
         )}
+        <div className="field field-full">
+          <div className="field-label-row">
+            <label>{editing ? '连通性' : '先测一下'}</label>
+          </div>
+          <div className="peer-probe-row">
+            <button className="btn" type="button" disabled={busy} onClick={() => void runProbe()}>
+              {probing ? '测试中…' : '测试连接'}
+            </button>
+            <span className="hint-text peer-probe-text">
+              {editing
+                ? draft.parentUrl
+                : '只检查能否连通、上游是否允许本机注册；不创建账号、不换凭据。可以填完地址先测，再填用户名密码。'}
+            </span>
+          </div>
+          {probeResult ? (
+            <div className={probeResult.ok ? 'peer-probe-ok' : 'rbac-form-error'}>{probeResult.text}</div>
+          ) : null}
+        </div>
         <Field
-          label="上游给的用户名"
+          label="用户名"
+          hint="第一次注册时自己填一个（例如 peer-<本机身份后几位>），上游照此建账号；之后每次重新注册都要填同一个。"
           value={draft.username}
-          placeholder="peer-xxxxxxxx"
+          placeholder="自己定一个用户名"
           onChange={(value) => onChange({ ...draft, username: value })}
         />
         <Field
           label="密码"
+          hint="同样是第一次注册时自己设定（至少 8 位），之后重新注册必须一字不差。上游只存摘要，本机不保存密码。"
           value={draft.password}
-          placeholder="上游设置的那个密码"
+          placeholder="自己设定一个密码"
           onChange={(value) => onChange({ ...draft, password: value })}
         />
         {editing ? null : (
@@ -629,8 +701,8 @@ function UpstreamDraftModal({
       </div>
       {error ? <div className="rbac-form-error">{error}</div> : null}
       <div className="modal-actions">
-        <button className="btn" type="button" onClick={onClose} disabled={saving}>取消</button>
-        <button className="btn primary" type="button" onClick={onSubmit} disabled={saving}>
+        <button className="btn" type="button" onClick={onClose} disabled={busy}>取消</button>
+        <button className="btn primary" type="button" onClick={onSubmit} disabled={busy}>
           {saving ? '注册中…' : editing ? '重新注册' : '注册'}
         </button>
       </div>

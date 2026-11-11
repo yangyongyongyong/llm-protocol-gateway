@@ -136,8 +136,8 @@ func (r *Router) SetLog2xxBodies(enabled bool) {
 	r.state.Log2xxBodies = enabled
 }
 
-// SetPeerRegistrationAllowCIDRs 设置对端注册的来源白名单。空串恢复默认
-// （只允许本机与内网）。
+// SetPeerRegistrationAllowCIDRs 设置对端注册的来源白名单。空串 = 没有白名单
+// （任何来源都能注册）。
 func (r *Router) SetPeerRegistrationAllowCIDRs(raw string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

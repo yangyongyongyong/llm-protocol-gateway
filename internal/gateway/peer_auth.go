@@ -24,8 +24,9 @@ import (
 // 也方便日志和告警按前缀归类。
 const peerTokenPrefix = "gwpeer-"
 
-// peerUsernamePrefix 让对端账号在用户管理页里一眼可辨，即使界面还没渲染
-// kind 列。用户名唯一由网关身份派生，因此同一个下游重复注册是幂等的。
+// peerUsernamePrefix 只是一个默认前缀，给界面上的示例和旧数据留个可辨识的
+// 习惯写法。对端账号名不强制带它：注册时用哪个用户名完全由下游运维自己定，
+// 上游原样存下来——重复注册之所以幂等，靠的是网关身份（gatewayId），不是名字。
 const peerUsernamePrefix = "peer-"
 
 var (

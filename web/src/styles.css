@@ -12947,6 +12947,11 @@ html[data-theme="dark"] .wb-task-badge[data-tone="ok"] { color: #6ee7b7; border-
   display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px;
 }
 
+/* 表单里的「测试连接」：按钮与说明同一行，结果另起一段（失败沿用 .rbac-form-error）。 */
+.peer-probe-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.peer-probe-text { margin-top: 0; flex: 1 1 220px; }
+.peer-probe-ok { margin-top: 6px; color: var(--text); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+
 @media (max-width: 900px) {
   /* 窄屏：一个网关就是一块，标题行藏起来——列头对不上时会比没有更误导。 */
   .peer-upstream-row-head { display: none; }

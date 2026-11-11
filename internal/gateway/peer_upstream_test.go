@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -482,5 +483,123 @@ func TestPeerUpstreamUpdateKeepsExistingPeerProvider(t *testing.T) {
 	}
 	if updated.Name != "vps1-改名后" || updated.AuthType != domain.AuthTypePeer {
 		t.Fatalf("updated = %+v", updated)
+	}
+}
+
+// 表单上的「测试连接」：只探连通性与注册来源限制，不建账号、不换凭据。
+func TestPeerUpstreamProbeChecksGatewayWithoutRegistering(t *testing.T) {
+	parent := newPeerTestServer(t)
+	parent.SetGatewayID(otherID)
+	parentHTTP := httptest.NewServer(parent.Handler())
+	defer parentHTTP.Close()
+
+	child := newPeerTestServer(t)
+	child.SetGatewayID(gwID)
+	body, _ := json.Marshal(map[string]any{"parentUrl": parentHTTP.URL + peerEndpointPrefix + "register"})
+	request := httptest.NewRequest(http.MethodPost, "/__peer-upstreams/probe", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Host = "127.0.0.1"
+	request.RemoteAddr = "127.0.0.1:40000"
+	recorder := httptest.NewRecorder()
+	child.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var probed struct {
+		ParentURL           string `json:"parentUrl"`
+		GatewayID           string `json:"gatewayId"`
+		RegistrationAllowed bool   `json:"registrationAllowed"`
+		Message             string `json:"message"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &probed); err != nil {
+		t.Fatal(err)
+	}
+	// 粘进来的 /__peer/register 路径要被去掉，回的是根地址。
+	if probed.ParentURL != parentHTTP.URL {
+		t.Fatalf("parentUrl = %q, want %q", probed.ParentURL, parentHTTP.URL)
+	}
+	if probed.GatewayID != otherID {
+		t.Fatalf("gatewayId = %q, want the upstream identity %q", probed.GatewayID, otherID)
+	}
+	if !probed.RegistrationAllowed || probed.Message == "" {
+		t.Fatalf("probe result = %+v", probed)
+	}
+	// 探测不能建账号：上游那侧一个 peer 用户都不该有。
+	users, err := parent.userStore.ListUsers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, user := range users {
+		if user.IsPeer() {
+			t.Fatalf("探测不该在上游建出账号：%+v", user)
+		}
+	}
+	// 本机也不该多出 provider。
+	if len(child.router.State().Providers) != 0 {
+		t.Fatalf("探测不该落 provider：%+v", child.router.State().Providers)
+	}
+}
+
+// 上游的白名单挡住本机时，探测仍然回答 200，但明确说"不能从这里注册"：
+// 运维要能区分「不是网关」和「对面不让你注册」。
+func TestPeerUpstreamProbeReportsRefusedSource(t *testing.T) {
+	parent := newPeerTestServer(t)
+	parent.SetGatewayID(otherID)
+	parent.router.SetPeerRegistrationAllowCIDRs("10.0.0.0/8")
+	parentHTTP := httptest.NewServer(parent.Handler())
+	defer parentHTTP.Close()
+
+	child := newPeerTestServer(t)
+	child.SetGatewayID(gwID)
+	body, _ := json.Marshal(map[string]any{"parentUrl": parentHTTP.URL})
+	request := httptest.NewRequest(http.MethodPost, "/__peer-upstreams/probe", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Host = "127.0.0.1"
+	request.RemoteAddr = "127.0.0.1:40000"
+	recorder := httptest.NewRecorder()
+	child.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var probed struct {
+		RegistrationAllowed    bool   `json:"registrationAllowed"`
+		RegistrationAllowCIDRs string `json:"registrationAllowCidrs"`
+		Message                string `json:"message"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &probed); err != nil {
+		t.Fatal(err)
+	}
+	if probed.RegistrationAllowed {
+		t.Fatalf("registrationAllowed must be false: %+v", probed)
+	}
+	if !strings.Contains(probed.Message, "白名单") || probed.RegistrationAllowCIDRs != "10.0.0.0/8" {
+		t.Fatalf("说明里要带上游实际的白名单：%+v", probed)
+	}
+}
+
+// 地址背后不是网关时，错误要说人话，而不是把 HTML 解析错误抛给运维。
+func TestPeerUpstreamProbeRejectsNonGatewayAddress(t *testing.T) {
+	notAGateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = io.WriteString(w, "<html>welcome to nginx</html>")
+	}))
+	defer notAGateway.Close()
+
+	child := newPeerTestServer(t)
+	child.SetGatewayID(gwID)
+	for _, parentURL := range []string{notAGateway.URL, "http://127.0.0.1:1"} {
+		body, _ := json.Marshal(map[string]any{"parentUrl": parentURL})
+		request := httptest.NewRequest(http.MethodPost, "/__peer-upstreams/probe", bytes.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		request.Host = "127.0.0.1"
+		request.RemoteAddr = "127.0.0.1:40000"
+		recorder := httptest.NewRecorder()
+		child.Handler().ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusBadGateway {
+			t.Fatalf("%s: status=%d body=%s", parentURL, recorder.Code, recorder.Body.String())
+		}
+		if !strings.Contains(recorder.Body.String(), "连不上") {
+			t.Fatalf("%s: 错误应当说清是连不上：%s", parentURL, recorder.Body.String())
+		}
 	}
 }

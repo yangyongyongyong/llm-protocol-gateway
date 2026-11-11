@@ -11,6 +11,36 @@ import (
 	"github.com/luca/llm-protocol-gateway/internal/domain"
 )
 
+// handlePeerProbe 让还没注册的下游先确认「这里是不是一个能接受注册的网关」。
+//
+// 它是「测试连接」按钮问的那一句，刻意不需要凭据、也不写任何状态：表单还没
+// 提交，既没有账号也没有密码，能证明的只有三件事——对面确实实现了互联协议、
+// 它认得这个来源、注册这条路此刻是通的。真正的凭据校验发生在注册那一刻。
+//
+// 回复里不含任何账号信息或 provider 清单：这是公开入口，能说出口的只有"能/不能
+// 从这里注册"。来源被白名单挡住时照样回 200，但 allowed=false 并带上说明——
+// 下游要能把「对面不是网关」和「对面不让你注册」区分开，否则运维只会看到一句
+// 连接失败。
+func (s *Server) handlePeerProbe(w http.ResponseWriter, r *http.Request) {
+	allowed := s.peerRegistrationAllowed(r)
+	payload := map[string]any{
+		"gateway": true,
+		// gatewayId 是公开身份（界面里本来就显示），下游据此在测试结果里告诉
+		// 运维「连通的是哪一台」，避免连到一台同域的旧机器上还以为成功。
+		"gatewayId":           s.GatewayID(),
+		"registrationAllowed": allowed,
+		"maxHops":             s.maxGatewayHopsConfigured(),
+		"message":             "上游网关可以访问，注册入口正常",
+	}
+	if !allowed {
+		// 白名单只回给被挡下的来源：它正是运维改配置所需的信息，也就不必向
+		// 所有匿名探测者公开这张网段表。
+		payload["registrationAllowCidrs"] = s.router.PeerRegistrationAllowCIDRs()
+		payload["message"] = "上游网关可以访问，但它的注册来源白名单不允许本机注册；请让上游管理员把本机出口地址加进白名单"
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
 // handlePeerMe 让下游确认自己的凭据还有效、拿到了哪些 provider。
 //
 // 它是下游的"探活"接口：注册成功后定期调一次，就能在上游把它们断开时

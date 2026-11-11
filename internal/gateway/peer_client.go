@@ -90,7 +90,7 @@ func trimPeerParentURL(raw string) (string, bool) {
 	// 端点由我们自己拼，用户粘进来的完整路径必须去掉，否则会得到
 	// https://host/__peer/register/__peer/register 这种地址。
 	for _, suffix := range []string{
-		peerEndpointPrefix + "register", peerEndpointPrefix + "me",
+		peerEndpointPrefix + "register", peerEndpointPrefix + "probe", peerEndpointPrefix + "me",
 		peerEndpointPrefix + "providers", peerEndpointPrefix + "chat/completions",
 	} {
 		if strings.HasSuffix(value, suffix) {
@@ -136,6 +136,57 @@ func (c *peerClient) register(ctx context.Context, parentURL, selfID, name, user
 		// 注册响应里的 GatewayID 是本机身份，两个方向别拿反。
 		ParentGatewayID: response.ParentGatewayID,
 	}, nil
+}
+
+// peerProbeResult 是上游 /__peer/probe 的回答：能连上、且注册这条路通不通。
+type peerProbeResult struct {
+	// Gateway 为 true 说明对面确实是一个实现了互联协议的网关。
+	Gateway bool `json:"gateway"`
+	// GatewayID 是上游自己的身份，用来在测试结果里说清连到了哪一台。
+	GatewayID string `json:"gatewayId"`
+	// RegistrationAllowed 是上游按它自己的来源白名单给本次来源的结论。
+	RegistrationAllowed bool `json:"registrationAllowed"`
+	// RegistrationAllowCIDRs 是上游配的白名单原文（空 = 不限来源），出错时
+	// 提示语要能直接告诉运维上游实际限制了什么。
+	RegistrationAllowCIDRs string `json:"registrationAllowCidrs"`
+	Message                string `json:"message"`
+}
+
+// probe 问一下这个地址背后是不是一个能接受注册的上游网关。
+//
+// 不带凭据、不建账号、不换凭据：它只服务于表单上的「测试连接」。老版本上游
+// 没有这个端点，会回 404/405，调用方据此提示「版本太旧，仍可直接注册」。
+func (c *peerClient) probe(ctx context.Context, parentURL string) (peerProbeResult, error) {
+	root, err := normalizePeerParentURL(parentURL)
+	if err != nil {
+		return peerProbeResult{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, root+peerEndpointPrefix+"probe", nil)
+	if err != nil {
+		return peerProbeResult{}, err
+	}
+	httpResponse, err := c.httpClient.Do(request)
+	if err != nil {
+		return peerProbeResult{}, err
+	}
+	defer func() { _ = httpResponse.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(httpResponse.Body, 1<<20))
+	if err != nil {
+		return peerProbeResult{}, err
+	}
+	if httpResponse.StatusCode != http.StatusOK {
+		return peerProbeResult{}, fmt.Errorf("上游返回 %d: %s", httpResponse.StatusCode, peerErrorText(body))
+	}
+	var result peerProbeResult
+	if err := json.Unmarshal(body, &result); err != nil {
+		// 200 但不是我们的形状：多半是搭在这条域名上的别的东西（反代默认页、
+		// 另一个服务）。把它说成"不是网关"比原样抛 JSON 解析错误有用。
+		return peerProbeResult{}, fmt.Errorf("这个地址有响应，但不像网关互联入口（%v）", err)
+	}
+	if !result.Gateway {
+		return peerProbeResult{}, fmt.Errorf("这个地址有响应，但不是网关互联入口")
+	}
+	return result, nil
 }
 
 // providers 取上游当前授权给本机的 provider 清单。

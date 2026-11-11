@@ -179,18 +179,77 @@ func TestPeerRegisterRejectsUsernameTakenByLocalUser(t *testing.T) {
 	}
 }
 
-// 公网来源默认不许注册：注册是唯一不需要已有凭据的入口。
-func TestPeerRegisterRefusedFromPublicSource(t *testing.T) {
+// 公网来源默认可以注册：下游从公网直接连上来是正常用法，来源不是安全边界，
+// 用户名+密码才是。
+func TestPeerRegisterAcceptsPublicSourceByDefault(t *testing.T) {
 	server := newPeerTestServer(t)
 	body, _ := json.Marshal(peerRegisterPayload(nil))
 	request := httptest.NewRequest(http.MethodPost, peerEndpointPrefix+"register", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
 	request.RemoteAddr = "203.0.113.9:4444"
-	// 即使伪造转发头也没用：requestClientIP 对公网对端忽略这些头。
-	request.Header.Set("X-Forwarded-For", "127.0.0.1")
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// 配了白名单之后它就是权威的：名单外的公网来源仍然被拒。
+func TestPeerRegisterRefusedWhenWhitelistExcludesSource(t *testing.T) {
+	server := newPeerTestServer(t)
+	server.router.SetPeerRegistrationAllowCIDRs("10.0.0.0/8")
+	body, _ := json.Marshal(peerRegisterPayload(nil))
+	request := httptest.NewRequest(http.MethodPost, peerEndpointPrefix+"register", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.RemoteAddr = "203.0.113.9:4444"
+	// 伪造转发头也没用：requestClientIP 对公网对端忽略这些头。
+	request.Header.Set("X-Forwarded-For", "10.1.2.3")
 	recorder := httptest.NewRecorder()
 	server.Handler().ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusForbidden {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	// 白名单里的来源照常放行。
+	inside := httptest.NewRequest(http.MethodPost, peerEndpointPrefix+"register", bytes.NewReader(body))
+	inside.Header.Set("Content-Type", "application/json")
+	inside.RemoteAddr = "10.1.2.3:5555"
+	insideRecorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(insideRecorder, inside)
+	if insideRecorder.Code != http.StatusOK {
+		t.Fatalf("whitelisted source status=%d body=%s", insideRecorder.Code, insideRecorder.Body.String())
+	}
+}
+
+// 公网放行之后，注册入口不能再是可以无限次猜密码的地方：同一来源连续失败
+// 到阈值就 429。
+func TestPeerRegisterThrottlesRepeatedCredentialFailures(t *testing.T) {
+	server := newPeerTestServer(t)
+	_, first := peerRegister(t, server, peerRegisterPayload(nil))
+	if first.Token == "" {
+		t.Fatal("the first registration must succeed")
+	}
+	body, _ := json.Marshal(peerRegisterPayload(map[string]any{"password": "wrong-password"}))
+	var lastCode int
+	for attempt := 0; attempt <= authMaxFailures+2; attempt++ {
+		request := httptest.NewRequest(http.MethodPost, peerEndpointPrefix+"register", bytes.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		request.RemoteAddr = "127.0.0.1:40000"
+		recorder := httptest.NewRecorder()
+		server.Handler().ServeHTTP(recorder, request)
+		lastCode = recorder.Code
+	}
+	if lastCode != http.StatusTooManyRequests {
+		t.Fatalf("after repeated failures status=%d, want 429", lastCode)
+	}
+	// 正确的凭据这时同样被挡：限流是按来源整段生效，不给攻击者留一条快路。
+	body, _ = json.Marshal(peerRegisterPayload(nil))
+	request := httptest.NewRequest(http.MethodPost, peerEndpointPrefix+"register", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.RemoteAddr = "127.0.0.1:40000"
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("throttled source with correct credentials = %d, want 429", recorder.Code)
 	}
 }
 

@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/luca/llm-protocol-gateway/internal/domain"
 )
@@ -49,7 +51,8 @@ type peerRegisterResponse struct {
 	// UserID 是上游为这个对端建的账号 ID。下游记下来，排查时能直接对上
 	// 上游用户管理页里的那一行。
 	UserID string `json:"userId"`
-	// Username 是上游账号名（带 peer- 前缀，与网关身份派生）。
+	// Username 是下游注册时自己填的那个用户名，上游原样记下来。它不是从网关
+	// 身份派生出来的：第一次注册时由运维自定义，之后每次重新注册必须填同一个。
 	Username string `json:"username"`
 	// GrantedProviderIDs 是上游当前实际授权给它的 provider 列表。可能比
 	// RequestedProviderIDs 少——被拒的请求要能看见，不然下游会一直重试一个
@@ -57,20 +60,13 @@ type peerRegisterResponse struct {
 	GrantedProviderIDs []string `json:"grantedProviderIds"`
 }
 
-// peerAccountName 由网关身份派生账号名：同一个下游无论重装多少次、改多少次
-// 显示名，落到的都是同一个用户名。
-func peerAccountName(gatewayID string) string {
-	id := strings.TrimSpace(strings.ToLower(gatewayID))
-	if id == "" {
-		return peerUsernamePrefix + "unknown"
-	}
-	return peerUsernamePrefix + id
-}
-
 // handlePeerRegister 处理下游的注册/重新注册。
 //
 // 幂等：同一个 GatewayID 再次注册时复用原账号，只换一把新凭据（旧的立刻失效
 // ——下游重装或怀疑凭据泄漏时会走这条路，留着旧的等于留了口子）。
+//
+// 用户名和密码都由下游运维自己定：第一次注册时想一个，上游原样建成账号；之后
+// 重新注册必须填同一个，否则拒绝。
 func (s *Server) handlePeerRegister(w http.ResponseWriter, r *http.Request) {
 	if s.userStore == nil {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "user store is not configured")
@@ -79,6 +75,19 @@ func (s *Server) handlePeerRegister(w http.ResponseWriter, r *http.Request) {
 	if !s.peerRegistrationAllowed(r) {
 		s.logs.AddApp("warn", "peer registration refused", "source address not allowed: "+requestClientIP(r))
 		writeOpenAIError(w, http.StatusForbidden, "peer registration is not allowed from this address")
+		return
+	}
+	// 注册是唯一不需要已有凭据的入口，所以失败也要按来源限流：公网来源默认放行
+	// 之后，这个入口不能再是「可以无限次猜用户名密码」的地方。用的是自己的一
+	// 个计数桶，而不是登录那份——免得对端注册失败把同一来源的操作员挡在登录页
+	// 外面，也免得攻击者靠猜别人的用户名把那个账号的控制台登录锁掉。
+	if blocked, wait := s.peerRegisterThrottled(r); blocked {
+		retry := int(wait.Seconds())
+		if retry < 1 {
+			retry = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(retry))
+		writeOpenAIError(w, http.StatusTooManyRequests, "too many failed peer registrations, try again later")
 		return
 	}
 	var payload peerRegisterRequest
@@ -110,6 +119,7 @@ func (s *Server) handlePeerRegister(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		// 没有这个网关的账号：确认用户名没被占用之后建一个。
 		if taken, lookupErr := s.userStore.UserByUsername(username); lookupErr == nil && !taken.IsPeer() {
+			s.recordPeerRegisterFailure(r)
 			writeOpenAIError(w, http.StatusConflict, "username already exists")
 			return
 		}
@@ -123,10 +133,12 @@ func (s *Server) handlePeerRegister(w http.ResponseWriter, r *http.Request) {
 		// 账号已经存在：用户名或密码对不上就不许改。否则任何人只要拿到一个
 		// 网关 ID（它是公开信息，会出现在界面上）就能冒名顶替、把别人的下游
 		// 顶掉并换走凭据。
+		s.recordPeerRegisterFailure(r)
 		s.logs.AddApp("warn", "peer re-registration refused", fmt.Sprintf("%s: credential mismatch", account.User.Username))
 		writeOpenAIError(w, http.StatusUnauthorized, "peer account already exists and the credentials do not match")
 		return
 	}
+	s.clearPeerRegisterFailures(r)
 
 	// 换发凭据：旧的立刻失效。同一次调用里完成，避免中途失败留下两把有效凭据。
 	token, err := generatePeerToken()
@@ -316,16 +328,17 @@ func (s *Server) setPeerGrants(userID string, requested []string) error {
 
 // peerRegistrationAllowed 判断这个来源是否允许注册。
 //
-// 注册是唯一不需要已有凭据的入口，所以它是整条链路上最值得收紧的地方：
-//   - 默认只允许本机/内网来源（下游通常在内网，或者经隧道从反代进来）；
-//   - 显式配置了 CIDR 白名单时，只认白名单。
+// 默认（没有配置白名单）放行任何来源：公网部署的下游直接连上来是正常用法，
+// 「必须先把来源网段写进白名单才能注册」只会让第一次对接无从下手。来源能不能
+// 注册不是安全边界——真正的边界是用户名+密码，以及管理员那一侧的授权与吊销。
+// 想收紧时显式写出 CIDR 白名单，那时它就是权威的：只有列出的网段能注册。
 //
 // 用 requestClientIP 而不是直接读 RemoteAddr：它已经处理了「公网对端伪造
 // X-Forwarded-For」的情况，公网直连时会忽略所有转发头。
 func (s *Server) peerRegistrationAllowed(r *http.Request) bool {
 	raw := strings.TrimSpace(s.router.PeerRegistrationAllowCIDRs())
 	if raw == "" {
-		return isPrivateOrLoopbackAddress(requestClientIP(r))
+		return true
 	}
 	ip := net.ParseIP(strings.TrimSpace(requestClientIP(r)))
 	if ip == nil {
@@ -339,13 +352,28 @@ func (s *Server) peerRegistrationAllowed(r *http.Request) bool {
 	return false
 }
 
-// isPrivateOrLoopbackAddress 判断来源是否属于本机/内网/链路本地。
-func isPrivateOrLoopbackAddress(raw string) bool {
-	ip := net.ParseIP(strings.TrimSpace(raw))
-	if ip == nil {
-		return false
-	}
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
+// peerRegisterThrottleKey 是注册失败计数的维度：只看来源，不看用户名。
+//
+// 按用户名分开计数有副作用——攻击者可以拿别人的用户名一直失败，把那个账号
+// 锁在限流里。注册本来就该由同一个来源的运维自己完成，按来源挡住足够了。
+func peerRegisterThrottleKey(r *http.Request) string {
+	return "\x00peer-register\x00" + authThrottleSource(r)
+}
+
+// peerRegisterThrottled 报告这个来源此刻是否因失败过多而不许再注册。
+func (s *Server) peerRegisterThrottled(r *http.Request) (bool, time.Duration) {
+	key := peerRegisterThrottleKey(r)
+	return s.authThrottle.blocked(key, authThrottleAnyUserKey, authMaxFailures)
+}
+
+// recordPeerRegisterFailure 记一次注册失败：凭据对不上、用户名被本地账号占用。
+func (s *Server) recordPeerRegisterFailure(r *http.Request) {
+	s.authThrottle.fail(peerRegisterThrottleKey(r), authThrottleAnyUserKey)
+}
+
+// clearPeerRegisterFailures 在注册成功后清空该来源的计数。
+func (s *Server) clearPeerRegisterFailures(r *http.Request) {
+	s.authThrottle.succeeded(peerRegisterThrottleKey(r), authThrottleAnyUserKey)
 }
 
 // splitCIDRList 把逗号/空白分隔的 CIDR 串拆开。

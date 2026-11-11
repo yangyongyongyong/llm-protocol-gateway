@@ -94,9 +94,11 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 		// 这条链路注册的是这台机器。
 		"gatewayId": s.GatewayID(),
 		// 让界面能把限额直接写在提示里，而不是写死一个数字。
-		"maxHops":                   s.maxGatewayHopsConfigured(),
-		"registrationAllowCidrs":    s.router.PeerRegistrationAllowCIDRs(),
-		"registrationAllowsPrivate": strings.TrimSpace(s.router.PeerRegistrationAllowCIDRs()) == "",
+		"maxHops":                s.maxGatewayHopsConfigured(),
+		"registrationAllowCidrs": s.router.PeerRegistrationAllowCIDRs(),
+		// registrationOpen 表示当前没有来源白名单：任何来源都能发起注册，
+		// 界面的提示语据此区分「默认全放行」和「只放行这些网段」。
+		"registrationOpen": strings.TrimSpace(s.router.PeerRegistrationAllowCIDRs()) == "",
 	})
 }
 
@@ -168,8 +170,8 @@ func (s *Server) handleRevokePeer(w http.ResponseWriter, r *http.Request) {
 
 // handleSetPeerRegistrationCIDRs 设置注册来源白名单。
 //
-// 注册是唯一不需要已有凭据的入口，所以这条设置值得单独暴露出来：默认只允许
-// 本机与内网，公网部署时管理员必须显式写出允许的来源段。
+// 默认没有白名单：任何来源都能发起注册，下游从公网直接连上来是正常用法。
+// 这条设置是用来收紧的——写进白名单之后，只有列出的网段还能注册。
 func (s *Server) handleSetPeerRegistrationCIDRs(w http.ResponseWriter, r *http.Request) {
 	if !s.requirePermission(w, r, domain.PermPeersManage) {
 		return
@@ -182,12 +184,12 @@ func (s *Server) handleSetPeerRegistrationCIDRs(w http.ResponseWriter, r *http.R
 		return
 	}
 	if payload.CIDRs == nil {
-		writeOpenAIError(w, http.StatusBadRequest, "cidrs is required (empty string restores the private-only default)")
+		writeOpenAIError(w, http.StatusBadRequest, "cidrs is required (an empty string removes the whitelist)")
 		return
 	}
 	raw := strings.TrimSpace(*payload.CIDRs)
 	// 先校验再保存：一个写错的 CIDR 如果只是被忽略，管理员会以为已经限制住了
-	// 来源，实际却仍在按默认规则放行内网。
+	// 来源，实际却仍在放行任何来源。
 	for _, cidr := range splitCIDRList(raw) {
 		if _, _, err := net.ParseCIDR(cidr); err != nil {
 			writeOpenAIError(w, http.StatusBadRequest, fmt.Sprintf("invalid CIDR %q: %v", cidr, err))

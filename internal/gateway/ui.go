@@ -206,8 +206,12 @@ func withHostSeparatedServing(api http.Handler, distDir string, roleForHost publ
 		}
 		switch role {
 		case "api":
-			// Model-API hostname: only protocol routes (+ health). No UI / admin APIs.
-			if r.URL.Path == "/__health" || isModelProtocolPath(r.URL.Path) {
+			// Model-API hostname: protocol routes (+ health) and the peer gateway
+			// endpoints. /__peer/* is where other gateways register and push their
+			// traffic, so it belongs to the API surface: on a split deployment the
+			// API domain is the only public hostname a peer should ever be given.
+			// Everything else under /__ is the console and stays 404 here.
+			if r.URL.Path == "/__health" || strings.HasPrefix(r.URL.Path, peerEndpointPrefix) || isModelProtocolPath(r.URL.Path) {
 				api.ServeHTTP(w, r)
 				return
 			}

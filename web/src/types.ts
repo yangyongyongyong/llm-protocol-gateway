@@ -838,8 +838,10 @@ export type PeersResponse = {
   /** 本机身份：下游注册时用的就是它。 */
   gatewayId: string;
   maxHops: number;
+  /** 注册来源白名单（逗号分隔的 CIDR）。空 = 不限制来源。 */
   registrationAllowCidrs: string;
-  registrationAllowsPrivate: boolean;
+  /** true = 没有白名单，任何来源都能注册（默认）。 */
+  registrationOpen: boolean;
 };
 
 /** 本机注册到的一个上游网关。它在本机就是一条 authType=peer 的 provider。 */

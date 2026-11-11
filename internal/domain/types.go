@@ -992,8 +992,8 @@ type GatewayState struct {
 	// and so does a 2xx whose response body carries an error payload.
 	Log2xxBodies bool `json:"log2xxBodies"`
 	// PeerRegistrationAllowCIDRs 是允许注册的对端来源白名单（逗号分隔的 CIDR）。
-	// 空 = 只允许本机与内网来源。注册是唯一不需要已有凭据的入口，所以它是整条
-	// 链路上最该收紧的地方；显式配置后只认白名单，内网默认值不再生效。
+	// 空 = 不限制来源（下游从公网直接连上来是正常用法）。显式配置后只认白名单：
+	// 注册的边界是用户名+密码与上游的授权/吊销，白名单是额外的收紧手段。
 	PeerRegistrationAllowCIDRs string `json:"peerRegistrationAllowCidrs,omitempty"`
 	// MaxGatewayHops 是一条链路允许经过的网关数量上限（1..8）。0 = 默认 3。
 	// 链路上的每台网关都按自己这份配置判断，超限的透传在 508 被拒；

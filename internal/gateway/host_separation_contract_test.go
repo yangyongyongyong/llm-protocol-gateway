@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -63,6 +65,52 @@ func TestHostSeparationKeepsModelRoutesOffTheUIDomain(t *testing.T) {
 		if recorder.Code != http.StatusNotFound {
 			t.Fatalf("API host %s = %d, want 404", path, recorder.Code)
 		}
+	}
+}
+
+// 网关互联入口属于 API 那一侧：对外暴露独立 API 域名时，别的网关只会拿到那个
+// 域名，/__peer/* 必须在那上面可达，否则注册与透传全是 404。
+func TestAPIHostServesPeerGatewayEndpoints(t *testing.T) {
+	server := NewServer(NewRouter(domain.GatewayState{}), monitor.NewStore())
+	server.SetGatewayID(gwID)
+	server.userStore = newMemoryUserStore()
+	server.roles = newMemoryRoleStore()
+	settings := server.router.State().PublicAccess
+	settings.CustomDomain = "api.test.local"
+	settings.UIDomain = "ui.test.local"
+	settings.ExposeAPI = true
+	settings.ExposeUI = true
+	server.router.UpdatePublicAccess(settings)
+	handler := server.Handler()
+
+	for _, path := range []string{peerEndpointPrefix + "probe", peerEndpointPrefix + "me", peerEndpointPrefix + "providers"} {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "http://api.test.local"+path, nil)
+		handler.ServeHTTP(recorder, request)
+		if recorder.Code == http.StatusNotFound && strings.Contains(recorder.Body.String(), "management UI is not available") {
+			t.Fatalf("API host %s was refused as a console path: %s", path, recorder.Body.String())
+		}
+	}
+
+	// 注册入口同样要在 API 域名上可达：公网下游只有这一个地址。
+	body, err := json.Marshal(peerRegisterPayload(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "http://api.test.local"+peerEndpointPrefix+"register", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.RemoteAddr = "203.0.113.9:4444"
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("API host register = %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	// 控制台接口在 API 域名上仍然不可达，这条分离不能被上面的放行带开。
+	console := httptest.NewRecorder()
+	handler.ServeHTTP(console, httptest.NewRequest(http.MethodGet, "http://api.test.local/__peers", nil))
+	if console.Code != http.StatusNotFound {
+		t.Fatalf("API host /__peers = %d, want 404", console.Code)
 	}
 }
 
