@@ -2249,9 +2249,9 @@ func (r *Router) SetPeerGrants(providerID string, grants domain.PeerUpstreamGran
 			continue
 		}
 		// 存一份副本：调用方（注册/刷新）常常还留着入参那片切片，
-		// 让它之后被改到就等于绕过了这里的锁。
-		snapshot := grants
-		snapshot.GrantedProviderIDs = append([]string(nil), grants.GrantedProviderIDs...)
+		// 让它之后被改到就等于绕过了这里的锁。快照里还嵌着一层
+		// GrantedProviders（每个带自己的模型切片），所以逐层拷。
+		snapshot := grants.Clone()
 		r.state.Providers[index].PeerGrants = &snapshot
 		return r.state.Providers[index], nil
 	}

@@ -1,4 +1,4 @@
-import {providerAccountLabel, providerOptionLabel, shortenAccountLabel} from '../lib';
+import {peerProviderMemberName, peerUpstreamName, providerAccountLabel, providerConnectKind, providerOptionLabel, shortenAccountLabel} from '../lib';
 import {resolveProviderIcon} from '../provider_presets';
 import type {Provider} from '../types';
 import {BrandIcon} from './ui';
@@ -24,15 +24,20 @@ export function ProviderLabel({ provider, size = 16, protocol, account = true, s
   stack?: boolean;
   className?: string;
 }) {
-  const accountLabel = account ? providerAccountLabel(provider) : '';
+  // 上游网关成员行：名字那格写成员名，第二格写它属于哪条上游（与账号同位置）。
+  const peer = providerConnectKind(provider) === 'peer';
+  const accountLabel = account
+    ? (peer ? peerUpstreamName(provider) : providerAccountLabel(provider))
+    : '';
   const showAccount = Boolean(accountLabel) && accountLabel !== provider.name;
+  const name = peer ? peerProviderMemberName(provider) : provider.name;
   return (
     <span
       className={`provider-label${stack ? ' stacked' : ''}${className ? ` ${className}` : ''}`}
       title={showAccount ? `${providerOptionLabel(provider)} · ${accountLabel}` : providerOptionLabel(provider)}
     >
       <BrandIcon icon={resolveProviderIcon(provider)} name={provider.name} size={size} />
-      <span className="provider-label-name">{provider.name}</span>
+      <span className="provider-label-name">{name}</span>
       {showAccount ? <span className="provider-label-account">{shortenAccountLabel(accountLabel)}</span> : null}
       {protocol ? <span className="provider-label-protocol">{protocol}</span> : null}
     </span>

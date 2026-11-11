@@ -12905,6 +12905,28 @@ html[data-theme="dark"] .wb-task-badge[data-tone="ok"] { color: #6ee7b7; border-
 /* 网关 ID 是一个定长的 gw_+16 位：窄屏下宁可让它自己换行，也不要把整行挤歪。 */
 .peer-gateway-code { overflow-wrap: anywhere; }
 
+/*
+ * 「输入 Provider」页里按上游分组的区块。
+ *
+ * 一个上游授权了 N 个 provider，本机就落 N 条 provider 行；它们和本地 provider
+ * 长得完全一样，只是收在这个标题下面——标题说的是「这些属于哪个上游」，
+ * 而不是「这里有一条链路」。所以标题很轻：一条标签 + 上游名 + 上游身份。
+ */
+.peer-provider-group { margin-top: 18px; }
+.peer-provider-group:first-of-type { margin-top: 14px; }
+.peer-provider-group-head {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  padding: 0 2px 10px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 12px;
+}
+.peer-provider-group-title { font-size: 13px; font-weight: 600; color: var(--text); }
+.peer-provider-group-hint { flex: 1 1 100%; font-size: 11.5px; line-height: 1.5; }
+@media (min-width: 900px) {
+  /* 宽屏时说明跟在标题后面收成一行，不额外占一行高度。 */
+  .peer-provider-group-hint { flex: 1 1 auto; }
+}
+
 .peer-upstream-list { display: flex; flex-direction: column; border-top: 1px solid var(--border); }
 .peer-upstream-row {
   display: grid;

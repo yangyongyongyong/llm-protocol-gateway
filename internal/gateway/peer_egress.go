@@ -21,8 +21,13 @@ import (
 // executeProtocolFlow 正是按它决定直通还是转换，所以走到这里时 body 一定是
 // 这个协议的形状。把这个值随包体告诉父网关，父网关才能在授权集里挑出真正读得懂
 // 它的 provider，而不是把一份 openai_chat 的请求喂给 Claude 端点。
+//
+// providerId 同理：上游授权了 N 个 provider 时，子网关这边就是 N 条 provider，
+// 每一条对应上游的一个。用户把其中一条选进备选，意思就是"这条请求走上游的那一个
+// provider"，所以这里要把它的 id 带上去；留空（升级前注册的老记录）时上游仍按
+// 授权集自己挑，行为和以前完全一样。
 func (s *Server) sendPeerDoor(ctx context.Context, r *http.Request, provider domain.Provider, model string, body []byte, accept string) (*http.Response, error) {
-	wrapped, err := buildPeerForwardBody("", provider.Protocol, body)
+	wrapped, err := buildPeerForwardBody(peerGrantedProviderID(provider), provider.Protocol, body)
 	if err != nil {
 		return nil, err
 	}

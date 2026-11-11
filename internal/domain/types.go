@@ -400,9 +400,57 @@ type PeerUpstreamGrants struct {
 	// GrantedProviderIDs 是上游最近一次告诉我们的授权清单。为空是真实状态
 	// （上游一个都没授权），不是"未知"——未知由 SyncedAt 为空表示。
 	GrantedProviderIDs []string `json:"grantedProviderIds"`
+	// GrantedProviders 是同一份清单的详细版：每个被授权 provider 在上游的
+	// 名字、协议和模型。GrantedProviderIDs 留着是因为老库里只有它，而它足够
+	// 回答"授权了几个"；详细版让子网关能把上游的 provider 原样摊开显示。
+	GrantedProviders []PeerGrantedProvider `json:"grantedProviders,omitempty"`
+	// UpstreamKey 把同一次注册落下来的若干条 provider 归到一个上游下面。
+	//
+	// 一个上游授权了 N 个 provider，子网关就落 N 条 provider——每条一个协议、
+	// 一份模型清单，和本地 provider 长得一模一样，也才能被单独选进备选。
+	// 它们共享同一把对端凭据和同一个上游地址，界面靠这个 key 把它们收成一组。
+	// 它在注册时生成一次，之后改名、刷新、重连都不变，否则分组会在改名时裂开。
+	UpstreamKey string `json:"upstreamKey,omitempty"`
+	// UpstreamName 是这条上游在子网关这边的显示名（注册时填的，或从主机名取）。
+	// 组标题和"属于哪个上游"都用它。
+	UpstreamName string `json:"upstreamName,omitempty"`
+	// GrantedProviderID 是这条 provider 对应的上游授权 provider。空 = 整条
+	// 上游链路（升级前注册的老记录，它自己一行为一整条链路）。非空时透传请求
+	// 会把这个 id 带上，上游据此把请求路由到这个被授权的 provider，而不是在
+	// 授权集里自己挑一个——这正是"备选里能单独选一个上游 provider"能成立的
+	// 前提。
+	GrantedProviderID string `json:"grantedProviderId,omitempty"`
 	// SyncedAt 是这份快照是什么时候取的（RFC3339）。空 = 从未同步过，
 	// 界面据此区分"确实授权了 0 个"和"还没问过上游"。
 	SyncedAt string `json:"syncedAt,omitempty"`
+}
+
+// PeerGrantedProvider 是上游授权清单里的一项，原样照抄上游的 /__peer/providers。
+//
+// 上游只下发 id、名字、协议和模型，这正是子网关把这条 provider"像本地 provider
+// 一样显示"所需要的全部；地址和凭据永远不下发，也永远不该出现在这里。
+type PeerGrantedProvider struct {
+	ID       string   `json:"id"`
+	Name     string   `json:"name,omitempty"`
+	Protocol string   `json:"protocol,omitempty"`
+	Models   []string `json:"models,omitempty"`
+}
+
+// Clone 深拷贝一份，包括切片的元素。
+//
+// router 存快照时要脱离调用方手里的那片内存；嵌套切片漏拷一层，调用方之后改
+// 自己那份就等于绕过了 router 的锁改到了"已经存好"的状态。
+func (g PeerUpstreamGrants) Clone() PeerUpstreamGrants {
+	out := g
+	out.GrantedProviderIDs = append([]string(nil), g.GrantedProviderIDs...)
+	if g.GrantedProviders != nil {
+		out.GrantedProviders = make([]PeerGrantedProvider, len(g.GrantedProviders))
+		for index, provider := range g.GrantedProviders {
+			out.GrantedProviders[index] = provider
+			out.GrantedProviders[index].Models = append([]string(nil), provider.Models...)
+		}
+	}
+	return out
 }
 
 // RequestAdapter customizes how gateway requests are sent to an upstream

@@ -44,19 +44,29 @@ type peerUpstreamRegisterRequest struct {
 // 刻意不回传 provider 本体：它的 apiKeySource 就是本机在上游的那把凭据，
 // 这个页面没有任何理由把它发到浏览器里。
 type peerUpstreamSummary struct {
-	ProviderID   string `json:"providerId"`
-	Name         string `json:"name"`
-	ParentURL    string `json:"parentUrl"`
-	Protocol     string `json:"protocol"`
-	Enabled      bool   `json:"enabled"`
-	HealthStatus string `json:"healthStatus,omitempty"`
-	// Models 是上游授权、且与本条协议对得上的模型。
+	ProviderID string `json:"providerId"`
+	Name       string `json:"name"`
+	ParentURL  string `json:"parentUrl"`
+	// Protocol / Models 是这一组里所有 provider 行的并集；一条上游授权了多种
+	// 协议时这里会有多个值，界面按行显示，不再假设"一条链路一种协议"。
+	Protocol string `json:"protocol"`
+	// Protocols 是这一组里各成员行的协议（去重、有序），界面按它渲染协议徽标。
+	Protocols    []string `json:"protocols"`
+	Enabled      bool     `json:"enabled"`
+	HealthStatus string   `json:"healthStatus,omitempty"`
+	// Models 是上游授权给本机、且已经落成本机 provider 行的模型（并集）。
 	Models []string `json:"models"`
+	// MemberCount 是这一组里有几条本机 provider 行。
+	//
+	// 一个上游授权了 N 个 provider，本机就落 N 行：它们和本地 provider 长得
+	// 一模一样，也才能被单独选进 API 密钥的备选链。界面上"一行上游"其实是
+	// 这一组，删掉某一行不该让整组消失。
+	MemberCount int `json:"memberCount"`
 	// GrantCount 是上游授权给本机的 provider 个数（不限协议）。
 	//
-	// 它和 Models 是两个口径：一条链路只说一种协议，所以协议对不上的授权
-	// provider 不会出现在 Models 里，但它们确实被授权了。界面要能告诉运维
-	// 「上游授权了 3 个，其中 1 个是本协议的」，靠的就是这两个数的差。
+	// 它和 Models 是两个口径：协议对不上的授权 provider 不会出现在 Models 里，
+	// 但它们确实被授权了。界面要能告诉运维「上游授权了 3 个，其中 1 个是本协议
+	// 的」，靠的就是这两个数的差。
 	GrantCount int `json:"grantCount"`
 	// GrantsSynced 表示 GrantCount 是不是真的问到过上游。false 时它是零值，
 	// 界面要显示「还没同步」而不是「授权了 0 个」——后者是一个会误导人的
@@ -64,10 +74,17 @@ type peerUpstreamSummary struct {
 	GrantsSynced bool `json:"grantsSynced"`
 	// GrantsSyncedAt 是这份授权快照的取得时间（RFC3339）；从未同步过时为空。
 	GrantsSyncedAt string `json:"grantsSyncedAt,omitempty"`
+	// GrantedProviders 是上游授权的 provider 清单（含名字、协议、模型）。
+	// 界面用它把上游那一侧的样子原样列出来，不再只报一个数字。
+	GrantedProviders []domain.PeerGrantedProvider `json:"grantedProviders,omitempty"`
 	// PeerUsername / ParentGatewayID 是上游那一侧的身份：排查时能直接对上
 	// 上游用户管理页里的那一行。
 	PeerUsername    string `json:"peerUsername,omitempty"`
 	ParentGatewayID string `json:"parentGatewayId,omitempty"`
+	// UpstreamKey / UpstreamName 是这一组的分组标识与显示名：本机落下来的每个
+	// 成员行都带着同一份，界面据此把"属于某个上游"说清楚。
+	UpstreamKey  string `json:"upstreamKey,omitempty"`
+	UpstreamName string `json:"upstreamName,omitempty"`
 }
 
 // peerProtocolChoices 是这条链路能说的协议，和网关对外的三种端点一致。
@@ -108,22 +125,52 @@ func (s *Server) handleListPeerUpstreams(w http.ResponseWriter, r *http.Request)
 }
 
 // peerUpstreamSummaries 把当前所有 peer provider 折成界面要的形状。
+//
+// 一个上游授权了 N 个 provider，本机就有 N 条成员行；它们共享同一个 UpstreamKey，
+// 在这里合成一行「已连接的上游」——界面上「一条上游」指的就是这一组，而不是
+// 某一条成员行。升级前注册的老记录没有 UpstreamKey，各自成组（一行一条链路），
+// 显示和以前完全一样。
 func (s *Server) peerUpstreamSummaries() []peerUpstreamSummary {
 	state := s.router.State()
-	out := make([]peerUpstreamSummary, 0)
+	modelsByProvider := map[string][]string{}
+	for _, model := range state.Models {
+		if id := strings.TrimSpace(model.ID); id != "" {
+			modelsByProvider[model.ProviderID] = append(modelsByProvider[model.ProviderID], id)
+		}
+	}
+	order := make([]string, 0)
+	groups := map[string]*peerUpstreamSummary{}
 	for _, provider := range state.Providers {
 		if provider.AuthType != domain.AuthTypePeer || provider.Deleted {
 			continue
 		}
-		summary := peerUpstreamSummary{
-			ProviderID:   provider.ID,
-			Name:         provider.Name,
-			ParentURL:    resolvePeerParentURL(provider),
-			Protocol:     string(provider.Protocol),
-			Enabled:      !provider.Disabled,
-			HealthStatus: provider.HealthStatus,
-			Models:       []string{},
+		key := peerGroupKeyForProvider(provider)
+		summary, ok := groups[key]
+		if !ok {
+			summary = &peerUpstreamSummary{
+				ProviderID:  provider.ID,
+				Name:        provider.Name,
+				ParentURL:   resolvePeerParentURL(provider),
+				Protocol:    string(provider.Protocol),
+				Protocols:   []string{},
+				Enabled:     true,
+				Models:      []string{},
+				UpstreamKey: key,
+			}
+			groups[key] = summary
+			order = append(order, key)
 		}
+		summary.MemberCount++
+		if provider.Disabled {
+			summary.Enabled = false
+		}
+		// 组内的健康状态取"最差"的：有一条成员行异常，整个上游就该显示异常，
+		// 否则运维看到绿色却有一部分请求在失败。
+		if summary.HealthStatus == "" || peerHealthRank(provider.HealthStatus) > peerHealthRank(summary.HealthStatus) {
+			summary.HealthStatus = provider.HealthStatus
+		}
+		summary.Protocols = appendUnique(summary.Protocols, string(provider.Protocol))
+		summary.Models = append(summary.Models, modelsByProvider[provider.ID]...)
 		// 授权快照是注册/刷新时存下来的（见 domain.PeerUpstreamGrants）。
 		// 没有快照 = 还没问过上游，GrantCount 保持 0 但 GrantsSynced 是 false，
 		// 界面据此说「还没同步」而不是「授权了 0 个」。
@@ -133,23 +180,99 @@ func (s *Server) peerUpstreamSummaries() []peerUpstreamSummary {
 			summary.GrantsSyncedAt = grants.SyncedAt
 			summary.PeerUsername = grants.Username
 			summary.ParentGatewayID = grants.ParentGatewayID
-		}
-		for _, model := range state.Models {
-			if model.ProviderID == provider.ID && strings.TrimSpace(model.ID) != "" {
-				summary.Models = append(summary.Models, model.ID)
+			if grants.UpstreamName != "" {
+				summary.UpstreamName = grants.UpstreamName
+			}
+			if grants.GrantedProviders != nil {
+				summary.GrantedProviders = grants.GrantedProviders
 			}
 		}
-		sort.Strings(summary.Models)
-		out = append(out, summary)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	out := make([]peerUpstreamSummary, 0, len(order))
+	for _, key := range order {
+		summary := groups[key]
+		sort.Strings(summary.Models)
+		summary.Models = dedupeStrings(summary.Models)
+		sort.Strings(summary.Protocols)
+		// 一条成员行的组沿用它的协议；多条时取第一个（协议徽标另有 Protocols）。
+		if len(summary.Protocols) > 0 {
+			summary.Protocol = summary.Protocols[0]
+		}
+		if summary.UpstreamName == "" {
+			summary.UpstreamName = summary.Name
+		}
+		out = append(out, *summary)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].UpstreamName != out[j].UpstreamName {
+			return out[i].UpstreamName < out[j].UpstreamName
+		}
+		return out[i].ProviderID < out[j].ProviderID
+	})
+	return out
+}
+
+// peerGroupKeyForProvider 是这条成员行所属上游的分组标识。
+//
+// 新注册的记录都带着 UpstreamKey；升级前的老记录没有，就用它自己的 provider id
+// 当 key——每条老记录各自成组，正是它原来的样子。
+func peerGroupKeyForProvider(provider domain.Provider) string {
+	if grants := provider.PeerGrants; grants != nil && strings.TrimSpace(grants.UpstreamKey) != "" {
+		return strings.TrimSpace(grants.UpstreamKey)
+	}
+	return "provider:" + provider.ID
+}
+
+// peerHealthRank 让"最差者胜"的合并能比较健康状态：数值越大越该被看见。
+func peerHealthRank(status string) int {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "unavailable":
+		return 3
+	case "failed":
+		return 2
+	case "healthy":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func appendUnique(list []string, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return list
+	}
+	for _, item := range list {
+		if item == value {
+			return list
+		}
+	}
+	return append(list, value)
+}
+
+func dedupeStrings(list []string) []string {
+	if len(list) < 2 {
+		return list
+	}
+	out := list[:1]
+	for _, item := range list[1:] {
+		if out[len(out)-1] != item {
+			out = append(out, item)
+		}
+	}
 	return out
 }
 
 // peerUpstreamSummaryOf 是单条的版本，用于注册/刷新之后直接回给界面。
+// 传任意一条成员行的 id 即可，返回它所属的那一组。
 func (s *Server) peerUpstreamSummaryOf(providerID string) peerUpstreamSummary {
+	provider, err := s.router.ProviderByID(providerID)
+	if err != nil {
+		return peerUpstreamSummary{ProviderID: providerID}
+	}
+	key := peerGroupKeyForProvider(provider)
 	for _, summary := range s.peerUpstreamSummaries() {
-		if summary.ProviderID == providerID {
+		if summary.UpstreamKey == key {
 			return summary
 		}
 	}
@@ -196,27 +319,41 @@ func (s *Server) handleRegisterPeerUpstream(w http.ResponseWriter, r *http.Reque
 		name = peerUpstreamDefaultName(registration.ParentURL)
 	}
 
-	created, err := s.createPeerUpstreamProvider(r, name, protocol, registration, granted)
+	created, err := s.createPeerUpstreamProviders(r, name, protocol, registration, granted)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, err.Error())
-		return
+		// 已经有成员行落下来了：注册本身成功，凭据可用，不该整批回滚。
+		// 只有一行都没落成时才算注册失败。
+		if len(created) == 0 {
+			writeOpenAIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		s.logs.AddApp("warn", "peer upstream member incomplete", fmt.Sprintf("parent=%s: %v", registration.ParentURL, err))
 	}
-	if err := s.ensurePeerUpstreamRoute(created); err != nil {
-		// 路由没建起来不算注册失败：provider 已经在，用户能在路由页手动接。
-		s.logs.AddApp("warn", "peer upstream route not created", fmt.Sprintf("provider=%s: %v", created.ID, err))
+	if created == nil {
+		created = []domain.Provider{}
+	}
+	for _, provider := range created {
+		if routeErr := s.ensurePeerUpstreamRoute(provider); routeErr != nil {
+			// 路由没建起来不算注册失败：provider 已经在，用户能在路由页手动接。
+			s.logs.AddApp("warn", "peer upstream route not created", fmt.Sprintf("provider=%s: %v", provider.ID, routeErr))
+		}
 	}
 	if err := s.saveState(); err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
 		return
 	}
 	s.logs.AddApp("info", "peer upstream registered",
-		fmt.Sprintf("provider=%s parent=%s user=%s granted=%d", created.ID, registration.ParentURL, registration.Username, len(granted)))
-	writeJSON(w, http.StatusCreated, map[string]any{
-		"upstream":  s.peerUpstreamSummaryOf(created.ID),
+		fmt.Sprintf("parent=%s user=%s providers=%d granted=%d", registration.ParentURL, registration.Username, len(created), len(granted)))
+	response := map[string]any{
 		"username":  registration.Username,
 		"userId":    registration.UserID,
 		"gatewayId": selfID,
-	})
+		"providers": created,
+	}
+	if len(created) > 0 {
+		response["upstream"] = s.peerUpstreamSummaryOf(created[0].ID)
+	}
+	writeJSON(w, http.StatusCreated, response)
 }
 
 // registerWithParent 是注册的公共部分：调上游、拿凭据、再取一次授权清单。
@@ -241,30 +378,146 @@ func (s *Server) registerWithParent(r *http.Request, parentURL, name, username, 
 	return registration, granted, nil
 }
 
-// createPeerUpstreamProvider 把一次成功的注册落成一条 provider。
-func (s *Server) createPeerUpstreamProvider(r *http.Request, name string, protocol domain.Protocol, registration peerRegistration, granted []peerProviderView) (domain.Provider, error) {
-	models := peerModelsForProtocol(protocol, granted)
-	provider := domain.Provider{
-		Name:         name,
-		Protocol:     protocol,
-		BaseURL:      registration.ParentURL,
-		APIKeySource: "literal:" + registration.Token,
-		AuthType:     domain.AuthTypePeer,
-		Models:       models,
-		HealthStatus: "healthy",
-		// 注册这一刻拿到的授权状态得存下来：列表接口要显示「上游授权了几个
-		// provider」，而它是个纯读接口，不能每渲染一次就去打一遍上游。
-		PeerGrants: peerGrantsFromRegistration(registration, granted),
-	}
-	// 默认模型只是给"客户端不带 model"的情形兜一个底，不强制：注册时上游
-	// 授权了哪些模型就挑第一个，一个都没有就留空。
-	if len(models) > 0 {
-		provider.DefaultModel = models[0].ID
-	}
+// createPeerUpstreamProvider 把一次成功的注册落成 provider 行。
+//
+// 一条上游可能授权了 N 个 provider。这里为其中每一个都落一条本机 provider：
+// 名字取上游的名字、协议取上游的协议、模型取上游的模型，于是它们在「输入 Provider」
+// 里和本地 provider 长得一模一样，也才能被单独选进 API 密钥的备选链（备选是
+// provider id 的列表，上游那一侧靠信封里的 providerId 精确路由）。
+//
+// 一个都没授权时退化成一条占位行：链路本身仍然存在（运维要能看到"连上了但没
+// 授权"），只是没有模型可发。
+func (s *Server) createPeerUpstreamProviders(r *http.Request, name string, protocol domain.Protocol, registration peerRegistration, granted []peerProviderView) ([]domain.Provider, error) {
+	ownerID := ""
 	if p := s.requestPrincipal(r); p.UserID != "" {
-		provider.OwnerUserID = p.UserID
+		ownerID = p.UserID
 	}
-	return s.router.AddProvider(provider)
+	grants := peerGrantsFromRegistration(registration, granted)
+	upstreamKey := peerUpstreamKey(grants, registration.ParentURL)
+	plans := peerProviderPlans(name, protocol, granted)
+	created := make([]domain.Provider, 0, len(plans))
+	for _, plan := range plans {
+		provider := domain.Provider{
+			Name:         plan.Name,
+			Protocol:     plan.Protocol,
+			BaseURL:      registration.ParentURL,
+			APIKeySource: "literal:" + registration.Token,
+			AuthType:     domain.AuthTypePeer,
+			Models:       plan.Models,
+			HealthStatus: "healthy",
+			OwnerUserID:  ownerID,
+		}
+		// 每一条都带上同一份授权快照（同一把凭据、同一个上游），只改"我对应
+		// 上游的哪一个"。列表接口靠这份快照显示「上游授权了几个」，透传靠
+		// GrantedProviderID 精确路由。
+		if grants != nil {
+			snapshot := grants.Clone()
+			snapshot.UpstreamKey = upstreamKey
+			snapshot.UpstreamName = name
+			snapshot.GrantedProviderID = plan.GrantedProviderID
+			provider.PeerGrants = &snapshot
+		}
+		// 默认模型只是给"客户端不带 model"的情形兜一个底，不强制：这条 provider
+		// 有哪些模型就挑第一个，一个都没有就留空。
+		if len(plan.Models) > 0 {
+			provider.DefaultModel = plan.Models[0].ID
+		}
+		saved, err := s.router.AddProvider(provider)
+		if err != nil {
+			// 已经落的行留着：注册本身成功了，凭据可用，多出来的行删掉反而
+			// 让运维难以理解发生了什么。错误往上带，由调用方决定怎么报。
+			return created, err
+		}
+		created = append(created, saved)
+	}
+	return created, nil
+}
+
+// peerProviderPlan 是"上游的一个授权 provider"在本机要落成的 provider 行的样子。
+type peerProviderPlan struct {
+	Name              string
+	Protocol          domain.Protocol
+	Models            []domain.Model
+	GrantedProviderID string
+}
+
+// peerProviderPlans 把上游的授权清单摊成要落的 provider 行。
+//
+// 上游没告诉我们协议时（老版本上游）只能按注册时选的协议落一行——这正是
+// 升级前的行为，保持不变：没有协议就没法判断该建几条、各自说哪种协议。
+//
+// 一个 provider 都没授权时仍然落一行占位：界面要能显示"这条上游连上了、
+// 但目前没有任何授权"，否则整个上游会从列表里消失，看起来像注册失败。
+func peerProviderPlans(name string, protocol domain.Protocol, granted []peerProviderView) []peerProviderPlan {
+	plans := make([]peerProviderPlan, 0, len(granted))
+	seen := map[string]bool{}
+	for _, view := range granted {
+		id := strings.TrimSpace(view.ID)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		memberProtocol := protocol
+		if declared := strings.TrimSpace(view.Protocol); declared != "" {
+			memberProtocol = domain.Protocol(declared)
+		}
+		models := peerModelsForProtocol(memberProtocol, []peerProviderView{view})
+		label := strings.TrimSpace(view.Name)
+		if label == "" {
+			label = id
+		}
+		plans = append(plans, peerProviderPlan{
+			// 名字带上上游的名字：子网关里可能连着好几个上游，都叫 "gpt-4o" 的
+			// 两行看起来像重复；「vps1 · 名字」一眼就知道它属于哪条链路。
+			Name:              peerMemberProviderName(name, label),
+			Protocol:          memberProtocol,
+			Models:            models,
+			GrantedProviderID: id,
+		})
+	}
+	if len(plans) > 0 {
+		return plans
+	}
+	// 没授权（或上游没给清单）：沿用注册时选的协议落一条占位行。
+	return []peerProviderPlan{{
+		Name:     name,
+		Protocol: protocol,
+		Models:   peerModelsForProtocol(protocol, granted),
+	}}
+}
+
+// peerMemberProviderName 是一条成员 provider 在子网关里的名字。
+//
+// 上游名字已经带着上游名时（运维给上游的 provider 起名 "vps1-gpt"）不再重复
+// 前缀，否则会出现「vps1 · vps1-gpt」这种自己叠自己的名字。
+func peerMemberProviderName(upstreamName, providerName string) string {
+	upstreamName = strings.TrimSpace(upstreamName)
+	providerName = strings.TrimSpace(providerName)
+	if upstreamName == "" {
+		return providerName
+	}
+	if providerName == "" || strings.EqualFold(upstreamName, providerName) {
+		return upstreamName
+	}
+	if strings.HasPrefix(strings.ToLower(providerName), strings.ToLower(upstreamName)) {
+		return providerName
+	}
+	return upstreamName + " · " + providerName
+}
+
+// peerUpstreamKey 是同一批成员行共享的分组标识。
+//
+// 注册时生成一次就固定下来（落进每条成员行的快照里），之后改名、刷新、重连都
+// 沿用旧值——分组跟着改名裂开会让界面上的"一个上游"变成两个。
+func peerUpstreamKey(grants *domain.PeerUpstreamGrants, parentURL string) string {
+	base := strings.TrimSpace(parentURL)
+	if grants != nil && strings.TrimSpace(grants.ParentGatewayID) != "" {
+		base = strings.TrimSpace(grants.ParentGatewayID) + "|" + base
+	}
+	if base == "" {
+		base = "peer-upstream"
+	}
+	return base
 }
 
 // peerRegistrationFromProvider 从已存的 provider 还原注册记录里那些不随
@@ -280,6 +533,192 @@ func peerRegistrationFromProvider(provider domain.Provider) peerRegistration {
 	return registration
 }
 
+// peerGrantedProviderID 是这条 provider 对应上游的哪个 provider（空 = 整条链路）。
+//
+// 透传时把它放进信封，上游才会把请求路由到这一个 provider，而不是在授权集里
+// 自己挑一个——「备选里单独选了上游的某一个 provider」要成立就靠它。
+func peerGrantedProviderID(provider domain.Provider) string {
+	if grants := provider.PeerGrants; grants != nil {
+		return strings.TrimSpace(grants.GrantedProviderID)
+	}
+	return ""
+}
+
+// peerUpstreamMembers 返回同一条上游落下来的所有成员行（不含已删除的）。
+func (s *Server) peerUpstreamMembers(upstreamKey string) []domain.Provider {
+	if strings.TrimSpace(upstreamKey) == "" {
+		return nil
+	}
+	members := make([]domain.Provider, 0)
+	for _, provider := range s.router.State().Providers {
+		if provider.AuthType != domain.AuthTypePeer || provider.Deleted {
+			continue
+		}
+		if peerGroupKeyForProvider(provider) == upstreamKey {
+			members = append(members, provider)
+		}
+	}
+	return members
+}
+
+// reconcilePeerUpstreamMembers 把一组成员行同步到上游最新的授权清单。
+//
+// 三件事：授权里新出现的 provider 落成新行；已有的按最新名字/模型就地更新；
+// 上游已经收回的软删除（绑过它的密钥引用会被 Router.DeleteProvider 一并清掉，
+// 这正是"这个 provider 不存在了"该有的效果）。
+//
+// 升级前注册的老记录没有"对应上游哪个 provider"这个身份（GrantedProviderID 为空），
+// 它自己一行就是整条链路。这里让它就地变成第一个成员行——保住它的 id，也就保住
+// 了已经绑在它上面的路由和密钥。优先挑与它当前协议一致的那个，否则换协议会让
+// 既有路由的协议流对不上。
+//
+// 凭据写在每一条成员行上，所以更新时只碰地址、名字、模型和快照，绝不把
+// APIKeySource 置空——UpdateProvider 会用 patch 里的空值覆盖旧值。
+func (s *Server) reconcilePeerUpstreamMembers(anchor domain.Provider, registration peerRegistration, granted []peerProviderView, upstreamName string) ([]domain.Provider, error) {
+	upstreamKey := peerGroupKeyForProvider(anchor)
+	grants := peerGrantsFromRegistration(registration, granted)
+	if grants == nil {
+		return nil, nil
+	}
+	grants.UpstreamKey = upstreamKey
+	grants.UpstreamName = upstreamName
+	plans := peerProviderPlans(upstreamName, anchor.Protocol, granted)
+
+	members := s.peerUpstreamMembers(upstreamKey)
+	byGrantedID := make(map[string]domain.Provider, len(members))
+	var legacy *domain.Provider
+	for index := range members {
+		if id := peerGrantedProviderID(members[index]); id != "" {
+			byGrantedID[id] = members[index]
+		} else if legacy == nil {
+			legacy = &members[index]
+		}
+	}
+	consumeLegacy := func(protocol domain.Protocol) (domain.Provider, bool) {
+		if legacy == nil {
+			return domain.Provider{}, false
+		}
+		if protocol != "" && legacy.Protocol != protocol {
+			return domain.Provider{}, false
+		}
+		member := *legacy
+		legacy = nil
+		return member, true
+	}
+
+	updated := make([]domain.Provider, 0, len(plans))
+	// kept 记"这一轮保住了哪些成员行"，两把键：本机 provider id，和它对应的上游
+	// provider id。上游 id 为空（升级前的老记录、占位行）时只记本机 id——把空串
+	// 当键会让所有没有上游身份的成员行一起被当成"已保住"，收回的授权就删不掉。
+	kept := make(map[string]bool, len(plans)*2)
+	markKept := func(providerID, grantedID string) {
+		kept[providerID] = true
+		if grantedID != "" {
+			kept[grantedID] = true
+		}
+	}
+	isKept := func(member domain.Provider) bool {
+		if kept[member.ID] {
+			return true
+		}
+		id := peerGrantedProviderID(member)
+		return id != "" && kept[id]
+	}
+	// 上游一个都没授权时 plans 只有一条占位行。这时优先让锚点自己就地退化成
+	// 「连上了但没授权」，而不是把整组成员删掉再新建一行：删掉会连带清空已经
+	// 绑在它们上面的路由与密钥备选，而上游重新授权时也拿不回原来的 id。
+	placeholderSurvivor := domain.Provider{}
+	if len(plans) == 1 && plans[0].GrantedProviderID == "" {
+		for _, member := range members {
+			if member.ID == anchor.ID {
+				placeholderSurvivor = member
+				break
+			}
+		}
+	}
+	for _, plan := range plans {
+		member, ok := byGrantedID[plan.GrantedProviderID]
+		if !ok {
+			// 老记录优先接住与自己同协议的那个 plan：换协议会让既有路由错位。
+			member, ok = consumeLegacy(plan.Protocol)
+		}
+		if !ok && placeholderSurvivor.ID != "" {
+			member, ok = placeholderSurvivor, true
+			placeholderSurvivor = domain.Provider{}
+		}
+		if ok && !isKept(member) {
+			markKept(member.ID, peerGrantedProviderID(member))
+			token := peerUpstreamToken(member)
+			if token == "" {
+				token = registration.Token
+			}
+			defaultModel := strings.TrimSpace(member.DefaultModel)
+			if defaultModel == "" && len(plan.Models) > 0 {
+				defaultModel = plan.Models[0].ID
+			}
+			if _, err := s.router.UpdateProvider(member.ID, domain.Provider{
+				Name:         plan.Name,
+				Protocol:     plan.Protocol,
+				BaseURL:      registration.ParentURL,
+				APIKeySource: "literal:" + token,
+				DefaultModel: defaultModel,
+			}); err != nil {
+				return updated, err
+			}
+			saved, err := s.router.UpdateProviderModels(member.ID, plan.Models, "healthy")
+			if err != nil {
+				return updated, err
+			}
+			snapshot := grants.Clone()
+			snapshot.GrantedProviderID = plan.GrantedProviderID
+			if _, err := s.router.SetPeerGrants(member.ID, snapshot); err != nil {
+				return updated, err
+			}
+			updated = append(updated, saved)
+			continue
+		}
+		// 新授权：落一条新的成员行。
+		provider := domain.Provider{
+			Name:         plan.Name,
+			Protocol:     plan.Protocol,
+			BaseURL:      registration.ParentURL,
+			APIKeySource: "literal:" + registration.Token,
+			AuthType:     domain.AuthTypePeer,
+			Models:       plan.Models,
+			HealthStatus: "healthy",
+			OwnerUserID:  anchor.OwnerUserID,
+		}
+		if len(plan.Models) > 0 {
+			provider.DefaultModel = plan.Models[0].ID
+		}
+		snapshot := grants.Clone()
+		snapshot.GrantedProviderID = plan.GrantedProviderID
+		provider.PeerGrants = &snapshot
+		saved, err := s.router.AddProvider(provider)
+		if err != nil {
+			return updated, err
+		}
+		markKept(saved.ID, plan.GrantedProviderID)
+		updated = append(updated, saved)
+	}
+
+	// 上游已经收回的：软删除。留着不删会让用户在备选里选中一个上游明确
+	// 拒绝了的 provider，而报错会指向"上游拒绝"，很难追到是授权没了。
+	for _, member := range members {
+		if isKept(member) {
+			continue
+		}
+		if len(updated) == 0 && member.ID == anchor.ID {
+			// 一条都没谈成时不要把锚点自己删掉：链路还在，只是暂时没授权。
+			continue
+		}
+		if err := s.router.DeleteProvider(member.ID); err != nil {
+			s.logs.AddApp("warn", "peer upstream member not revoked", fmt.Sprintf("provider=%s: %v", member.ID, err))
+		}
+	}
+	return updated, nil
+}
+
 // peerGrantsFromRegistration 把注册/刷新拿到的东西折成要落库的授权快照。
 //
 // granted 为 nil 表示"没问到上游"（注册时取清单失败，见 registerWithParent），
@@ -290,17 +729,36 @@ func peerGrantsFromRegistration(registration peerRegistration, granted []peerPro
 		return nil
 	}
 	ids := make([]string, 0, len(granted))
+	details := make([]domain.PeerGrantedProvider, 0, len(granted))
 	for _, view := range granted {
-		if id := strings.TrimSpace(view.ID); id != "" {
-			ids = append(ids, id)
+		id := strings.TrimSpace(view.ID)
+		if id == "" {
+			continue
 		}
+		ids = append(ids, id)
+		models := make([]string, 0, len(view.Models))
+		for _, modelID := range view.Models {
+			if trimmed := strings.TrimSpace(modelID); trimmed != "" {
+				models = append(models, trimmed)
+			}
+		}
+		sort.Strings(models)
+		details = append(details, domain.PeerGrantedProvider{
+			ID:       id,
+			Name:     strings.TrimSpace(view.Name),
+			Protocol: strings.TrimSpace(view.Protocol),
+			Models:   models,
+		})
 	}
+	// 两份清单按 id 排序：上游响应顺序会变，快照不该跟着抖。
 	sort.Strings(ids)
+	sort.Slice(details, func(i, j int) bool { return details[i].ID < details[j].ID })
 	return &domain.PeerUpstreamGrants{
 		Username:           registration.Username,
 		UserID:             registration.UserID,
 		ParentGatewayID:    registration.ParentGatewayID,
 		GrantedProviderIDs: ids,
+		GrantedProviders:   details,
 		SyncedAt:           time.Now().UTC().Format(time.RFC3339),
 	}
 }
@@ -393,16 +851,26 @@ func (s *Server) handleRefreshPeerUpstream(w http.ResponseWriter, r *http.Reques
 		writeOpenAIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// 授权快照一起更新：这次确实问到了上游，所以「授权了 0 个」从此是个
-	// 可信的结论，而不是还没问过。注册时记下的账号信息沿用旧值，本次响应
+	// 授权快照与成员行一起同步：这次确实问到了上游，所以「授权了 0 个」从此
+	// 是个可信的结论，而不是还没问过。注册时记下的账号信息沿用旧值，本次响应
 	// 里没有它们。
 	//
 	// granted 仍可能是 nil（上游回了 "providers": null），那说明这次其实也
-	// 没问到，快照保持原样——不能拿它当"授权了 0 个"。
-	if grants := peerGrantsFromRegistration(peerRegistrationFromProvider(provider), granted); grants != nil {
-		if _, err := s.router.SetPeerGrants(provider.ID, *grants); err != nil {
-			writeOpenAIError(w, http.StatusInternalServerError, err.Error())
+	// 没问到，快照保持原样——不能拿它当"授权了 0 个"，成员行也不动。
+	if granted != nil {
+		upstreamName := provider.Name
+		if provider.PeerGrants != nil && strings.TrimSpace(provider.PeerGrants.UpstreamName) != "" {
+			upstreamName = provider.PeerGrants.UpstreamName
+		}
+		members, memberErr := s.reconcilePeerUpstreamMembers(provider, peerRegistrationFromProvider(provider), granted, upstreamName)
+		if memberErr != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, memberErr.Error())
 			return
+		}
+		for _, member := range members {
+			if routeErr := s.ensurePeerUpstreamRoute(member); routeErr != nil {
+				s.logs.AddApp("warn", "peer upstream route not created", fmt.Sprintf("provider=%s: %v", member.ID, routeErr))
+			}
 		}
 	}
 	if err := s.saveState(); err != nil {
@@ -442,29 +910,43 @@ func (s *Server) handleReconnectPeerUpstream(w http.ResponseWriter, r *http.Requ
 		writeOpenAIError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	models := peerModelsForProtocol(provider.Protocol, granted)
-	defaultModel := strings.TrimSpace(provider.DefaultModel)
-	if defaultModel == "" && len(models) > 0 {
-		defaultModel = models[0].ID
+	// 新凭据要落到这一组的每一条成员行上：它们各存一份 apiKeySource。
+	upstreamKey := peerGroupKeyForProvider(provider)
+	upstreamName := provider.Name
+	if provider.PeerGrants != nil && strings.TrimSpace(provider.PeerGrants.UpstreamName) != "" {
+		upstreamName = provider.PeerGrants.UpstreamName
 	}
-	if _, err := s.router.UpdateProvider(provider.ID, domain.Provider{
-		APIKeySource: "literal:" + registration.Token,
-		BaseURL:      registration.ParentURL,
-		DefaultModel: defaultModel,
-		Models:       models,
-	}); err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, err.Error())
-		return
+	members := s.peerUpstreamMembers(upstreamKey)
+	if len(members) == 0 {
+		members = []domain.Provider{provider}
 	}
-	if _, err := s.router.UpdateProviderModels(provider.ID, models, "healthy"); err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	// 重新注册换了一把凭据，也重新问到了授权清单和账号信息：整份快照刷新。
-	if grants := peerGrantsFromRegistration(registration, granted); grants != nil {
-		if _, err := s.router.SetPeerGrants(provider.ID, *grants); err != nil {
+	for _, member := range members {
+		models := peerModelsForProtocol(member.Protocol, granted)
+		defaultModel := strings.TrimSpace(member.DefaultModel)
+		if defaultModel == "" && len(models) > 0 {
+			defaultModel = models[0].ID
+		}
+		if _, err := s.router.UpdateProvider(member.ID, domain.Provider{
+			APIKeySource: "literal:" + registration.Token,
+			BaseURL:      registration.ParentURL,
+			DefaultModel: defaultModel,
+			Models:       models,
+		}); err != nil {
 			writeOpenAIError(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+	}
+	if granted != nil {
+		// 重新注册换了一把凭据，也重新问到了授权清单和账号信息：成员行与整份
+		// 快照一起刷新（授权可能在这期间变了，增删也在这里统一处理）。
+		if _, err := s.reconcilePeerUpstreamMembers(provider, registration, granted, upstreamName); err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		for _, member := range s.peerUpstreamMembers(upstreamKey) {
+			if routeErr := s.ensurePeerUpstreamRoute(member); routeErr != nil {
+				s.logs.AddApp("warn", "peer upstream route not created", fmt.Sprintf("provider=%s: %v", member.ID, routeErr))
+			}
 		}
 	}
 	if err := s.saveState(); err != nil {

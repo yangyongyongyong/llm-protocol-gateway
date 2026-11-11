@@ -476,6 +476,35 @@ test('providerMatchesQuery：空格分词按 AND 收窄，账号也能搜到', (
   assert.equal(lib.providerMatchesQuery(provider, 'qoder workbuddy'), false, '任一词不命中就过滤掉');
 });
 
+test('上游网关成员行：按所属上游分组，行内只写成员自己的名字', () => {
+  const deepseek = {
+    id: 'sub-gw-ds', name: 'vps1 · DeepSeek Chat', protocol: 'openai_chat', authType: 'peer',
+    baseUrl: 'https://parent.example',
+    peerGrants: {grantedProviderIds: ['ds'], upstreamKey: 'gw_parent|https://parent.example', upstreamName: 'vps1', grantedProviderId: 'ds'},
+  };
+  const qwen = {
+    id: 'sub-gw-qw', name: 'vps1 · Qwen Max', protocol: 'openai_chat', authType: 'peer',
+    baseUrl: 'https://parent.example',
+    peerGrants: {grantedProviderIds: ['ds'], upstreamKey: 'gw_parent|https://parent.example', upstreamName: 'vps1', grantedProviderId: 'qw'},
+  };
+  // 同一次注册落下来的多条成员行共用一个组：标题是上游名，不是成员名。
+  assert.equal(lib.providerGroupLabel(deepseek), lib.providerGroupLabel(qwen));
+  assert.equal(lib.peerUpstreamName(deepseek), 'vps1');
+  assert.equal(lib.peerProviderMemberName(deepseek), 'DeepSeek Chat', '名字里的上游前缀在分组内是重复信息');
+  // 账号位：认人用成员名，不是那条对整组都一样的上游名。
+  assert.equal(lib.providerAccountLabel(deepseek), 'vps1');
+  assert.equal(lib.providerShortLabel(deepseek), 'DeepSeek Chat');
+  assert.equal(lib.providerDisplayLabel(deepseek), 'vps1 · DeepSeek Chat', '完整署名不再重复上游名');
+  assert.deepEqual(lib.providerUsageParts('sub-gw-ds', [deepseek, qwen]), {label: 'DeepSeek Chat', sub: 'vps1'});
+
+  // 升级前的老记录：没有 upstreamKey / upstreamName，各自成组，名字原样保留。
+  const legacy = {id: 'peer-old', name: '老上游', protocol: 'openai_chat', authType: 'peer', baseUrl: 'https://old.example'};
+  assert.equal(lib.peerUpstreamName(legacy), '老上游');
+  assert.equal(lib.peerProviderMemberName(legacy), '老上游');
+  assert.equal(lib.providerGroupLabel(legacy), lib.providerGroupLabel(legacy), '同一行永远落在同一组');
+  assert.notEqual(lib.providerGroupLabel(legacy), lib.providerGroupLabel(deepseek));
+});
+
 test('retargetSelfRegisterBaseURL：占位地址跟着协议走，真实隧道地址一个字不动', () => {
   // 还没被脚本注册过：占位主机的地址要跟着协议换成对应的路径，
   // 否则表单会带着一个跟协议对不上的占位值提交。

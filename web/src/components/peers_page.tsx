@@ -43,6 +43,17 @@ function formatTime(value: string | undefined): string {
   return new Date(ts).toLocaleString();
 }
 
+/**
+ * 授权清单的悬浮提示：这条上游授权了哪些 Provider，名字与上游那边的写法一致。
+ * 「授权 N 个 Provider」这几个字本身答不出"到底授权了哪一个"，而这一栏正是
+ * 运维核对的地方。
+ */
+function grantedProviderTitles(upstream: PeerUpstream): string {
+  const granted = (upstream.grantedProviders || []).map((item) => item.name?.trim() || item.id).filter(Boolean);
+  if (granted.length === 0) return '';
+  return `上游授权的 Provider：\n${granted.join('\n')}`;
+}
+
 /** 本机身份：注册时发给上游的就是它，运维靠它核对"上游那一行是不是我"。 */
 function GatewayIdChip({ gatewayId }: { gatewayId: string }) {
   if (!gatewayId) {
@@ -303,7 +314,8 @@ export function PeersPage({
             <h2 className="panel-title">网关互联</h2>
             <p className="panel-desc">
               把本机接到另一个网关，或者管理注册到本机的下游网关。透传的请求由上游用它自己的凭据转发、记在它的账上；
-              本机从不接触上游的凭据，也不复制它的 Provider。
+              本机从不接触上游的凭据。上游授权给你的每个 Provider 都会在「输入 Provider」页按上游分组，各占一条、
+              可以单独绑进 API 密钥（含备选）——地址与凭据仍由本页维护，改授权只在上游那边改。
             </p>
           </div>
           <div className="panel-header-actions">
@@ -349,7 +361,7 @@ export function PeersPage({
                   <div className="peer-upstream-meta">
                     {upstream.peerUsername ? <span>上游账号 {upstream.peerUsername}</span> : null}
                     {upstream.grantsSynced ? (
-                      <span>上游授权 {upstream.grantCount} 个 Provider</span>
+                      <span title={grantedProviderTitles(upstream)}>上游授权 {upstream.grantCount} 个 Provider</span>
                     ) : (
                       <span title="点「测试连接」会重新向上游查询授权清单">授权清单还没同步</span>
                     )}

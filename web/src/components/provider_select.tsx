@@ -2,6 +2,8 @@ import React from 'react';
 import {PROVIDER_PRESETS} from '../provider_presets';
 import {
     protocolLabel,
+    peerProviderMemberName,
+    peerUpstreamName,
     providerAccountLabel,
     providerConnectKind,
     providerGroupLabel,
@@ -28,8 +30,12 @@ export function providerAccountFace(provider: Provider): string {
 /**
  * 下拉行里的名字。展开时头顶有分组标题写着品牌名，每行再重复一遍「claude pro」
  * 只会把账号挤进省略号——所以菜单里用「账号」，品牌只留给触发器。
+ *
+ * 上游网关成员行相反：它的名字（vps1 · DeepSeek Chat）本身就是唯一能认人的那截，
+ * 品牌名又恰好是上游名、已经写在分组标题上，所以菜单里用成员自己的名字。
  */
 function providerMenuLabel(provider: Provider): string {
+  if (providerConnectKind(provider) === 'peer') return peerProviderMemberName(provider);
   const brand = providerBrandName(provider);
   const tail = providerAccountFaceTail(provider);
   return tail || brand;
@@ -37,6 +43,9 @@ function providerMenuLabel(provider: Provider): string {
 
 /** 品牌名之后要跟着的那截（账号 / 短 ID）；贴回名字里就是完整标签。 */
 function providerAccountFaceTail(provider: Provider): string {
+  // 上游网关没有「账号」：成员行自己的名字里已经带着上游名（vps1 · DeepSeek
+  // Chat），再补一段只会把名字挤掉。上游名由分组标题说，这里留空。
+  if (providerConnectKind(provider) === 'peer') return '';
   const account = providerAccountLabel(provider);
   if (!account || account === provider.name) return '';
   return maskAccountLabel(account);
@@ -86,6 +95,9 @@ export type ProviderBrandGroup = {
  * 平铺出来全是同名项；模型页的一级筛选和下拉菜单的分组标题都走这一份口径，
  * 免得两处对「算不算同一家」判断不一致。
  *
+ * 上游网关的组就是「哪一条上游」，标题写上游名——成员行的名字是「上游 · 成员」，
+ * 拿第一条的名字当标题会在标题里重复成员名。
+ *
  * 品牌顺序按目录磁贴的排法（订阅登录 → 模型厂商 → 中转 → 本机/自建），目录里
  * 没有的落到「自定义」（排最后）；同段内保持 Provider 出现的顺序。
  */
@@ -93,6 +105,7 @@ export function groupProvidersByBrand(providers: Provider[]): ProviderBrandGroup
   const groups = new Map<string, ProviderBrandGroup>();
   providers.forEach((provider) => {
     const key = providerGroupLabel(provider);
+    const peer = providerConnectKind(provider) === 'peer';
     const group = groups.get(key);
     if (group) {
       group.items.push(provider);
@@ -100,7 +113,7 @@ export function groupProvidersByBrand(providers: Provider[]): ProviderBrandGroup
     }
     groups.set(key, {
       key,
-      title: providerBrandName(provider) || key,
+      title: (peer ? peerUpstreamName(provider) : providerBrandName(provider)) || key,
       icon: providerIcon(provider),
       kind: providerConnectKind(provider),
       items: [provider],
@@ -124,8 +137,9 @@ export function providerSelectOptions(providers: Provider[], options: { withProt
       const provider = group.items[index];
       const account = providerAccountLabel(provider);
       const face = faces[index];
-      // 有账号的：右栏只写账号；没有账号的：完整名称，短 ID 放第二行。
-      const label = duplicated ? provider.name.trim() : account ? face : provider.name.trim();
+      // 有账号的：右栏只写账号；上游成员：成员名（上游名在分组标题上）；
+      // 没有账号可认的：完整名称。同组撞名时整组退回完整名称才分得清。
+      const label = duplicated ? provider.name.trim() : face;
       return {
         value: provider.id,
         label,

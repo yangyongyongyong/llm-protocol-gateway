@@ -112,6 +112,10 @@ import {
     providerConnectLabel,
     providerDisplayLabel,
     providerOptionLabel,
+    providerShortLabel,
+    peerProviderMemberName,
+    peerUpstreamGroupLabel,
+    peerUpstreamName,
     publicAccessMetricValue,
     publicAccessStatusLabel,
     publicAccessURL,
@@ -947,6 +951,116 @@ function App() {
     });
   }, [sortedProviders, providersStatusFilter, providersConnectFilter, providersSearch, consoleUsers, state.models]);
 
+  /**
+   * 「输入 Provider」页的渲染分组。
+   *
+   * 本地 Provider 照旧平铺；上游网关那一类按「属于哪个上游」收成若干组，每组
+   * 一个标题（上游名字 + 上游身份），组里的成员行仍然是完整的 Provider 卡片——
+   * 上游授权了哪些 provider，这里就应该一条条看得见，而不是只剩"一条链路"。
+   * 这也正是它们在备选里能被单独选中的原因：它们本来就是一条条独立的 provider。
+   */
+  const providerRenderGroups = useMemo(() => {
+    const regular: Provider[] = [];
+    const peerGroups = new Map<string, {key: string; title: string; parentId: string; items: Provider[]}>();
+    const peerOrder: string[] = [];
+    for (const provider of filteredProviders) {
+      if (providerConnectKind(provider) !== 'peer') {
+        regular.push(provider);
+        continue;
+      }
+      const key = peerUpstreamGroupLabel(provider);
+      const existing = peerGroups.get(key);
+      if (existing) {
+        existing.items.push(provider);
+        continue;
+      }
+      peerGroups.set(key, {
+        key,
+        title: peerUpstreamName(provider),
+        parentId: provider.peerGrants?.parentGatewayId || '',
+        items: [provider],
+      });
+      peerOrder.push(key);
+    }
+    return {regular, peerGroups: peerOrder.map((key) => peerGroups.get(key)!).filter(Boolean)};
+  }, [filteredProviders]);
+
+  /**
+   * 一张 Provider 卡片。抽成函数是因为它现在要在两处渲染：本地 Provider 那片
+   * 平铺列表，和每条上游下面那一组（组里的成员行和本地卡片长得一样）。
+   */
+  const renderProviderCard = (provider: Provider) => {
+    const usedCount = (state.apiKeys || []).filter((key) => (
+      apiKeyReferencesProvider(key, state.routes, provider.id)
+    )).length;
+    // 上游网关的成员行按上游给自己的名字原样展示（分组标题已经写着属于哪条上游），
+    // 账号位留空——它没有账号，把上游名再写一遍只是重复标题。
+    const peer = providerConnectKind(provider) === 'peer';
+    return (
+      <ProviderCard
+        key={provider.id}
+        layout={providerCardDensity === 'compact' ? 'list' : 'card'}
+        active={selectedProvider?.id === provider.id}
+        selected={selectedExportProviderIDs.includes(provider.id)}
+        name={peer ? peerProviderMemberName(provider) : provider.name}
+        providerId={provider.id}
+        protocol={protocolLabel(provider.protocol)}
+        tone={protocolTone(provider.protocol)}
+        url={provider.authType === 'claude_oauth' ? 'api.anthropic.com' : provider.authType === 'cursor_oauth' ? '本地 gRPC Bridge' : provider.authType === 'chatgpt_oauth' ? 'chatgpt.com/codex' : provider.baseUrl}
+        defaultModel={provider.defaultModel}
+        modelCount={(provider.models || []).length}
+        usedCount={usedCount}
+        healthStatus={provider.healthStatus || 'unchecked'}
+        nextRetryAt={provider.nextRetryAt}
+        testing={testingProviderID === provider.id}
+        chatTesting={chatTestingKeys.includes(`provider:${provider.id}`)}
+        readOnly={(isNormalUser && provider.ownerUserId !== authStatus?.userId) || !canDo('providers.edit')}
+        selectable={!isNormalUser && canDo('providers.create')}
+        providerDisabled={!!provider.disabled}
+        onToggleEnabled={!isNormalUser && canDo('providers.toggle') ? () => void toggleProviderEnabled(provider) : undefined}
+        onToggleRTK={!isNormalUser && canDo('providers.toggle') ? () => void toggleProviderRTK(provider) : undefined}
+        subtitle={peer ? undefined : (providerAccountLabel(provider) || undefined)}
+        icon={resolveProviderIcon(provider)}
+        isClaudeOAuth={provider.authType === 'claude_oauth'}
+        claudeOAuthConnected={provider.claudeOAuth?.connected}
+        isCursorOAuth={provider.authType === 'cursor_oauth'}
+        cursorOAuthConnected={provider.cursorOAuth?.connected}
+        isChatGPTOAuth={provider.authType === 'chatgpt_oauth'}
+        chatgptOAuthConnected={provider.chatgptOAuth?.connected}
+        isQoderPAT={isQoderConnectKind(provider.authType)}
+        qoderPATConnected={provider.qoderPat?.connected}
+        isWorkBuddy={isWorkBuddyConnectKind(provider.authType || 'api_key')}
+        workBuddyConnected={provider.workbuddyOAuth?.connected}
+        provider={provider}
+        cursorBridge={provider.authType === 'cursor_oauth' ? state.cursorBridge : undefined}
+        ownerName={authStatus?.scope === 'all' || canDo('usage.all') ? providerOwnerName(provider) : undefined}
+        highlightQuery={providersSearchQuery}
+        onToggleSelect={() => toggleExportProviderSelection(provider.id)}
+        onClick={() => {
+          setSelectedProviderID(provider.id);
+          showToast(`已选择输入 Provider：${provider.name}`);
+        }}
+        onTest={canDo('providers.test') ? () => void fetchProviderModels(provider.id, provider.name, true) : undefined}
+        onChatTest={canDo('providers.test') ? () => openChatTestForProvider(provider) : undefined}
+        onConformance={canDo('providers.test') ? () => void runProviderConformance(provider) : undefined}
+        onEdit={canDo('providers.edit') ? () => openEditProviderModal(provider) : undefined}
+        onClone={canDo('providers.create') ? () => openCloneProviderModal(provider) : undefined}
+        onDelete={canDo('providers.delete') ? () => void deleteProvider(provider.id, provider.name) : undefined}
+      />
+    );
+  };
+
+  const providerListHead = providerCardDensity === 'compact' ? (
+    <div className="provider-list-head" aria-hidden="true">
+      <span />
+      <span />
+      <span>Provider</span>
+      <span>额度</span>
+      <span>模型 / Keys</span>
+      <span className="provider-list-head-actions">操作</span>
+    </div>
+  ) : null;
+
   const modelsMenuProviders = useMemo(() => {
     const providerIDs = new Set(state.models.map((model) => model.providerId));
     // Always show Cursor/Claude OAuth providers that are connected, even before
@@ -990,7 +1104,9 @@ function App() {
     if (modelsProviderFilter !== '__all__') {
       const provider = state.providers.find((item) => item.id === modelsProviderFilter);
       if (!provider) return modelsProviderFilter;
-      const account = shortenAccountLabel(providerAccountLabel(provider));
+      // 上游网关成员的名字本来就写着上游名，别再缀一遍。
+      if (providerConnectKind(provider) === 'peer') return peerProviderMemberName(provider);
+      const account = providerShortLabel(provider);
       return account && account !== provider.name ? `${provider.name} · ${account}` : provider.name;
     }
     return modelsActiveGroup ? modelsActiveGroup.title : '';
@@ -5354,75 +5470,30 @@ function App() {
               ) : filteredProviders.length === 0 ? (
                 <div className="empty-state">没有匹配的 Provider，请调整检索词或连接方式过滤。</div>
               ) : (
-                <div className={providerCardDensity === 'compact' ? 'provider-list' : 'provider-card-grid'}>
-                  {providerCardDensity === 'compact' ? (
-                    <div className="provider-list-head" aria-hidden="true">
-                      <span />
-                      <span />
-                      <span>Provider</span>
-                      <span>额度</span>
-                      <span>模型 / Keys</span>
-                      <span className="provider-list-head-actions">操作</span>
+                <>
+                  {providerRenderGroups.regular.length > 0 ? (
+                    <div className={providerCardDensity === 'compact' ? 'provider-list' : 'provider-card-grid'}>
+                      {providerCardDensity === 'compact' ? providerListHead : null}
+                      {providerRenderGroups.regular.map(renderProviderCard)}
                     </div>
                   ) : null}
-                  {filteredProviders.map((provider) => {
-                    const usedCount = (state.apiKeys || []).filter((key) => (
-                      apiKeyReferencesProvider(key, state.routes, provider.id)
-                    )).length;
-                    return (
-                      <ProviderCard
-                        key={provider.id}
-                        layout={providerCardDensity === 'compact' ? 'list' : 'card'}
-                        active={selectedProvider?.id === provider.id}
-                        selected={selectedExportProviderIDs.includes(provider.id)}
-                        name={provider.name}
-                        providerId={provider.id}
-                        protocol={protocolLabel(provider.protocol)}
-                        tone={protocolTone(provider.protocol)}
-                        url={provider.authType === 'claude_oauth' ? 'api.anthropic.com' : provider.authType === 'cursor_oauth' ? '本地 gRPC Bridge' : provider.authType === 'chatgpt_oauth' ? 'chatgpt.com/codex' : provider.baseUrl}
-                        defaultModel={provider.defaultModel}
-                        modelCount={(provider.models || []).length}
-                        usedCount={usedCount}
-                        healthStatus={provider.healthStatus || 'unchecked'}
-                        nextRetryAt={provider.nextRetryAt}
-                        testing={testingProviderID === provider.id}
-                        chatTesting={chatTestingKeys.includes(`provider:${provider.id}`)}
-                        readOnly={(isNormalUser && provider.ownerUserId !== authStatus?.userId) || !canDo('providers.edit')}
-                        selectable={!isNormalUser && canDo('providers.create')}
-                        providerDisabled={!!provider.disabled}
-                        onToggleEnabled={!isNormalUser && canDo('providers.toggle') ? () => void toggleProviderEnabled(provider) : undefined}
-                        onToggleRTK={!isNormalUser && canDo('providers.toggle') ? () => void toggleProviderRTK(provider) : undefined}
-                        subtitle={providerAccountLabel(provider) || undefined}
-                        icon={resolveProviderIcon(provider)}
-                        isClaudeOAuth={provider.authType === 'claude_oauth'}
-                        claudeOAuthConnected={provider.claudeOAuth?.connected}
-                        isCursorOAuth={provider.authType === 'cursor_oauth'}
-                        cursorOAuthConnected={provider.cursorOAuth?.connected}
-                        isChatGPTOAuth={provider.authType === 'chatgpt_oauth'}
-                        chatgptOAuthConnected={provider.chatgptOAuth?.connected}
-                        isQoderPAT={isQoderConnectKind(provider.authType)}
-                        qoderPATConnected={provider.qoderPat?.connected}
-                        isWorkBuddy={isWorkBuddyConnectKind(provider.authType || 'api_key')}
-                        workBuddyConnected={provider.workbuddyOAuth?.connected}
-                        provider={provider}
-                        cursorBridge={provider.authType === 'cursor_oauth' ? state.cursorBridge : undefined}
-                        ownerName={authStatus?.scope === 'all' || canDo('usage.all') ? providerOwnerName(provider) : undefined}
-                        highlightQuery={providersSearchQuery}
-                        onToggleSelect={() => toggleExportProviderSelection(provider.id)}
-                        onClick={() => {
-                          setSelectedProviderID(provider.id);
-                          showToast(`已选择输入 Provider：${provider.name}`);
-                        }}
-                        onTest={canDo('providers.test') ? () => void fetchProviderModels(provider.id, provider.name, true) : undefined}
-                        onChatTest={canDo('providers.test') ? () => openChatTestForProvider(provider) : undefined}
-                        onConformance={canDo('providers.test') ? () => void runProviderConformance(provider) : undefined}
-                        onEdit={canDo('providers.edit') ? () => openEditProviderModal(provider) : undefined}
-                        onClone={canDo('providers.create') ? () => openCloneProviderModal(provider) : undefined}
-                        onDelete={canDo('providers.delete') ? () => void deleteProvider(provider.id, provider.name) : undefined}
-                      />
-                    );
-                  })}
-                </div>
+                  {providerRenderGroups.peerGroups.map((group) => (
+                    <section className="peer-provider-group" key={group.key}>
+                      <div className="peer-provider-group-head">
+                        <Badge tone="cyan">上游网关</Badge>
+                        <span className="peer-provider-group-title" title={group.title}>{group.title}</span>
+                        {group.parentId ? <code className="peer-gateway-code" title="上游网关身份">{group.parentId}</code> : null}
+                        <span className="hint-text peer-provider-group-hint">
+                          上游授权的 Provider，和本地 Provider 一样可以单独绑进 API 密钥（含备选）；地址、凭据与授权由「网关互联」页维护。
+                        </span>
+                      </div>
+                      <div className={providerCardDensity === 'compact' ? 'provider-list' : 'provider-card-grid'}>
+                        {providerCardDensity === 'compact' ? providerListHead : null}
+                        {group.items.map(renderProviderCard)}
+                      </div>
+                    </section>
+                  ))}
+                </>
               )}
               {selectedProvider && !isNormalUser ? <div className="hint-text">{`当前 Provider 被 ${activeProviderRouteCount} 个 API 密钥引用（含备选）。删除时这些密钥的 Provider 绑定会自动重置为空。`}</div> : null}
               <ProviderCatalogDialog
@@ -5982,12 +6053,13 @@ function App() {
                       {')'}
                     </button>
                     {modelsActiveGroup.items.map((provider) => {
-                      const account = shortenAccountLabel(providerAccountLabel(provider)) || provider.name;
+                      const account = providerShortLabel(provider) || provider.name;
+                      const peer = providerConnectKind(provider) === 'peer';
                       return (
                         <button
                           key={provider.id}
                           className={`models-filter-chip ${modelsProviderFilter === provider.id ? 'active' : ''}`}
-                          title={account !== provider.name ? `${provider.name} · ${account}` : provider.name}
+                          title={peer ? provider.name : account !== provider.name ? `${provider.name} · ${account}` : provider.name}
                           onClick={() => setModelsProviderFilter(modelsProviderFilter === provider.id ? '__all__' : provider.id)}
                         >
                           <span className="models-filter-account">{account}</span>

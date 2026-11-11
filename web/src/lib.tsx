@@ -1761,12 +1761,60 @@ const GENERIC_ACCOUNT_LABELS = new Set(['cursor', 'qoder', 'workbuddy', 'trae', 
  * 按端点主机名归——同一个反代上起的多个 Provider 是一条链路，域名不同才是别家。
  */
 export function providerGroupLabel(provider: Provider): string {
-  if (providerConnectKind(provider) !== 'api_key') return providerConnectKind(provider);
+  if (providerConnectKind(provider) !== 'api_key') {
+    // 上游网关按「哪一条上游」分组，而不是所有上游挤成一组：同一次注册落下来的
+    // 成员行共享 upstreamKey，各自的上游名不同，分组标题才能说出「属于哪个上游」。
+    if (providerConnectKind(provider) === 'peer') return peerUpstreamGroupLabel(provider);
+    return providerConnectKind(provider);
+  }
   try {
     return `api_key:${new URL(provider.baseUrl).host.toLowerCase() || provider.id}`;
   } catch {
     return `api_key:${provider.id}`;
   }
+}
+
+/**
+ * 一条 peer provider 所属上游的显示名。
+ *
+ * 新注册的记录带 UpstreamName；升级前的老记录没有，它在界面上就是自己的名字
+ * （那本来就是运维注册时填的上游名）。
+ */
+export function peerUpstreamName(provider: Provider): string {
+  const name = (provider.peerGrants?.upstreamName || '').trim();
+  return name || provider.name.trim();
+}
+
+/**
+ * 上游网关这一类的分组键与标题。同一条上游的成员行合成一组，标题就是上游名。
+ *
+ * 没有 upstreamKey 的老记录各自成组：它自己就是一条完整的链路，和以前一样。
+ */
+export function peerUpstreamGroupLabel(provider: Provider): string {
+  const key = (provider.peerGrants?.upstreamKey || '').trim();
+  return key ? `peer:${key}` : `peer:${provider.id}`;
+}
+
+/**
+ * 上游网关成员行「自己的」名字：整行名字是「上游 · 成员」，分组标题已经写着上游名，
+ * 行里再重复一遍只会把成员名挤进省略号。
+ */
+export function peerProviderMemberName(provider: Provider): string {
+  const name = provider.name.trim();
+  const upstream = peerUpstreamName(provider);
+  if (upstream && name.startsWith(`${upstream} · `)) return name.slice(upstream.length + 3).trim();
+  return name;
+}
+
+/**
+ * 同一组里用来认人的那一小段：订阅登录是脱敏账号，上游网关是成员自己的名字。
+ *
+ * 上游成员行的「账号」就是上游名（见 providerAccountLabel），同一上游下的每一行
+ * 都相同，拿它当胶囊/副标题会得到一排一模一样的字；真正不同的只有成员名。
+ */
+export function providerShortLabel(provider: Provider): string {
+  if (providerConnectKind(provider) === 'peer') return peerProviderMemberName(provider);
+  return shortenAccountLabel(providerAccountLabel(provider));
 }
 
 export function providerAccountLabel(provider: Provider): string {
@@ -1792,6 +1840,10 @@ export function providerAccountLabel(provider: Provider): string {
     case 'zcode_bigmodel': return pick(provider.zcodeOAuth?.accountLabel);
     case 'trae_cn':
     case 'trae_global': return pick(provider.traeOAuth?.accountLabel, provider.traeOAuth?.userId);
+    // 上游网关的"账号"就是它属于哪一条上游：备选和下拉里必须能看出这一条是
+    // 哪个上游授权来的，只写上游自己的名字（成员行的名字）不够——同一个上游
+    // 落下来的好几条成员行会看起来像互不相干的 Provider。
+    case 'peer': return peerUpstreamName(provider);
     default: return '';
   }
 }
@@ -1811,6 +1863,8 @@ export function shortenAccountLabel(label: string): string {
 /** Provider 的完整署名：名字 + 账号标识，用来在名字撞车时区分是哪一条。 */
 export function providerDisplayLabel(provider: Provider | undefined, missing = '未知 Provider') {
   if (!provider) return missing;
+  // 上游网关成员行的名字本来就是「上游 · 成员」，再缀一次上游名只会重复。
+  if (providerConnectKind(provider) === 'peer') return provider.name.trim() || missing;
   const account = providerAccountLabel(provider);
   return account && account !== provider.name ? `${provider.name} · ${account}` : provider.name;
 }
@@ -2324,6 +2378,10 @@ export function providerUsageParts(providerId: string, providers: Provider[]) {
   if (providerId === '_unknown') return { label: '未知 Provider', sub: '' };
   const provider = providers.find((item) => item.id === providerId);
   if (!provider) return { label: providerId, sub: '' };
+  // 上游网关：第一行写成员名，第二行写它属于哪条上游（与账号同位置）。
+  if (providerConnectKind(provider) === 'peer') {
+    return { label: peerProviderMemberName(provider), sub: peerUpstreamName(provider) };
+  }
   const account = providerAccountLabel(provider);
   const sub = account && account !== provider.name ? shortenAccountLabel(account) : '';
   return { label: provider.name, sub };

@@ -3,7 +3,10 @@ import {
   fallbackAdd,
   fallbackMove,
   fallbackRemove,
+  peerProviderMemberName,
+  peerUpstreamName,
   providerAccountLabel,
+  providerConnectKind,
   providerGroupLabel,
   providerMatchesQuery,
   providerOptionLabel,
@@ -51,15 +54,24 @@ function BrandFilterChips({groups, value, onChange}: {
   );
 }
 
+/**
+ * ProviderRowFace 是两侧列表里的一行：名字 + 账号（第二行）+ 协议。
+ *
+ * 上游网关的成员行拆成「成员名 + 上游名」两行：名字那一格写「vps1 · DeepSeek
+ * Chat」会自己把自己挤进省略号，而真正要知道的「它属于哪条上游」正好可以放在
+ * 第二行——和账号的位置一样。
+ */
 function ProviderRowFace({provider}: {provider: Provider}) {
-  const account = providerAccountLabel(provider);
-  const showAccount = account && account !== provider.name;
+  const peer = providerConnectKind(provider) === 'peer';
+  const name = peer ? peerProviderMemberName(provider) : provider.name;
+  const account = peer ? peerUpstreamName(provider) : providerAccountLabel(provider);
+  const showAccount = Boolean(account) && account !== provider.name && account !== name;
   return (
     <span className="fpp-face">
       <BrandIcon icon={providerIcon(provider)} name={provider.name} size={15} className="filter-option-icon" />
       <span className="fpp-face-text">
-        <span className="fpp-face-name" title={providerOptionLabel(provider)}>{provider.name}</span>
-        {showAccount ? <span className="fpp-face-account" title={account}>{account}</span> : null}
+        <span className="fpp-face-name" title={peer ? provider.name : providerOptionLabel(provider)}>{name}</span>
+        {showAccount ? <span className="fpp-face-account" title={peer ? `来自上游网关 ${account}` : account}>{account}</span> : null}
       </span>
       <span className="fpp-face-proto">{provider.protocol}</span>
     </span>

@@ -199,14 +199,17 @@ func TestPeerUpstreamSummariesReportGrantCount(t *testing.T) {
 	if len(granted) != 1 || granted[0].ID != "ds-claude" {
 		t.Fatalf("上游应当只授权了 ds-claude：%+v", granted)
 	}
-	created, err := child.createPeerUpstreamProvider(
+	created, err := child.createPeerUpstreamProviders(
 		httptest.NewRequest(http.MethodGet, "/__probe", nil), "vps1", domain.ProtocolOpenAIChat, registration, granted,
 	)
 	if err != nil {
 		t.Fatalf("create provider: %v", err)
 	}
+	if len(created) != 1 {
+		t.Fatalf("只授权了一个 provider，就该只落一行：%+v", created)
+	}
 
-	summary := child.peerUpstreamSummaryOf(created.ID)
+	summary := child.peerUpstreamSummaryOf(created[0].ID)
 	if summary.GrantCount != 1 {
 		t.Fatalf("grantCount = %d，注册日志里 granted=1 就该是 1", summary.GrantCount)
 	}
@@ -324,14 +327,16 @@ func TestPeerUpstreamRefreshKeepsAccountIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	created, err := child.createPeerUpstreamProvider(
+	createdRows, err := child.createPeerUpstreamProviders(
 		httptest.NewRequest(http.MethodGet, "/__probe", nil), "vps1", domain.ProtocolOpenAIChat, registration,
 		[]peerProviderView{{ID: "ds-claude", Protocol: "openai_chat", Models: []string{"m1"}}},
 	)
 	if err != nil {
 		t.Fatalf("create provider: %v", err)
 	}
-	// 旧快照带着账号信息；上游这边紧接着再被问一次，只会回 provider 清单。
+	created := createdRows[0]
+	// 升级前的记录只有账号信息、没有分组键：刷新要能就地把它接住，
+	// 而不是另起一行。
 	if _, err := child.router.SetPeerGrants(created.ID, domain.PeerUpstreamGrants{
 		Username: "peer-gw-sub", UserID: "u-sub", ParentGatewayID: otherID, GrantedProviderIDs: []string{"ds-claude"},
 	}); err != nil {
@@ -450,14 +455,15 @@ func TestPeerUpstreamUpdateKeepsExistingPeerProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	created, err := child.createPeerUpstreamProvider(
+	createdRows, err := child.createPeerUpstreamProviders(
 		httptest.NewRequest(http.MethodGet, "/__probe", nil),
 		"vps1", domain.ProtocolOpenAIChat, registration,
-		[]peerProviderView{{Protocol: "openai_chat", Models: []string{"m1"}}},
+		[]peerProviderView{{ID: "parent-model", Protocol: "openai_chat", Models: []string{"m1"}}},
 	)
 	if err != nil {
 		t.Fatalf("create provider: %v", err)
 	}
+	created := createdRows[0]
 
 	// 控制台编辑：只改名字，其余原样回传（含 authType=peer 与凭据）。
 	body, _ := json.Marshal(map[string]any{
@@ -601,5 +607,235 @@ func TestPeerUpstreamProbeRejectsNonGatewayAddress(t *testing.T) {
 		if !strings.Contains(recorder.Body.String(), "连不上") {
 			t.Fatalf("%s: 错误应当说清是连不上：%s", parentURL, recorder.Body.String())
 		}
+	}
+}
+
+// 一条上游授权了多个 provider 时，子网关要落成多条 provider 行：只有这样才能
+// 像本地 provider 一样一条条显示，也才能被单独选进 API 密钥的备选链。它们共享
+// 同一把凭据、同一个上游，各自记住"我对应上游的哪一个"。
+func TestPeerUpstreamSplitsGrantedProvidersIntoRows(t *testing.T) {
+	registration := peerRegistration{
+		ParentURL: "https://parent.example.com", Token: peerTokenPrefix + "tok",
+		Username: "peer-gw-sub", UserID: "u1", ParentGatewayID: otherID,
+	}
+	granted := []peerProviderView{
+		{ID: "ds-chat", Name: "DeepSeek Chat", Protocol: "openai_chat", Models: []string{"ds-chat"}},
+		{ID: "ds-claude", Name: "DeepSeek Claude", Protocol: "claude", Models: []string{"ds-claude-opus"}},
+	}
+	server := newPeerTestServer(t)
+	server.SetGatewayID(gwID)
+	rows, err := server.createPeerUpstreamProviders(
+		httptest.NewRequest(http.MethodGet, "/__probe", nil), "vps1", domain.ProtocolOpenAIChat, registration, granted,
+	)
+	if err != nil {
+		t.Fatalf("create providers: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("授权了两个 provider 就该落两行：%+v", rows)
+	}
+	seen := map[string]domain.Protocol{}
+	for _, row := range rows {
+		if row.AuthType != domain.AuthTypePeer {
+			t.Fatalf("成员行必须是对端类型：%+v", row)
+		}
+		if peerUpstreamToken(row) != peerTokenPrefix+"tok" {
+			t.Fatalf("每一条成员行都要带着同一把凭据：% +v", row.APIKeySource)
+		}
+		if row.PeerGrants == nil || row.PeerGrants.UpstreamKey == "" {
+			t.Fatalf("成员行必须带上分组键：%+v", row.PeerGrants)
+		}
+		grantedID := peerGrantedProviderID(row)
+		if grantedID == "" {
+			t.Fatalf("成员行必须记住自己对应上游的哪个 provider：%+v", row.PeerGrants)
+		}
+		seen[grantedID] = row.Protocol
+	}
+	if seen["ds-chat"] != domain.ProtocolOpenAIChat || seen["ds-claude"] != domain.ProtocolClaude {
+		t.Fatalf("每个成员行的协议应当取自上游：%+v", seen)
+	}
+	// 组里只要一条：界面上它就是一个上游。
+	if summaries := server.peerUpstreamSummaries(); len(summaries) != 1 {
+		t.Fatalf("同一上游的成员行要收成一组，实际 %d 组：%+v", len(summaries), summaries)
+	} else if summaries[0].MemberCount != 2 || summaries[0].GrantCount != 2 {
+		t.Fatalf("组信息不对：%+v", summaries[0])
+	}
+}
+
+// 刷新时上游新授权一个、又收回一个：成员行要跟着增删。收回的那条被软删除，
+// 于是绑过它的密钥引用会被一并清掉，而不是继续指向一个上游已经拒绝的 provider。
+func TestPeerUpstreamRefreshAddsAndRevokesMembers(t *testing.T) {
+	parent := newPeerTestServer(t,
+		domain.Provider{
+			ID: "a", Name: "a", Protocol: domain.ProtocolOpenAIChat, BaseURL: "https://parent.example.com",
+			Models: []domain.Model{{ID: "m-a", ProviderID: "a", InMenu: true}},
+		},
+		domain.Provider{
+			ID: "b", Name: "b", Protocol: domain.ProtocolOpenAIChat, BaseURL: "https://parent.example.com",
+			Models: []domain.Model{{ID: "m-b", ProviderID: "b", InMenu: true}},
+		},
+		domain.Provider{
+			ID: "c", Name: "c", Protocol: domain.ProtocolOpenAIChat, BaseURL: "https://parent.example.com",
+			Models: []domain.Model{{ID: "m-c", ProviderID: "c", InMenu: true}},
+		},
+	)
+	parent.SetGatewayID(otherID)
+	parentHTTP := httptest.NewServer(parent.Handler())
+	defer parentHTTP.Close()
+
+	child := newPeerTestServer(t)
+	child.SetGatewayID(gwID)
+	registration, granted, err := child.registerWithParent(
+		httptest.NewRequest(http.MethodGet, "/__probe", nil),
+		parentHTTP.URL, "vps1", "sub-gw", "a-strong-password", []string{"a", "b"},
+	)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	rows, err := child.createPeerUpstreamProviders(
+		httptest.NewRequest(http.MethodGet, "/__probe", nil), "vps1", domain.ProtocolOpenAIChat, registration, granted,
+	)
+	if err != nil {
+		t.Fatalf("create providers: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("应当落两行：%+v", rows)
+	}
+	var rowB domain.Provider
+	for _, row := range rows {
+		if peerGrantedProviderID(row) == "b" {
+			rowB = row
+		}
+	}
+	if rowB.ID == "" {
+		t.Fatalf("没找到对应 b 的那一行：%+v", rows)
+	}
+
+	// 上游改授权：收回 b、加上 c。
+	account, err := parent.userStore.UserByGatewayID(gwID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.setPeerGrants(account.ID, []string{"a", "c"}); err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/__peer-upstreams/"+rows[0].ID+"/refresh", nil)
+	request.SetPathValue("id", rows[0].ID)
+	request.Host = "127.0.0.1"
+	request.RemoteAddr = "127.0.0.1:40000"
+	recorder := httptest.NewRecorder()
+	child.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	members := child.peerUpstreamMembers(peerGroupKeyForProvider(rows[0]))
+	byGranted := map[string]bool{}
+	for _, member := range members {
+		byGranted[peerGrantedProviderID(member)] = true
+	}
+	if !byGranted["a"] || !byGranted["c"] {
+		t.Fatalf("新授权的 c 要落成一行、a 要留着：%+v", byGranted)
+	}
+	if byGranted["b"] {
+		t.Fatalf("上游收回的 b 必须从成员里消失：%+v", byGranted)
+	}
+	if _, err := child.router.ProviderByID(rowB.ID); err == nil {
+		t.Fatalf("被收回的成员行应当被软删除：%s", rowB.ID)
+	}
+}
+
+// 透传信封里的 providerId 取自这条 provider 对应上游的哪个 provider：有了它，
+// 「在子网关里选中上游的某一个 provider」才会被上游精确路由到那一个。
+func TestPeerForwardEnvelopeCarriesGrantedProviderID(t *testing.T) {
+	provider := domain.Provider{
+		ID: "vps1-ds-claude", Name: "vps1 · ds-claude", Protocol: domain.ProtocolOpenAIChat,
+		AuthType:   domain.AuthTypePeer,
+		PeerGrants: &domain.PeerUpstreamGrants{GrantedProviderID: "ds-claude"},
+	}
+	if got := peerGrantedProviderID(provider); got != "ds-claude" {
+		t.Fatalf("peerGrantedProviderID = %q, want ds-claude", got)
+	}
+	// 升级前的老记录没有这个字段：留空，上游仍按授权集自己挑。
+	if got := peerGrantedProviderID(domain.Provider{AuthType: domain.AuthTypePeer}); got != "" {
+		t.Fatalf("老记录不该凭空多出一个 providerId：%q", got)
+	}
+	body, err := buildPeerForwardBody(peerGrantedProviderID(provider), provider.Protocol, []byte(`{"model":"m"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `"providerId":"ds-claude"`) {
+		t.Fatalf("信封里必须带上被选中的上游 provider：%s", body)
+	}
+}
+
+// 上游一次把授权全收回：整组成员收敛成一条「连上了但没授权」的占位行，而不是
+// 全删光再从零建一条——绑过其中某条的密钥备选不该被顺手清掉，锚点也还是原来那条。
+func TestPeerUpstreamRefreshKeepsAnchorWhenGrantsEmptied(t *testing.T) {
+	parent := newPeerTestServer(t,
+		domain.Provider{
+			ID: "a", Name: "a", Protocol: domain.ProtocolOpenAIChat, BaseURL: "https://parent.example.com",
+			Models: []domain.Model{{ID: "m-a", ProviderID: "a", InMenu: true}},
+		},
+		domain.Provider{
+			ID: "b", Name: "b", Protocol: domain.ProtocolOpenAIChat, BaseURL: "https://parent.example.com",
+			Models: []domain.Model{{ID: "m-b", ProviderID: "b", InMenu: true}},
+		},
+	)
+	parent.SetGatewayID(otherID)
+	parentHTTP := httptest.NewServer(parent.Handler())
+	defer parentHTTP.Close()
+
+	child := newPeerTestServer(t)
+	child.SetGatewayID(gwID)
+	registration, granted, err := child.registerWithParent(
+		httptest.NewRequest(http.MethodGet, "/__probe", nil),
+		parentHTTP.URL, "vps1", "sub-gw", "a-strong-password", []string{"a", "b"},
+	)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	// 锚点就是本机自己落的第一行：它必须活过这一轮，且身份（id）不变。
+	rows, err := child.createPeerUpstreamProviders(
+		httptest.NewRequest(http.MethodGet, "/__probe", nil), "vps1", domain.ProtocolOpenAIChat, registration, granted,
+	)
+	if err != nil {
+		t.Fatalf("create providers: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("应当落两行：%+v", rows)
+	}
+	anchor := rows[0]
+	account, err := parent.userStore.UserByGatewayID(gwID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.setPeerGrants(account.ID, []string{}); err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/__peer-upstreams/"+anchor.ID+"/refresh", nil)
+	request.SetPathValue("id", anchor.ID)
+	request.Host = "127.0.0.1"
+	request.RemoteAddr = "127.0.0.1:40000"
+	recorder := httptest.NewRecorder()
+	child.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	members := child.peerUpstreamMembers(peerGroupKeyForProvider(anchor))
+	if len(members) != 1 {
+		t.Fatalf("授权全收回后应当只剩一条占位行，实际 %d 条：%+v", len(members), members)
+	}
+	if members[0].ID != anchor.ID {
+		t.Fatalf("留下的应当是原来的锚点 %s，实际 %s", anchor.ID, members[0].ID)
+	}
+	if got := peerGrantedProviderID(members[0]); got != "" {
+		t.Fatalf("占位行不该声称自己对应上游的某个 provider：%q", got)
+	}
+	if grants := members[0].PeerGrants; grants == nil || grants.SyncedAt == "" {
+		// 授权快照仍要刷新：界面上「上游授权 0 个」是个可信的结论，不是没同步。
+		t.Fatalf("快照仍应更新：%+v", grants)
 	}
 }

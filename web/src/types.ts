@@ -668,6 +668,12 @@ export type Provider = {
     lastSeenAt?: string;
   };
   authType?: 'api_key' | 'claude_oauth' | 'cursor_oauth' | 'chatgpt_oauth' | 'qoder_pat' | 'qoder_cn' | 'workbuddy' | 'workbuddy_ai' | 'zcode' | 'zcode_bigmodel' | 'trae_cn' | 'trae_global' | 'opencode_zen_free' | 'self_register' | 'peer';
+  /**
+   * 仅 authType=peer 有意义：这一行对应上游授权清单里的哪一个 provider。
+   * 一个上游授权了 N 个 provider，本机就落 N 行，每行各自带着这个 id——
+   * 于是它们在列表里像本地 provider 一样一条条展示，也能被单独选进备选。
+   */
+  peerGrants?: PeerUpstreamGrants;
   // 智谱（bigmodel / z.ai）编程套餐额度查询配置：团队版需要组织 + 项目 ID，
   // 两者都填时走团队版端点（?type=2 + bigmodel-organization/-project 请求头），
   // 否则走个人版端点。均为非敏感账号标识。
@@ -850,10 +856,14 @@ export type PeerUpstream = {
   name: string;
   parentUrl: string;
   protocol: Protocol;
+  /** 这一组里各成员行的协议（去重、有序）。 */
+  protocols?: string[];
   enabled: boolean;
   healthStatus?: string;
-  /** 上游授权、且与本条协议对得上的模型。 */
+  /** 上游授权、且已经落成本机 provider 行的模型。 */
   models: string[];
+  /** 这一组里有几条本机 provider 行（一个上游授权 N 个，就有 N 行）。 */
+  memberCount?: number;
   /**
    * 上游授权给本机的 provider 个数（不限协议）。它和 models 是两个口径：
    * 一条链路只说一种协议，所以协议对不上的授权不会出现在 models 里。
@@ -864,10 +874,40 @@ export type PeerUpstream = {
   grantsSynced: boolean;
   /** 授权快照的取得时间（RFC3339）；从未同步过时为空。 */
   grantsSyncedAt?: string;
+  /** 上游授权的 provider 清单（含名字、协议、模型）：界面按它原样列出上游那一侧。 */
+  grantedProviders?: PeerGrantedProvider[];
   /** 上游为这台机器建的账号名，对得上上游用户管理页那一行。 */
   peerUsername?: string;
   /** 上游网关自己的身份。 */
   parentGatewayId?: string;
+  /** 分组键：同一次注册落下来的成员行共享它。 */
+  upstreamKey?: string;
+  /** 这条上游在子网关这边的显示名（注册时填的，或从主机名取）。 */
+  upstreamName?: string;
+};
+
+/** 上游授权清单里的一项，原样来自上游的 /__peer/providers。 */
+export type PeerGrantedProvider = {
+  id: string;
+  name?: string;
+  protocol?: Protocol;
+  models?: string[];
+};
+
+/** 一条 peer provider 上的授权快照（后端 Provider.PeerGrants 的投影）。 */
+export type PeerUpstreamGrants = {
+  username?: string;
+  userId?: string;
+  parentGatewayId?: string;
+  grantedProviderIds?: string[];
+  grantedProviders?: PeerGrantedProvider[];
+  /** 同一次注册落下来的成员行共享它，界面靠它把「一个上游」收成一组。 */
+  upstreamKey?: string;
+  /** 这条上游在子网关这边的显示名。 */
+  upstreamName?: string;
+  /** 这一行对应上游的哪个 provider；空 = 整条上游链路（升级前的老记录）。 */
+  grantedProviderId?: string;
+  syncedAt?: string;
 };
 
 export type PeerUpstreamsResponse = {
