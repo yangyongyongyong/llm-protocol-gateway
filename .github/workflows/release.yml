@@ -80,6 +80,7 @@ jobs:
           npm ci --no-audit --no-fund
           npm run build
           node --test src/lib.test.mjs
+          node --test src/dialogs.test.mjs
 
   # ------------------------------------------------------------------ 核心网关（7 个平台）
   cli:
@@ -138,10 +139,15 @@ jobs:
   desktop-macos:
     name: desktop macos (arm64 + amd64)
     needs: gate
-    # 两个架构合在一个 job 里顺序构建：分成两个 matrix job 会同时抢同一池
-    # macos-14，第二个经常排不到 runner 而在启动阶段被取消（steps=0）。
-    # 串行只多花几分钟，但只占一个并发额度。
-    runs-on: macos-14
+    # 两个架构合在一个 job 里顺序构建：分成两个 matrix job 会同时抢同一池，
+    # 第二个经常排不到 runner 而在启动阶段被取消（steps=0）。串行只多花几分钟，
+    # 但只占一个并发额度。
+    #
+    # runner 标签用 macos-latest 而不是固定 macos-14：实测 2026-11-10 起
+    # macos-14 连续四次在启动瞬间被取消（steps=0、runner 为空），同一时间
+    # macos-latest 上的 go test 跑得好好的。macos-latest 现在是 arm64，
+    # amd64 那轮靠 Rosetta 编（下面的步骤已经会确保 Rosetta 在位）。
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
         with:

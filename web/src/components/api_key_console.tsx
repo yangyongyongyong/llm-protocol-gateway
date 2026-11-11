@@ -17,12 +17,16 @@ import {providerSelectOptions} from './provider_select';
 import {FilterPopoverSelect, type PopoverFilterOption} from './filter_popover';
 import {IconSelect, SearchableModelSelect} from './selects';
 import {Badge, BrandIcon, InfoTip, Switch} from './ui';
+import {alertDialog, confirmDialog} from '../dialogs';
 import {
   API_BASE,
   apiKeyClientBaseURL,
   apiKeyGatewayRoot,
+  applyClaudeClientSetup,
+  buildClaudeCodeSwitcherScript,
   clientConfigsForProtocol,
   copyToClipboard,
+  localAgentGatewayRoot,
   protocolLabel,
   protocolFromLabel,
   ScheduleModeOptions,
@@ -687,7 +691,13 @@ export function ApiKeyDetailWorkspace(props: ApiKeyWorkspaceProps) {
   }, [publicAvailable, publicPreview]);
 
   function copy(text: string, message: string, token = 'plain') {
-    if (!text) return;
+    if (!text) {
+      // 空文本不是复制，而是"动作完成"的反馈：一键写入本机写完配置后走这条
+      // 路（它没有要复制的东西）。以前这里直接 return，写入成功什么都不弹。
+      flashCopied(token);
+      if (message) onToast(message);
+      return;
+    }
     // 局域网 HTTP 下 navigator.clipboard 不存在，必须走带 execCommand 降级的
     // copyToClipboard；直接调 clipboard 会让点击静默失败。
     void copyToClipboard(text).then((ok) => {
@@ -1389,8 +1399,9 @@ function SchemeActions({
           className="akc-soft-btn danger"
           disabled={saving}
           onClick={() => {
-            if (!window.confirm(`删除方案「${activeProfile.name}」？删除后将切换到其余方案之一。`)) return;
-            void onDelete(keyItem, activeProfile.id);
+            void confirmDialog(`删除方案「${activeProfile.name}」？删除后将切换到其余方案之一。`, {danger: true, confirmLabel: '删除'}).then((ok) => {
+              if (ok) void onDelete(keyItem, activeProfile.id);
+            });
           }}
         >
           <Icon path={ICONS.trash} size={13} />
@@ -1697,8 +1708,41 @@ function ClientTab({
   onUpdateField: ApiKeyPanelHandlers['onUpdateField'];
 }) {
   const [snippet, setSnippet] = React.useState<'claude' | 'openai' | 'codex'>('claude');
+  const [applyingClients, setApplyingClients] = React.useState(false);
   const gatewayURL = apiKeyGatewayRoot(endpoints, publicPreview && publicAvailable ? livePublicURL : '').replace(/\/$/, '');
   const publicBase = publicPreview && publicAvailable ? livePublicURL : '';
+  // 「一键写入本机」写的是跑网关这台机器上的配置：CLI 与桌面端共用同一个地址。
+  // 本机走 127.0.0.1，选了公网 https 域名才用公网。以前 CLI 那半写的是网卡
+  // IP，换网络、换网卡、拔掉 Wi-Fi 都会失效，而 127.0.0.1 永远通。
+  // （Desktop 的 3p 配置还额外要求 https 或回环 http，这条规则同时满足它。）
+  const localAgentURL = localAgentGatewayRoot(endpoints, publicBase);
+
+  // 直接调后端把本机配置写好：CLI 与桌面端读的是两套文件，后端一次都写。
+  const applyLocally = async () => {
+    if (!route) return;
+    setApplyingClients(true);
+    try {
+      const outcome = await applyClaudeClientSetup({
+        baseURL: `${localAgentURL}/anthropic`,
+        gatewayURL: localAgentURL,
+        token: keyItem.key,
+        model: 'default[1m]',
+      });
+      if (!outcome.ok) {
+        void alertDialog(outcome.error || '写入失败');
+        return;
+      }
+      // 没有文本可复制，这里要的是"写入成功"的反馈：copy() 对空文本只弹
+      // 提示、不碰剪贴板（早期它直接 return，导致写入成功后毫无反应）。
+      onCopy('', '已写入本机 Claude Code CLI 与 Claude Desktop 配置', 'claude-local');
+      const notes = (outcome.result?.notes || []).join('\n');
+      void alertDialog(`已写入本机配置：\n${outcome.result?.cliPath || ''}\n${outcome.result?.desktopPath || ''}${notes ? `\n\n${notes}` : ''}`);
+    } catch (error) {
+      void alertDialog(String(error));
+    } finally {
+      setApplyingClients(false);
+    }
+  };
 
   const snippets = {
     claude: {
@@ -1772,6 +1816,40 @@ function ClientTab({
                 <span>{copied === client ? '已复制' : `复制 ${clientConfigButtonLabel(client)} 配置`}</span>
               </button>
             ))}
+            {/* 第四种按钮不走 clientConfigsForProtocol：它是「一次配置、平台换模型」的
+                固定入口，模型名恒为 default，因此不依赖当前 Provider 选了哪个模型，
+                也不受输出协议变化影响（协议在平台上换，客户端不用重配）。 */}
+            <button
+              type="button"
+              className={`akc-client-btn${copied === 'claude-switcher' ? ' copied' : ''}`}
+              disabled={!route || route.outputProtocol !== 'claude'}
+              title={route && route.outputProtocol !== 'claude'
+                ? '需要输出协议为 Claude（Messages）：这条链走 /anthropic/v1/messages'
+                : '把内置模型名固定为 default，模型与 Provider 之后全在平台上切'}
+              onClick={() => onCopy(
+                buildClaudeCodeSwitcherScript(keyItem, endpoints, publicBase),
+                '已复制 Claude Code 一键接入脚本（模型固定为 default，粘贴到终端执行）',
+                'claude-switcher',
+              )}
+            >
+              <BrandIcon icon="claude-color" name="claude" size={15} />
+              <span>{copied === 'claude-switcher' ? '已复制' : '复制 Claude Code 一键接入'}</span>
+            </button>
+            {/* 桌面 App 里的会话不读 ~/.claude/settings.json，走自己的 3p 配置。
+                这条按钮直接在「运行网关的这台机器」上把两端都写好，省掉粘贴终端
+                这一步；后端只接受本机请求，公网管理员点了会被拒。 */}
+            <button
+              type="button"
+              className={`akc-client-btn${copied === 'claude-local' ? ' copied' : ''}`}
+              disabled={!route || route.outputProtocol !== 'claude' || applyingClients}
+              title={route && route.outputProtocol !== 'claude'
+                ? '需要输出协议为 Claude（Messages）'
+                : '在本机直接写入 Claude Code CLI 与桌面端的配置（都固定为 default）'}
+              onClick={() => void applyLocally()}
+            >
+              <BrandIcon icon="claude-color" name="claude" size={15} />
+              <span>{copied === 'claude-local' ? '已写入本机' : applyingClients ? '写入中…' : '一键写入本机（CLI + 桌面端）'}</span>
+            </button>
           </div>
           <div className="akc-hint">
             {route ? `当前输出协议：${protocolLabel(route.outputProtocol)}` : '请先在「基本绑定」里为该密钥选择 Provider 与输出协议。'}
@@ -1782,6 +1860,13 @@ function ClientTab({
             <li><b>粘贴到客户端配置</b>：OpenCode → <code>opencode.json</code>，Codex → <code>config.toml</code>，Claude → 环境变量。</li>
             <li><b>发一条消息验证</b>：在「在线调试沙箱」里点发送，能看到状态、时延和协议转换结果。</li>
           </ol>
+          <div className="akc-hint">
+            <b>Claude Code 一键接入</b>：模型名固定成 <code>default</code>（<code>default[1m]</code> 表示 1M 上下文），
+            并把 opus / sonnet / haiku / fable 四个内置档位与子 agent 一起钉到 <code>default</code>。
+            之后换 Provider、换模型、换上游协议都在平台完成，客户端不用再改配置，也不用像改配置工具那样重启。
+            脚本会先备份、只改 <code>env</code> 里这几个键，其余配置原样保留；环境变量只在启动时读取，
+            所以第一次执行后重开一次客户端。
+          </div>
         </div>
 
         <div className="akc-card">

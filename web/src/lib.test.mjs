@@ -474,3 +474,109 @@ test('providerMatchesQuery：空格分词按 AND 收窄，账号也能搜到', (
   assert.equal(lib.providerMatchesQuery(provider, 'qoder 邓丽霞'), true, '多个词按 AND 收窄');
   assert.equal(lib.providerMatchesQuery(provider, 'qoder workbuddy'), false, '任一词不命中就过滤掉');
 });
+
+test('retargetSelfRegisterBaseURL：占位地址跟着协议走，真实隧道地址一个字不动', () => {
+  // 还没被脚本注册过：占位主机的地址要跟着协议换成对应的路径，
+  // 否则表单会带着一个跟协议对不上的占位值提交。
+  assert.equal(
+    lib.retargetSelfRegisterBaseURL('https://pending-self-registration.example/v1/chat/completions', 'claude'),
+    'https://pending-self-registration.example/v1/messages',
+  );
+  assert.equal(
+    lib.retargetSelfRegisterBaseURL('https://pending-self-registration.example/v1/messages', 'openai_responses'),
+    'https://pending-self-registration.example/v1/responses',
+  );
+  // 脚本已经回填过真实地址：改协议只是改网关对上游的预期，地址原样保留
+  // （真路径要等对方脚本下次注册时自己声明，这里拼一个只会把能用的地址改坏）。
+  const registered = 'https://quiet-river-1234.trycloudflare.com/v1/messages';
+  assert.equal(lib.retargetSelfRegisterBaseURL(registered, 'openai_chat'), registered);
+  // 克隆出来的空值：给新协议的占位地址。
+  assert.equal(
+    lib.retargetSelfRegisterBaseURL('', 'claude'),
+    'https://pending-self-registration.example/v1/messages',
+  );
+  // 解析不出主机的脏值按占位处理，不把脏值当真实地址留住。
+  assert.equal(
+    lib.retargetSelfRegisterBaseURL('not a url', 'claude'),
+    'https://pending-self-registration.example/v1/messages',
+  );
+});
+
+test('buildSelfRegistrationPrompt：以控制台选中的协议为主，不再让脚本四选一', () => {
+  const provider = {id: 'prov-sr', name: '内网穿透自助注册-x', protocol: 'claude'};
+  const text = lib.buildSelfRegistrationPrompt(provider, 'sr_token', 'https://gw.example.com');
+  assert.ok(text.includes('POST /v1/messages'), '主协议路径要出现');
+  // 别的协议只能出现在「手上已有现成实现」的备选清单里，主协议段落必须只讲 Claude。
+  const primary = text.slice(0, text.indexOf('接口路径'));
+  assert.ok(!primary.includes('openai_chat'), '主协议段不该提别的协议');
+  assert.ok(text.includes('protocol="openai_chat"'), '其它协议作为备选列出，但注明要回控制台改协议');
+  assert.ok(text.includes('x-api-key: <SHARED_SECRET>'), 'Claude 的鉴权头要按惯例推导');
+  assert.ok(text.includes('"protocol": "claude"'), '注册示例带上控制台选的那个协议');
+  assert.ok(text.includes('原样透传'), '要说明网关不做协议转换');
+
+  const chat = lib.buildSelfRegistrationPrompt({...provider, protocol: 'openai_chat'}, '', 'https://gw.example.com');
+  assert.ok(chat.includes('POST /v1/chat/completions'));
+  assert.ok(chat.includes('Authorization: Bearer <SHARED_SECRET>'));
+  assert.ok(chat.includes('生成注册令牌'), '没有原始令牌时用占位提示，不编一个');
+});
+
+test('Claude Code 一键接入：模型钉死 default，四个档位与子 agent 全部跟随', () => {
+  const env = lib.buildClaudeCodeSwitcherEnv({baseURL: 'https://gw.example.com/anthropic', token: 'sk-gw-x'});
+  assert.equal(env.ANTHROPIC_MODEL, 'default[1m]', '默认要 1M 变体（客户端按 1M 算窗口）');
+  // 内置子 agent 的模型是硬编码的（claude-code-guide→haiku、statusline-setup→sonnet），
+  // 只钉 ANTHROPIC_MODEL 它们仍会带着 haiku/sonnet 打上来。
+  for (const tier of ['ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_FABLE_MODEL']) {
+    assert.equal(env[tier], 'default[1m]', `${tier} 必须一起钉死`);
+  }
+  assert.equal(env.ANTHROPIC_DEFAULT_HAIKU_MODEL, 'default', 'haiku 档不带 1M：只做摘要分类');
+  assert.equal(env.ANTHROPIC_SMALL_FAST_MODEL, 'default');
+  assert.equal(env.CLAUDE_CODE_SUBAGENT_MODEL, 'default', '自定义子 agent 也要跟随');
+  assert.equal(env.ANTHROPIC_BASE_URL, 'https://gw.example.com/anthropic');
+  assert.equal(env.ANTHROPIC_AUTH_TOKEN, 'sk-gw-x');
+
+  // 关掉 1M 时所有档位都退回不带后缀的 default。
+  const plain = lib.buildClaudeCodeSwitcherEnv({baseURL: 'https://x/anthropic', token: 't', oneMillionContext: false});
+  assert.equal(plain.ANTHROPIC_MODEL, 'default');
+  assert.equal(plain.ANTHROPIC_DEFAULT_OPUS_MODEL, 'default');
+});
+
+test('Claude Code 一键接入脚本：只动 env、先备份、不覆盖用户自己选的 model', () => {
+  const key = {id: 'k1', name: 'k', key: 'sk-gw-x', enabled: true};
+  const endpoints = [{id: 'e2', name: 'Claude', protocol: 'claude', basePath: '/anthropic', listenHost: '127.0.0.1', listenPort: 18093, publicAccessEnabled: false}];
+
+  const text = lib.buildClaudeCodeSwitcherConfig(key, endpoints, '');
+  const parsed = JSON.parse(text);
+  assert.equal(parsed.env.ANTHROPIC_MODEL, 'default[1m]');
+  assert.equal(parsed.model, 'default[1m]', '顶层 model 同步，/config 里显示的就是它');
+
+  const script = lib.buildClaudeCodeSwitcherScript(key, endpoints, '');
+  assert.ok(script.includes('.claude" / "settings.json'), script);
+  assert.ok(script.includes('_backup(FILE)'), '必须先备份');
+  assert.ok(script.includes('setdefault("model"'), '用户自己在 /config 里选的模型不能被覆盖');
+  assert.ok(script.includes('重开一次'), '要提示 env 只在启动时读取');
+  const b64 = script.match(/_b64\("([A-Za-z0-9+/=]+)"\)/);
+  assert.ok(b64, '配置正文要 base64 内嵌，避免引号坑');
+  const embedded = JSON.parse(Buffer.from(b64[1], 'base64').toString('utf8'));
+  assert.equal(embedded.env.CLAUDE_CODE_SUBAGENT_MODEL, 'default');
+});
+
+test('写进本机配置的网关地址：回环 http 或公网 https，绝不写内网 http', () => {
+  // 两个理由叠在一起：
+  //   1. 本机配置指向的是跑网关的这台机器，网卡 IP 会随 Wi-Fi 切换 / DHCP 续租
+  //      而变，写死进去过几天就不通了；127.0.0.1 永远通。
+  //   2. Desktop 的 3p 托管配置校验是 "must use https (or http on loopback)"，
+  //      写内网 http 进去不会当场报错，它会在启动时丢掉整条配置并说
+  //      「Couldn't load your organization's model list」。
+  const lan = [{id: 'e1', protocol: 'openai_chat', basePath: '/v1', listenHost: '192.168.1.10', listenPort: 18093}];
+  assert.equal(lib.localAgentGatewayRoot(lan, ''), 'http://127.0.0.1:18093', '没有公网地址时退回回环，不能写内网 IP');
+
+  const loopback = [{id: 'e1', protocol: 'openai_chat', basePath: '/v1', listenHost: '127.0.0.1', listenPort: 18093}];
+  assert.equal(lib.localAgentGatewayRoot(loopback, ''), 'http://127.0.0.1:18093');
+
+  // 公网 https 优先。
+  assert.equal(lib.localAgentGatewayRoot(lan, 'https://gw.example.com'), 'https://gw.example.com');
+  assert.equal(lib.localAgentGatewayRoot(lan, 'https://gw.example.com/'), 'https://gw.example.com', '去掉尾部斜杠');
+
+  // 公网但只有 http：Desktop 不接受，仍退回回环，而不是把一个会被拒的地址写进去。
+  assert.equal(lib.localAgentGatewayRoot(lan, 'http://gw.example.com'), 'http://127.0.0.1:18093');
+});

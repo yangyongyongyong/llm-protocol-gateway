@@ -108,8 +108,8 @@ export function ThemeSwitch({
   );
 }
 
-export function Badge({ tone, children }: { tone: BadgeTone; children: React.ReactNode }) {
-  return <span className={`badge ${tone}`}>{children}</span>;
+export function Badge({ tone, children, title }: { tone: BadgeTone; children: React.ReactNode; title?: string }) {
+  return <span className={`badge ${tone}`} title={title}>{children}</span>;
 }
 
 export interface MoreMenuItem {

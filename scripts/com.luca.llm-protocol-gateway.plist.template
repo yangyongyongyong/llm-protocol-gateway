@@ -20,8 +20,21 @@
   </dict>
   <key>RunAtLoad</key>
   <true/>
+  <!-- 不能用裸 KeepAlive=true：它表示「进程退出就重拉」，不看退出原因。
+       启动脚本一旦被删（源码目录挪走 / 清理过），launchd 就会每 10 秒重拉
+       一个必然失败的任务，stderr 无声地涨 —— 实测一台机器上 51MB，全是
+       「run-gateway-service.sh: No such file or directory」，而且这个循环
+       还一直占着 18093，桌面 App 想自己托管同一端口时永远起不来。
+       加上 SuccessfulExit=false 后，脚本非零退出（含 exec 找不到文件）时
+       launchd 仍然按 KeepAlive 重试，但配合 ThrottleInterval 把间隔拉开；
+       真正兜底的是桌面 App 与 install 脚本会删掉指向已消失脚本的 plist。 -->
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
   <key>StandardOutPath</key>
   <string>__ROOT__/.cache/gateway-launchd.out.log</string>
   <key>StandardErrorPath</key>

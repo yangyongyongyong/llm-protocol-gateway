@@ -236,6 +236,14 @@ func routePermission(method, path string) *domain.Permission {
 			return perm(domain.PermKeysView)
 		}
 		return perm(domain.PermKeysCreate)
+	case "/__peers", "/__peer-upstreams":
+		// 网关互联：列出下游/上游是浏览，注册与吊销是改动。
+		if read {
+			return perm(domain.PermPeersView)
+		}
+		return perm(domain.PermPeersManage)
+	case "/__settings/peer-registration-cidrs":
+		return perm(domain.PermPeersManage)
 	case "/__providers":
 		if method == http.MethodPost {
 			return perm(domain.PermProvidersCreate)
@@ -274,6 +282,10 @@ func routePermission(method, path string) *domain.Permission {
 		return perm(domain.PermUsersView)
 	case strings.HasPrefix(path, "/__users/"):
 		return perm(domain.PermUsersManage)
+	case strings.HasPrefix(path, "/__peers/"):
+		return perm(domain.PermPeersManage)
+	case strings.HasPrefix(path, "/__peer-upstreams/"):
+		return perm(domain.PermPeersManage)
 	case strings.HasPrefix(path, "/__apikeys/"):
 		if read {
 			return perm(domain.PermKeysView)

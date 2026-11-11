@@ -18,6 +18,14 @@ func workBuddyNumberPtr(value float64) *workBuddyNumber {
 	return &number
 }
 
+// pinWorkBuddyClock freezes the quota reader's clock for one test.
+func pinWorkBuddyClock(t *testing.T, at time.Time) {
+	t.Helper()
+	original := workBuddyNow
+	workBuddyNow = func() time.Time { return at }
+	t.Cleanup(func() { workBuddyNow = original })
+}
+
 func TestParseWorkBuddyClock(t *testing.T) {
 	// WorkBuddy writes its billing dates as Beijing wall clock with no zone.
 	at, ok := parseWorkBuddyClock("2026-10-13 00:39:27")
@@ -157,6 +165,10 @@ func TestWorkBuddyQuotaRefreshesARevokedToken(t *testing.T) {
 // and only with the codes WorkBuddy's client names — a detail read without them
 // answers 10001.
 func TestWorkBuddyQuotaAsksThePackageDoorOnlyWhenItCounts(t *testing.T) {
+	// The paid batch below ends 2026-11-06 15:39 Beijing. Read against the wall
+	// clock, this test went red the day that date passed — pin the clock to the
+	// morning of it so the fixture means the same thing every run.
+	pinWorkBuddyClock(t, time.Date(2026, 11, 6, 7, 0, 0, 0, time.UTC))
 	cases := []struct {
 		name        string
 		summary     string

@@ -57,6 +57,15 @@ var workBuddyFreePackages = []string{
 	"TCACA_code_030_BjSt89qTvr",
 }
 
+// workBuddyNow is the clock the quota reads use, a var so a test can pin it.
+//
+// A personal account's credits come in dated batches, and one that is already
+// out of time is dropped from the window. So an end-to-end read judged against
+// the wall clock turns red on the day its fixture's expiry passes, with nothing
+// about the code changed: a fixture ending 2026-11-06 read green until that day
+// and red from 2026-11-10 on, blocking every release in between.
+var workBuddyNow = time.Now
+
 // workBuddyPackage is one credit package as the billing meter lists it.
 type workBuddyPackage struct {
 	PackageCode  string           `json:"PackageCode"`
@@ -279,7 +288,8 @@ type workBuddyTokenRefresher func() (domain.WorkBuddyCredential, error)
 // retry; the credential that ended up being used is returned so the caller can
 // keep the rotated token.
 func workBuddyQuotaFor(ctx context.Context, site workBuddySite, credential domain.WorkBuddyCredential, refresh workBuddyTokenRefresher) (workBuddyQuota, domain.WorkBuddyCredential) {
-	quota := workBuddyQuota{User: credential.AccountLabel, Windows: []workBuddyQuotaWin{}, FetchedAt: time.Now().UTC().Format(time.RFC3339)}
+	now := workBuddyNow()
+	quota := workBuddyQuota{User: credential.AccountLabel, Windows: []workBuddyQuotaWin{}, FetchedAt: now.UTC().Format(time.RFC3339)}
 	headers := workBuddyAccountHeaders(site, credential)
 	base := site.api()
 	call := func(path string, dst any) error {
@@ -305,14 +315,14 @@ func workBuddyQuotaFor(ctx context.Context, site workBuddySite, credential domai
 	if total > 0 {
 		// Only a personal account's credits come in dated batches.
 		key := site.authType + "|" + credential.UserID
-		batches := workBuddyBatches(ctx, site, key, base, headers, time.Now())
-		quota.Plan, windows = workBuddyQuotaWindows(summary, batches, workBuddyEnterpriseCycle{}, time.Now())
+		batches := workBuddyBatches(ctx, site, key, base, headers, now)
+		quota.Plan, windows = workBuddyQuotaWindows(summary, batches, workBuddyEnterpriseCycle{}, now)
 	} else {
 		// A team account answers the summary with no packages at all; its credits
 		// only live in the enterprise meter.
 		var enterprise workBuddyEnterpriseCycle
 		_ = call(workBuddyEnterprisePath, &enterprise)
-		quota.Plan, windows = workBuddyQuotaWindows(summary, nil, enterprise, time.Now())
+		quota.Plan, windows = workBuddyQuotaWindows(summary, nil, enterprise, now)
 	}
 	quota.Windows = windows
 	return quota, credential

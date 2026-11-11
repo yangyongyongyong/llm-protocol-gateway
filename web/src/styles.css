@@ -3797,6 +3797,9 @@ details:not([open]) > *:not(summary) { display: none !important; }
 .modal-form .field-full { grid-column: 1 / -1; }
 .modal-actions { justify-content: flex-end; margin-top: 20px; }
 .modal-toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 10px; margin-bottom: 16px; }
+/* 应用内确认框的正文：原文里的换行要留住（删除 Provider 的提示是多行的），
+   长串 ID / 路径也要能断行，不然会把卡片撑出横向滚动。 */
+.dialog-message { margin: 0; color: var(--text); font-size: 13px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* ---- 对话测试弹窗 ------------------------------------------------------- */
 /* 一次运行有三个结果（主对话 / Cache / Thinking），全部收在这一个弹窗里用分段
@@ -7639,9 +7642,10 @@ html[data-theme="dark"] .quota-next { background: var(--surface-strong); }
    38. API 日志请求表 (magpie 式密集表格)
    ---------------------------------------------------------------- */
 .tlog-scroll { overflow-x: auto; }
-/* 列宽按"1250px 可视区不横向滚动"倒推：14 列一旦超宽，整张表就要左右拖，
-   比少几列难用得多。 */
-.tlog { min-width: 1300px; }
+/* 列宽按"1250px 可视区不横向滚动"倒推：列一多，整张表就要左右拖，
+   比少几列难用得多。「链路」列只在父子网关场景下才有内容，所以给窄档
+   （84px）：「直连」两个字放得下，←…abcdef 这种六位缩写也放得下。 */
+.tlog { min-width: 1360px; }
 .tlog-grid {
   display: grid; gap: 0 8px; align-items: center;
   grid-template-columns:
@@ -7651,6 +7655,7 @@ html[data-theme="dark"] .quota-next { background: var(--surface-strong); }
     minmax(112px, 1fr)
     78px
     minmax(172px, 1.4fr)
+    84px
     44px
     66px 66px 76px 76px
     76px
@@ -7758,6 +7763,13 @@ html[data-theme="dark"] .quota-next { background: var(--surface-strong); }
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   color: var(--muted); font-family: var(--mono); font-size: 11.5px;
 }
+/* 「链路」格：直连是灰的（常态，不该抢眼）；一旦真的经过了对端网关，
+   用强调色标出来——那才是需要有人核对上下游记录的那几条。 */
+.tlog-peer {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--subtle); font-family: var(--mono); font-size: 11px;
+}
+.tlog-peer.peered { color: var(--blue); }
 
 /* ----------------------------------------------------------------
    告警规则清单（UI 精简：卡片网格 → 单行清单）
@@ -12839,3 +12851,96 @@ html[data-theme="dark"] .wb-task-badge[data-tone="ok"] { color: #6ee7b7; border-
   padding: 0 1px;
   box-shadow: 0 0 0 1px rgba(250, 204, 21, 0.35) inset;
 }
+
+/* ---- 网关互联（父子网关） ----
+   一张页面两半：上半「我连到谁」，下半「谁连到我」。两半用同一套行网格，
+   列宽写死成共享模板（12px 的字体、等宽网关 ID 都在这个宽度里放得下），
+   这样两个列表上下对齐时读起来是一张表，而不是两张各自为政的卡片。 */
+.peers-gateway-id-row {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  padding: 0 0 12px;
+}
+.peer-gateway-id {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 8px; border-radius: 7px;
+  background: var(--surface-2); border: 1px solid var(--border);
+}
+.peer-gateway-id-label { font-size: 10.5px; color: var(--muted); }
+.peer-gateway-id code, .peer-gateway-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px; color: var(--text);
+}
+/* 网关 ID 是一个定长的 gw_+16 位：窄屏下宁可让它自己换行，也不要把整行挤歪。 */
+.peer-gateway-code { overflow-wrap: anywhere; }
+
+.peer-upstream-list { display: flex; flex-direction: column; border-top: 1px solid var(--border); }
+.peer-upstream-row {
+  display: grid;
+  grid-template-columns: minmax(160px, 1.4fr) 108px minmax(150px, 1.2fr) minmax(110px, 0.9fr) auto;
+  align-items: center; gap: 12px;
+  padding: 10px 4px; border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.peer-downstream-row {
+  grid-template-columns: minmax(150px, 1.3fr) minmax(130px, 1fr) minmax(150px, 1.2fr) minmax(120px, 0.9fr) auto;
+}
+.peer-upstream-row-head {
+  font-size: 10.5px; font-weight: 600; letter-spacing: 0.02em;
+  color: var(--muted); padding: 7px 4px;
+}
+.peer-upstream-main { min-width: 0; }
+.peer-upstream-name {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  font-weight: 600; color: var(--text);
+}
+/* 上游地址 / 下游用户名都是长标识：省略号截断，完整值在 title 里。 */
+.peer-upstream-url {
+  font-size: 11px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* 账号 / 授权数 / 同步时间是一串短标签：允许换行，不让长串把列撑开。 */
+.peer-upstream-meta {
+  display: flex; flex-wrap: wrap; gap: 4px 10px;
+  margin-top: 2px; font-size: 11px; color: var(--muted);
+}
+.peer-upstream-models { min-width: 0; color: var(--text); overflow-wrap: anywhere; }
+.peer-upstream-actions { display: flex; align-items: center; gap: 6px; justify-content: flex-end; }
+.peer-upstream-actions .mini-btn.danger { color: var(--danger, #dc2626); }
+
+.peer-cidr-editor {
+  display: flex; flex-direction: column; gap: 8px;
+  margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border);
+}
+.peer-cidr-actions {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px;
+}
+
+@media (max-width: 900px) {
+  /* 窄屏：一个网关就是一块，标题行藏起来——列头对不上时会比没有更误导。 */
+  .peer-upstream-row-head { display: none; }
+  .peer-upstream-row,
+  .peer-downstream-row {
+    grid-template-columns: 1fr auto;
+    row-gap: 6px;
+  }
+  .peer-upstream-main { grid-column: 1 / -1; }
+  .peer-upstream-actions { grid-column: 1 / -1; justify-content: flex-start; }
+}
+
+/* ----------------------------------------------------------------
+   父子网关：APM 面板里的口径说明
+   ----------------------------------------------------------------
+   只有这条日志真的经过了对端网关才出现。不画「跨网关耗时」那一格：
+   网关没有单独测它的字段，凭空给一个百分比只会让人对着一个编出来的
+   数字排障。两行小字说清「上游等待 TTFB」在链路里到底是什么，更有用。 */
+.log-waterfall-note {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  background: var(--surface-sunken);
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+.log-waterfall-note + .log-waterfall-note { margin-top: -4px; }
+.log-waterfall-note b { color: var(--text-strong); font-weight: 600; }

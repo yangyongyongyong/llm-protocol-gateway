@@ -42,6 +42,7 @@ import {
 } from '../types';
 import {Badge, CopyButton, InfoTip, Modal, Switch} from './ui';
 import {ProviderLabel} from './provider_label';
+import {confirmDialog} from '../dialogs';
 import {providerSelectOptions} from './provider_select';
 import {FallbackProviderPicker} from './fallback_picker';
 
@@ -228,7 +229,7 @@ export function ApiKeyDetailPanel({
       onToast?.('至少保留一套方案，或先新建再删除');
       return;
     }
-    if (!window.confirm(`删除方案「${activeProfile.name}」？删除后将切换到其余方案之一。`)) return;
+    if (!(await confirmDialog(`删除方案「${activeProfile.name}」？删除后将切换到其余方案之一。`, {danger: true, confirmLabel: '删除'}))) return;
     await onDeleteProfile(keyItem, activeProfile.id);
   }
 

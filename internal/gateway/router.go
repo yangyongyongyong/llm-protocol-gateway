@@ -136,6 +136,50 @@ func (r *Router) SetLog2xxBodies(enabled bool) {
 	r.state.Log2xxBodies = enabled
 }
 
+// SetPeerRegistrationAllowCIDRs 设置对端注册的来源白名单。空串恢复默认
+// （只允许本机与内网）。
+func (r *Router) SetPeerRegistrationAllowCIDRs(raw string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.PeerRegistrationAllowCIDRs = strings.TrimSpace(raw)
+}
+
+// PeerRegistrationAllowCIDRs 返回当前白名单。Go 不允许同一个类型上出现与
+// 字段同名的 Getter，所以字段是 PeerRegistrationAllowCIDRs、方法加前缀区分。
+func (r *Router) PeerRegistrationAllowCIDRs() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return strings.TrimSpace(r.state.PeerRegistrationAllowCIDRs)
+}
+
+// SetMaxGatewayHops 设置链路跳数上限（1..8）。0 恢复默认 3。
+func (r *Router) SetMaxGatewayHops(hops int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.MaxGatewayHops = clampMaxGatewayHops(hops)
+}
+
+// MaxGatewayHops 返回当前跳数上限。配置缺失（0）时用默认值。
+func (r *Router) MaxGatewayHops() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return clampMaxGatewayHops(r.state.MaxGatewayHops)
+}
+
+// clampMaxGatewayHops 把配置收进合法区间。0 表示"没配过"而不是"0 跳"：
+// 没有哪个部署真的想要 0 跳（那会拒掉一切透传），所以它回到默认值。
+// 上限 8 是刻意的：与旧版共用常量上限之外，更大只是给配置错误留出更长的
+// 等待窗口，每跳都占着两边的连接。
+func clampMaxGatewayHops(hops int) int {
+	if hops <= 0 {
+		return maxGatewayHops
+	}
+	if hops > maxGatewayHopsCeiling {
+		return maxGatewayHopsCeiling
+	}
+	return hops
+}
+
 func (r *Router) SetUsageBatchConfig(maxSize, maxWaitSeconds int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -356,7 +400,11 @@ func (r *Router) AddProvider(provider domain.Provider) (domain.Provider, error) 
 		provider.AuthType != domain.AuthTypeOpenCodeZenFree &&
 		!isZCodeAuthType(provider.AuthType) &&
 		!isTraeAuthType(provider.AuthType) &&
-		!isWorkBuddyAuthType(provider.AuthType) {
+		!isWorkBuddyAuthType(provider.AuthType) &&
+		// A self-register provider is created empty on purpose: its owner's
+		// script declares baseUrl (and protocol) through the self-register
+		// endpoint right after the console mints the token.
+		provider.AuthType != domain.AuthTypeSelfRegister {
 		return domain.Provider{}, fmt.Errorf("provider baseUrl is required")
 	}
 	if provider.ID == "" {
@@ -727,6 +775,65 @@ func (r *Router) AddAPIKey(key domain.APIKey) (domain.APIKey, error) {
 
 	r.state.APIKeys = append(r.state.APIKeys, key)
 	return key, nil
+}
+
+// ReplacePeerKey 用一个对端的全部旧凭据换成新的一把。
+//
+// 换发（重装后重新注册）和吊销后重建在语义上是同一件事，共用这一条路径。
+// 整个过程在写锁内完成：请求线程看到的要么是旧凭据、要么是新凭据，绝不会
+// 出现"旧的已删、新的还没插上"的空档，否则下游会在那一刻被拒。
+//
+// 只动 kind=peer 账号名下的密钥；名字里带 peerTokenPrefix 但归属本地用户的
+// 行不会被碰——那种行只可能来自手工干预，留给管理员处理而不是悄悄删掉。
+func (r *Router) ReplacePeerKey(key domain.APIKey) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ownerID := strings.TrimSpace(key.OwnerUserID)
+	if ownerID == "" {
+		return fmt.Errorf("peer key must have an owner")
+	}
+	kept := make([]domain.APIKey, 0, len(r.state.APIKeys)+1)
+	for _, existing := range r.state.APIKeys {
+		if strings.TrimSpace(existing.OwnerUserID) == ownerID && strings.HasPrefix(existing.Key, peerTokenPrefix) {
+			continue
+		}
+		kept = append(kept, existing)
+	}
+	key.Name = strings.TrimSpace(key.Name)
+	if key.Name == "" {
+		key.Name = "网关"
+	}
+	// 对端密钥不绑 route：走哪个 provider 由上游按模型和授权集决定，不是
+	// 一把密钥对应一条固定路由。
+	key.RouteID = ""
+	key.Enabled = true
+	if key.CreatedAt == "" {
+		key.CreatedAt = nowRFC3339()
+	}
+	r.state.APIKeys = append(kept, key)
+	return nil
+}
+
+// RemovePeerKeys 删掉一个对端名下的全部对端凭据。吊销用它，返回删掉的条数。
+//
+// 只删带 peerTokenPrefix 的行：同一个 owner 名下如果还有手工建的普通密钥，
+// 那不属于对端这一侧，吊销网关不该顺手把它们删掉。
+func (r *Router) RemovePeerKeys(ownerUserID string) error {
+	ownerUserID = strings.TrimSpace(ownerUserID)
+	if ownerUserID == "" {
+		return fmt.Errorf("owner is required")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	kept := make([]domain.APIKey, 0, len(r.state.APIKeys))
+	for _, key := range r.state.APIKeys {
+		if strings.TrimSpace(key.OwnerUserID) == ownerUserID && strings.HasPrefix(key.Key, peerTokenPrefix) {
+			continue
+		}
+		kept = append(kept, key)
+	}
+	r.state.APIKeys = kept
+	return nil
 }
 
 // UpdateAPIKeyOwner reassigns a key to a console user ("" = admin-owned).
@@ -2046,6 +2153,29 @@ func (r *Router) UpdateProviderModels(providerID string, models []domain.Model, 
 	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
 }
 
+// SetPeerGrants 记下这条链路上游那一侧的授权快照（见 domain.PeerUpstreamGrants）。
+//
+// 它和 UpdateProviderModels 分开，是因为两者由不同的上游响应驱动、更新的频率也
+// 不同：模型清单来自 /__peer/providers，而授权快照还会带上注册响应里的账号信息。
+// 合进 UpdateProvider 更不行——那条路径会清掉凭据（见那里的注释）。
+func (r *Router) SetPeerGrants(providerID string, grants domain.PeerUpstreamGrants) (domain.Provider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID != providerID {
+			continue
+		}
+		// 存一份副本：调用方（注册/刷新）常常还留着入参那片切片，
+		// 让它之后被改到就等于绕过了这里的锁。
+		snapshot := grants
+		snapshot.GrantedProviderIDs = append([]string(nil), grants.GrantedProviderIDs...)
+		r.state.Providers[index].PeerGrants = &snapshot
+		return r.state.Providers[index], nil
+	}
+	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+}
+
 func (r *Router) RouteByID(routeID string) (domain.Route, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -2234,6 +2364,23 @@ func (r *Router) providerLocked(providerID string) (domain.Provider, bool) {
 		}
 	}
 	return domain.Provider{}, false
+}
+
+// providerIsSelfRegistered 回答「这台上游是不是用户自建、只按约定透传的服务」。
+//
+// 它决定了网关要不要对请求自作主张：自助注册的上游既不在网关的模型目录里，也不
+// 是 Anthropic —— 按模型名猜 max_tokens、把 budget_tokens 反推成 effort，都是拿
+// Anthropic 的口径去改一个我们并不认识的实现，对方只认自己客户端那套字段时就会
+// 400。这类 Provider 一律原样透传。providerID 为空（故障转移落到别的上游之前的
+// 空档）按 false 处理，走原来的逻辑。
+func (r *Router) providerIsSelfRegistered(providerID string) bool {
+	if providerID == "" {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	provider, ok := r.providerLocked(providerID)
+	return ok && provider.AuthType == domain.AuthTypeSelfRegister
 }
 
 func (r *Router) endpointByProtocolLocked(protocol domain.Protocol) (domain.OutputEndpoint, bool) {

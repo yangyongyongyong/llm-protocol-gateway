@@ -341,15 +341,20 @@ func (s *Server) handleProviderSelfCheckChat(w http.ResponseWriter, r *http.Requ
 }
 
 // bearerToken extracts the raw token from "Authorization: Bearer <token>".
-
-// bearerToken extracts the raw token from "Authorization: Bearer <token>".
+//
+// Scheme 比较不区分大小写：RFC 7235 规定 auth-scheme 大小写无关，各语言的
+// HTTP 客户端也确实 "bearer" / "Bearer" 混着写。这条路径两边都是别人写的
+// 程序，不该因为一个大小写就让整条链路失败。
 func bearerToken(r *http.Request) string {
-	header := strings.TrimSpace(r.Header.Get("Authorization"))
-	const prefix = "Bearer "
-	if !strings.HasPrefix(header, prefix) {
+	if r == nil {
 		return ""
 	}
-	return strings.TrimSpace(strings.TrimPrefix(header, prefix))
+	header := strings.TrimSpace(r.Header.Get("Authorization"))
+	const prefix = "bearer "
+	if len(header) < len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return ""
+	}
+	return strings.TrimSpace(header[len(prefix):])
 }
 
 // validateSelfRegisterBaseURL blocks obviously-private/loopback targets

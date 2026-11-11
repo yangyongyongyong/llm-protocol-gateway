@@ -128,6 +128,7 @@ import {
     resolveProviderTestModel,
     routeGatewayTestURL,
     selfRegisterPlaceholderBaseURL,
+    retargetSelfRegisterBaseURL,
     shortenAccountLabel,
     splitCustomDomain,
     statusTone,
@@ -145,6 +146,9 @@ import {
     writeStoredSidebarCollapsed,
     writeUICache
 } from './lib';
+// 桌面 App 的 WKWebView 里 window.confirm 恒为 false、window.alert 静默丢弃，
+// 落在它们上面的按钮会变成「点了没反应」。一律走应用内弹窗。
+import {alertDialog, confirmDialog} from './dialogs';
 import {
     ChatGPTOAuthUsagePanel,
     ClaudeOAuthUsagePanel,
@@ -221,6 +225,7 @@ import {
 import {TerminalAuthGate} from './components/terminal_auth';
 import {RolesPage, useRoles} from './components/roles_page';
 import {ProfileModal, UsersPage} from './components/users_page';
+import {PeersPage} from './components/peers_page';
 import {
     CURRENT_APP_VERSION,
     dismissUpgrade,
@@ -453,6 +458,10 @@ function App() {
       (log.errorDescription && log.errorDescription.toLowerCase().includes(kw)) ||
       (log.userName && log.userName.toLowerCase().includes(kw)) ||
       (log.accessSource && log.accessSource.toLowerCase().includes(kw)) ||
+      // 搜「gw_」前缀就能把某条链路两头的日志都捞出来，排障时最先要做的就是这件事。
+      (log.ingress && log.ingress.toLowerCase().includes(kw)) ||
+      (log.egress && log.egress.toLowerCase().includes(kw)) ||
+      (log.peerOrigin && log.peerOrigin.toLowerCase().includes(kw)) ||
       (log.providerId && log.providerId.toLowerCase().includes(kw))
     );
   }, [logs, logsKeyword]);
@@ -1730,7 +1739,7 @@ function App() {
   }
 
   async function logoutAdmin() {
-    if (!window.confirm('确定退出登录？')) return;
+    if (!(await confirmDialog('确定退出登录？'))) return;
     setAuthBusy(true);
     try {
       await fetch(`${API_BASE}/__auth/logout`, { method: 'POST', credentials: 'same-origin' });
@@ -2544,7 +2553,7 @@ function App() {
   }
 
   async function revokePublicControlToken() {
-    if (!window.confirm('确定撤销公网控制令牌？已发出的令牌会立即失效，脚本 / LLM 将无法再远程开关公网访问。')) return;
+    if (!(await confirmDialog('确定撤销公网控制令牌？已发出的令牌会立即失效，脚本 / LLM 将无法再远程开关公网访问。', {danger: true, confirmLabel: '撤销'}))) return;
     setPublicControlTokenBusy(true);
     try {
       const response = await fetch(`${API_BASE}/__public/control-token/revoke`, {
@@ -2895,14 +2904,19 @@ function App() {
   }
 
   // 目录里选中一个预设：把它的连接方式 / 协议 / 接入地址灌进草稿，再进表单。
-  // 订阅类的地址与协议由后端按连接方式固定，草稿不留占位地址。
+  // 订阅类的地址与协议由后端按连接方式固定，草稿不留占位地址；自助注册的地址
+  // 由脚本回填，这里放占位值（与下拉切到 self_register 时同一个值），否则表单
+  // 没有 Base URL 输入框可填，提交上去就是空的、被后端拒掉。
   function openProviderDraftForPreset(preset: ProviderPreset) {
     setProviderSheetOpen(false);
     setEditingProviderID('');
+    const protocol = (preset.protocol || 'openai_chat') as Protocol;
     setProviderDraft({
       name: preset.name,
-      protocol: (preset.protocol || 'openai_chat') as Protocol,
-      baseUrl: preset.authType === 'api_key' ? (preset.baseUrl || 'https://example.com/v1/chat/completions') : (preset.baseUrl || ''),
+      protocol,
+      baseUrl: preset.authType === 'self_register'
+        ? selfRegisterPlaceholderBaseURL(protocol)
+        : preset.authType === 'api_key' ? (preset.baseUrl || 'https://example.com/v1/chat/completions') : (preset.baseUrl || ''),
       apiKeySource: '',
       defaultModel: '',
       defaultThinkingDepth: '',
@@ -2957,14 +2971,17 @@ function App() {
     // Clone opens the create flow (no editingProviderID) pre-filled from an
     // existing provider so the user can tweak and save it as a new provider.
     setEditingProviderID('');
+    const cloneAuthType = resolveProviderAuthType(provider);
     setProviderDraft({
       name: `${provider.name} Copy`,
       protocol: provider.protocol,
-      baseUrl: provider.baseUrl,
+      // 自助注册类原本的 baseUrl 可能是脚本回填的真实地址（或尚未回填时的空值），
+      // 克隆出来的是一张全新的卡、还没有令牌，所以统一放占位值，等新脚本注册。
+      baseUrl: cloneAuthType === 'self_register' ? selfRegisterPlaceholderBaseURL(provider.protocol) : provider.baseUrl,
       apiKeySource: provider.apiKeySource,
       defaultModel: provider.defaultModel || '',
       defaultThinkingDepth: provider.defaultThinkingDepth || '',
-      authType: resolveProviderAuthType(provider),
+      authType: cloneAuthType,
       requestAdapterJSON: provider.requestAdapter ? JSON.stringify({
         urlTemplate: provider.requestAdapter.urlTemplate || '',
         headers: provider.requestAdapter.headers || {},
@@ -3736,7 +3753,7 @@ function App() {
   }
 
   async function revokeProviderSelfRegistration(providerID: string) {
-    if (!window.confirm('确定撤销自助注册？之前签发的令牌会立即失效，对方脚本将无法再更新地址。')) return;
+    if (!(await confirmDialog('确定撤销自助注册？之前签发的令牌会立即失效，对方脚本将无法再更新地址。', {danger: true, confirmLabel: '撤销'}))) return;
     setSelfRegBusy(true);
     try {
       const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(providerID)}/self-register-token/revoke`, {
@@ -3757,7 +3774,7 @@ function App() {
   async function deleteProvider(providerID: string, providerName: string) {
     if (denyAction('providers.delete')) return;
     const usedBy = state.routes.filter((route) => route.providerId === providerID);
-    if (!window.confirm(`确定删除输入 Provider：${providerName}？\n\n绑定到该 Provider 的 API 密钥引用（备选 / 故障转移 / 模型覆盖）将自动重置为空${usedBy.length > 0 ? `；使用它的 ${usedBy.length} 个路由（${usedBy.map((route) => route.name).join('、')}）将一并删除，绑定这些路由的密钥 RouteID 重置为空` : ''}。`)) return;
+    if (!(await confirmDialog(`确定删除输入 Provider：${providerName}？\n\n绑定到该 Provider 的 API 密钥引用（备选 / 故障转移 / 模型覆盖）将自动重置为空${usedBy.length > 0 ? `；使用它的 ${usedBy.length} 个路由（${usedBy.map((route) => route.name).join('、')}）将一并删除，绑定这些路由的密钥 RouteID 重置为空` : ''}。`, {danger: true, confirmLabel: '删除'}))) return;
     setSaving(true);
     try {
       const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(providerID)}`, { method: 'DELETE' });
@@ -3782,7 +3799,7 @@ function App() {
     const ids = selectedExportProviderIDs.filter((id) => (state.providers || []).some((provider) => provider.id === id));
     if (ids.length === 0) return;
     const names = ids.map((id) => (state.providers || []).find((provider) => provider.id === id)?.name || id);
-    if (!window.confirm(`确定删除选中的 ${ids.length} 个输入 Provider？\n\n${names.join('、')}\n\n绑定到这些 Provider 的 API 密钥引用（备选 / 故障转移 / 模型覆盖）将自动重置为空；使用这些 Provider 的路由将一并删除，绑定这些路由的密钥 RouteID 重置为空。`)) return;
+    if (!(await confirmDialog(`确定删除选中的 ${ids.length} 个输入 Provider？\n\n${names.join('、')}\n\n绑定到这些 Provider 的 API 密钥引用（备选 / 故障转移 / 模型覆盖）将自动重置为空；使用这些 Provider 的路由将一并删除，绑定这些路由的密钥 RouteID 重置为空。`, {danger: true, confirmLabel: '删除'}))) return;
     setSaving(true);
     try {
       const results = await Promise.allSettled(ids.map(async (id) => {
@@ -4349,7 +4366,7 @@ function App() {
 
   async function deleteApiKey(key: APIKey) {
     if (denyAction('keys.delete')) return;
-    if (!window.confirm(`确定删除 API 密钥：${key.name}？`)) return;
+    if (!(await confirmDialog(`确定删除 API 密钥：${key.name}？`, {danger: true, confirmLabel: '删除'}))) return;
     setSaving(true);
     try {
       const response = await fetch(`${API_BASE}/__apikeys/${encodeURIComponent(key.id)}`, { method: 'DELETE' });
@@ -4494,7 +4511,7 @@ function App() {
     if (denyAction('keys.delete')) return;
     const ids = checkedApiKeyIDs.filter((id) => (state.apiKeys || []).some((key) => key.id === id));
     if (ids.length === 0) return;
-    if (!window.confirm(`确定删除选中的 ${ids.length} 个 API 密钥？此操作不可恢复。`)) return;
+    if (!(await confirmDialog(`确定删除选中的 ${ids.length} 个 API 密钥？此操作不可恢复。`, {danger: true, confirmLabel: '删除'}))) return;
     setSaving(true);
     try {
       const results = await Promise.allSettled(ids.map(async (id) => {
@@ -4524,7 +4541,7 @@ function App() {
   }
 
   async function deleteRoute(routeID: string, routeName: string) {
-    if (!window.confirm(`确定删除路由：${routeName}？`)) return;
+    if (!(await confirmDialog(`确定删除路由：${routeName}？`, {danger: true, confirmLabel: '删除'}))) return;
     setSaving(true);
     try {
       const response = await fetch(`${API_BASE}/__routes/${encodeURIComponent(routeID)}`, { method: 'DELETE' });
@@ -6537,11 +6554,22 @@ function App() {
               refreshRoleOptions={rolesModel.refresh}
               onToast={showToast}
               onChanged={() => { void refreshConsoleUsers(); void refreshState(false); }}
+              onOpenPeers={canDo('peers.view') || canDo('peers.manage') ? () => goToPage('peers') : undefined}
             />
           )}
 
           {activeNav === 'roles' && navVisibleFor(permissions, 'roles', legacyUser) && (
             <RolesPage model={rolesModel} canManage={canDo('roles.manage')} onToast={showToast} />
+          )}
+
+          {/* 网关互联：上半是"我连到谁"，下半是"谁连到我"。注册上游会新建
+              provider 与路由，所以 onChanged 顺手刷一次全局状态。 */}
+          {activeNav === 'peers' && navVisibleFor(permissions, 'peers', legacyUser) && (
+            <PeersPage
+              canView={canDo('peers.view') || canDo('peers.manage')}
+              canManage={canDo('peers.manage')}
+              onChanged={() => { void refreshState(false); }}
+            />
           )}
 
           {activeNav === 'machine' && navVisibleFor(permissions, 'machine', legacyUser) && (
@@ -7151,6 +7179,22 @@ function App() {
                     <div className="troubleshoot-row"><span>客户端 IP (Client IP)</span><code>{trafficLogDetail.clientIp || '—'}</code></div>
                     <div className="troubleshoot-row"><span>代理域名 (Host)</span><span>{trafficLogDetail.clientHost || '—'}</span></div>
                     <div className="troubleshoot-row"><span>网络类型 (Source)</span><Badge tone="slate">{trafficLogDetail.accessSource || 'local'}</Badge></div>
+                    {/* 父子网关的链路：三行都空就是一次纯本地请求，整段不出现，
+                        免得每一条普通日志下面都挂两行「—」。 */}
+                    {trafficLogDetail.ingress ? (
+                      <div className="troubleshoot-row"><span>来自下游网关</span><code>{trafficLogDetail.ingress}</code></div>
+                    ) : null}
+                    {trafficLogDetail.egress ? (
+                      <div className="troubleshoot-row"><span>转发至上游网关</span><code>{trafficLogDetail.egress}</code></div>
+                    ) : null}
+                    {trafficLogDetail.peerOrigin && trafficLogDetail.peerOrigin !== trafficLogDetail.ingress ? (
+                      <div className="troubleshoot-row"><span>链路起点网关</span><code>{trafficLogDetail.peerOrigin}</code></div>
+                    ) : null}
+                    {/* 三级及以上链路才有意义的完整链：相邻方已经能说清两级，
+                        别让普通两级链路多出一行重复信息。 */}
+                    {(trafficLogDetail.peerPath || '').split(',').map((id) => id.trim()).filter(Boolean).length > 1 ? (
+                      <div className="troubleshoot-row"><span>完整链路</span><code>{(trafficLogDetail.peerPath || '').split(',').map((id) => id.trim()).filter(Boolean).join(' → ')} → 本机</code></div>
+                    ) : null}
                   </div>
 
                   {/* 分组 2: 鉴权与身份 */}
@@ -7232,7 +7276,11 @@ function App() {
               const connectChoices = PROVIDER_CONNECT_CHOICES;
               const connectLocked = providerDraft.authType !== 'api_key' && providerDraft.authType !== 'self_register';
               const connectValue = providerDraft.authType;
-              const protocolHint = '该平台必须原生兼容这里选中的上游协议（本网关只实现了这三种）：OpenAI Chat 最常见（DeepSeek、智谱、多数中转站），Responses 用于 Codex 一类上游，Claude 用于 Anthropic 及兼容端点。自定义或私有协议请改用「内网穿透自助注册」。';
+              // 自助注册的协议是「你自己服务实际实现的格式」，网关按它原样透传；
+              // 其它连接方式的协议则由平台固定，选了也没得换。两句话不能共用。
+              const protocolHint = providerDraft.authType === 'self_register'
+                ? '选你的本地服务实际实现的那一种协议：网关按它原样透传、不做协议转换，客户端和你的服务说的是同一种格式。选 Claude 就实现 /v1/messages，选 Responses 就实现 /v1/responses，选 OpenAI Chat 就实现 /v1/chat/completions —— 与本地模型原生支持的格式对齐最稳。'
+                : '该平台必须原生兼容这里选中的上游协议（本网关只实现了这三种）：OpenAI Chat 最常见（DeepSeek、智谱、多数中转站），Responses 用于 Codex 一类上游，Claude 用于 Anthropic 及兼容端点。自定义或私有协议请改用「内网穿透自助注册」。';
               // 各连接方式的说明不再占表单行：按当前选择折成一句，挂到「连接方式」标签旁。
               const connectHints: Record<ProviderConnectKind, string> = {
                 api_key: "本网关只实现了 OpenAI Chat、OpenAI Responses、Claude 三种上游协议。密钥所属平台不限，但该平台必须原生兼容上面选中的协议（例如 DeepSeek、智谱、各类中转站多为 OpenAI Chat 兼容）。若上游是自定义或私有协议，请改用「内网穿透自助注册」，由你的脚本自行适配后再接入。",
@@ -7248,18 +7296,21 @@ function App() {
                 trae_cn: "Trae 走 IDE 自己的协议：登录、令牌续期、模型列表与额度都由网关代为完成，客户端看到的仍是 OpenAI Chat。Trae 的授权页只接受 127.0.0.1 的回调，所以请在运行网关的这台机器上点登录；网关会临时监听一个本地端口，拿到令牌后即关闭。",
                 trae_global: "与 Trae CN 同一套协议的国际部署（节点随账号走）：登录、令牌续期、模型列表与额度都由网关代为完成，客户端看到的仍是 OpenAI Chat。授权页只接受 127.0.0.1 的回调，请在运行网关的这台机器上点登录。",
                 opencode_zen_free: "OpenCode Zen 的免费模型（-free 结尾、big-pickle、grok-code）无需任何密钥：网关会按 OpenCode 自己的客户端形状发出，并改走它的推理入口。免费档只接受流式请求，客户端要求一次性返回时网关会在上游把流收回来拼成一条回复。付费模型在下方填入自己的 OpenCode 密钥即可，两种模型可共用这一个 Provider。",
-                self_register: "适合“用户自己内网穿透暴露服务”的场景：无需现在填写 Base URL / API Key Source / 协议，保存后会自动生成一个专属令牌 + 一段配置 Prompt，交给对方脚本使用——协议不限（chat/response/claude 任选，脚本已有哪种代码就用哪种），脚本调用接口时把实际用的 baseUrl / 协议一并声明即可。",
+                self_register: "适合“用户自己内网穿透暴露服务”的场景：先选好本地服务实际实现的协议（OpenAI Chat / OpenAI Responses / Claude），网关就按这个协议原样透传，不做协议转换——上游说什么、客户端就收到什么，最稳定也最省事。保存后会自动生成一个专属令牌 + 一段配置 Prompt，交给对方脚本使用。脚本注册时声明的 protocol 以此处选择为准；如果本地服务后来改了协议，让脚本在注册时改传新的 protocol 即可覆盖。",
+                // 这一条在创建表单里选不到（PROVIDER_CONNECT_CHOICES 不含 peer）：
+                // 它只会由「网关互联」页注册上游时自动落下，这里给文案只是为了让
+                // 编辑既有记录时下拉框有个能对上的标签，不至于空白。
+                peer: "这一条不是手填出来的 Provider，而是本机注册到某个上游网关后由「网关互联」页自动创建的那扇门：地址、凭据（gwpeer-…）与可用模型都由那边维护。要换上游或刷新模型，请回「网关互联」页操作——在这里手改地址会绕过上游的授权校验。",
               };
               const connectHint = connectHints[providerDraft.authType] ?? '';
-              // 自助注册类 Provider：协议只能由脚本通过 self-register 接口的
-              // protocol 字段声明，控制台不提供选择/修改入口。
-              // resolveProviderAuthType 已根据 selfRegistration 回填 self_register。
+              // 每种连接方式各自锁定协议，但锁定的是「选定的那个」而不是写死值：
+              // 自助注册的协议由用户在下面显式选择，本地服务是什么协议就选什么，
+              // 网关按它原样透传，不做协议转换。
               const editingProviderRecord = editingProviderID ? state.providers.find((item) => item.id === editingProviderID) : undefined;
-              const protocolManagedByAPI = providerDraft.authType === 'self_register' || !!editingProviderRecord?.selfRegistration;
               return (
                 <>
                   {/* 先选连接方式，协议由连接方式决定：OAuth 三选一时协议自动锁定，
-                      自助注册协议交给脚本自己声明，只有 API Key 能自由选协议。 */}
+                      自助注册与 API Key 一样可选协议（透传，不做转换）。 */}
                   <IconSelect
                     fullWidth
                     label="连接方式"
@@ -7269,6 +7320,8 @@ function App() {
                     onChange={(value) => setProviderDraft((current) => {
                       const picked = value as ProviderConnectKind;
                       const authType = picked ?? 'api_key';
+                      // 自助注册不预设协议：沿用用户当前选中的那个，避免把已选好的
+                      // Claude 又悄悄改回 OpenAI Chat。切到别的连接方式时才按平台锁定。
                       const protocol = authType === 'claude_oauth' ? 'claude'
                         : authType === 'cursor_oauth' ? 'openai_chat'
                         : authType === 'chatgpt_oauth' ? 'openai_responses'
@@ -7276,37 +7329,50 @@ function App() {
                         : authType === 'workbuddy' || authType === 'workbuddy_ai' ? 'openai_chat'
                         : isZCodeConnectKind(authType) ? 'claude'
                         : isTraeConnectKind(authType) || authType === 'opencode_zen_free' ? 'openai_chat'
-                        // 自助注册：协议不在控制台选，这里只是内部占位默认值
-                        // （真实协议以脚本注册时声明的为准），固定用 openai_chat。
-                        : authType === 'self_register' ? 'openai_chat'
                         : current.protocol;
                       return {
                         ...current,
                         authType,
                         protocol,
-                        baseUrl: authType === 'self_register' ? selfRegisterPlaceholderBaseURL(protocol)
+                        // 切进自助注册：原来那条连接方式的 baseUrl 是别家的真实上游，
+                        // 不能当成本地服务地址带走，统一放占位值等脚本注册；本来就在
+                        // 自助注册里（只是换了协议）才保留脚本回填过的真实地址。
+                        baseUrl: authType === 'self_register'
+                          ? (current.authType === 'self_register'
+                            ? retargetSelfRegisterBaseURL(current.baseUrl, protocol)
+                            : selfRegisterPlaceholderBaseURL(protocol))
                           : isQoderConnectKind(authType) ? qoderDefaultBaseURL(authType)
                           : current.baseUrl,
                       };
                     })}
                   />
-                  {protocolManagedByAPI ? (
-                    <div className="field field-full">
-                      <div className="field-label-row">
-                        <label>协议</label>
-                        <InfoTip text="由脚本通过自助注册接口的 protocol 字段声明，控制台不提供协议选择/修改；要换协议请让脚本下次注册时改传新的 protocol。" />
-                      </div>
-                      <div className="static-field">当前：{protocolLabel(editingProviderRecord?.protocol ?? providerDraft.protocol)}</div>
-                    </div>
+                  {connectLocked ? (
+                    <IconSelect
+                      fullWidth
+                      label="协议"
+                      hint={protocolHint}
+                      disabled
+                      value={protocolLabel(providerDraft.protocol)}
+                      options={[protocolLabel(providerDraft.protocol)].map((label) => ({value: label, label, icon: protocolIcon(label)}))}
+                      onChange={() => undefined}
+                    />
                   ) : (
                     <IconSelect
                       fullWidth
                       label="协议"
                       hint={protocolHint}
-                      disabled={connectLocked}
                       value={protocolLabel(providerDraft.protocol)}
-                      options={(connectLocked ? [protocolLabel(providerDraft.protocol)] : fixedOutputLabels).map((label) => ({value: label, label, icon: protocolIcon(label)}))}
-                      onChange={(value) => setProviderDraft((current) => ({ ...current, protocol: protocolFromLabel(value) }))}
+                      options={fixedOutputLabels.map((label) => ({value: label, label, icon: protocolIcon(label)}))}
+                      onChange={(value) => setProviderDraft((current) => {
+                        const protocol = protocolFromLabel(value);
+                        return {
+                          ...current,
+                          protocol,
+                          // 自助注册的占位地址带着协议路径（/v1/messages 等），
+                          // 换协议时一起换；已经注册过的真实隧道地址原样不动。
+                          baseUrl: current.authType === 'self_register' ? retargetSelfRegisterBaseURL(current.baseUrl, protocol) : current.baseUrl,
+                        };
+                      })}
                     />
                   )}
                 </>
@@ -7582,7 +7648,7 @@ function App() {
             // 连接方式切成了 self_register，要么该 Provider 后端已持久化 selfRegistration
             // 状态。纯 API Key Provider 不再显示「生成注册令牌」——连接方式是互斥的，
             // 生成注册令牌属于「内网穿透自助注册」这一种连接方式，不应出现在 API Key 下。
-            const isSelfRegisterProvider = providerDraft.authType === 'self_register' || !!editingProvider.selfRegistration;
+            const isSelfRegisterProvider = providerDraft.authType === 'self_register' || editingProvider.authType === 'self_register' || !!editingProvider.selfRegistration;
             if (!isSelfRegisterProvider) return null;
             const selfReg = editingProvider.selfRegistration;
             const promptText = buildSelfRegistrationPrompt(editingProvider, selfRegToken, window.location.origin);

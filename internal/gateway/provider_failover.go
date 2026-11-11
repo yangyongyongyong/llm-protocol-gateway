@@ -1348,6 +1348,13 @@ func (s *Server) executeProtocolFlowWithFailover(
 		}
 		chain = allowedChain
 		if len(chain) == 0 {
+			// 账号被禁用时整条链都会被滤空（见 principalForUserID）。必须在这里
+			// 先认出来，否则报错会指向"没有分配 Provider"，运维会去查一份其实
+			// 完全正常的授权表。
+			if s.keyOwnerDisabled(matchedKey) {
+				return http.StatusForbidden, TokenUsage{}, nil, decision, model,
+					fmt.Errorf("%w: the account owning this API key is disabled", errProviderNotAssigned)
+			}
 			// 管理员 Key 没有授权表，整条链只剩禁用/已删除的 Provider 时，这是
 			// 上游不可用，不是权限问题。
 			if strings.TrimSpace(matchedKey.OwnerUserID) == "" {

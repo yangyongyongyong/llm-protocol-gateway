@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/luca/llm-protocol-gateway/internal/config"
 	"github.com/luca/llm-protocol-gateway/internal/cursor"
+	"github.com/luca/llm-protocol-gateway/internal/domain"
 	"github.com/luca/llm-protocol-gateway/internal/gateway"
 	"github.com/luca/llm-protocol-gateway/internal/monitor"
 	"github.com/luca/llm-protocol-gateway/internal/netutil"
@@ -266,6 +268,24 @@ func (rt *Runtime) Start(cfg Config) error {
 	// upgrade prompt, so it must be set before the first request is served.
 	gateway.SetBuildVersion(cfg.Version)
 	server := gateway.NewServer(router, logs, db)
+	// 网关身份要在第一条请求之前就位：环路检测拿它判断"链路里是不是我自己"。
+	// 身份从机器标识派生，重装、清库都不变（用户明确要求"同一台电脑重新安装
+	// app 要身份一样"）；读不到机器标识时退化成库里存的随机值。salt 用库文件
+	// 路径的目录，这样同一台机器上跑两套网关是两个身份，它们互相转发不会被
+	// 自己的环检测误判成环。
+	if identity := gateway.ResolveGatewayIdentity(db, filepath.Dir(db.Path())); identity.ID != "" {
+		server.SetGatewayIdentity(domain.GatewayIdentity{
+			ID:                identity.ID,
+			Name:              identity.Name,
+			Source:            identity.Source,
+			MachineIDReadable: identity.MachineIDReadable,
+		})
+		slog.Info("gateway identity", "id", identity.ID, "source", identity.Source, "machineIdReadable", identity.MachineIDReadable)
+	} else {
+		// 身份缺失时环路检测放行——这不该让网关起不来，但必须留痕，否则
+		// 将来排查"为什么环没被拦住"会找不到原因。
+		slog.Warn("gateway identity unavailable; gateway loop detection is disabled for this run")
+	}
 	// 采样器跟着进程活，而不是跟着第一个访问机器状态页的请求：否则重启之后
 	// 要等到有人打开那个页面才恢复采样，中间那段曲线就是空的（SQLite 里也
 	// 没有点可回填，因为根本没采）。

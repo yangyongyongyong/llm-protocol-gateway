@@ -46,6 +46,10 @@ export type ConsoleUser = {
   // 最近活跃：用户浏览器最近一次控制台接口请求时间（内存精确值，
   // 后端最多 5 分钟落库一次）。
   lastActiveAt?: string;
+  /** 账号种类：'peer' = 注册到本机的下游网关，不填 = 本地账号。 */
+  kind?: 'peer' | string;
+  /** kind=peer 才有：这个下游网关的稳定身份（gw_…）。 */
+  gatewayId?: string;
 };
 
 export type TunnelRuntime = {
@@ -663,7 +667,7 @@ export type Provider = {
     createdAt?: string;
     lastSeenAt?: string;
   };
-  authType?: 'api_key' | 'claude_oauth' | 'cursor_oauth' | 'chatgpt_oauth' | 'qoder_pat' | 'qoder_cn' | 'workbuddy' | 'workbuddy_ai' | 'zcode' | 'zcode_bigmodel' | 'trae_cn' | 'trae_global' | 'opencode_zen_free';
+  authType?: 'api_key' | 'claude_oauth' | 'cursor_oauth' | 'chatgpt_oauth' | 'qoder_pat' | 'qoder_cn' | 'workbuddy' | 'workbuddy_ai' | 'zcode' | 'zcode_bigmodel' | 'trae_cn' | 'trae_global' | 'opencode_zen_free' | 'self_register' | 'peer';
   // 智谱（bigmodel / z.ai）编程套餐额度查询配置：团队版需要组织 + 项目 ID，
   // 两者都填时走团队版端点（?type=2 + bigmodel-organization/-project 请求头），
   // 否则走个人版端点。均为非敏感账号标识。
@@ -805,6 +809,69 @@ export type DataPaths = {
   note?: string;
 };
 
+// ---- 网关互联（父子网关） ----
+
+/** 注册到本机的一个下游网关。凭据的任何形态都不在这里。 */
+export type PeerGateway = {
+  userId: string;
+  username: string;
+  /** 下游的稳定身份（gw_…），重装 app 不变。 */
+  gatewayId: string;
+  name?: string;
+  enabled: boolean;
+  createdAt?: string;
+  /** 它那把对端凭据的最后使用时间。 */
+  lastSeenAt?: string;
+  keyId?: string;
+  /** 吊销后用户行还在（保留授权），凭据已删，两者分开显示。 */
+  keyEnabled: boolean;
+  grantedProviderIds: string[];
+  /** 最近这段时间它送进来的请求数，用来一眼看出活跃/挂空。 */
+  ingressRequests: number;
+};
+
+export type PeersResponse = {
+  peers: PeerGateway[];
+  /** 本机身份：下游注册时用的就是它。 */
+  gatewayId: string;
+  maxHops: number;
+  registrationAllowCidrs: string;
+  registrationAllowsPrivate: boolean;
+};
+
+/** 本机注册到的一个上游网关。它在本机就是一条 authType=peer 的 provider。 */
+export type PeerUpstream = {
+  providerId: string;
+  name: string;
+  parentUrl: string;
+  protocol: Protocol;
+  enabled: boolean;
+  healthStatus?: string;
+  /** 上游授权、且与本条协议对得上的模型。 */
+  models: string[];
+  /**
+   * 上游授权给本机的 provider 个数（不限协议）。它和 models 是两个口径：
+   * 一条链路只说一种协议，所以协议对不上的授权不会出现在 models 里。
+   * grantsSynced 为 false 时这个数是零值，不代表"授权了 0 个"。
+   */
+  grantCount: number;
+  /** grantCount 是不是真的问到过上游。false = 还没同步过，别说"0 个"。 */
+  grantsSynced: boolean;
+  /** 授权快照的取得时间（RFC3339）；从未同步过时为空。 */
+  grantsSyncedAt?: string;
+  /** 上游为这台机器建的账号名，对得上上游用户管理页那一行。 */
+  peerUsername?: string;
+  /** 上游网关自己的身份。 */
+  parentGatewayId?: string;
+};
+
+export type PeerUpstreamsResponse = {
+  upstreams: PeerUpstream[];
+  /** 本机身份；界面把它显示出来，运维才能核对"上游那一行是不是我"。 */
+  gatewayId: string;
+  protocols: Protocol[];
+};
+
 export type GatewayState = {
   providers: Provider[];
   endpoints: OutputEndpoint[];
@@ -831,6 +898,21 @@ export type GatewayState = {
   webExposed?: boolean;
   dataPaths?: DataPaths;
   cursorBridge?: CursorBridgeRuntime;
+  /** 本网关的稳定身份；重装不变。父子对接靠它互相识别。 */
+  gatewayIdentity?: GatewayIdentity;
+};
+
+/**
+ * 本网关身份。ID 从机器标识派生，因此重装、清库都不变——下游注册记录
+ * 不会因为重装而全部失效。
+ */
+export type GatewayIdentity = {
+  id: string;
+  name?: string;
+  /** machine = 从机器标识派生；persisted = 库里存的随机值（读不到机器标识时）。 */
+  source?: string;
+  /** false 时重装会换身份，界面必须提示。 */
+  machineIdReadable: boolean;
 };
 
 /** 一次请求碰到过的每个 Provider：谁在服务、谁被跳过、为什么换下一个。 */
@@ -897,6 +979,19 @@ export type LogEntry = {
   clientHost?: string;
   clientIp?: string;
   accessSource?: 'lan' | 'public' | 'local' | string;
+  // 父子网关透传的链路标记。三者都空 = 一次纯本地请求（和引入父子功能之前
+  // 完全一样），界面据此决定要不要显示链路。
+  /** 把这次请求送进来的下游网关 ID（空 = 客户端直连本机）。 */
+  ingress?: string;
+  /** 本机把这次请求转发出去的上游网关 ID（空 = 本机直连 provider）。 */
+  egress?: string;
+  /** 这次透传要对账的对端网关 ID：有 ingress 取 ingress，否则取 egress。 */
+  peerGatewayId?: string;
+  peerDirection?: 'ingress' | 'egress' | string;
+  /** 三级链路里真正的起点网关（X-Gateway-Origin 一路带过来的）。 */
+  peerOrigin?: string;
+  /** 请求已经过的网关 ID 链（发起方开始、不含本机）。三级及以上排障用。 */
+  peerPath?: string;
   errorDescription?: string;
   requestBody?: string;
   responseBody?: string;
@@ -1251,7 +1346,7 @@ export type TrafficRankCache = {
   models: Record<string, number>;
 };
 
-export type ProviderConnectKind = 'api_key' | 'self_register' | 'claude_oauth' | 'cursor_oauth' | 'chatgpt_oauth' | 'qoder_pat' | 'qoder_cn' | 'workbuddy' | 'workbuddy_ai' | 'zcode' | 'zcode_bigmodel' | 'trae_cn' | 'trae_global' | 'opencode_zen_free';
+export type ProviderConnectKind = 'api_key' | 'self_register' | 'peer' | 'claude_oauth' | 'cursor_oauth' | 'chatgpt_oauth' | 'qoder_pat' | 'qoder_cn' | 'workbuddy' | 'workbuddy_ai' | 'zcode' | 'zcode_bigmodel' | 'trae_cn' | 'trae_global' | 'opencode_zen_free';
 
 /** 需要浏览器登录的订阅连接方式：它们共用一套「发起 → 等待 → 已连接」流程。 */
 export type SubscriptionConnectKind = 'workbuddy' | 'workbuddy_ai' | 'zcode' | 'zcode_bigmodel' | 'trae_cn' | 'trae_global';

@@ -247,6 +247,14 @@ type Server struct {
 	quotaProbeInFlight map[string]bool
 	quotaLastProbeAt   map[string]time.Time
 	quotaLastPruneAt   time.Time
+
+	// gatewayID 是本网关的稳定身份（见 internal/gatewayid）：父子透传用它判断
+	// "这次请求是不是已经过我自己"。启动时由 SetGatewayID 注入；空串表示尚未
+	// 初始化，此时环路检测放行而不是误拒所有透传流量。
+	gatewayID string
+	// gatewayIdentity 是同一身份的完整描述（来源、是否派生于机器标识），
+	// 只用于控制台展示；gatewayID 才是环路检测读的那个值。
+	gatewayIdentity *domain.GatewayIdentity
 }
 
 func NewServer(router *Router, logs *monitor.Store, stateSaver ...StateSaver) *Server {
@@ -573,11 +581,37 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /__apikeys/{id}/profiles/{pid}", s.handleUpdateKeyProfile)
 	mux.HandleFunc("DELETE /__apikeys/{id}/profiles/{pid}", s.handleDeleteKeyProfile)
 	mux.HandleFunc("POST /__apikeys/{id}/active-profile", s.handleSwitchKeyProfile)
+	// 把运行网关的这台机器上的 Claude Code CLI / Claude Desktop 指向本网关。
+	// 桌面 App 与管理页共用这一条：只有本机请求才会落盘（见 handleSetupClients）。
+	mux.HandleFunc("POST /__clients/setup", s.handleSetupClients)
 	mux.HandleFunc("GET /__users", s.handleListUsers)
 	mux.HandleFunc("POST /__users", s.handleCreateUser)
 	mux.HandleFunc("PATCH /__users/{id}", s.handleUpdateUser)
 	mux.HandleFunc("DELETE /__users/{id}", s.handleDeleteUser)
 	mux.HandleFunc("POST /__users/{id}/reset-password", s.handleResetUserPassword)
+	// 对端网关（父子对接）。注册是唯一不需要已有凭据的入口，靠来源地址与
+	// 用户名密码把关；其余端点只认对端凭据。整段前缀在 admin_auth 里被旁路
+	// 掉会话鉴权，见 withAdminAuth。
+	mux.HandleFunc("POST /__peer/register", s.handlePeerRegister)
+	mux.HandleFunc("GET /__peer/me", s.handlePeerMe)
+	mux.HandleFunc("GET /__peer/providers", s.handlePeerProviders)
+	mux.HandleFunc("POST /__peer/chat/completions", s.handlePeerChatCompletions)
+	// 管理侧：列出/吊销已注册的下游网关。
+	mux.HandleFunc("GET /__peers", s.handleListPeers)
+	mux.HandleFunc("DELETE /__peers/{id}", s.handleRevokePeer)
+	mux.HandleFunc("PATCH /__settings/peer-registration-cidrs", s.handleSetPeerRegistrationCIDRs)
+	mux.HandleFunc("PATCH /__settings/peer-max-hops", s.handleSetPeerMaxHops)
+	// 修改一个已注册下游的授权（按层授权的编辑入口）：注册时的预置授权只是一次
+	// 快照，之后上游随时可以改，立即生效。
+	mux.HandleFunc("PATCH /__peers/{id}/grants", s.handleSetPeerGrants)
+	// 下游侧：本机注册到上游网关，与上面那组是同一张页面的两半——上半是
+	// "谁连到我"，下半是"我连到谁"。凭据（gwpeer-…）落在 provider 的
+	// apiKeySource 上，所以这一组本质是普通的 provider 管理动作，只是包一层，
+	// 免得运维要在"输入 Provider"里手填一个 /__peer 地址。
+	mux.HandleFunc("GET /__peer-upstreams", s.handleListPeerUpstreams)
+	mux.HandleFunc("POST /__peer-upstreams", s.handleRegisterPeerUpstream)
+	mux.HandleFunc("POST /__peer-upstreams/{id}/refresh", s.handleRefreshPeerUpstream)
+	mux.HandleFunc("POST /__peer-upstreams/{id}/reconnect", s.handleReconnectPeerUpstream)
 	// RBAC: roles, the permission catalog, resource grant targets, and the
 	// signed-in user's own profile (display name + avatar).
 	mux.HandleFunc("GET /__roles", s.handleListRoles)
@@ -628,9 +662,18 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /openai/v1/responses/compact", s.handleOpenAIResponsesCompact)
 	mux.HandleFunc("POST /anthropic/v1/messages", s.handleClaudeMessages)
 	mux.HandleFunc("POST /anthropic/v1/messages/count_tokens", s.handleClaudeCountTokens)
+	// Claude Desktop 把 /v1/messages 直接拼在 inferenceGatewayBaseUrl 后面，
+	// 它写进配置的地址不带 /anthropic（3p 模式的约定，magpie 也是在根路径上
+	// 提供这个端点）。少了这两条，桌面端能列出模型却一发消息就 404。
+	mux.HandleFunc("POST /v1/messages", s.handleClaudeMessages)
+	mux.HandleFunc("POST /v1/messages/count_tokens", s.handleClaudeCountTokens)
 	api := withCORS(mux)
 	// 任何 POST 正文都有上限：限制在读取处（ReadAll 之前），超限时各协议自己回 413。
 	api = withBodyLimit(api)
+	// 环路闸门放在最内层（紧贴 mux）：它只需要看请求头，越早拒绝越省。
+	// 必须包在 mux 外层而不是塞进每个 handler——模型端点和控制台端点都会
+	// 经过这里，漏掉任何一个就等于留了一条能把自己绕死的路径。
+	api = s.withGatewayLoopGuard(api)
 	// 宿主分离必须在鉴权外层：API 域名上的控制台接口应当"不存在"（404），
 	// 而不是先被鉴权回 401——那等于告诉外面"这里有个管理接口，只是你没登录"。
 	// UI 域名上的模型协议同理，不该先走一遍管理鉴权。
@@ -692,6 +735,9 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	// 服务器自己的"今天"（API 密钥今日计数、定时任务、纯日期的日界）按 time.Local
 	// 算；控制台据此把「今日」换算到同一个时区，两个页面才不会各说一天。
 	state.ServerTimeZone = serverTimeZoneName()
+	// 身份对所有角色可见：普通用户配"父网关 ID"时也要能复制自己这一侧的 ID。
+	// 它不含机器标识本身，只有派生后的哈希，所以不存在泄漏问题。
+	state.GatewayIdentity = s.GatewayIdentityForConsole()
 	if p := s.requestPrincipal(r); p.scopeOf() != domain.ScopeAll {
 		writeJSON(w, http.StatusOK, s.stateForUser(identity, state))
 		return
@@ -1586,6 +1632,9 @@ func (s *Server) recordRequestLogEx(r *http.Request, started time.Time, matchedK
 	// scheduler to report.
 	if r != nil {
 		scheduleTraceOf(r.Context()).applyTo(&entry.Analysis)
+		// 父子透传的位置标记：纯本地请求是零值，applyPeerTrace 直接返回，
+		// 所以这一段不会改变既有日志的任何一个字段。
+		applyPeerTrace(&entry, peerTraceFor(r, timing))
 	}
 	if gatewayKeyMatched {
 		entry.APIKeyID = matchedKey.ID
@@ -2422,6 +2471,14 @@ func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid provider json: "+err.Error())
 		return
 	}
+	// 对端 provider 的地址与凭据是一体的：baseUrl 是父网关根地址，凭据是注册
+	// 那一刻签发的 gwpeer- 令牌，两者只能由「网关互联」的注册流程一起写下来。
+	// 在这里放行一条手写的 authType=peer 只会得到一条既没有凭据、也找不到门的
+	// 记录——它在请求路径上以 401 失败，而看到的人只会以为"上游拒绝"。
+	if provider.AuthType == domain.AuthTypePeer {
+		writeOpenAIError(w, http.StatusBadRequest, "authType=peer 不能手工创建：请在「网关互联」页注册到上游网关，网关会自动生成这条记录")
+		return
+	}
 	if p := s.requestPrincipal(r); p.scopeOf() != domain.ScopeAll {
 		// Restricted users own the providers they create (including clones),
 		// while every other account's provider is labelled with its own
@@ -2518,6 +2575,17 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&provider); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid provider json: "+err.Error())
 		return
+	}
+	// 编辑一张已有的对端记录时，控制台会把 authType=peer 原样回传（见 frontend
+	// 的 providerConnectKind）。那不是"创建一个 peer"，只是"还是那条记录"，
+	// 所以这里不能一刀切拒绝；真正要拦的是「把一条普通 provider 改成 peer」，
+	// 那会得到一条手工伪造的对端门，凭据与地址都对不上。
+	if provider.AuthType == domain.AuthTypePeer {
+		existing, err := s.router.ProviderByID(r.PathValue("id"))
+		if err != nil || existing.AuthType != domain.AuthTypePeer {
+			writeOpenAIError(w, http.StatusBadRequest, "只有「网关互联」注册生成的对端记录才能是 authType=peer；请到该页面重新注册，不要手改连接方式")
+			return
+		}
 	}
 	updated, err := s.router.UpdateProvider(r.PathValue("id"), provider)
 	if err != nil {
@@ -3332,6 +3400,13 @@ func resolveProviderEndpointURL(provider domain.Provider, path string) string {
 }
 
 func resolveProviderChatURL(provider domain.Provider, model string) string {
+	if provider.AuthType == domain.AuthTypePeer {
+		// 父子透传的 provider 不是 provider，而是「上游网关的一扇门」：地址
+		// 固定是它的 /__peer/chat/completions，模型写在包体里。走通用的
+		// baseUrl + /chat/completions 拼接会打到上游的普通模型入口，那里不认
+		// 对端凭据。
+		return resolvePeerParentURL(provider) + peerEndpointPrefix + "chat/completions"
+	}
 	if isTraeProvider(provider) {
 		// Trae has one agent endpoint per realm and no OpenAI-style path to
 		// append to it.
@@ -4119,27 +4194,54 @@ func (s *Server) persistProviderOAuth(provider domain.Provider) error {
 	return s.saveState()
 }
 
+// handleOpenAIModels 是 OpenAI 形态的模型目录。
+//
+// Claude Desktop 也读这个接口，但它只保留读起来像 Anthropic 的 id——只提供
+// m1/m2 的网关在它眼里就是"没有任何模型"。所以对 Desktop 的请求单独出一份
+// 清单：本来就被它接受的 id 原样给，其余换成 anthropic/gw-<哈希> 别名并在
+// display_name 里保留真名（见 desktop_models.go）。请求回来时再把别名反查
+// 回真实模型，两边靠同一份模型集合保证一致。
 func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 	models := s.modelsForRequest(r)
+	desktop := isClaudeDesktopRequest(r.Header.Get("User-Agent"))
+	if desktop {
+		models = desktopModelView(models)
+	}
 	data := make([]map[string]any, 0, len(models))
 	for _, model := range models {
 		contextLen := resolveModelContextLength(model.ID, model.ContextLength)
-		data = append(data, map[string]any{
+		entry := map[string]any{
 			"id":             model.ID,
 			"object":         "model",
 			"created":        0,
 			"owned_by":       model.ProviderID,
 			"context_length": contextLen,
-		})
+		}
+		if desktop {
+			// Desktop 的菜单显示 display_name，不显示 id；别名不给名字的话
+			// 用户看到的就是一串 anthropic/gw-1234567890。
+			name := strings.TrimSpace(model.Name)
+			if name == "" {
+				name = model.ID
+			}
+			entry["display_name"] = name
+		}
+		data = append(data, entry)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
 
+// handleClaudeModels is Claude Code's model discovery. It publishes the
+// caller's real catalog plus two kinds of synthetic entries: the sonnet/opus/
+// haiku tier aliases the built-in sub-agents ask for by name, and the reserved
+// "default" alias. The tier aliases are limited to the tiers this caller can
+// actually reach — advertising a model no provider serves is a capacity lie the
+// client acts on (see claudeModelAliasEntries).
 func (s *Server) handleClaudeModels(w http.ResponseWriter, r *http.Request) {
 	models := s.modelsForRequest(r)
-	data := make([]map[string]any, 0, len(models)+len(claudeModelAliases))
+	data := make([]map[string]any, 0, len(models)+len(claudeModelAliases)+2)
 	seen := map[string]bool{}
-	for _, entry := range claudeModelAliasEntries() {
+	for _, entry := range claudeModelAliasEntries(models) {
 		id := stringValue(entry["id"])
 		if id == "" || seen[id] {
 			continue
@@ -4148,6 +4250,16 @@ func (s *Server) handleClaudeModels(w http.ResponseWriter, r *http.Request) {
 		if entry["created_at"] == "" {
 			entry["created_at"] = time.Now().UTC().Format(time.RFC3339)
 		}
+		data = append(data, entry)
+	}
+	// The reserved "default" alias, so a client that pins ANTHROPIC_MODEL once
+	// finds it in model discovery too. Two spellings, matching Claude Code's
+	// own extended-context convention: the bare one and the 1M variant.
+	for _, entry := range reservedDefaultModelEntries() {
+		if seen[entry["id"].(string)] {
+			continue
+		}
+		seen[entry["id"].(string)] = true
 		data = append(data, entry)
 	}
 	for _, model := range models {
@@ -4953,6 +5065,10 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 	requestModel, _ := req["model"].(string)
 	model, logModel := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
 	r = attachAPIKeyMaxOutputTokens(r, matchedKey, gatewayKeyMatched)
+	// 自助注册的上游是用户自己的服务：它要什么思考档位，客户端的请求已经说清楚
+	// 了。网关拿自己的档位表（以及 budget<->effort 的反推）去改写，等于替一个
+	// 我们并不认识的上游改主意——见下面 applyClaudeEffort 处同一判断。
+	selfRegistered := s.router.providerIsSelfRegistered(route.ProviderID)
 	thinkingOverride := ""
 	if gatewayKeyMatched {
 		thinkingOverride = matchedKey.ThinkingDepthOverride
@@ -4968,7 +5084,7 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 	// Key 的思考深度与路由的 Provider 默认档位在 Claude 路径上同样要生效，
 	// 判定口径与 Chat 路径一致：Key 覆盖优先，否则用客户端要求的档位。
 	requestDepth := claudePayloadEffort(req)
-	if depth := s.router.ResolveThinkingDepth(route, thinkingOverride, requestDepth != "", requestDepth); depth != "" {
+	if depth := s.router.ResolveThinkingDepth(route, thinkingOverride, requestDepth != "", requestDepth); depth != "" && !selfRegistered {
 		if applyClaudeEffort(req, model, depth) {
 			r = withReasoningEffort(r, fitModelEffort(depth, model))
 		}
@@ -5193,6 +5309,13 @@ type providerTestResult struct {
 }
 
 func (s *Server) fetchProviderModels(r *http.Request, provider domain.Provider, started time.Time) providerTestResult {
+	if provider.AuthType == domain.AuthTypePeer {
+		// 对端 provider 不是一台"上游服务"，而是父网关的一扇门：它的模型清单
+		// 来自 /__peer/providers，父网关根本不提供 baseUrl + /models 这个端点。
+		// 走下面通用的模型发现只会打到父网关的一个 404，然后把这个本来完全
+		// 正常的 provider 标成"异常"、清空它可用的模型清单。
+		return s.fetchPeerUpstreamModels(r, provider, started)
+	}
 	if provider.AuthType == domain.AuthTypeCursorOAuth {
 		baseURL, refreshed, err := s.resolveCursorBridgeBaseURL(r.Context(), provider)
 		if err != nil {
@@ -5986,6 +6109,11 @@ func (s *Server) proxyOpenAIChat(w http.ResponseWriter, r *http.Request, provide
 		incomingAuth = r.Header.Get("Authorization")
 	}
 	send := func(requestBody []byte) (*http.Response, error) {
+		if provider.AuthType == domain.AuthTypePeer {
+			// 对端 provider 是父网关的一扇门：这条直通路径不经过
+			// doOpenAIProviderRequest，出口要自己接上。
+			return s.sendPeerDoor(r.Context(), r, provider, model, requestBody, r.Header.Get("Accept"))
+		}
 		request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(requestBody))
 		if err != nil {
 			return nil, err
@@ -6262,6 +6390,13 @@ func (s *Server) claudePassThroughInterrupter(r *http.Request, provider domain.P
 // resolved upstream (Anthropic for claude_oauth providers, provider.BaseURL for
 // regular Claude API-key providers), returning the raw response.
 func (s *Server) sendClaudeMessagesUpstream(r *http.Request, provider domain.Provider, body []byte) (*http.Response, error) {
+	if provider.AuthType == domain.AuthTypePeer {
+		// 对端 provider 是父网关的一扇门，不是某个具体的 Claude 兼容上游：
+		// 下面所有整流（stop_sequences 剪裁、thinking 关闭写法、被拒签名记忆）
+		// 都是围着某个真实上游的校验习惯转的，对门后面的真实上游一无所知。
+		// 报文原样进信封，由父网关按它自己选中的那个 provider 去整形。
+		return s.sendPeerDoor(r.Context(), r, provider, stringValue(claudeBodyField(body, "model")), body, r.Header.Get("Accept"))
+	}
 	isOAuth := provider.AuthType == domain.AuthTypeClaudeOAuth
 	// 这个上游拒过的 thinking 签名先剥掉：一次拒签之后，对话的后续每一轮都不必
 	// 再花一次 400 去重新学同一件事（对标 magpie thinking_bound.go 的记忆）。
@@ -6409,6 +6544,12 @@ func (s *Server) maybeRectifyClaudeThinkingResend(r *http.Request, provider doma
 }
 
 func (s *Server) doClaudeProviderRequest(ctx context.Context, r *http.Request, provider domain.Provider, body []byte, accept string) (*http.Response, error) {
+	if provider.AuthType == domain.AuthTypePeer {
+		// 对端 provider 是父网关的一扇门：报文进信封，由父网关交给它自己
+		// 选中的 provider（下面那些整流都是围着某个真实上游的校验习惯转的，
+		// 对门后面是谁一无所知）。
+		return s.sendPeerDoor(ctx, r, provider, stringValue(claudeBodyField(body, "model")), body, accept)
+	}
 	isOAuth := provider.AuthType == domain.AuthTypeClaudeOAuth
 	// 同上：这个上游拒过的 thinking 签名不再重复提交。
 	body = stripRefusedClaudeThinkingBody(body, provider)

@@ -358,6 +358,10 @@ type Provider struct {
 	// matched exactly (case-insensitively) and does not need to name an existing
 	// provider: grouping providers that are not otherwise related is allowed.
 	LaneGroup string `json:"laneGroup,omitempty"`
+	// PeerGrants 是这条链路在上游那一侧的授权快照，只对 AuthType == "peer"
+	// 的 provider 有意义（见 domain.PeerUpstreamGrants）。它只用来显示：
+	// 真实鉴权永远由上游按当下授权决定，本机从不拿这份快照放行任何请求。
+	PeerGrants *PeerUpstreamGrants `json:"peerGrants,omitempty"`
 }
 
 // ProviderSelfRegistration is the server-side state backing the self-register
@@ -373,6 +377,32 @@ type ProviderSelfRegistration struct {
 	// availability/异常 status is driven purely by real proxied-request
 	// failures (see gateway.shouldFailoverProvider), not by heartbeat gaps.
 	LastSeenAt string `json:"lastSeenAt,omitempty"`
+}
+
+// PeerUpstreamGrants 是本机注册到上游网关后，上游那一侧告诉我们的授权状态。
+//
+// 它必须落库，而不是每次现取：界面上「已连接的上游」那一行要显示上游当前
+// 授权了几个 provider，而 /__peer-upstreams 是个纯读接口——每渲染一次就去
+// 打一遍上游，上游慢一点整个控制台就跟着卡，上游挂了更是连自己已经存在哪
+// 都看不见。所以注册/刷新/测试连接拿到清单时顺手存下来，列表只读这份快照。
+//
+// 快照会和上游真实授权渐渐不一致（管理员改了授权但本机没再刷新），所以它
+// 只用于显示，不做任何鉴权判断：每一次真实透传仍由上游按当下授权决定。
+type PeerUpstreamGrants struct {
+	// Username 是上游为这台机器建的账号名（带 peer- 前缀）。排查时能直接
+	// 对上上游用户管理页里的那一行。
+	Username string `json:"username,omitempty"`
+	// UserID 是同一行在上游的账号 ID。
+	UserID string `json:"userId,omitempty"`
+	// ParentGatewayID 是上游网关自己的身份；注册响应里回显的是"上游记录的
+	// 身份"（也就是我们），所以这里存的是谁在为我们服务。
+	ParentGatewayID string `json:"parentGatewayId,omitempty"`
+	// GrantedProviderIDs 是上游最近一次告诉我们的授权清单。为空是真实状态
+	// （上游一个都没授权），不是"未知"——未知由 SyncedAt 为空表示。
+	GrantedProviderIDs []string `json:"grantedProviderIds"`
+	// SyncedAt 是这份快照是什么时候取的（RFC3339）。空 = 从未同步过，
+	// 界面据此区分"确实授权了 0 个"和"还没问过上游"。
+	SyncedAt string `json:"syncedAt,omitempty"`
 }
 
 // RequestAdapter customizes how gateway requests are sent to an upstream
@@ -634,6 +664,23 @@ const (
 	// looks like OpenCode's own. No sign-in exists; the provider works as soon
 	// as it is added.
 	AuthTypeOpenCodeZenFree = "opencode_zen_free"
+	// AuthTypeSelfRegister is a Bearer provider whose baseUrl/apiKeySource are
+	// declared by its owner's own script through PATCH /__providers/{id}/
+	// self-register instead of being typed into the console form: the console
+	// only issues the provider-scoped token (see domain.ProviderSelfRegistration).
+	// It forwards exactly like AuthTypeAPIKey once a script has registered, so
+	// the forward path treats it as a Bearer provider; it exists as its own
+	// value because the console's create form has nothing to type for one.
+	AuthTypeSelfRegister = "self_register"
+	// AuthTypePeer 是本机注册到某个上游网关后得到的那一侧：请求不是直接打给
+	// 真实上游，而是打到上游的 POST /__peer/chat/completions，由上游用它自己
+	// 的凭据转发，并把用量记在它的账上。
+	//
+	// 它之所以是独立的一种而不是复用 api_key：这类 provider 的 baseUrl 必须
+	// 固定拼上 /__peer/chat/completions，请求体要包一层 {"providerId",
+	// "payload"}，而且要带上链路头——把这三件事塞进 api_key 分支的 if 里，
+	// 等于让一条普通转发路径同时承担两种协议。
+	AuthTypePeer = "peer"
 )
 
 type Model struct {
@@ -853,7 +900,38 @@ type User struct {
 	// is flushed asynchronously and at most once per 5 minutes per user to
 	// avoid hot-path write churn.
 	LastActiveAt string `json:"lastActiveAt,omitempty"`
+	// Kind 区分本地账号与「下游网关」账号。空 = local（升级前所有行都是
+	// 本地账号）。peer 行由下游网关注册时自动创建，它存在的意义只有两个：
+	// 让下游出现在用户管理页、让授权表能按 user_id 挂 provider。
+	Kind UserKind `json:"kind,omitempty"`
+	// GatewayID 是 peer 账号对应的网关稳定身份（同 gatewayid.ID）。本地账号
+	// 为空。它比用户名可靠：用户名可以改，网关身份不会，所以环路检测和用量
+	// 对账都以它为准。
+	GatewayID string `json:"gatewayId,omitempty"`
 }
+
+// UserKind 区分 users 表里两类完全不同东西。
+//
+// 它们共用一张表是刻意的：授权（AllowedResourceIDs）、用量归属、按 owner
+// 过滤密钥、禁用即停流量，这些机制全都已经按 user_id 建好了。给下游网关另
+// 起一张表意味着上面每一条都要写第二遍，而它们迟早会不一致。
+//
+// 区别也必须在数据上体现出来：peer 账号不能登录控制台（登录与会话恢复都
+// 显式拒绝 IsPeer 的账号），不能持有会话，只能在 /__peer/* 上以凭据形式
+// 出现。password_hash 仍然保留——它只服务于「重新注册时证明还是同一个下游」，
+// 不是一个登录凭据。
+type UserKind string
+
+const (
+	// UserKindLocal 是控制台账号：有密码、能登录、能拥有密钥。
+	UserKindLocal UserKind = "local"
+	// UserKindPeer 是注册到本机的下游网关。它同样拥有 api_keys 行（那把密钥
+	// 就是它对上游的凭据），但永远不能登录。
+	UserKindPeer UserKind = "peer"
+)
+
+// IsPeer 报告这是否是一个下游网关账号。
+func (u User) IsPeer() bool { return u.Kind == UserKindPeer }
 
 type RouteDecision struct {
 	RouteID         string    `json:"routeId"`
@@ -895,6 +973,14 @@ type GatewayState struct {
 	// rarely needed. Failed requests always store bodies regardless of this flag,
 	// and so does a 2xx whose response body carries an error payload.
 	Log2xxBodies bool `json:"log2xxBodies"`
+	// PeerRegistrationAllowCIDRs 是允许注册的对端来源白名单（逗号分隔的 CIDR）。
+	// 空 = 只允许本机与内网来源。注册是唯一不需要已有凭据的入口，所以它是整条
+	// 链路上最该收紧的地方；显式配置后只认白名单，内网默认值不再生效。
+	PeerRegistrationAllowCIDRs string `json:"peerRegistrationAllowCidrs,omitempty"`
+	// MaxGatewayHops 是一条链路允许经过的网关数量上限（1..8）。0 = 默认 3。
+	// 链路上的每台网关都按自己这份配置判断，超限的透传在 508 被拒；
+	// 想组更长的多级链路（内网 → 公网 → 公网）就把它调大。
+	MaxGatewayHops int `json:"maxGatewayHops,omitempty"`
 	// UsageBatchMaxSize / UsageBatchMaxWaitSeconds tune how the async usage
 	// worker batches usage_daily_buckets commits. Larger values mean fewer,
 	// bigger commits (less disk wear) at the cost of a longer window whose
@@ -915,6 +1001,24 @@ type GatewayState struct {
 	// day bounds of a bare date — all use it, so the console must build its
 	// "today" from the same zone instead of the browser's. Runtime-only.
 	ServerTimeZone string `json:"serverTimeZone,omitempty"`
+	// GatewayIdentity 是本网关的稳定身份，父子对接靠它互相识别。Runtime-only。
+	// 所有角色都能看到（普通用户也需要它来填"父网关 ID"），不含机器标识本身。
+	GatewayIdentity *GatewayIdentity `json:"gatewayIdentity,omitempty"`
+}
+
+// GatewayIdentity 是暴露给控制台的网关身份。
+//
+// ID 从机器标识派生，重装、清库都不变；它也是环路检测里判断"这是不是我自己"
+// 的那个值。这里只放派生后的哈希，机器标识本身绝不出现在这个结构里。
+type GatewayIdentity struct {
+	ID string `json:"id"`
+	// Name 是界面上显示的名字，默认取主机名，可改。
+	Name string `json:"name,omitempty"`
+	// Source 是 machine（从机器标识派生）或 persisted（库里存的随机值）。
+	Source string `json:"source"`
+	// MachineIDReadable 为 false 时重装会换身份，界面必须提示，否则运维会
+	// 在重装后发现下游全部失联却不知道为什么。
+	MachineIDReadable bool `json:"machineIdReadable"`
 }
 
 // CursorBridgeRuntime mirrors the local cursor-bridge subprocess for status responses.

@@ -141,6 +141,9 @@ func (s *Server) doOpenAIProviderRequest(ctx context.Context, r *http.Request, p
 		incomingAuth = r.Header.Get("Authorization")
 	}
 	send := func(requestBody []byte) (*http.Response, error) {
+		if provider.AuthType == domain.AuthTypePeer {
+			return s.sendPeerDoor(ctx, r, provider, model, requestBody, accept)
+		}
 		request, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(requestBody))
 		if err != nil {
 			return nil, err
@@ -492,6 +495,10 @@ func (s *Server) proxyConvertedThroughChat(w http.ResponseWriter, r *http.Reques
 		accept = "text/event-stream"
 	}
 	sendUpstream := func() (*http.Response, error) {
+		if provider.AuthType == domain.AuthTypePeer {
+			// 对端 provider 只认父网关那一扇门，不走 adapter/URL 拼装。
+			return s.sendPeerDoor(ctx, r, provider, model, upstreamBody, accept)
+		}
 		if provider.AuthType == domain.AuthTypeCursorOAuth {
 			baseURL, refreshed, bridgeErr := s.resolveCursorBridgeBaseURL(r.Context(), provider)
 			if bridgeErr != nil {

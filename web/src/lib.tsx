@@ -395,6 +395,7 @@ export const navItems = [
   { id: 'traffic-tokens', label: 'API 日志' },
   { id: 'monitoring', label: '监控中心' },
   { id: 'quota-keeper', label: '额度保活' },
+  { id: 'peers', label: '网关互联' },
   { id: 'users', label: '用户管理' },
   { id: 'roles', label: '角色管理' },
   { id: 'machine', label: '机器状态' },
@@ -419,7 +420,7 @@ export const navSections: NavSection[] = [
   { id: 'keys', label: '密钥与接入', children: [{ id: 'api-keys' }, { id: 'output-providers' }, { id: 'public-access' }] },
   { id: 'insights', label: '数据洞察', children: [{ id: 'usage-stats' }, { id: 'traffic-tokens' }] },
   { id: 'operations', label: '运维监控', children: [{ id: 'monitoring' }, { id: 'quota-keeper' }, { id: 'machine' }] },
-  { id: 'admin', label: '权限与账户', children: [{ id: 'users' }, { id: 'roles' }] },
+  { id: 'admin', label: '权限与账户', children: [{ id: 'users' }, { id: 'roles' }, { id: 'peers' }] },
   { id: 'system', label: '系统', children: [{ id: 'settings' }] },
 ];
 
@@ -443,6 +444,7 @@ export const navPermissions: Record<NavItemIDValue, string[]> = {
   'traffic-tokens': ['logs.view'],
   'monitoring': ['monitor.view', 'monitor.manage'],
   'quota-keeper': ['quota.view', 'quota.manage'],
+  'peers': ['peers.view', 'peers.manage'],
   'users': ['users.view', 'users.manage'],
   'roles': ['roles.manage'],
   'machine': ['system.machine'],
@@ -755,6 +757,56 @@ export function isTrafficLogError(log: LogEntry) {
   return log.status >= 400 || Boolean(log.errorDescription?.trim());
 }
 
+/**
+ * 网关 ID 是 gw_ + 16 位十六进制（19 字符），日志表那一格放不下全称。
+ * 只留末 6 位认人——同一台机器上两条下游撞这 6 位的概率是 1/1.6e7，
+ * 而完整 ID 在悬浮提示与详情弹窗里都有，抄下来照样能用。
+ */
+export function shortGatewayId(id: string): string {
+  const trimmed = (id || '').trim();
+  if (trimmed.length <= 9) return trimmed;
+  return `…${trimmed.slice(-6)}`;
+}
+
+/**
+ * API 日志「链路」一列：这条请求从哪来、往哪去。
+ *
+ * 设计稿原本要拆成「请求入口」「请求出口」两列，但绝大多数请求两头都空，两列
+ * 就是两块恒定的空白；而真实出现时又总是成对出现（A→B→C 的 B 两头都有）。合成
+ * 一格，宽度省一半，读起来还是同一句话。
+ *
+ * - 两头都空 → 直连。不给空白：空白会被读成「这一列没有数据」，可它其实一致有。
+ * - ingress  → 下游网关把请求送了进来，本机是它的上游。
+ * - egress   → 本机把请求转给了上游网关，本机是它的下游。
+ * 三级链路时两者同时出现，此时 peerOrigin 才是真正的起点。
+ *
+ * 超过两级（peerPath 里的网关数 > 1）时悬浮提示给出完整链路：一两级用相邻方
+ * 就能说清，更多级只有完整链能回答"请求到底绕了几道"。
+ */
+export function trafficLogPeerChain(log: LogEntry): { text: string; title: string; peered: boolean } {
+  const ingress = (log.ingress || '').trim();
+  const egress = (log.egress || '').trim();
+  const origin = (log.peerOrigin || '').trim();
+  if (!ingress && !egress) {
+    return { text: '直连', title: '客户端直连本机、本机直连 Provider：这条请求没有经过任何对端网关', peered: false };
+  }
+  const text = [
+    ingress ? `←${shortGatewayId(ingress)}` : '',
+    egress ? `→${shortGatewayId(egress)}` : '',
+  ].filter(Boolean).join(' ');
+  const lines: string[] = [];
+  if (ingress) lines.push(`来自下游网关 ${ingress}`);
+  if (egress) lines.push(`转发至上游网关 ${egress}`);
+  if (origin && origin !== ingress) lines.push(`链路起点：${origin}`);
+  // peerPath 是请求已经过的网关（发起方开始、不含本机）。两级链路相邻方已经
+  // 说清，只有更长才需要把它拼成一条完整链展示。
+  const path = (log.peerPath || '').split(',').map((id) => id.trim()).filter(Boolean);
+  if (path.length > 1) {
+    lines.push(`完整链路：${path.join(' → ')} → 本机`);
+  }
+  return { text, title: lines.join('\n'), peered: true };
+}
+
 export function parseSSEStreamContent(raw: string): string {
   if (!raw || typeof raw !== 'string') return '';
   const lines = raw.split(/\r?\n/);
@@ -1007,6 +1059,17 @@ export function formatTrafficLogJSON(log: LogEntry, providers: Provider[] = []):
       host: log.clientHost,
       source: log.accessSource,
     },
+    // 父子网关链路：三者都空时整块不写，别让普通日志多出一堆 null。
+    peer: (log.ingress || log.egress)
+      ? {
+          ingress: log.ingress || undefined,
+          egress: log.egress || undefined,
+          gatewayId: log.peerGatewayId || undefined,
+          direction: log.peerDirection || undefined,
+          origin: log.peerOrigin || undefined,
+          path: log.peerPath || undefined,
+        }
+      : undefined,
     timing: {
       prepMs: log.prepMs,
       preUpstreamMs: log.preUpstreamMs,
@@ -1047,6 +1110,12 @@ export function formatTrafficLogDetail(log: LogEntry, providers: Provider[] = []
     `timingFlags: ${log.timingFlags || '-'}`,
     `tokens: in=${log.inputTokens} out=${log.outputTokens}${log.cacheTokens ? ` cache=${log.cacheTokens}` : ''}`,
   ];
+  // 父子网关链路：没有对端就不写这行，普通日志的简报保持原样。
+  if (log.ingress || log.egress) {
+    const chain = (log.peerPath || '').split(',').map((id) => id.trim()).filter(Boolean);
+    const chainText = chain.length > 1 ? ` path=${chain.join('→')}` : '';
+    lines.push(`peer: ingress=${log.ingress || '-'} egress=${log.egress || '-'} origin=${log.peerOrigin || '-'}${chainText}`);
+  }
   if (log.errorDescription) lines.push(`error: ${log.errorDescription}`);
   if (log.requestBody) lines.push('', '--- Request Body ---', formatJsonDisplay(log.requestBody));
   if (log.responseBody) lines.push('', '--- Response Body ---', formatJsonDisplay(log.responseBody));
@@ -1318,6 +1387,29 @@ export function selfRegisterPlaceholderBaseURL(protocol: Protocol): string {
   return `https://pending-self-registration.example${selfRegistrationEndpointSpec(protocol).path}`;
 }
 
+// 自助注册的占位主机名：带着它说明这个 Provider 还没有被脚本注册过。
+const SELF_REGISTER_PLACEHOLDER_HOST = 'pending-self-registration.example';
+
+/**
+ * retargetSelfRegisterBaseURL 在协议变了之后重算自助注册 Provider 的 baseUrl。
+ *
+ * 还在占位主机上（脚本没注册过）：换成新协议对应的占位路径，创建表单才能带着
+ * 一个形状正确的地址提交。已经是脚本回填过的真实隧道地址：一个字都不动——改协议
+ * 只是改网关对上游的预期，真实路径要等对方脚本下次注册时自己声明；在这里顺手
+ * 拼路径反而会把一个当下可用的地址改坏。
+ */
+export function retargetSelfRegisterBaseURL(baseUrl: string, protocol: Protocol): string {
+  const trimmed = (baseUrl || '').trim();
+  if (!trimmed) return selfRegisterPlaceholderBaseURL(protocol);
+  let host = '';
+  try {
+    host = new URL(trimmed).host.toLowerCase();
+  } catch {
+    return selfRegisterPlaceholderBaseURL(protocol);
+  }
+  return host === SELF_REGISTER_PLACEHOLDER_HOST ? selfRegisterPlaceholderBaseURL(protocol) : trimmed;
+}
+
 export function selfRegistrationEndpointSpec(protocol: Protocol): { path: string; label: string; hint: string } {
   switch (protocol) {
     case 'openai_chat':
@@ -1354,25 +1446,47 @@ export function selfRegistrationEndpointSpec(protocol: Protocol): { path: string
 export function buildSelfRegistrationPrompt(provider: Provider, rawToken: string, originBase: string): string {
   const registerUrl = `${originBase}/__providers/${provider.id}/self-register`;
   const tokenLine = rawToken || '<在控制台点击"生成注册令牌"后粘贴到这里>';
-  // 三种协议逐条列出，供本地已有代码对号入座，不预设/不强制其中任何一种。
-  const protocolMenu = (['openai_chat', 'openai_responses', 'claude', 'gemini'] as Protocol[])
-    .map((protocol) => {
-      const spec = selfRegistrationEndpointSpec(protocol);
-      const header = protocol === 'claude' ? 'x-api-key: <SHARED_SECRET>' : protocol === 'gemini' ? 'x-goog-api-key: <SHARED_SECRET>' : 'Authorization: Bearer <SHARED_SECRET>';
-      return `  \u00b7 protocol="${protocol}"：POST ${spec.path}（${spec.label} 协议格式），鉴权头默认 ${header}\n    ${spec.hint}`;
+  // 协议以控制台里选的为准：网关按它原样透传，本地服务照它实现即可，
+  // 不再让脚本从四种协议里自己挑一种（那正是"要转换协议"的来源）。
+  const protocol = provider.protocol;
+  const spec = selfRegistrationEndpointSpec(protocol);
+  const secretHeader = protocol === 'claude' ? 'x-api-key'
+    : protocol === 'gemini' ? 'x-goog-api-key'
+    : 'Authorization';
+  const secretHeaderLine = secretHeader === 'Authorization'
+    ? 'Authorization: Bearer <SHARED_SECRET>'
+    : `${secretHeader}: <SHARED_SECRET>`;
+  // 其余协议只作为"手上已有现成实现"时的备选提示：真要换，必须回控制台把协议
+  // 改成对应项，否则透传会错位——这一点得在 Prompt 里说清楚。
+  // 只列控制台协议下拉里真能选到的那几项（fixedOutputLabels）——提示里让人
+  // "回控制台改协议"，就不能指向一个下拉里根本没有的选项。
+  const consoleProtocols: Protocol[] = ['openai_chat', 'openai_responses', 'claude'];
+  const alternatives = consoleProtocols
+    .filter((item) => item !== protocol)
+    .map((item) => {
+      const alt = selfRegistrationEndpointSpec(item);
+      return `  \u00b7 ${alt.label}（protocol="${item}"）：POST ${alt.path}`;
     })
     .join('\n');
   return `帮我实现一个本地服务 + 内网穿透 + 自动注册的完整方案，要求如下：
 
-【1. 本地服务 —— 四选一，选你已有代码 / 更顺手的那种，不强制】
-网关支持下面三种协议格式，你的本地服务只需要实现其中任意一种（哪怕你手头已经有
-现成的某种格式的代码，直接拿来用即可，不用为了迁就我而改写）：
-${protocolMenu}
+【1. 本地服务 —— 实现 ${spec.label} 协议（protocol="${protocol}"）】
+这个 Provider 在控制台里选的协议就是 ${spec.label}。网关按它**原样透传、不做协议
+转换**：客户端说什么格式，你的服务就收到什么格式；你的服务答什么格式，客户端就
+收到什么格式。所以照下面这个形状收发即可：
 
-- 无论选哪种，鉴权都要求请求带上面对应的头（SHARED_SECRET 由我自己设定，作为
-  "上游密钥"，和下面第 3 步注册接口用的令牌是两回事，不要混淆；如果你想用非标准
-  头名，第 3 步注册时可以用 authHeader 字段显式覆盖，不必强行匹配上面的默认值）
-- 内部对接我自己现有的模型/服务即可，只要出参符合你选定的那个协议格式
+  接口路径：POST ${spec.path}
+  鉴权头：  ${secretHeaderLine}
+  ${spec.hint}
+
+- SHARED_SECRET 由我自己设定，作为这个本地服务的"上游密钥"（和下面第 3 步注册
+  接口用的令牌是两回事，不要混淆）。用非标准头名也行，第 3 步注册时用 authHeader
+  字段显式覆盖，不必强行匹配上面的默认值
+- 内部对接我自己现有的模型/服务即可，只要出参符合 ${spec.label} 格式
+
+（如果你手头已经有现成的、别的协议格式的代码，不想为迁就我而改写：网关也支持下面
+这些协议，但要先在控制台把这个 Provider 的协议改成对应那一项，透传才对得上）
+${alternatives}
 
 【2. 内网穿透】
 - 用 cloudflared 快速隧道（免费、无需域名、无需登录）：
@@ -1380,24 +1494,22 @@ ${protocolMenu}
 - 该命令会在标准输出打印一个形如 https://xxxx.trycloudflare.com 的公网地址；
   注意：这个地址每次重启隧道都会变，脚本要能捕获它
 
-【3. 自动注册到网关平台 —— 必须声明你选的协议】
-- 每次拿到新的公网地址后（包括隧道意外重启），立刻调用（**protocol 字段必填，
-  取值必须跟你在第 1 步实际实现的协议一致**：openai_chat / openai_responses / claude
-  四选一；网关这边不会预先假定协议，完全以这次调用声明的为准）：
+【3. 自动注册到网关平台 —— 只声明地址（协议已在控制台定好）】
+- 每次拿到新的公网地址后（包括隧道意外重启），立刻调用：
   curl -X PATCH "${registerUrl}" \\
     -H "Authorization: Bearer ${tokenLine}" \\
     -H "Content-Type: application/json" \\
-    -d '{"baseUrl": "https://xxxx.trycloudflare.com/<你第1步实现的路径，比如 /v1/chat/completions>", "apiKeySource": "literal:<第1步里设定的 SHARED_SECRET>", "protocol": "<openai_chat|openai_responses|claude|gemini 四选一>"}'
+    -d '{"baseUrl": "https://xxxx.trycloudflare.com${spec.path}", "apiKeySource": "literal:<第1步里设定的 SHARED_SECRET>", "protocol": "${protocol}"}'
   （把 xxxx.trycloudflare.com 换成实际隧道打印出来的地址；这里 Bearer 后面跟的是
   第 3 步专用的"注册令牌"，跟第 1 步本地服务自己的 SHARED_SECRET 是两个不同的东西）
+- protocol 带的是 "${protocol}"，跟控制台选的一致；其实不传也行——不传就沿用控制台
+  里选的协议。只有本地服务后来改成了别的协议实现，才需要把这里换成新值覆盖它
+  （取值只能是 openai_chat / openai_responses / claude / gemini 之一，且必须跟第 1 步
+  实际实现的协议一致，否则透传会错位）
 - 这个注册接口只鉴权 Bearer 令牌本身，和登录账号无关；只允许改这一个 Provider 的
-  baseUrl / apiKeySource / protocol / authHeader 这几个字段，改不了别的东西；网关控制台
-  这边也不提供协议选择/修改的入口——协议只能通过这个接口声明，这是唯一的协议来源
-- 不传 authHeader 时，网关按第 1 步表格里的惯例自动推导鉴权头（claude -> x-api-key，
+  baseUrl / apiKeySource / protocol / authHeader 这几个字段，改不了别的东西
+- 不传 authHeader 时，网关按第 1 步的惯例自动推导鉴权头（claude -> x-api-key，
   其余 -> Authorization）；本地服务用了非标准头名时可以显式传 authHeader 覆盖
-- baseUrl 不能是内网地址（127.0.0.1 / 192.168.x.x / 10.x.x.x 等会被拒绝），必须是
-  隧道给的公网地址
-- 以后如果想换成另一种协议实现，不用回控制台改，下次注册时把 protocol 换成新值即可
 
 【4. 协议 conformance（注册成功后立刻跑，直到必过项全绿）】
 网关提供协议套件诊断（用第 3 步同一个注册令牌鉴权）：
@@ -1405,7 +1517,7 @@ ${protocolMenu}
     curl -X POST "${originBase}/__providers/${provider.id}/self-check/conformance" \\
       -H "Authorization: Bearer ${tokenLine}"
 
-按你声明的 protocol 自动跑：models 鉴权、非流式形状、流式 SSE、usage 字段、
+按这个 Provider 的协议（${spec.label}）自动跑：models 鉴权、非流式形状、流式 SSE、usage 字段、
 cache 命中（后两项为建议项）。返回 JSON：
   - success / passedRequired = true 表示必过项全部通过（可以认为协议合格）
   - passedAll = true 表示建议项也全过
@@ -1418,7 +1530,7 @@ cache 命中（后两项为建议项）。返回 JSON：
 （可选兼容）仍可用旧的 health×3 与 chat 自检，但新脚本优先只用 conformance。
 
 【5. 整合成一个常驻脚本】
-- 启动本地服务 -> 启动 cloudflared 隧道 -> 解析出公网 URL -> 调用注册接口（带上 protocol）
+- 启动本地服务 -> 启动 cloudflared 隧道 -> 解析出公网 URL -> 调用注册接口（带上 baseUrl + protocol）
   -> 注册成功后跑 conformance 直到 success=true -> 持续监控隧道进程，一旦断线/重启就重新走一遍
   解析+注册+conformance
 - 可以用 Python/Bash 都行，帮我把这五步串成一个可以后台常驻运行的脚本`;
@@ -1619,7 +1731,14 @@ export function providerConnectKind(provider: Provider): ProviderConnectKind {
   if (provider.authType === 'trae_cn') return 'trae_cn';
   if (provider.authType === 'trae_global') return 'trae_global';
   if (provider.authType === 'opencode_zen_free') return 'opencode_zen_free';
-  if (provider.selfRegistration) return 'self_register';
+  // 后端已把 self_register 存成正式的 authType；selfRegistration 只在生成过
+  // 令牌后才非空，所以两种都要认——否则新建、还没生成令牌的那张卡会被当成
+  // API Key，编辑它时 Base URL 又会变回可填的真实地址。
+  if (provider.authType === 'self_register' || provider.selfRegistration) return 'self_register';
+  // 对端 provider 是本机注册到某个上游网关后落下的那一条：它的地址、凭据、
+  // 模型都由「网关互联」页维护，在 Provider 列表里只该被认出来并标来源，
+  // 不该落进 api_key 那一栏被人当成一个普通上游去编辑。
+  if (provider.authType === 'peer') return 'peer';
   return 'api_key';
 }
 
@@ -1912,6 +2031,7 @@ export function providerConnectLabel(kind: ProviderConnectKind): string {
     case 'trae_global': return '登录 Trae 国际版账号';
     case 'opencode_zen_free': return 'OpenCode Zen 免费档（无需密钥）';
     case 'self_register': return '内网穿透自助注册（Bearer 令牌）';
+    case 'peer': return '上游网关（父子透传）';
     default: return 'API Key';
   }
 }
@@ -1920,6 +2040,7 @@ export const PROVIDER_CONNECT_FILTERS: Array<{ id: '' | ProviderConnectKind; lab
   { id: '', label: '全部连接方式' },
   { id: 'api_key', label: 'API Key' },
   { id: 'self_register', label: '内网穿透自助注册' },
+  { id: 'peer', label: '上游网关（父子透传）' },
   { id: 'claude_oauth', label: 'Claude OAuth' },
   { id: 'cursor_oauth', label: 'Cursor OAuth' },
   { id: 'chatgpt_oauth', label: 'ChatGPT OAuth' },
@@ -2460,6 +2581,151 @@ export function buildApiKeyClaudeConfig(key: APIKey, route: Route | undefined, e
   return `${JSON.stringify(config, null, 2)}\n`;
 }
 
+/**
+ * Claude Code「一次配置、平台换模型」的环境变量。
+ *
+ * 思路：客户端只认一个保留模型名 `default`，真正用哪个模型由网关按这把 Key 的
+ * 配置解析。于是换 Provider / 换模型 / 换协议全在平台上完成，客户端配置一个字
+ * 都不用改，也就不用像 ccswitch / magpie 那样每次改完重启客户端。
+ *
+ * `[1m]` 是 Claude Code 的「扩展上下文」标记，不是模型名的一部分：客户端发出前
+ * 会把它去掉（2.1.322 实测），改成请求头 `anthropic-beta: context-1m-2025-08-07`。
+ * 所以 `default` 与 `default[1m]` 在网关上解析到同一个真实模型，区别只是客户端
+ * 自己按 200k 还是 1M 算窗口（日志里也拿得到要没要 1M）。
+ *
+ * 为什么要连 tier 变量一起钉死：Claude Code 内置子 agent 的模型是硬编码的
+ * （`claude-code-guide` 用 haiku、`statusline-setup` 用 sonnet），只设
+ * ANTHROPIC_MODEL 时这些子 agent 仍会带着 haiku/sonnet 打上来，上游没有这个模型
+ * 就直接失败。把 opus/sonnet/haiku/fable 四个档位一起指到 default，子 agent 才会
+ * 跟着平台配置走。CLAUDE_CODE_SUBAGENT_MODEL 再兜一层自定义子 agent。
+ *
+ * haiku / small-fast 故意不带 [1m]：这两档只做摘要与分类，带上 1M beta 没有收益。
+ */
+export function buildClaudeCodeSwitcherEnv(options: {
+  baseURL: string;
+  token: string;
+  oneMillionContext?: boolean;
+}) {
+  const suffix = options.oneMillionContext === false ? '' : '[1m]';
+  return {
+    ANTHROPIC_BASE_URL: options.baseURL,
+    ANTHROPIC_AUTH_TOKEN: options.token,
+    ANTHROPIC_MODEL: `default${suffix}`,
+    ANTHROPIC_DEFAULT_OPUS_MODEL: `default${suffix}`,
+    ANTHROPIC_DEFAULT_SONNET_MODEL: `default${suffix}`,
+    ANTHROPIC_DEFAULT_FABLE_MODEL: `default${suffix}`,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'default',
+    ANTHROPIC_SMALL_FAST_MODEL: 'default',
+    CLAUDE_CODE_SUBAGENT_MODEL: 'default',
+  } as Record<string, string>;
+}
+
+/** `~/.claude/settings.json` 的 env 片段（完整版，含子 agent 档位）。 */
+export function buildClaudeCodeSwitcherConfig(key: APIKey, endpoints: OutputEndpoint[], publicBase: string, oneMillionContext = true) {
+  const baseURL = `${apiKeyGatewayRoot(endpoints, publicBase)}/anthropic`;
+  const env = buildClaudeCodeSwitcherEnv({baseURL, token: key.key, oneMillionContext});
+  return `${JSON.stringify({env, model: env.ANTHROPIC_MODEL}, null, 2)}\n`;
+}
+
+/**
+ * 一键写入脚本：增量合并进 ~/.claude/settings.json 的 env。
+ *
+ * 只改 env 里本工具管理的那几个键，permissions / hooks / statusLine / mcpServers
+ * 等用户自己的配置原样保留（和「复制 Claude 配置」用的是同一套 merge）。
+ * 不复用 buildApiKeyClientConfigInstallScript 是因为文案要讲清「以后换模型不用再
+ * 回来点一次」，而且这里必须提示重开一次客户端——env 只在进程启动时读。
+ */
+export function buildClaudeCodeSwitcherScript(
+  key: APIKey,
+  endpoints: OutputEndpoint[],
+  publicBase: string,
+  oneMillionContext = true,
+) {
+  const configText = buildClaudeCodeSwitcherConfig(key, endpoints, publicBase, oneMillionContext);
+  const jsonB64 = utf8ToBase64(configText.endsWith('\n') ? configText : `${configText}\n`);
+  const py = [
+    PY_HELPERS,
+    'import json',
+    'HOME = pathlib.Path.home()',
+    'FILE = HOME / ".claude" / "settings.json"',
+    `NEW = json.loads(_b64(${JSON.stringify(jsonB64)}))`,
+    '',
+    'FILE.parent.mkdir(parents=True, exist_ok=True)',
+    'data = {}',
+    'if FILE.exists():',
+    '    _backup(FILE)',
+    '    try:',
+    '        loaded = json.loads(FILE.read_text(encoding="utf-8") or "{}")',
+    '        if isinstance(loaded, dict):',
+    '            data = loaded',
+    '    except Exception:',
+    '        data = {}',
+    'env = data.get("env")',
+    'if not isinstance(env, dict):',
+    '    env = {}',
+    'env.update(NEW["env"])',
+    'data["env"] = env',
+    '# 顶层 model 只在本工具写过时才覆盖：用户自己在 /config 里选的模型更该保留。',
+    'data.setdefault("model", NEW["model"])',
+    'FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")',
+    'print(f"已写入: {FILE}")',
+    'print("模型已固定为 default，之后在网关平台换模型 / 换 Provider 都不用改这里。")',
+    'print("环境变量只在客户端启动时读取：请重开一次 claude（或桌面端）。")',
+  ].join('\n');
+  return wrapMacPythonScript(py, '修改脚本（把 Claude Code 接到本网关；只更新 env 里本工具管理的键，保留你其它配置）');
+}
+
+/**
+ * 在「运行网关的这台机器」上直接写入 Claude Code CLI 与 Claude Desktop 的配置。
+ *
+ * 和上面那个脚本的区别只是执行者不同：脚本要用户自己粘贴到终端，这条路由界面
+ * 直接调后端落盘，适合桌面 App 里点一下就配好的场景。两端都写是因为它们读的
+ * 根本不是同一份文件——CLI 读 ~/.claude/settings.json 的 env，Desktop 的第三方
+ * 网关模式读自己的 Claude-3p 目录。
+ *
+ * 后端只接受本机请求（反代过来的公网管理员会被拒绝）：它写的是那台机器的文件，
+ * 里面带 API 密钥。
+ */
+export type ClientSetupOutcome = {
+  ok: boolean;
+  error?: string;
+  result?: {
+    cliPath?: string;
+    cliChanged?: boolean;
+    cliUnchanged?: boolean;
+    desktopPath?: string;
+    desktopChange?: boolean;
+    backups?: string[];
+    notes?: string[];
+  };
+};
+
+export async function applyClaudeClientSetup(options: {
+  baseURL: string;
+  gatewayURL: string;
+  token: string;
+  model: string;
+}): Promise<ClientSetupOutcome> {
+  const response = await fetch(`${API_BASE}/__clients/setup`, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      baseUrl: options.baseURL,
+      gatewayUrl: options.gatewayURL,
+      token: options.token,
+      model: options.model,
+    }),
+  });
+  if (response.status === 403) {
+    return {ok: false, error: '只能在运行网关的这台机器上操作（浏览器需通过本机地址打开管理页）。'};
+  }
+  if (!response.ok) {
+    return {ok: false, error: `写入失败：HTTP ${response.status}`};
+  }
+  return (await response.json()) as ClientSetupOutcome;
+}
+
 export function clientConfigFilePath(client: 'opencode' | 'codex' | 'claude') {
   if (client === 'opencode') return '~/.config/opencode/opencode.json';
   if (client === 'codex') return '~/.codex/config.toml';
@@ -2835,6 +3101,28 @@ export function buildApiKeyCallPayload(route: Route, model: string) {
 export function localGatewayRoot(endpoints: OutputEndpoint[]) {
   const endpoint = endpoints[0];
   return endpoint ? `http://${endpoint.listenHost}:${endpoint.listenPort}` : 'http://127.0.0.1:18093';
+}
+
+export function localGatewayLoopbackRoot(endpoints: OutputEndpoint[]) {
+  const endpoint = endpoints[0];
+  return endpoint ? `http://127.0.0.1:${endpoint.listenPort}` : 'http://127.0.0.1:18093';
+}
+
+/**
+ * 「写进本机配置」的网关根地址——Claude Code CLI 与 Claude Desktop 共用这一个。
+ *
+ * 本机配置指向的是跑网关的这台机器，所以默认用 127.0.0.1：网卡 IP 会随 Wi-Fi
+ * 切换、网线插拔、DHCP 续租而变，写死进去的地址过几天就不通了。选了公网域名
+ * （且是 https）才用公网地址——那时客户端可能不在本机。
+ *
+ * Desktop 的 3p 托管配置还额外只接受 https 或回环 http
+ * （`must use https (or http on loopback)`），内网 http 会被它判定为 malformed
+ * 并整条丢弃。这个选择规则同时满足两边。
+ */
+export function localAgentGatewayRoot(endpoints: OutputEndpoint[], publicBase: string) {
+  const base = (publicBase || '').trim().replace(/\/$/, '');
+  if (base && base.toLowerCase().startsWith('https://')) return base;
+  return localGatewayLoopbackRoot(endpoints);
 }
 
 /**

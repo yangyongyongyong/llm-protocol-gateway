@@ -44,6 +44,8 @@ type UserStore interface {
 	ListUsers() ([]domain.User, error)
 	UserByID(id string) (domain.User, error)
 	UserByUsername(username string) (domain.User, error)
+	// UserByGatewayID 按网关稳定身份找 peer 账号，用于下游注册的幂等判定。
+	UserByGatewayID(gatewayID string) (domain.User, error)
 	CreateUser(domain.User) error
 	UpdateUser(domain.User) error
 	DeleteUser(id string) error
@@ -139,6 +141,13 @@ func (s *Server) withAdminAuth(next http.Handler) http.Handler {
 		// access without a console session — see
 		// authenticatePublicAccessControlRequest.
 		if isPublicAccessControlPath(r.Method, r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// 对端网关入口：只认对端凭据，与控制台的会话/cookie 鉴权完全无关。
+		// 两条鉴权路径必须彻底分开——混在一起的话，任何一个控制台接口的疏漏
+		// 都会变成对端入口的疏漏，而那个入口能把请求转发到真实的 provider。
+		if strings.HasPrefix(r.URL.Path, peerEndpointPrefix) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -514,7 +523,9 @@ func (s *Server) sessionIdentity(r *http.Request) (sessionIdentity, bool) {
 		return sessionIdentity{}, false
 	}
 	user, err := s.userStore.UserByID(userID)
-	if err != nil || !user.Enabled {
+	// IsPeer 与登录口一致：即便某个对端账号将来真的拿到了会话 cookie
+	// （比如升级前误发的），它也不能恢复成一个控制台身份。
+	if err != nil || !user.Enabled || user.IsPeer() {
 		return sessionIdentity{}, false
 	}
 	return sessionIdentity{UserID: user.ID, Username: user.Username, Role: user.Role}, true
@@ -626,7 +637,10 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user, err := s.userStore.UserByUsername(username)
-	if err != nil || !user.Enabled {
+	// peer 账号（下游网关）永远不能登录控制台：它的密码只用于「重新注册时
+	// 证明自己是同一个下游」，不是一个身份入口。允许它登录等于把一个只该
+	// 按授权集取流量的账号，变成能看日志、能改自己密钥的会话用户。
+	if err != nil || !user.Enabled || user.IsPeer() {
 		s.recordAuthFailure(r, username)
 		writeOpenAIError(w, http.StatusUnauthorized, "invalid username or password")
 		return
