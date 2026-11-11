@@ -113,6 +113,9 @@ func exchangeQoderJobToken(ctx context.Context, site qoderSite, base domain.Qode
 		if credential.UID == "" {
 			credential.UID = info.accountUID()
 		}
+		// The plan identity goes into the COSY blob; without it an enterprise
+		// account is answered as a personal one.
+		info.applyPlanIdentity(&credential)
 	}
 	if strings.TrimSpace(credential.UID) == "" {
 		return base, fmt.Errorf("%s 无法确认这个令牌属于哪个账号，请重新登录", site.Name)

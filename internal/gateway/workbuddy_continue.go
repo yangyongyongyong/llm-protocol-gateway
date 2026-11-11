@@ -150,6 +150,17 @@ func workBuddyNeedsContinuation(completion map[string]any) bool {
 	if workBuddyCompletionHasToolCalls(completion) {
 		return false
 	}
+	// A tool call written as *text* is still a tool call: the client parses the markup
+	// and runs it. Continuing there asks the model for a second call, which the client
+	// runs again — a loop the reference implementation measured in production (33% of
+	// its continuation triggers, 2026-11-10, "任务早该结束了却一直在工具调用").
+	//
+	// Both closed and unclosed markup are excluded: closed means the call is complete,
+	// and an unclosed one means the stream broke inside it — continuing would splice a
+	// second call onto a partial first one.
+	if workBuddyHasToolCallMarkup(workBuddyCompletionText(completion)) {
+		return false
+	}
 	reason := strings.ToLower(workBuddyCompletionFinish(completion))
 	// "length" is OpenAI's word for it and "max_tokens" is Anthropic's; this upstream
 	// passes whichever its own stream carries straight through, so both mean the same
@@ -348,3 +359,30 @@ func workBuddyAggregateToMap(streamBody []byte, model string) map[string]any {
 // workBuddyContinueTimeout bounds one continuation call, so a stalled segment cannot
 // hold the request open after the client already has a usable answer.
 const workBuddyContinueTimeout = 5 * time.Minute
+
+// workBuddyToolCallMarkupMarkers are the strings a model uses when it writes a tool call
+// as text instead of a structured call.
+//
+// Measured upstream (DSH clients, 2026-11-10): the DSML form appears with both full-width
+// and ASCII pipes, and a few prompts teach an XML form instead. The list is the reference
+// implementation's, kept identical on purpose — a marker it guards and this gateway does
+// not is exactly the gap that produced the loop.
+var workBuddyToolCallMarkupMarkers = []string{
+	"｜｜DSML｜｜", "|DSML|",
+	"</function_calls>", "<function_calls>",
+	"antml:invoke", "<invoke name=",
+	"</tool_calls>", "<tool_calls>",
+}
+
+// workBuddyHasToolCallMarkup reports whether text carries a tool call written as markup.
+func workBuddyHasToolCallMarkup(text string) bool {
+	if text == "" {
+		return false
+	}
+	for _, marker := range workBuddyToolCallMarkupMarkers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}

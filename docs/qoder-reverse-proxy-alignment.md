@@ -359,7 +359,33 @@ GC 是台 Linux 服务器，`/opt/Qoder/resources/umid/runtime-info` 与 `~/.qod
 - **HEAD 上有既有红灯**：`TestWorkBuddyQuotaAsksThePackageDoorOnlyWhenItCounts/personal` 稳定失败（断言 `RunsOut == 18.04`，实际窗口是 `Credits Used: 33.3%`）。工作区未触碰 WorkBuddy，属其他提交遗留，与本轮无关。
 - 参考库新增 `/credits/probe` 自动探测与「老网关 404 提示」，暗示**额度**端点可能有过变动；我们的 `/sash/api/v2/me/usage` 尚未验证是否受影响（本次未纳入）。
 
-## 12. 附录：可直接落代码的常量表（参考实现口径）
+## 12. 2026-11-11 复核：参考库 v1.9.5 / v1.9.6 的更新与对齐结论
+
+对照 `origin/main` = `b2ef2a4`（v1.9.6）。11-10 的实质改动只有一项：**企业 VPC 专属域**；v1.9.5 是面板动画修复 + README 赞助位。
+
+| 参考侧更新 | 内容 | 对我们的链路 |
+|---|---|---|
+| **v1.9.6** `QD_CN_VPC_ENDPOINT` | 由实例名（`acme`）推导 CN 的官网 / OpenAPI / 推理网关三个主机；未配置时保持原行为，INTL 不变 | **无需对齐**，除非用户是 Qoder CN 企业 VPC 客户。我们没有按账号/实例覆盖主机的入口，若要支持需新增 provider 级 endpoint 覆盖 |
+| v1.9.6 隔离补强 | VPC 不回退公网、重定向只允许本实例 HTTPS 默认端口、实例名 ≤55 字符、不跨区试探令牌 | 只在实现 VPC 时才需要，属安全设计参考 |
+| v1.9.5 | 统计页呼吸点/流光动画闪烁修复 + README 赞助区块 | 面板与文档，**与反代无关** |
+| v1.9.3 chunked 请求体 | 参考自己手写 `BaseHTTPRequestHandler`，只读 `Content-Length`，chunked 会被当成空 body → Anthropic 报 `messages is required` | **无需对齐**：Go 的 `net/http` 自动解 chunked，`io.ReadAll(io.LimitReader(...))` 与 `MaxBytesReader` 都按解码后字节算，`ContentLength=-1` 也不会误判超限 |
+| v1.9.2 模型 app-only | 新增发现只出现在 app 场景的模型（`lmodel` = QoDuck） | **已覆盖**：我们本来就合并 `app` + `chat` 两个场景，实测 CN 账号能拿到 |
+| 额度端点自动探测（11 个候选） | INTL 与 CN 额度接口不是一套，参考按候选矩阵探测并缓存 6h | **已覆盖**：实测 `/sash/api/v2/me/usage` 在 CN 与 INTL 均 200（返回 `displayMode`/`qoderUsage`），参考的 v1 候选反而全部 404 |
+
+### 12.1 唯一实际缺口：企业组织字段没进身份 blob（已修）
+
+v1.9.6 的变更说明里有一句「导入时**保留企业组织字段**」。对照后发现我们确实缺：
+
+- 参考从 `/api/v1/userinfo` 取 `user_type` / `organization_id` / `organization_name`，写进 `identity` 再进 COSY blob（`qoder_accounts.py:1910-1911,4783-4786`）。
+- 我们的 `qoderUserInfo` 只读 `id/uid/name/email`，凭证里也没有这三个字段 → blob 里 `user_type` 恒为 `personal_professional_trial`、org 恒空。
+- 后果：**企业账号在上游看来是个「个人号」**，而活动列表与模型列表都按这个身份过滤。
+
+已修（4 处）：`qoderUserInfo` 增加三种字段并兼容 snake/camel 两种拼写 → `domain.QoderCredential` 增加三个可选字段 → 签入与 PAT 交换两处落地 → `qoderAccount` 传给签名层（`qoderUserBlob` 早已按 9 键输出，只差喂值）。
+
+> 存量账号的三个字段在下一次令牌刷新 / 重新登录前仍为空；重新登录即可补齐。
+
+
+## 13. 附录：可直接落代码的常量表（参考实现口径）
 
 ```go
 // 排队

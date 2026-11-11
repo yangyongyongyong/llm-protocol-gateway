@@ -155,12 +155,15 @@ func (s *Server) sendQoderChat(ctx context.Context, provider domain.Provider, mo
 	}
 	site := qoderSiteOf(provider)
 	account := qoderAccount{
-		UID:          credential.UID,
-		Name:         credential.Name,
-		Email:        credential.Email,
-		Token:        credential.AccessToken,
-		MachineID:    credential.MachineID,
-		RefreshToken: credential.RefreshToken,
+		UID:              credential.UID,
+		Name:             credential.Name,
+		Email:            credential.Email,
+		Token:            credential.AccessToken,
+		MachineID:        credential.MachineID,
+		RefreshToken:     credential.RefreshToken,
+		UserType:         credential.UserType,
+		OrganizationID:   credential.OrganizationID,
+		OrganizationName: credential.OrganizationName,
 	}
 	response, err := qoderPost(ctx, site, qoderChatPath, wire, info.Key, info.Source, account)
 	if err != nil {

@@ -496,6 +496,14 @@ type QoderCredential struct {
 	// Qoder's envelope carries it as the machine identity, and its client
 	// rejects an account whose machine keeps changing.
 	MachineID string `json:"machineId,omitempty"`
+	// UserType, OrganizationID and OrganizationName are the plan identity
+	// /api/v1/userinfo reports. They travel inside the COSY identity blob, and
+	// the vendor filters both the campaign list and the model list by what that
+	// blob claims: an enterprise account whose organization is missing there is
+	// answered as if it were a personal one.
+	UserType         string `json:"userType,omitempty"`
+	OrganizationID   string `json:"organizationId,omitempty"`
+	OrganizationName string `json:"organizationName,omitempty"`
 	// DeviceChat says AccessToken is the device token rather than a job token,
 	// because the site refused to trade it (Qoder CN's CLI works this way). It
 	// is then refreshed as a device token.

@@ -209,3 +209,47 @@ func TestWorkBuddyCompletionTextReadsBothShapes(t *testing.T) {
 		t.Fatalf("parts = %q", got)
 	}
 }
+
+// A tool call written as text must not trigger continuation: the client parses the markup
+// and runs it, so continuing asks for a second call and the client runs that too — the
+// loop the reference implementation measured in production.
+func TestWorkBuddyNeedsContinuationStopsAtToolCallMarkup(t *testing.T) {
+	cases := []string{
+		// DSML, both pipe spellings, closed.
+		"任务做完了。</｜｜DSML｜｜ invoke> </｜｜DSML｜｜ calls>",
+		"任务做完了。</|DSML| invoke> </|DSML| calls>",
+		// Unclosed: the stream broke inside the markup.
+		"准备调用：<｜｜DSML｜｜ invoke name=\"read\"",
+		// XML forms a prompt may have taught.
+		"done</function_calls>",
+		"done<function_calls>",
+		"done<antml:invoke name=\"x\">",
+		"done<invoke name=\"x\">",
+		"done</tool_calls>",
+		"done<tool_calls>",
+	}
+	for _, text := range cases {
+		completion := buildCompletion(text, "max_tokens")
+		if workBuddyNeedsContinuation(completion) {
+			t.Fatalf("%q triggered a continuation; the call is already there", text)
+		}
+	}
+	// A plain truncated answer still continues: the guard is about markup, not length.
+	if !workBuddyNeedsContinuation(buildCompletion("half a sentence", "max_tokens")) {
+		t.Fatal("a plain cut answer stopped continuing")
+	}
+}
+
+// The marker table itself, so a marker cannot be dropped silently.
+func TestWorkBuddyHasToolCallMarkup(t *testing.T) {
+	for _, marker := range workBuddyToolCallMarkupMarkers {
+		if !workBuddyHasToolCallMarkup("text " + marker + " more") {
+			t.Fatalf("marker %q is not detected", marker)
+		}
+	}
+	for _, text := range []string{"", "普通回答", "mention tool_calls in prose without brackets"} {
+		if workBuddyHasToolCallMarkup(text) {
+			t.Fatalf("%q was treated as markup", text)
+		}
+	}
+}

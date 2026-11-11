@@ -237,6 +237,12 @@ func (s *Server) checkinProviderNow(ctx context.Context, providerID string, soon
 		record.Tries = previous.Tries + 1
 	}
 	s.recordCheckin(provider, record, now)
+	// A failure the vendor describes as temporary gets two more attempts later today:
+	// one attempt that lands on "请稍后重试" costs the whole day, and a lost day breaks
+	// the streak (workbuddy_checkin_retry.go).
+	if workBuddyCheckinTransient(record) {
+		s.queueWorkBuddyCheckinRetry(provider.ID)
+	}
 	return provider, record, true
 }
 

@@ -1633,6 +1633,12 @@ func (s *Server) sendWorkBuddyChat(provider domain.Provider, model string, body 
 	// workbuddy_continue.go).
 	if aggregate {
 		response = s.continueWorkBuddyAnswer(provider, model, body, send, response)
+	} else {
+		// A streaming client reads the frames as they are, so a frame the upstream
+		// concatenated two chunks into would fail in its parser and cost the turn
+		// (workbuddy_sse_split.go). Wrapped before the tool-name restore, so that
+		// restore sees one value per line.
+		wrapWorkBuddyFrameSplitting(response)
 	}
 	restoreWorkBuddyToolNames(response, aliases)
 	return response, nil
@@ -2148,9 +2154,12 @@ func buildWorkBuddyCompletion(streamBody []byte, model string) (map[string]any, 
 		sawChunk       bool
 		upstreamErrMsg string
 	)
-	for _, line := range strings.Split(string(streamBody), "\n") {
-		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "data:"))
-		if line == "" || line == "[DONE]" {
+	// One data line can carry several JSON values (upstream concatenates chunks, see
+	// workbuddy_sse_split.go). Parsing it whole drops every value in it, which used to
+	// lose that text with nothing in the logs — so each value is parsed on its own.
+	for _, raw := range workBuddyStreamPayloads(streamBody) {
+		line := raw
+		if line == "" {
 			continue
 		}
 		var chunk workBuddyStreamChunk
@@ -2654,4 +2663,29 @@ func workBuddyAccountHeaders(site workBuddySite, credential domain.WorkBuddyCred
 		"X-Product":     "SaaS",
 		"X-IDE-Type":    "WorkBuddy",
 	}
+}
+
+// workBuddyStreamPayloads lists the JSON payloads in a stream body, one per value.
+//
+// A data line the upstream concatenated into `{a} {b}` is split into its values, because
+// a whole-line parse would fail and drop both. Lines that are not `data:` (comments,
+// blank separators) and the `[DONE]` sentinel are skipped.
+func workBuddyStreamPayloads(streamBody []byte) []string {
+	var payloads []string
+	for _, line := range strings.Split(string(streamBody), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, ":") {
+			continue
+		}
+		trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+		if trimmed == "" || trimmed == "[DONE]" {
+			continue
+		}
+		if parts := splitWorkBuddyConcatenatedJSON(trimmed); len(parts) > 1 {
+			payloads = append(payloads, parts...)
+			continue
+		}
+		payloads = append(payloads, trimmed)
+	}
+	return payloads
 }

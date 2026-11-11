@@ -158,6 +158,49 @@ type qoderUserInfo struct {
 	Name     string `json:"name"`
 	Username string `json:"username"`
 	Email    string `json:"email"`
+	// The account's plan identity. Both spellings are read because the two
+	// sites answer with different ones, and the COSY identity blob carries all
+	// three: an enterprise account whose organization is missing there looks
+	// like a personal one to the vendor, and both the campaign list and the
+	// model list are filtered by what that blob claims.
+	UserType          string `json:"user_type"`
+	UserTypeAlt       string `json:"userType"`
+	OrganizationID    string `json:"organization_id"`
+	OrganizationIDAlt string `json:"organizationId"`
+	OrgName           string `json:"organization_name"`
+	OrgNameAlt        string `json:"organizationName"`
+}
+
+// userType is the plan kind the account reports, if it names one.
+func (u qoderUserInfo) userType() string {
+	return firstNonEmpty(strings.TrimSpace(u.UserType), strings.TrimSpace(u.UserTypeAlt))
+}
+
+// organizationID is the enterprise the account belongs to, if any.
+func (u qoderUserInfo) organizationID() string {
+	return firstNonEmpty(strings.TrimSpace(u.OrganizationID), strings.TrimSpace(u.OrganizationIDAlt))
+}
+
+// organizationName is that enterprise's display name.
+func (u qoderUserInfo) organizationName() string {
+	return firstNonEmpty(strings.TrimSpace(u.OrgName), strings.TrimSpace(u.OrgNameAlt))
+}
+
+// applyPlanIdentity copies the plan fields onto a credential. A site that
+// answers with none (a personal account) leaves the credential as it was.
+func (u qoderUserInfo) applyPlanIdentity(credential *domain.QoderCredential) {
+	if credential == nil {
+		return
+	}
+	if value := u.userType(); value != "" {
+		credential.UserType = value
+	}
+	if value := u.organizationID(); value != "" {
+		credential.OrganizationID = value
+	}
+	if value := u.organizationName(); value != "" {
+		credential.OrganizationName = value
+	}
 }
 
 func (u qoderUserInfo) accountUID() string {
@@ -516,6 +559,9 @@ func qoderCompleteSignIn(ctx context.Context, site qoderSite, deviceToken qoderD
 		if credential.UID == "" {
 			credential.UID = info.accountUID()
 		}
+		// The plan identity goes into the COSY blob; without it an enterprise
+		// account is answered as a personal one.
+		info.applyPlanIdentity(&credential)
 	}
 	if credential.Name == "" {
 		credential.Name = strings.TrimSpace(deviceToken.UserName)

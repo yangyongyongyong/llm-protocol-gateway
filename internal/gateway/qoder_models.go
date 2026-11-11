@@ -540,12 +540,15 @@ func qoderAccountOf(provider domain.Provider) qoderAccount {
 		return qoderAccount{}
 	}
 	return qoderAccount{
-		UID:          provider.QoderPAT.UID,
-		Name:         provider.QoderPAT.Name,
-		Email:        provider.QoderPAT.Email,
-		Token:        provider.QoderPAT.AccessToken,
-		MachineID:    provider.QoderPAT.MachineID,
-		RefreshToken: provider.QoderPAT.RefreshToken,
+		UID:              provider.QoderPAT.UID,
+		Name:             provider.QoderPAT.Name,
+		Email:            provider.QoderPAT.Email,
+		Token:            provider.QoderPAT.AccessToken,
+		MachineID:        provider.QoderPAT.MachineID,
+		RefreshToken:     provider.QoderPAT.RefreshToken,
+		UserType:         provider.QoderPAT.UserType,
+		OrganizationID:   provider.QoderPAT.OrganizationID,
+		OrganizationName: provider.QoderPAT.OrganizationName,
 	}
 }
 
