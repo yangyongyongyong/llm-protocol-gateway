@@ -4205,11 +4205,17 @@ func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
 
+// handleClaudeModels is Claude Code's model discovery. It publishes the
+// caller's real catalog plus two kinds of synthetic entries: the sonnet/opus/
+// haiku tier aliases the built-in sub-agents ask for by name, and the reserved
+// "default" alias. The tier aliases are limited to the tiers this caller can
+// actually reach — advertising a model no provider serves is a capacity lie the
+// client acts on (see claudeModelAliasEntries).
 func (s *Server) handleClaudeModels(w http.ResponseWriter, r *http.Request) {
 	models := s.modelsForRequest(r)
 	data := make([]map[string]any, 0, len(models)+len(claudeModelAliases)+2)
 	seen := map[string]bool{}
-	for _, entry := range claudeModelAliasEntries() {
+	for _, entry := range claudeModelAliasEntries(models) {
 		id := stringValue(entry["id"])
 		if id == "" || seen[id] {
 			continue

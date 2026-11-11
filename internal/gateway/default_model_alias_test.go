@@ -316,3 +316,122 @@ func TestClaudeModelsListsReservedDefaultAlias(t *testing.T) {
 		t.Fatalf("default[1m] max_input_tokens = %d, want %d", got, contextLength1M)
 	}
 }
+
+// Model discovery must not advertise a tier the provider does not serve. A
+// provider offering only m1/m2 used to list sonnet/opus/haiku with full-size
+// context windows, which is a capacity claim the client acts on.
+func TestClaudeModelsOmitsUnservedTierAliases(t *testing.T) {
+	router := NewRouter(domain.GatewayState{
+		Providers: []domain.Provider{{
+			ID: "p1", Name: "P1", Protocol: domain.ProtocolClaude,
+			AuthType: domain.AuthTypeAPIKey, BaseURL: "https://example.invalid",
+			Models: []domain.Model{
+				{ID: "m1", ProviderID: "p1", Protocol: domain.ProtocolClaude, InMenu: true},
+				{ID: "m2", ProviderID: "p1", Protocol: domain.ProtocolClaude, InMenu: true},
+			},
+		}},
+		Routes: []domain.Route{{
+			ID: "r1", Name: "R1", ProviderID: "p1",
+			OutputProtocol: domain.ProtocolClaude, Mode: domain.RouteModeAuto, Enabled: true,
+		}},
+		APIKeys: []domain.APIKey{{ID: "k1", Name: "K1", Key: "sk-gw", RouteID: "r1", Enabled: true}},
+	})
+	server := NewServer(router, monitor.NewStore())
+
+	request := httptest.NewRequest(http.MethodGet, "/anthropic/v1/models", nil)
+	request.Header.Set("x-api-key", "sk-gw")
+	recorder := httptest.NewRecorder()
+	server.handleClaudeModels(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	byID := map[string]bool{}
+	for _, entry := range payload.Data {
+		byID[entry.ID] = true
+	}
+	for _, alias := range []string{"sonnet", "opus", "haiku"} {
+		if byID[alias] {
+			t.Fatalf("model list advertised %q, which no provider serves: %v", alias, byID)
+		}
+	}
+	for _, real := range []string{"m1", "m2"} {
+		if !byID[real] {
+			t.Fatalf("the provider's own model %q must be listed, got %v", real, byID)
+		}
+	}
+	// The reserved alias is about "let the gateway choose", not about a tier
+	// existing, so it survives regardless of the catalog.
+	if !byID["default"] {
+		t.Fatalf("the reserved alias must stay listed, got %v", byID)
+	}
+}
+
+// The counterpart: a provider that does serve a tier keeps advertising it, so
+// official Claude providers see no change.
+func TestClaudeModelsKeepsServedTierAliases(t *testing.T) {
+	router := NewRouter(domain.GatewayState{
+		Providers: []domain.Provider{{
+			ID: "p1", Name: "P1", Protocol: domain.ProtocolClaude,
+			AuthType: domain.AuthTypeAPIKey, BaseURL: "https://example.invalid",
+			Models: []domain.Model{
+				{ID: "claude-sonnet-5", ProviderID: "p1", Protocol: domain.ProtocolClaude, InMenu: true},
+				// A relay namespaces its ids; that is still the same model.
+				{ID: "anthropic/claude-haiku-4-5-20251001", ProviderID: "p1", Protocol: domain.ProtocolClaude, InMenu: true},
+			},
+		}},
+		Routes: []domain.Route{{
+			ID: "r1", Name: "R1", ProviderID: "p1",
+			OutputProtocol: domain.ProtocolClaude, Mode: domain.RouteModeAuto, Enabled: true,
+		}},
+		APIKeys: []domain.APIKey{{ID: "k1", Name: "K1", Key: "sk-gw", RouteID: "r1", Enabled: true}},
+	})
+	server := NewServer(router, monitor.NewStore())
+
+	request := httptest.NewRequest(http.MethodGet, "/anthropic/v1/models", nil)
+	request.Header.Set("x-api-key", "sk-gw")
+	recorder := httptest.NewRecorder()
+	server.handleClaudeModels(recorder, request)
+	var payload struct {
+		Data []struct {
+			ID             string `json:"id"`
+			MaxInputTokens int    `json:"max_input_tokens"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	byID := map[string]int{}
+	for _, entry := range payload.Data {
+		byID[entry.ID] = entry.MaxInputTokens
+	}
+	if got := byID["sonnet"]; got != contextLength1M {
+		t.Fatalf("sonnet max_input_tokens = %d, want %d", got, contextLength1M)
+	}
+	if got := byID["haiku"]; got != contextLength200K {
+		t.Fatalf("haiku max_input_tokens = %d, want %d", got, contextLength200K)
+	}
+	if _, ok := byID["opus"]; ok {
+		t.Fatalf("opus is not served and must not be listed, got %v", byID)
+	}
+}
+
+// Discovery is not the rewriting layer: even when the alias is not listed, a
+// client that sends the tier name still resolves to the model it names.
+func TestClaudeTierAliasResolvesWithoutBeingListed(t *testing.T) {
+	provider := domain.Provider{
+		ID: "p1", Protocol: domain.ProtocolClaude,
+		Models: []domain.Model{{ID: "m1", ProviderID: "p1", Protocol: domain.ProtocolClaude}},
+	}
+	model, _ := resolveConsumerModelOnProvider(provider, domain.APIKey{}, false, "sonnet")
+	if model != "claude-sonnet-5" {
+		t.Fatalf("model = %q, want the alias to keep rewriting to claude-sonnet-5", model)
+	}
+}
