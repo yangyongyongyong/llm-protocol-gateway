@@ -698,11 +698,21 @@ type Model struct {
 	// display-only: a request still names the model by ID, because that is the
 	// key the upstream routes on. Empty means the upstream gives no other name,
 	// which is the case for every API-Key vendor whose model id is its label.
-	Name            string   `json:"name,omitempty"`
-	Protocol        Protocol `json:"protocol"`
-	ContextLength   int      `json:"contextLength"`
-	MaxOutputTokens int      `json:"maxOutputTokens,omitempty"`
-	InMenu          bool     `json:"inMenu"`
+	Name          string   `json:"name,omitempty"`
+	Protocol      Protocol `json:"protocol"`
+	ContextLength int      `json:"contextLength"`
+	// ContextOverride 是运维给这个模型单独定的上下文窗口；0 = 没定，按厂商
+	// 已知值或上游声明值算。定过之后对外的窗口由它说了算（见
+	// gateway.modelWindow），目录同步也不会把它冲掉——这正是它和 ContextLength
+	// 分开存的原因：ContextLength 记的是「上游/厂商怎么说」，会随同步变化，
+	// 也是清空设置后要退回去的那个值。
+	//
+	// 有了它，一条实际上真有 1M 的中转模型才能在 Claude Desktop / Claude Code
+	// 里被当成 1M 模型列出去（对端认 max_input_tokens >= 1e6，见
+	// gateway.desktopModelView）。
+	ContextOverride int  `json:"contextOverride,omitempty"`
+	MaxOutputTokens int  `json:"maxOutputTokens,omitempty"`
+	InMenu          bool `json:"inMenu"`
 	// Free and Rate are what the upstream charges for this model, read from its
 	// own listing: Rate is the credits multiple a request costs, RateWas the
 	// price struck through beside it while a discount runs (0: none), and Free

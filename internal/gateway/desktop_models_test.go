@@ -223,3 +223,205 @@ func TestGatewayServesDesktopRootModelPaths(t *testing.T) {
 		t.Fatal("the root messages paths must count as model paths, or a local host never forwards them to the mux")
 	}
 }
+
+// desktop1MServer 起一个「窗口各不相同」的网关：厂商已知的 1M 模型、上游自己
+// 报了 1M 的模型、正好 1M 的模型、差一点的和默认的。
+func desktop1MServer(t *testing.T) (*Server, string) {
+	t.Helper()
+	router := NewRouter(domain.GatewayState{
+		Providers: []domain.Provider{{
+			ID: "p1", Name: "P1", Protocol: domain.ProtocolOpenAIChat,
+			AuthType: domain.AuthTypeAPIKey, BaseURL: "https://example.invalid",
+			Models: []domain.Model{
+				// 厂商已知窗口：就算上游没说也是 1M。
+				{ID: "claude-opus-5", ProviderID: "p1", Protocol: domain.ProtocolOpenAIChat, InMenu: true},
+				// 上游自己报的窗口。
+				{ID: "m-long", ProviderID: "p1", Protocol: domain.ProtocolOpenAIChat, ContextLength: 1_048_576, InMenu: true},
+				// 正好 1M：Desktop 的门槛是 >=，包含它。
+				{ID: "m-edge", ProviderID: "p1", Protocol: domain.ProtocolOpenAIChat, ContextLength: 1_000_000, InMenu: true},
+				// 872K 和没报的：都不是 1M，不许被标成 1M。
+				{ID: "m-short", ProviderID: "p1", Protocol: domain.ProtocolOpenAIChat, ContextLength: 872_000, InMenu: true},
+				{ID: "m-plain", ProviderID: "p1", Protocol: domain.ProtocolOpenAIChat, InMenu: true},
+				// 上游自己就把 [1m] 写进 id 的：不要再叠一层。
+				{ID: "some-model[1m]", ProviderID: "p1", Protocol: domain.ProtocolOpenAIChat, InMenu: true},
+			},
+		}},
+		Routes: []domain.Route{{
+			ID: "r1", Name: "R1", ProviderID: "p1",
+			OutputProtocol: domain.ProtocolOpenAIChat, Mode: domain.RouteModeAuto, Enabled: true,
+		}},
+		APIKeys: []domain.APIKey{{ID: "k1", Name: "K1", Key: "sk-gw", RouteID: "r1", Enabled: true}},
+	})
+	return NewServer(router, monitor.NewStore()), "sk-gw"
+}
+
+// 1M 窗口必须真的告诉 Desktop：它判「这是不是 1M 模型」看的是
+// max_input_tokens（app.asar 2.7032），而我们过去只发 context_length，于是
+// 每个模型在它眼里都是短窗口，Code 页永远跑 200K。
+//
+// 同时：1M 的模型按 "[1m]" 的 id 列出去。不带这个标记的话，Desktop 会在菜单里
+// 给同一个模型再补一条「1M context window」，一个模型变成两条（magpie #1272：
+// 21 个模型 34 条）。
+func TestOpenAIModelsGivesClaudeDesktopA1MWindow(t *testing.T) {
+	server, token := desktop1MServer(t)
+	data := getModels(t, server, token, claudeDesktopUA)
+	if len(data) != 6 {
+		t.Fatalf("got %d entries, want one per model (no duplicates): %v", len(data), data)
+	}
+	// 真实模型 id -> 它在 Desktop 清单里的那一行。菜单显示的是 display_name，
+	// 我们给 id 加的 "[1m]" 不进名字，所以它正好就是真实 id。
+	byName := map[string]map[string]any{}
+	for _, entry := range data {
+		name, _ := entry["display_name"].(string)
+		if _, dup := byName[name]; dup {
+			t.Fatalf("one model listed twice to Desktop: %q in %v", name, data)
+		}
+		byName[name] = entry
+	}
+
+	long := []string{"claude-opus-5", "m-long", "m-edge", "some-model[1m]"}
+	for _, name := range long {
+		entry := byName[name]
+		if entry == nil {
+			t.Fatalf("%q missing from the Desktop list", name)
+		}
+		id, _ := entry["id"].(string)
+		if !strings.HasSuffix(id, claudeContextTag1M) {
+			t.Fatalf("%q listed as %q, want a [1m] id so Desktop's Code tab runs the 1M window", name, id)
+		}
+		if strings.HasSuffix(id, claudeContextTag1M+claudeContextTag1M) {
+			t.Fatalf("%q listed as %q: the tag must not be doubled", name, id)
+		}
+		if !desktopAcceptsModelID(stripClaudeContextTag(id)) {
+			t.Fatalf("Desktop would drop this id: %q", id)
+		}
+		if said, _ := entry["description"].(string); said != desktop1MSaid {
+			t.Fatalf("%q description = %q, want %q (Desktop tells its own 1M entry that way)", name, said, desktop1MSaid)
+		}
+	}
+	// 三个名字都要给：Desktop 看 max_input_tokens，别的客户端看 context_length，
+	// 而 magpie 的 modelObject 三个都发，我们一起对齐。
+	for _, name := range long {
+		for _, field := range []string{"max_input_tokens", "context_length", "context_window"} {
+			got, _ := byName[name][field].(float64)
+			if got < desktop1M {
+				t.Fatalf("%s.%s = %v, want >= %d", name, field, got, desktop1M)
+			}
+		}
+	}
+
+	for _, name := range []string{"m-short", "m-plain"} {
+		entry := byName[name]
+		id, _ := entry["id"].(string)
+		if strings.HasSuffix(id, claudeContextTag1M) {
+			t.Fatalf("%q listed as %q, but it has no 1M window", name, id)
+		}
+		if said, _ := entry["description"].(string); said != "" {
+			t.Fatalf("%q described as %q, want no 1M claim", name, said)
+		}
+	}
+	// 872K 是它自己的数，不能被抹平成默认值。
+	if got, _ := byName["m-short"]["max_input_tokens"].(float64); got != 872_000 {
+		t.Fatalf("m-short max_input_tokens = %v, want its own 872000", got)
+	}
+}
+
+// 1M 标记是窗口标记，不是模型名：请求带着它回来（Desktop 的 Code 页会把列出去
+// 的 id 原样交给 Claude Code，会话里存下来的也是它）时必须还原成真实模型。
+// 目录里真有这个带标记的 id 时保留原样——那是一个真实的模型名。
+func TestDesktop1MIDResolvesToTheModel(t *testing.T) {
+	provider := domain.Provider{
+		ID: "p1", Protocol: domain.ProtocolOpenAIChat,
+		Models: []domain.Model{
+			{ID: "claude-opus-5", ProviderID: "p1"},
+			{ID: "m1", ProviderID: "p1"},
+		},
+	}
+	for _, tc := range []struct{ request, want, wantLog string }{
+		// 只是多了个窗口标记：同一个模型，日志里不该多出一次「映射」。
+		{"claude-opus-5[1m]", "claude-opus-5", "claude-opus-5"},
+		// 别名是真的换了个 id：日志两侧都要留。
+		{desktopModelAlias("m1") + claudeContextTag1M, "m1", desktopModelAlias("m1") + claudeContextTag1M + " -> m1"},
+	} {
+		model, logModel := resolveConsumerModelOnProvider(provider, domain.APIKey{}, false, tc.request)
+		if model != tc.want {
+			t.Fatalf("%q resolved to %q, want %q", tc.request, model, tc.want)
+		}
+		if logModel != tc.wantLog {
+			t.Fatalf("%q logged as %q, want %q", tc.request, logModel, tc.wantLog)
+		}
+	}
+
+	// 上游真的有一个叫 "vendor-model[1m]" 的模型时，它自己就是那个模型名。
+	tagged := domain.Provider{ID: "p2", Models: []domain.Model{{ID: "vendor-model[1m]", ProviderID: "p2"}}}
+	if model, _ := resolveConsumerModelOnProvider(tagged, domain.APIKey{}, false, "vendor-model[1m]"); model != "vendor-model[1m]" {
+		t.Fatalf("a real [1m] model id must not be stripped: %q", model)
+	}
+}
+
+// 走完整的 Claude 透传：Desktop 的 Code 页会拿 /v1/models 里那个 "[1m]" 的 id
+// 直接发 /v1/messages，上游必须收到真实模型名，并带上 1M 上下文那个 beta
+// （new-api 风格的中转不带它会 400）。
+func TestClaudeMessagesAcceptsDesktop1MID(t *testing.T) {
+	var gotModel string
+	var gotBeta string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBeta = r.Header.Get("anthropic-beta")
+		body, _ := io.ReadAll(r.Body)
+		var parsed map[string]any
+		_ = json.Unmarshal(body, &parsed)
+		gotModel, _ = parsed["model"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-opus-5","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	defer upstream.Close()
+
+	router := NewRouter(domain.GatewayState{
+		Providers: []domain.Provider{{
+			ID: "p1", Name: "P1", Protocol: domain.ProtocolClaude,
+			AuthType: domain.AuthTypeSelfRegister, BaseURL: upstream.URL,
+			APIKeySource: "literal:sk-test", AuthHeader: "x-api-key",
+			Models: []domain.Model{
+				{ID: "claude-opus-5", ProviderID: "p1", Protocol: domain.ProtocolClaude, InMenu: true},
+				{ID: "m1", ProviderID: "p1", Protocol: domain.ProtocolClaude, InMenu: true},
+			},
+			// 有默认模型才能证明请求没被悄悄换成它。
+			DefaultModel: "m1",
+		}},
+		Routes: []domain.Route{{
+			ID: "r1", Name: "R1", ProviderID: "p1",
+			OutputProtocol: domain.ProtocolClaude, Mode: domain.RouteModeAuto, Enabled: true,
+		}},
+		APIKeys: []domain.APIKey{{ID: "k1", Name: "K1", Key: "sk-gw", RouteID: "r1", Enabled: true}},
+	})
+	server := NewServer(router, monitor.NewStore())
+
+	// Desktop 把列出去的 id 原样交给 Claude Code：claude-opus-5 本来就被接受，
+	// m1 拿到的是别名；两者发回来都带 [1m]。
+	for _, sent := range []struct{ request, want string }{
+		{"claude-opus-5" + claudeContextTag1M, "claude-opus-5"},
+		{desktopModelAlias("m1") + claudeContextTag1M, "m1"},
+	} {
+		gotModel = ""
+		gotBeta = ""
+		body := `{"model":"` + sent.request + `","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
+		request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+		request.Header.Set("x-api-key", "sk-gw")
+		request.Header.Set("anthropic-version", "2023-06-01")
+		recorder := httptest.NewRecorder()
+		server.handleClaudeMessages(recorder, request)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, body = %s", sent.request, recorder.Code, recorder.Body.String())
+		}
+		if gotModel != sent.want {
+			t.Fatalf("%s reached the upstream as %q, want %q", sent.request, gotModel, sent.want)
+		}
+		// 1M 的 id 到了上游是真实模型名，beta 就得按真实模型判：Opus 5 是 1M 家族。
+		if !isClaude1MContextModel(sent.want) {
+			continue
+		}
+		if !strings.Contains(gotBeta, claudeContext1MBeta) {
+			t.Fatalf("%s: anthropic-beta %q must carry %q", sent.request, gotBeta, claudeContext1MBeta)
+		}
+	}
+}

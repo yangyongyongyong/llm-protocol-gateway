@@ -342,6 +342,12 @@ func (s *Store) migrate() error {
 	if err := addColumnIfMissing(tx, "models", "rate_was", "REAL NOT NULL DEFAULT 0"); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
+	// context_override: 运维给这个模型单独定的上下文窗口，0 = 没定。它和
+	// context_length 分开存：后者记录「上游/厂商怎么说」，每次目录同步都会重写，
+	// 而运维的话不能被同步冲掉。
+	if err := addColumnIfMissing(tx, "models", "context_override", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
 	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS users (
 		id TEXT PRIMARY KEY,
 		username TEXT NOT NULL UNIQUE,
@@ -756,10 +762,10 @@ func (s *Store) Save(state domain.GatewayState) error {
 				modelFree = 1
 			}
 			if _, err := tx.Exec(`INSERT INTO models
-				(provider_id, id, protocol, context_length, in_menu, position, display_name, free, rate, rate_was)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				(provider_id, id, protocol, context_length, in_menu, position, display_name, free, rate, rate_was, context_override)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				provider.ID, model.ID, string(model.Protocol), model.ContextLength, inMenu, mIndex, model.Name,
-				modelFree, model.Rate, model.RateWas); err != nil {
+				modelFree, model.Rate, model.RateWas, model.ContextOverride); err != nil {
 				return err
 			}
 		}
@@ -1016,7 +1022,7 @@ func (s *Store) loadProviders() ([]domain.Provider, error) {
 }
 
 func (s *Store) loadModels(providerID string) ([]domain.Model, error) {
-	rows, err := s.reader().Query(`SELECT id, protocol, context_length, in_menu, display_name, free, rate, rate_was FROM models WHERE provider_id = ? ORDER BY position, id`, providerID)
+	rows, err := s.reader().Query(`SELECT id, protocol, context_length, in_menu, display_name, free, rate, rate_was, context_override FROM models WHERE provider_id = ? ORDER BY position, id`, providerID)
 	if err != nil {
 		return nil, err
 	}
@@ -1027,7 +1033,7 @@ func (s *Store) loadModels(providerID string) ([]domain.Model, error) {
 		var protocol string
 		var inMenu int
 		var free int
-		if err := rows.Scan(&m.ID, &protocol, &m.ContextLength, &inMenu, &m.Name, &free, &m.Rate, &m.RateWas); err != nil {
+		if err := rows.Scan(&m.ID, &protocol, &m.ContextLength, &inMenu, &m.Name, &free, &m.Rate, &m.RateWas, &m.ContextOverride); err != nil {
 			return nil, err
 		}
 		m.Free = free != 0

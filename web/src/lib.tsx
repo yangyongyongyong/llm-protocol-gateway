@@ -3736,11 +3736,22 @@ export function modelRateLabel(model: Model): { rate: string; was: string } | nu
 }
 
 /**
+ * declaredModelWindow 是模型最终对外宣称的上下文窗口：运维设过就以设的为准，
+ * 否则是厂商规格 / 上游声明算出来的那个数。列表里的数字、筛选和合并都按它走。
+ */
+export function declaredModelWindow(model: Model): number {
+  return model.contextOverride || model.contextLength || 0;
+}
+
+/**
  * modelContextLabel 只在窗口到 1M 及以上、且名字里没写过 M 时给一个短标签：
  * 200K 这类窗口在列表里到处都有，标出来只会淹没真正的大窗口。
+ *
+ * 看的是对外宣称的窗口：一个手动标成 1M 的模型，它底下的自动值还是 128K，
+ * 按自动值判就永远不会出现这个标签。
  */
 export function modelContextLabel(model: Model): string {
-  const context = model.contextLength || 0;
+  const context = declaredModelWindow(model);
   if (context < 1_000_000) return '';
   if (/\b\d+(\.\d+)?m\b/i.test(`${model.id} ${model.name || ''}`)) return '';
   const millions = context / 1_000_000;

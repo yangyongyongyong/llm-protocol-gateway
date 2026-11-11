@@ -5413,6 +5413,38 @@ html[data-theme="dark"] .output-curl-head {
   color: var(--muted);
 }
 
+/* 上下文长度那一格：数字、1M 徽标、「手动」标记和设置按钮挤在一行里。
+   手动标记不能省——设过之后上游再报什么都会被它盖住，运维得一眼看出该去哪里改。 */
+.model-context-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.model-context-value {
+  font-variant-numeric: tabular-nums;
+}
+.model-context-manual {
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--surface-2, transparent);
+  color: var(--text);
+  font-size: 11px;
+  white-space: nowrap;
+}
+/* 「设置」按钮平时收起来，指到那一行才出现：一屏几十个模型，常驻按钮会把
+   数字挤成两行。键盘 focus 时也出现，不至于只有鼠标能用。 */
+.model-context-cell .mini-btn {
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.models-table tr:hover .model-context-cell .mini-btn,
+.model-card:hover .model-context-cell .mini-btn,
+.model-context-cell .mini-btn:focus-visible {
+  opacity: 1;
+}
+
 /* 「获取模型」结果：先给一目了然的价格/窗口概况，再是一张可滚动的紧凑表 */
 .test-result-provider { margin-left: auto; }
 .fetched-model-summary {

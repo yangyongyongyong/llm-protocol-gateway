@@ -449,7 +449,7 @@ func (r *Router) UpdateProvider(providerID string, patch domain.Provider) (domai
 			updated.AuthHeader = strings.TrimSpace(patch.AuthHeader)
 		}
 		if patch.Models != nil {
-			updated.Models = patch.Models
+			updated.Models = carryModelContextOverrides(patch.Models, updated.Models)
 		}
 		if strings.TrimSpace(patch.AuthType) != "" {
 			updated.AuthType = strings.TrimSpace(patch.AuthType)
@@ -2128,6 +2128,88 @@ func dedupeProviderModels(models []domain.Model) []domain.Model {
 	return out
 }
 
+// carryModelContextOverrides 把运维给模型定的上下文窗口带到新的清单上。
+//
+// 窗口是「运维对这个模型的判断」，不是上游属性：目录同步、刷新授权、重新注册
+// 都会整份换掉模型清单，而这些路径都不该把人的话冲掉——冲掉之后那个模型会从
+// 「1M」悄悄退回默认值，界面上看不出发生过什么（magpie 的模型规格同样明说
+// 「任何一项都不会被目录同步碰到」）。清单里已经没有的模型，它的设置也就随之
+// 消失，不另外存档。
+//
+// 要往上写的时候先复制一份：incoming 可能正是调用方从 state 里取出来的那一片
+// （见 peer_upstream.go 拿 provider.Models 回写的路径），就地改会绕过调用方对
+// 那份数据的预期。
+func carryModelContextOverrides(incoming, existing []domain.Model) []domain.Model {
+	if len(incoming) == 0 || len(existing) == 0 {
+		return incoming
+	}
+	overrides := make(map[string]int, len(existing))
+	for _, model := range existing {
+		if model.ContextOverride > 0 {
+			overrides[strings.ToLower(strings.TrimSpace(model.ID))] = model.ContextOverride
+		}
+	}
+	if len(overrides) == 0 {
+		return incoming
+	}
+	out := incoming
+	copied := false
+	for index := range out {
+		if out[index].ContextOverride > 0 {
+			continue
+		}
+		override := overrides[strings.ToLower(strings.TrimSpace(out[index].ID))]
+		if override <= 0 {
+			continue
+		}
+		if !copied {
+			out = append([]domain.Model(nil), incoming...)
+			copied = true
+		}
+		out[index].ContextOverride = override
+	}
+	return out
+}
+
+// SetProviderModelContext 给某个模型定一个上下文窗口，或（n = 0）退回自动。
+//
+// 它有自己的入口而不是走 Provider 的增量 PATCH：那里 int 的零值分不清「没传」
+// 和「清空」，而清空恰恰是这里最要紧的一件事——设错了窗口会让客户端以为还能
+// 塞更多，看不出错在哪。首包超时、并发上限也都是这个理由各走各的。
+func (r *Router) SetProviderModelContext(providerID, modelID string, n int) (domain.Provider, error) {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return domain.Provider{}, fmt.Errorf("model id is required")
+	}
+	if n < 0 || n > maxModelContextOverride {
+		return domain.Provider{}, fmt.Errorf("a context window is between 0 and %d tokens, not %d", maxModelContextOverride, n)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID != providerID {
+			continue
+		}
+		for modelIndex := range r.state.Providers[index].Models {
+			if !strings.EqualFold(strings.TrimSpace(r.state.Providers[index].Models[modelIndex].ID), modelID) {
+				continue
+			}
+			model := &r.state.Providers[index].Models[modelIndex]
+			// 覆盖值只写进 ContextOverride，ContextLength 留着自动值——清空设置
+			// 要能原样退回去（见 fillModelTokenBudgets）。老数据里被写进去过的
+			// 顺手校正回来。
+			model.ContextOverride = n
+			model.ContextLength = resolveModelContextLength(model.ID, model.ContextLength)
+			fillModelTokenBudgets(model)
+			r.rebuildModelsLocked()
+			return r.state.Providers[index], nil
+		}
+		return domain.Provider{}, fmt.Errorf("provider %q has no model %q", providerID, modelID)
+	}
+	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+}
+
 func (r *Router) UpdateProviderModels(providerID string, models []domain.Model, healthStatus string) (domain.Provider, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -2136,7 +2218,7 @@ func (r *Router) UpdateProviderModels(providerID string, models []domain.Model, 
 		if r.state.Providers[index].ID != providerID {
 			continue
 		}
-		models = dedupeProviderModels(models)
+		models = dedupeProviderModels(carryModelContextOverrides(models, r.state.Providers[index].Models))
 		for modelIndex := range models {
 			models[modelIndex].ProviderID = providerID
 			models[modelIndex].Protocol = r.state.Providers[index].Protocol

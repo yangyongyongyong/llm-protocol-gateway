@@ -54,13 +54,14 @@ export default {};
 execFileSync(process.execPath, [
   tsc,
   '--target', 'es2022', '--module', 'es2022', '--moduleResolution', 'bundler',
-  '--jsx', 'react-jsx', '--skipLibCheck', '--ignoreConfig', '--outDir', outDir, join(here, 'lib.tsx'), join(here, 'pollers.ts'), join(here, 'usage_poll.ts')
+  '--jsx', 'react-jsx', '--skipLibCheck', '--ignoreConfig', '--outDir', outDir, join(here, 'lib.tsx'), join(here, 'pollers.ts'), join(here, 'usage_poll.ts'), join(here, 'model_merge.ts')
 ], {cwd: webDir, stdio: 'inherit'});
 const lib = await import(pathToFileURL(join(outDir, 'lib.js')).href);
 // 编译产物里的 import './lib' 没有扩展名，ESM 解析不了：把它补成 './lib.js'。
 writeFileSync(join(outDir, 'pollers.js'), readFileSync(join(outDir, 'pollers.js'), 'utf8').replace("from './lib'", "from './lib.js'"));
 const pollers = await import(pathToFileURL(join(outDir, 'pollers.js')).href);
 const usagePoll = await import(pathToFileURL(join(outDir, 'usage_poll.js')).href);
+const modelMerge = await import(pathToFileURL(join(outDir, 'model_merge.js')).href);
 
 test('cloudflareAuthPollOutcome: 授权成功就收尾，不再等待', () => {
   assert.equal(lib.cloudflareAuthPollOutcome({authorized: true, elapsedMs: 0, timeoutMs: 600000}), 'authorized');
@@ -579,4 +580,52 @@ test('写进本机配置的网关地址：回环 http 或公网 https，绝不�
 
   // 公网但只有 http：Desktop 不接受，仍退回回环，而不是把一个会被拒的地址写进去。
   assert.equal(lib.localAgentGatewayRoot(lan, 'http://gw.example.com'), 'http://127.0.0.1:18093');
+});
+
+// 运维手动设的上下文窗口是「对外宣称的窗口」：模型页的数字、1M 标签、长上下文
+// 筛选和跨账号合并都得按它走。按自动值（contextLength）判的话，一个手动标成
+// 1M、底下的自动值还是 128K 的模型在界面上完全看不出被设过，Claude Desktop
+// 那边却已经按 1M 列出了它。
+test('declaredModelWindow: 设过手动窗口就以它为准', () => {
+  const plain = {id: 'm1', providerId: 'p1', protocol: 'openai_chat', contextLength: 128000, inMenu: true};
+  assert.equal(lib.declaredModelWindow(plain), 128000);
+  assert.equal(lib.modelContextLabel(plain), '', '128K 不该出 1M 标签');
+
+  const pinned = {...plain, contextOverride: 1000000};
+  assert.equal(lib.declaredModelWindow(pinned), 1000000, '手动值压过自动值');
+  assert.equal(lib.modelContextLabel(pinned), '1M', '手动标成 1M 就要出 1M 标签');
+
+  // 名字里已经写了 M 的不再重复标（沿用既有规则）。
+  assert.equal(lib.modelContextLabel({...pinned, id: 'gpt-5.5-1m'}), '');
+  // 清空手动值后回到自动值。
+  assert.equal(lib.declaredModelWindow({...pinned, contextOverride: 0}), 128000);
+});
+
+test('mergeModelsAcrossAccounts: 同名模型按宣称窗口取大的那个', () => {
+  const models = [
+    // 先出现的这个自动值是 128K，但运维手动把它标成了 1M。
+    {id: 'm1', providerId: 'p1', protocol: 'openai_chat', contextLength: 128000, contextOverride: 1000000, inMenu: true},
+    {id: 'm1', providerId: 'p2', protocol: 'openai_chat', contextLength: 200000, inMenu: true},
+  ];
+  const providers = new Map([
+    ['p1', {id: 'p1', name: 'P1'}],
+    ['p2', {id: 'p2', name: 'P2'}],
+  ]);
+  const merged = modelMerge.mergeModelsAcrossAccounts(models, providers);
+  assert.equal(merged.length, 1);
+  assert.equal(lib.declaredModelWindow(merged[0]), 1000000, '手动设的 1M 不能被 200K 的账号盖掉');
+  assert.equal(merged[0].providers.length, 2);
+
+  // 后出现的账号窗口更大：整组值一起搬过去，不能只搬 contextLength 而
+  // 把 contextOverride 留在原地（那会变成「自动值 1M、手动值 128K」）。
+  const swapped = modelMerge.mergeModelsAcrossAccounts(
+    [
+      {id: 'm2', providerId: 'p1', protocol: 'openai_chat', contextLength: 128000, contextOverride: 200000, inMenu: true},
+      {id: 'm2', providerId: 'p2', protocol: 'openai_chat', contextLength: 900000, inMenu: true},
+    ],
+    providers,
+  );
+  assert.equal(swapped.length, 1);
+  assert.equal(swapped[0].contextLength, 900000);
+  assert.equal(swapped[0].contextOverride, 0, '换过来的账号没有手动值，不能留着上一个的');
 });

@@ -85,7 +85,7 @@ func claudeModelAliasEntries(catalog []domain.Model) []map[string]any {
 		if !catalogServesModel(catalog, target) {
 			continue
 		}
-		contextLen := resolveModelContextLength(target, 0)
+		contextLen := catalogModelWindow(catalog, target)
 		entries = append(entries, map[string]any{
 			"id":               alias,
 			"type":             "model",
@@ -96,6 +96,20 @@ func claudeModelAliasEntries(catalog []domain.Model) []map[string]any {
 		})
 	}
 	return entries
+}
+
+// catalogModelWindow 是目录里那个模型的窗口：别名（sonnet → claude-sonnet-5）
+// 要和被指向的模型说自己一样的窗口，包括运维显式设过的那个值。否则同一个
+// 模型按别名问是一个数、按 id 问是另一个数。
+func catalogModelWindow(catalog []domain.Model, model string) int {
+	want := strings.ToLower(strings.TrimSpace(model))
+	for _, item := range catalog {
+		id := strings.ToLower(strings.TrimSpace(item.ID))
+		if id == want || (want != "" && strings.HasSuffix(id, "/"+want)) {
+			return modelWindow(item)
+		}
+	}
+	return resolveModelContextLength(model, 0)
 }
 
 // catalogServesModel reports whether one of the models in the catalog is the
