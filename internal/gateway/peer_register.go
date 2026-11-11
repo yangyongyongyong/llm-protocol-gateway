@@ -42,6 +42,10 @@ type peerRegisterResponse struct {
 	Token string `json:"token"`
 	// GatewayID 回显上游记录的网关身份，方便下游核对注册到了谁身上。
 	GatewayID string `json:"gatewayId"`
+	// ParentGatewayID 是上游自己的网关身份。上面那个 GatewayID 回显的是下游
+	// 自己的身份（上游把你记成了谁），这里回答的是另一个问题：是谁在为你服务。
+	// 下游把它存进授权快照，界面显示出来，运维才能对上"上游那一台"。
+	ParentGatewayID string `json:"parentGatewayId"`
 	// UserID 是上游为这个对端建的账号 ID。下游记下来，排查时能直接对上
 	// 上游用户管理页里的那一行。
 	UserID string `json:"userId"`
@@ -157,8 +161,11 @@ func (s *Server) handlePeerRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	s.logs.AddApp("info", "peer gateway "+verb, fmt.Sprintf("%s (%s) from %s", account.User.Username, gatewayID, requestClientIP(r)))
 	writeJSON(w, http.StatusOK, peerRegisterResponse{
-		Token:              token,
-		GatewayID:          gatewayID,
+		Token:     token,
+		GatewayID: gatewayID,
+		// 上游自己的身份。老版本下游不认这个字段，忽略即可；新版本据此在
+		// 「已连接的上游」里显示对面是哪台机器。
+		ParentGatewayID:    s.GatewayID(),
 		UserID:             account.User.ID,
 		Username:           account.User.Username,
 		GrantedProviderIDs: granted,

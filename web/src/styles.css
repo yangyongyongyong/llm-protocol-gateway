@@ -12890,6 +12890,11 @@ html[data-theme="dark"] .wb-task-badge[data-tone="ok"] { color: #6ee7b7; border-
   font-size: 11px; color: var(--muted);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+/* 账号 / 授权数 / 同步时间是一串短标签：允许换行，不让长串把列撑开。 */
+.peer-upstream-meta {
+  display: flex; flex-wrap: wrap; gap: 4px 10px;
+  margin-top: 2px; font-size: 11px; color: var(--muted);
+}
 .peer-upstream-models { min-width: 0; color: var(--text); overflow-wrap: anywhere; }
 .peer-upstream-actions { display: flex; align-items: center; gap: 6px; justify-content: flex-end; }
 .peer-upstream-actions .mini-btn.danger { color: var(--danger, #dc2626); }

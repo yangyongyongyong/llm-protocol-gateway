@@ -346,11 +346,27 @@ export function PeersPage({
                     {upstream.enabled ? null : <Badge tone="slate">已禁用</Badge>}
                   </div>
                   <div className="peer-upstream-url" title={upstream.parentUrl}>{upstream.parentUrl}</div>
+                  <div className="peer-upstream-meta">
+                    {upstream.peerUsername ? <span>上游账号 {upstream.peerUsername}</span> : null}
+                    {upstream.grantsSynced ? (
+                      <span>上游授权 {upstream.grantCount} 个 Provider</span>
+                    ) : (
+                      <span title="点「测试连接」会重新向上游查询授权清单">授权清单还没同步</span>
+                    )}
+                    {upstream.grantsSyncedAt ? <span>同步于 {formatTime(upstream.grantsSyncedAt)}</span> : null}
+                  </div>
                 </div>
                 <div><Badge tone="blue">{protocolLabel(upstream.protocol)}</Badge></div>
                 <div className="peer-upstream-models">
                   {upstream.models.length === 0 ? (
-                    <span className="hint-text">上游还没授权任何模型</span>
+                    <span className="hint-text">
+                      {!upstream.grantsSynced
+                        ? '还没同步到上游的授权清单'
+                        : upstream.grantCount > 0
+                          // 授权了、但都不是这条链路的协议：说清楚，否则"没模型"看起来像故障。
+                          ? `上游授权了 ${upstream.grantCount} 个 Provider，但其中没有 ${protocolLabel(upstream.protocol)} 的模型`
+                          : '上游还没授权任何模型'}
+                    </span>
                   ) : (
                     <>
                       <span>{upstream.models.slice(0, 3).join('、')}</span>

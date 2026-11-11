@@ -40,8 +40,10 @@ type peerRegistration struct {
 	Username string `json:"username"`
 	// GrantedProviderIDs 是上游最近一次告诉我们的授权清单。
 	GrantedProviderIDs []string `json:"grantedProviderIds"`
-	// GatewayID 是上游自己的网关身份（注册响应里回显的那个是"上游记录的身份"，
-	// 也就是我们自己的 ID；这里记的是上游是谁，用于展示）。
+	// ParentGatewayID 是上游自己的网关身份，即"谁在为我们服务"。
+	//
+	// 注意别和注册响应里的 GatewayID 搞混：那个回显的是本机自己的身份，
+	// 也就是上游把我们记成了谁。两个方向刚好相反。
 	ParentGatewayID string `json:"parentGatewayId"`
 }
 
@@ -130,6 +132,9 @@ func (c *peerClient) register(ctx context.Context, parentURL, selfID, name, user
 		UserID:             response.UserID,
 		Username:           response.Username,
 		GrantedProviderIDs: response.GrantedProviderIDs,
+		// 上游自己的身份，界面显示出来，运维才能核对上游那一侧到底是哪台机器。
+		// 注册响应里的 GatewayID 是本机身份，两个方向别拿反。
+		ParentGatewayID: response.ParentGatewayID,
 	}, nil
 }
 

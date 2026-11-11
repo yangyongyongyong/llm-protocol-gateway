@@ -2153,6 +2153,29 @@ func (r *Router) UpdateProviderModels(providerID string, models []domain.Model, 
 	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
 }
 
+// SetPeerGrants 记下这条链路上游那一侧的授权快照（见 domain.PeerUpstreamGrants）。
+//
+// 它和 UpdateProviderModels 分开，是因为两者由不同的上游响应驱动、更新的频率也
+// 不同：模型清单来自 /__peer/providers，而授权快照还会带上注册响应里的账号信息。
+// 合进 UpdateProvider 更不行——那条路径会清掉凭据（见那里的注释）。
+func (r *Router) SetPeerGrants(providerID string, grants domain.PeerUpstreamGrants) (domain.Provider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID != providerID {
+			continue
+		}
+		// 存一份副本：调用方（注册/刷新）常常还留着入参那片切片，
+		// 让它之后被改到就等于绕过了这里的锁。
+		snapshot := grants
+		snapshot.GrantedProviderIDs = append([]string(nil), grants.GrantedProviderIDs...)
+		r.state.Providers[index].PeerGrants = &snapshot
+		return r.state.Providers[index], nil
+	}
+	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+}
+
 func (r *Router) RouteByID(routeID string) (domain.Route, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

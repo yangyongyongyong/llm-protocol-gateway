@@ -596,6 +596,19 @@ func (s *Store) Load(defaultState domain.GatewayState) (domain.GatewayState, err
 			}
 		}
 	}
+	// 链路授权快照（见 domain.PeerUpstreamGrants）。和 adapter 一样按 provider id
+	// 存在 settings 里，而不是给 providers 表加一列：它是一小块只读的展示状态，
+	// 结构以后可能还得带上游的名字/额度，不值得每改一次就迁移一次表结构。
+	if raw := s.setting("peerUpstreamGrants"); raw != "" {
+		var grants map[string]*domain.PeerUpstreamGrants
+		if err := json.Unmarshal([]byte(raw), &grants); err == nil {
+			for index := range state.Providers {
+				if grant, ok := grants[state.Providers[index].ID]; ok {
+					state.Providers[index].PeerGrants = grant
+				}
+			}
+		}
+	}
 	return state, nil
 }
 
@@ -827,6 +840,19 @@ func (s *Store) Save(state domain.GatewayState) error {
 		return err
 	}
 	if err := setSetting(tx, "providerRequestAdapters", string(adapterRaw)); err != nil {
+		return err
+	}
+	grants := make(map[string]*domain.PeerUpstreamGrants, len(state.Providers))
+	for _, provider := range state.Providers {
+		if provider.PeerGrants != nil {
+			grants[provider.ID] = provider.PeerGrants
+		}
+	}
+	grantsRaw, err := json.Marshal(grants)
+	if err != nil {
+		return err
+	}
+	if err := setSetting(tx, "peerUpstreamGrants", string(grantsRaw)); err != nil {
 		return err
 	}
 	if err := pruneCheckins(tx); err != nil {

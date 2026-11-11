@@ -832,7 +832,20 @@ export type PeerUpstream = {
   healthStatus?: string;
   /** 上游授权、且与本条协议对得上的模型。 */
   models: string[];
+  /**
+   * 上游授权给本机的 provider 个数（不限协议）。它和 models 是两个口径：
+   * 一条链路只说一种协议，所以协议对不上的授权不会出现在 models 里。
+   * grantsSynced 为 false 时这个数是零值，不代表"授权了 0 个"。
+   */
   grantCount: number;
+  /** grantCount 是不是真的问到过上游。false = 还没同步过，别说"0 个"。 */
+  grantsSynced: boolean;
+  /** 授权快照的取得时间（RFC3339）；从未同步过时为空。 */
+  grantsSyncedAt?: string;
+  /** 上游为这台机器建的账号名，对得上上游用户管理页那一行。 */
+  peerUsername?: string;
+  /** 上游网关自己的身份。 */
+  parentGatewayId?: string;
 };
 
 export type PeerUpstreamsResponse = {

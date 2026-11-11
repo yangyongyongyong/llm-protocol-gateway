@@ -165,6 +165,197 @@ func TestPeerUpstreamRefreshKeepsCredential(t *testing.T) {
 	}
 }
 
+// 授权快照要一路走到列表接口上：/__peer-upstreams 的 grantCount 曾经恒为 0，
+// 因为注册时把上游告诉我们的 GrantedProviderIDs 整个丢掉了，列表接口压根没有
+// 数据来源。这条测试盯住整条链——注册落 provider 时存下快照、读出来是几个、
+// 界面拿到的 summary 也是几个。
+func TestPeerUpstreamSummariesReportGrantCount(t *testing.T) {
+	parent := newPeerTestServer(t,
+		domain.Provider{
+			ID: "ds-claude", Name: "ds-claude", Protocol: domain.ProtocolOpenAIChat,
+			BaseURL: "https://parent.example.com",
+			Models:  []domain.Model{{ID: "m1", ProviderID: "ds-claude", Protocol: domain.ProtocolOpenAIChat, InMenu: true}},
+		},
+		domain.Provider{
+			ID: "only-claude", Name: "only-claude", Protocol: domain.ProtocolClaude,
+			BaseURL: "https://parent.example.com",
+			Models:  []domain.Model{{ID: "claude-x", ProviderID: "only-claude", Protocol: domain.ProtocolClaude, InMenu: true}},
+		},
+	)
+	parent.SetGatewayID(otherID)
+	parentHTTP := httptest.NewServer(parent.Handler())
+	defer parentHTTP.Close()
+
+	child := newPeerTestServer(t)
+	child.SetGatewayID(gwID)
+	registration, granted, err := child.registerWithParent(
+		httptest.NewRequest(http.MethodGet, "/__probe", nil),
+		parentHTTP.URL, "vps1", "sub-gw", "a-strong-password", []string{"ds-claude"},
+	)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if len(granted) != 1 || granted[0].ID != "ds-claude" {
+		t.Fatalf("上游应当只授权了 ds-claude：%+v", granted)
+	}
+	created, err := child.createPeerUpstreamProvider(
+		httptest.NewRequest(http.MethodGet, "/__probe", nil), "vps1", domain.ProtocolOpenAIChat, registration, granted,
+	)
+	if err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+
+	summary := child.peerUpstreamSummaryOf(created.ID)
+	if summary.GrantCount != 1 {
+		t.Fatalf("grantCount = %d，注册日志里 granted=1 就该是 1", summary.GrantCount)
+	}
+	if !summary.GrantsSynced {
+		t.Fatal("注册时问到了上游，grantsSynced 必须是 true")
+	}
+	if summary.GrantsSyncedAt == "" {
+		t.Fatal("同步过就必须记下同步时间")
+	}
+	if summary.PeerUsername != registration.Username {
+		t.Fatalf("peerUsername = %q，应当是对上游给本机建的账号 %q", summary.PeerUsername, registration.Username)
+	}
+	if summary.ParentGatewayID != otherID {
+		t.Fatalf("parentGatewayId = %q，应当是上游的身份 %q（注册响应里回显过，却从没被抄下来）",
+			summary.ParentGatewayID, otherID)
+	}
+	// 一条链路只说一种协议：另一个被授权的 claude provider 不进模型清单，
+	// 但它照样算"被授权了"，所以 grantCount 和 models 不相等是对的。
+	if len(summary.Models) != 1 || summary.Models[0] != "m1" {
+		t.Fatalf("models = %v", summary.Models)
+	}
+}
+
+// 从没同步过的链路不能报"授权了 0 个"：那是一个会误导人的结论。列表中它是
+// grantCount=0 + grantsSynced=false，界面据此说「还没同步」。
+func TestPeerUpstreamSummaryDistinguishesNeverSynced(t *testing.T) {
+	server := newPeerTestServer(t, domain.Provider{
+		ID: "vps1", Name: "vps1", Protocol: domain.ProtocolOpenAIChat,
+		AuthType: domain.AuthTypePeer, APIKeySource: "literal:" + peerTokenPrefix + "sometoken",
+		BaseURL: "https://parent.example.com",
+	})
+	summary := server.peerUpstreamSummaryOf("vps1")
+	if summary.GrantCount != 0 {
+		t.Fatalf("grantCount = %d", summary.GrantCount)
+	}
+	if summary.GrantsSynced {
+		t.Fatal("没有快照就是还没问过上游，grantsSynced 必须是 false")
+	}
+	if summary.GrantsSyncedAt != "" {
+		t.Fatalf("没同步过不该有时间：%q", summary.GrantsSyncedAt)
+	}
+}
+
+// granted 为 nil 和空切片是两件事：前者是"没问到上游"，后者是"问到了，答案
+// 是零个"。合并成一个就再也分不出「上游没授权」和「网络挂了」。
+func TestPeerGrantsFromRegistrationNilVersusEmpty(t *testing.T) {
+	registration := peerRegistration{Username: "peer-gw-1", UserID: "u1", ParentGatewayID: "gw_parent"}
+
+	if grants := peerGrantsFromRegistration(registration, nil); grants != nil {
+		t.Fatalf("没问到上游时不该落快照：%+v", grants)
+	}
+
+	grants := peerGrantsFromRegistration(registration, []peerProviderView{})
+	if grants == nil {
+		t.Fatal("问到了、答案是零个，也必须落快照")
+	}
+	if len(grants.GrantedProviderIDs) != 0 {
+		t.Fatalf("grantedProviderIds = %v", grants.GrantedProviderIDs)
+	}
+	if grants.SyncedAt == "" {
+		t.Fatal("问到了就要记下同步时间")
+	}
+	if grants.Username != "peer-gw-1" || grants.UserID != "u1" || grants.ParentGatewayID != "gw_parent" {
+		t.Fatalf("账号信息应当原样保留：%+v", grants)
+	}
+
+	// 授权清单排好序再存：上游响应顺序会变，快照不该跟着抖。
+	ordered := peerGrantsFromRegistration(registration, []peerProviderView{{ID: "b"}, {ID: "a"}, {ID: " "}})
+	if strings.Join(ordered.GrantedProviderIDs, ",") != "a,b" {
+		t.Fatalf("grantedProviderIds = %v", ordered.GrantedProviderIDs)
+	}
+}
+
+// Router 存快照时要拷一份：调用方之后改自己那片切片，不能绕过后台的锁改到
+// 已经"存好"的状态。
+func TestRouterSetPeerGrantsCopiesSlice(t *testing.T) {
+	registry := NewRouter(domain.GatewayState{Providers: []domain.Provider{{
+		ID: "vps1", Name: "vps1", Protocol: domain.ProtocolOpenAIChat,
+		AuthType: domain.AuthTypePeer, BaseURL: "https://parent.example.com",
+	}}})
+	ids := []string{"ds-claude"}
+	if _, err := registry.SetPeerGrants("vps1", domain.PeerUpstreamGrants{GrantedProviderIDs: ids}); err != nil {
+		t.Fatal(err)
+	}
+	ids[0] = "tampered"
+	provider, err := registry.ProviderByID("vps1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider.PeerGrants == nil || len(provider.PeerGrants.GrantedProviderIDs) != 1 ||
+		provider.PeerGrants.GrantedProviderIDs[0] != "ds-claude" {
+		t.Fatalf("存下来的快照被调用方改到了：%+v", provider.PeerGrants)
+	}
+	if _, err := registry.SetPeerGrants("nope", domain.PeerUpstreamGrants{}); err == nil {
+		t.Fatal("不存在的 provider 必须报错")
+	}
+}
+
+// 刷新只重新要授权清单，账号信息不会再来一遍：那份必须从旧快照沿用，
+// 否则一次「测试连接」就会把上游账号名擦掉。
+func TestPeerUpstreamRefreshKeepsAccountIdentity(t *testing.T) {
+	parent := newPeerTestServer(t, domain.Provider{
+		ID: "ds-claude", Name: "ds-claude", Protocol: domain.ProtocolOpenAIChat,
+		BaseURL: "https://parent.example.com",
+		Models:  []domain.Model{{ID: "m1", ProviderID: "ds-claude", Protocol: domain.ProtocolOpenAIChat, InMenu: true}},
+	})
+	parent.SetGatewayID(otherID)
+	parentHTTP := httptest.NewServer(parent.Handler())
+	defer parentHTTP.Close()
+
+	child := newPeerTestServer(t)
+	child.SetGatewayID(gwID)
+	registration, err := newPeerClient().register(
+		t.Context(), parentHTTP.URL, gwID, "vps1", "sub-gw", "a-strong-password", []string{"ds-claude"})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	created, err := child.createPeerUpstreamProvider(
+		httptest.NewRequest(http.MethodGet, "/__probe", nil), "vps1", domain.ProtocolOpenAIChat, registration,
+		[]peerProviderView{{ID: "ds-claude", Protocol: "openai_chat", Models: []string{"m1"}}},
+	)
+	if err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	// 旧快照带着账号信息；上游这边紧接着再被问一次，只会回 provider 清单。
+	if _, err := child.router.SetPeerGrants(created.ID, domain.PeerUpstreamGrants{
+		Username: "peer-gw-sub", UserID: "u-sub", ParentGatewayID: otherID, GrantedProviderIDs: []string{"ds-claude"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/__peer-upstreams/"+created.ID+"/refresh", nil)
+	request.SetPathValue("id", created.ID)
+	request.Host = "127.0.0.1"
+	request.RemoteAddr = "127.0.0.1:40000"
+	recorder := httptest.NewRecorder()
+	child.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	summary := child.peerUpstreamSummaryOf(created.ID)
+	if summary.GrantCount != 1 || !summary.GrantsSynced {
+		t.Fatalf("刷新之后授权数应当是 1：%+v", summary)
+	}
+	if summary.PeerUsername != "peer-gw-sub" || summary.ParentGatewayID != otherID {
+		t.Fatalf("刷新不该擦掉账号信息：%+v", summary)
+	}
+}
+
 // 对端 provider 的「获取模型」不能走 baseUrl + /models：父网关没有那个端点。
 func TestPeerUpstreamFetchModelsUsesProvidersEndpoint(t *testing.T) {
 	parent := newPeerTestServer(t, domain.Provider{

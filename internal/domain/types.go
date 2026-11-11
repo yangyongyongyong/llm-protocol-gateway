@@ -358,6 +358,10 @@ type Provider struct {
 	// matched exactly (case-insensitively) and does not need to name an existing
 	// provider: grouping providers that are not otherwise related is allowed.
 	LaneGroup string `json:"laneGroup,omitempty"`
+	// PeerGrants 是这条链路在上游那一侧的授权快照，只对 AuthType == "peer"
+	// 的 provider 有意义（见 domain.PeerUpstreamGrants）。它只用来显示：
+	// 真实鉴权永远由上游按当下授权决定，本机从不拿这份快照放行任何请求。
+	PeerGrants *PeerUpstreamGrants `json:"peerGrants,omitempty"`
 }
 
 // ProviderSelfRegistration is the server-side state backing the self-register
@@ -373,6 +377,32 @@ type ProviderSelfRegistration struct {
 	// availability/异常 status is driven purely by real proxied-request
 	// failures (see gateway.shouldFailoverProvider), not by heartbeat gaps.
 	LastSeenAt string `json:"lastSeenAt,omitempty"`
+}
+
+// PeerUpstreamGrants 是本机注册到上游网关后，上游那一侧告诉我们的授权状态。
+//
+// 它必须落库，而不是每次现取：界面上「已连接的上游」那一行要显示上游当前
+// 授权了几个 provider，而 /__peer-upstreams 是个纯读接口——每渲染一次就去
+// 打一遍上游，上游慢一点整个控制台就跟着卡，上游挂了更是连自己已经存在哪
+// 都看不见。所以注册/刷新/测试连接拿到清单时顺手存下来，列表只读这份快照。
+//
+// 快照会和上游真实授权渐渐不一致（管理员改了授权但本机没再刷新），所以它
+// 只用于显示，不做任何鉴权判断：每一次真实透传仍由上游按当下授权决定。
+type PeerUpstreamGrants struct {
+	// Username 是上游为这台机器建的账号名（带 peer- 前缀）。排查时能直接
+	// 对上上游用户管理页里的那一行。
+	Username string `json:"username,omitempty"`
+	// UserID 是同一行在上游的账号 ID。
+	UserID string `json:"userId,omitempty"`
+	// ParentGatewayID 是上游网关自己的身份；注册响应里回显的是"上游记录的
+	// 身份"（也就是我们），所以这里存的是谁在为我们服务。
+	ParentGatewayID string `json:"parentGatewayId,omitempty"`
+	// GrantedProviderIDs 是上游最近一次告诉我们的授权清单。为空是真实状态
+	// （上游一个都没授权），不是"未知"——未知由 SyncedAt 为空表示。
+	GrantedProviderIDs []string `json:"grantedProviderIds"`
+	// SyncedAt 是这份快照是什么时候取的（RFC3339）。空 = 从未同步过，
+	// 界面据此区分"确实授权了 0 个"和"还没问过上游"。
+	SyncedAt string `json:"syncedAt,omitempty"`
 }
 
 // RequestAdapter customizes how gateway requests are sent to an upstream

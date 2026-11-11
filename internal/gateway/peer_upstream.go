@@ -51,8 +51,22 @@ type peerUpstreamSummary struct {
 	HealthStatus string `json:"healthStatus,omitempty"`
 	// Models 是上游授权、且与本条协议对得上的模型。
 	Models []string `json:"models"`
-	// GrantCount 是上游当前授权给本机的 provider 个数。
+	// GrantCount 是上游授权给本机的 provider 个数（不限协议）。
+	//
+	// 它和 Models 是两个口径：一条链路只说一种协议，所以协议对不上的授权
+	// provider 不会出现在 Models 里，但它们确实被授权了。界面要能告诉运维
+	// 「上游授权了 3 个，其中 1 个是本协议的」，靠的就是这两个数的差。
 	GrantCount int `json:"grantCount"`
+	// GrantsSynced 表示 GrantCount 是不是真的问到过上游。false 时它是零值，
+	// 界面要显示「还没同步」而不是「授权了 0 个」——后者是一个会误导人的
+	// 结论。老数据（升级前注册的链路）就是 false，点一次「测试连接」即可。
+	GrantsSynced bool `json:"grantsSynced"`
+	// GrantsSyncedAt 是这份授权快照的取得时间（RFC3339）；从未同步过时为空。
+	GrantsSyncedAt string `json:"grantsSyncedAt,omitempty"`
+	// PeerUsername / ParentGatewayID 是上游那一侧的身份：排查时能直接对上
+	// 上游用户管理页里的那一行。
+	PeerUsername    string `json:"peerUsername,omitempty"`
+	ParentGatewayID string `json:"parentGatewayId,omitempty"`
 }
 
 // peerProtocolChoices 是这条链路能说的协议，和网关对外的三种端点一致。
@@ -108,6 +122,16 @@ func (s *Server) peerUpstreamSummaries() []peerUpstreamSummary {
 			Enabled:      !provider.Disabled,
 			HealthStatus: provider.HealthStatus,
 			Models:       []string{},
+		}
+		// 授权快照是注册/刷新时存下来的（见 domain.PeerUpstreamGrants）。
+		// 没有快照 = 还没问过上游，GrantCount 保持 0 但 GrantsSynced 是 false，
+		// 界面据此说「还没同步」而不是「授权了 0 个」。
+		if grants := provider.PeerGrants; grants != nil {
+			summary.GrantCount = len(grants.GrantedProviderIDs)
+			summary.GrantsSynced = true
+			summary.GrantsSyncedAt = grants.SyncedAt
+			summary.PeerUsername = grants.Username
+			summary.ParentGatewayID = grants.ParentGatewayID
 		}
 		for _, model := range state.Models {
 			if model.ProviderID == provider.ID && strings.TrimSpace(model.ID) != "" {
@@ -227,6 +251,9 @@ func (s *Server) createPeerUpstreamProvider(r *http.Request, name string, protoc
 		AuthType:     domain.AuthTypePeer,
 		Models:       models,
 		HealthStatus: "healthy",
+		// 注册这一刻拿到的授权状态得存下来：列表接口要显示「上游授权了几个
+		// provider」，而它是个纯读接口，不能每渲染一次就去打一遍上游。
+		PeerGrants: peerGrantsFromRegistration(registration, granted),
 	}
 	// 默认模型只是给"客户端不带 model"的情形兜一个底，不强制：注册时上游
 	// 授权了哪些模型就挑第一个，一个都没有就留空。
@@ -237,6 +264,44 @@ func (s *Server) createPeerUpstreamProvider(r *http.Request, name string, protoc
 		provider.OwnerUserID = p.UserID
 	}
 	return s.router.AddProvider(provider)
+}
+
+// peerRegistrationFromProvider 从已存的 provider 还原注册记录里那些不随
+// 刷新变化的字段（账号名 / 账号 ID / 上游身份）。刷新只重新要授权清单，
+// 不会再拿到一遍账号信息，所以沿用注册时存下的那份。
+func peerRegistrationFromProvider(provider domain.Provider) peerRegistration {
+	registration := peerRegistration{ParentURL: resolvePeerParentURL(provider), Token: peerUpstreamToken(provider)}
+	if grants := provider.PeerGrants; grants != nil {
+		registration.Username = grants.Username
+		registration.UserID = grants.UserID
+		registration.ParentGatewayID = grants.ParentGatewayID
+	}
+	return registration
+}
+
+// peerGrantsFromRegistration 把注册/刷新拿到的东西折成要落库的授权快照。
+//
+// granted 为 nil 表示"没问到上游"（注册时取清单失败，见 registerWithParent），
+// 这时 SyncedAt 留空，界面才能把「上游确实一个都没授权」和「还没问过」分开。
+// 空切片则是真实答案：问到了，答案是零个。
+func peerGrantsFromRegistration(registration peerRegistration, granted []peerProviderView) *domain.PeerUpstreamGrants {
+	if granted == nil {
+		return nil
+	}
+	ids := make([]string, 0, len(granted))
+	for _, view := range granted {
+		if id := strings.TrimSpace(view.ID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return &domain.PeerUpstreamGrants{
+		Username:           registration.Username,
+		UserID:             registration.UserID,
+		ParentGatewayID:    registration.ParentGatewayID,
+		GrantedProviderIDs: ids,
+		SyncedAt:           time.Now().UTC().Format(time.RFC3339),
+	}
 }
 
 // peerModelsForProtocol 从上游的授权清单里挑出与本条协议对得上的模型。
@@ -327,6 +392,18 @@ func (s *Server) handleRefreshPeerUpstream(w http.ResponseWriter, r *http.Reques
 		writeOpenAIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// 授权快照一起更新：这次确实问到了上游，所以「授权了 0 个」从此是个
+	// 可信的结论，而不是还没问过。注册时记下的账号信息沿用旧值，本次响应
+	// 里没有它们。
+	//
+	// granted 仍可能是 nil（上游回了 "providers": null），那说明这次其实也
+	// 没问到，快照保持原样——不能拿它当"授权了 0 个"。
+	if grants := peerGrantsFromRegistration(peerRegistrationFromProvider(provider), granted); grants != nil {
+		if _, err := s.router.SetPeerGrants(provider.ID, *grants); err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
 	if err := s.saveState(); err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
 		return
@@ -381,6 +458,13 @@ func (s *Server) handleReconnectPeerUpstream(w http.ResponseWriter, r *http.Requ
 	if _, err := s.router.UpdateProviderModels(provider.ID, models, "healthy"); err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	// 重新注册换了一把凭据，也重新问到了授权清单和账号信息：整份快照刷新。
+	if grants := peerGrantsFromRegistration(registration, granted); grants != nil {
+		if _, err := s.router.SetPeerGrants(provider.ID, *grants); err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	if err := s.saveState(); err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
