@@ -13175,40 +13175,39 @@ html[data-theme="dark"] .wb-task-badge[data-tone="ok"] { color: #6ee7b7; border-
 .log-waterfall-note b { color: var(--text-strong); font-weight: 600; }
 
 /* ----------------------------------------------------------------
-   输入 Provider 页：连接方式 / 排序下拉 + 「需要处理」状态带
-   连接方式原来是 16 枚同形胶囊，把后端枚举直接铺在了界面上；收成一个
-   带标签的下拉后，横向空间固定、键盘可达、当前值一眼可见。
+   输入 Provider 页：排序分段控件 + 「需要处理」状态带
+
+   连接方式那一排保留带品牌图标的胶囊——它是这页最有辨识度的部分（一眼认厂商）。
+   上一版把它换成原生 <select> 是个错误：丢了品牌图标、标签还被截断，而且通栏宽度
+   让排序换行，比原来更高。这里只把「排序」做成紧凑分段控件：与胶囊同高、同圆角，
+   不额外占行。
    ---------------------------------------------------------------- */
-.providers-connect-select {
-  display: inline-flex; align-items: center; gap: 6px;
-  min-width: 0; max-width: 100%;
-  padding: 2px 8px 2px 10px;
+.providers-sort-toggle {
+  display: inline-flex; align-items: center; gap: 2px;
+  flex: 0 0 auto;
+  padding: 2px;
   border: 1px solid var(--border);
   border-radius: 999px;
-  background: var(--surface);
+  background: var(--surface-soft);
 }
-.providers-connect-select-label {
-  flex: none;
+.providers-sort-toggle-label {
+  padding: 0 6px 0 8px;
   font-size: var(--fs-sm); font-weight: 600; color: var(--muted);
   white-space: nowrap;
 }
-.providers-connect-select select {
-  min-width: 0; max-width: 220px;
-  height: 26px; padding: 0 22px 0 2px;
-  border: 0; background: transparent; color: var(--text);
-  font-size: var(--fs-base); font-weight: 600;
-  cursor: pointer;
-}
-.providers-connect-select select:focus-visible { outline-offset: 0; border-radius: var(--r-xs); }
-.providers-connect-select-clear {
-  flex: none;
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 18px; height: 18px; padding: 0;
+.providers-sort-btn {
+  height: 24px; padding: 0 10px;
   border: 0; border-radius: 999px;
-  background: var(--slate-soft); color: var(--muted);
-  font-size: var(--fs-xs); line-height: 1; cursor: pointer;
+  background: transparent; color: var(--muted);
+  font-size: var(--fs-sm); font-weight: 600;
+  white-space: nowrap; cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
 }
-.providers-connect-select-clear:hover { color: var(--red-text); background: var(--red-soft); }
+.providers-sort-btn:hover { color: var(--text); }
+.providers-sort-btn.active {
+  background: var(--surface); color: var(--text);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+}
 
 /* 「需要处理」：把异常与已停用的数量提到网格上方，点一下即筛。
    这页要回答的是「哪个上游要出事了」，不该让人从 38 张等权卡片里自己找。 */

@@ -5604,58 +5604,56 @@ function App() {
                     </button>
                   ) : null}
                   {(() => {
-                    // 连接方式：只列真的配了的。这里原先铺成 16 枚同形胶囊（带计数与
-                    // 品牌图标），把「后端枚举」直接变成了界面控件：决策点从 4 个跳到
-                    // 16 个，其中 7 对只差一个后缀（Qoder / Qoder CN、WorkBuddy /
-                    // WorkBuddy AI…），每次进来都要重读一遍。改成带标签的下拉：一个控件、
-                    // 键盘可达、当前值一眼可见，枚举多长都不再占用横向空间。
+                    // 连接方式：带品牌图标 + 计数的胶囊。
+                    // 上一版我把它换成了原生 <select>「降低决策点」——那是错的：这一排
+                    // 图标是这页最有辨识度的地方（一眼认厂商），换成灰下拉后既丢了品牌，
+                    // 排序还因为通栏宽度换行、比原来更高。恢复胶囊；「决策点太多」的问题
+                    // 交给搜索框（已支持名称/ID/地址/创建者）与状态胶囊，不再靠砍掉图标解决。
                     const counts = new Map<string, number>();
                     for (const provider of sortedProviders) {
                       const kind = providerConnectKind(provider);
                       counts.set(kind, (counts.get(kind) || 0) + 1);
                     }
                     const visible = PROVIDER_CONNECT_FILTERS.filter((item) => item.id === '' || (counts.get(item.id) || 0) > 0);
-                    const current = visible.find((item) => item.id === providersConnectFilter);
-                    return (
-                      <label className="providers-connect-select" title="按连接方式筛选">
-                        <span className="providers-connect-select-label">连接方式</span>
-                        <select
-                          value={providersConnectFilter}
-                          onChange={(event) => setProvidersConnectFilter(event.target.value as '' | ProviderConnectKind)}
+                    return visible.map((item) => {
+                      const icon = providerConnectIcon(item.id);
+                      const count = item.id === '' ? sortedProviders.length : (counts.get(item.id) || 0);
+                      return (
+                        <button
+                          key={item.id || 'all'}
+                          type="button"
+                          className={`models-filter-chip${icon ? ' with-icon' : ''} ${providersConnectFilter === item.id ? 'active' : ''}`}
+                          onClick={() => setProvidersConnectFilter(item.id)}
+                          title={`${item.label}（${count}）`}
                         >
-                          {visible.map((item) => {
-                            const count = item.id === '' ? sortedProviders.length : (counts.get(item.id) || 0);
-                            return (
-                              <option key={item.id || 'all'} value={item.id}>
-                                {item.label}（{count}）
-                              </option>
-                            );
-                          })}
-                        </select>
-                        {current && current.id !== '' ? (
-                          <button
-                            type="button"
-                            className="providers-connect-select-clear"
-                            onClick={() => setProvidersConnectFilter('')}
-                            title="清除连接方式筛选"
-                          >✕</button>
-                        ) : null}
-                      </label>
-                    );
+                          {icon ? <BrandIcon icon={icon} name={item.label} size={14} /> : null}
+                          <span>{item.label}</span>
+                          <span className="models-filter-chip-count">({count})</span>
+                        </button>
+                      );
+                    });
                   })()}
-                  {/* 排序口径：默认「近 3 日请求量」，但顺序必须能被看见、能被改。
-                      原先只有排序结果，没有任何控件说明它按什么排。 */}
-                  <label className="providers-connect-select" title="列表排序口径">
-                    <span className="providers-connect-select-label">排序</span>
-                    <select
-                      value={providersSortMode}
-                      onChange={(event) => setProvidersSortMode(event.target.value as 'requests' | 'name' | 'status')}
-                    >
-                      <option value="requests">近 3 日请求量</option>
-                      <option value="status">状态（异常优先）</option>
-                      <option value="name">名称</option>
-                    </select>
-                  </label>
+                  {/* 排序：紧凑分段控件，跟胶囊同高同形，不占第二行。
+                      排序口径此前完全不可见，也没有控件能改。 */}
+                  <span className="providers-sort-toggle" role="group" aria-label="列表排序">
+                    <span className="providers-sort-toggle-label">排序</span>
+                    {([
+                      ['requests', '请求量'],
+                      ['status', '异常优先'],
+                      ['name', '名称'],
+                    ] as const).map(([value, label]) => (
+                      <button
+                        key={value}
+                        type="button"
+                        className={`providers-sort-btn${providersSortMode === value ? ' active' : ''}`}
+                        aria-pressed={providersSortMode === value}
+                        onClick={() => setProvidersSortMode(value)}
+                        title={value === 'requests' ? '按近 3 日请求量降序（卡片页脚显示该数值）' : value === 'status' ? '把异常待试与已停用排到前面' : '按名称排序'}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </span>
                 </div>
                 {isNormalUser || !canDo('providers.create') ? (
                   <div className="models-toolbar-meta">
