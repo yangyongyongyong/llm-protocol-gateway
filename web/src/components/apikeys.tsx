@@ -671,7 +671,6 @@ export function ApiKeyFallbackProvidersModal({
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const [showModels, setShowModels] = useState(false);
   const selectedProviders = orderedIds
     .map((id) => candidates.find((item) => item.id === id))
     .filter((item): item is Provider => Boolean(item));
@@ -776,32 +775,28 @@ export function ApiKeyFallbackProvidersModal({
               selectedIds={orderedIds}
               sameProtocol={sameProtocol}
               onChange={applyChain}
-            />
-            {/* 模型替换收进一个折叠区：多数情况下留空即可，默认不展开能省掉
-                一大块表单；跨协议只影响协议转换，不再强制用户选模型。 */}
-            {selectedProviders.length > 0 ? (
-              <details
-                className="api-key-fallback-models"
-                open={showModels}
-                onToggle={(event) => setShowModels((event.currentTarget as HTMLDetailsElement).open)}
-              >
-                <summary>
-                  <span>固定模型替换（可选）</span>
-                  <span className="api-key-fallback-models-note">
-                    {crossProtocolProviders.length > 0
-                      ? `${crossProtocolProviders.length} 个跨协议备选会自动转换协议`
-                      : '留空时自动沿用请求模型或 Provider 默认模型'}
-                  </span>
-                </summary>
-                <div className="api-key-fallback-models-list">
+              thirdColumn={selectedProviders.length > 0 ? (
+                // 固定模型替换作为第三列，和「可选 / 备选链」并排。
+                // 它原来是双栏下面另起的一段（还带折叠 + 自己的滚动），于是页面上出现
+                // 两个上下堆着的大下拉，再加第二个滚轮。并排之后：同一行读「选谁 →
+                // 谁先 → 每台用哪个模型」，是同一件事的三个面，不用来回上下找。
+                <section className="fpp-col" aria-label="固定模型替换">
+                  <header className="fpp-col-head">
+                    <span className="fpp-col-title">固定模型替换</span>
+                    <span className="fpp-col-count">{selectedProviders.length}</span>
+                    <span className="api-key-fallback-models-note">
+                      {crossProtocolProviders.length > 0
+                        ? `${crossProtocolProviders.length} 个跨协议会自动转换`
+                        : '留空 = 自动'}
+                    </span>
+                  </header>
                   {selectedProviders.length > 1 ? (
-                    <div className="api-key-fallback-models-batch">
-                      <span className="api-key-fallback-models-batch-label">批量</span>
+                    <div className="api-key-fallback-models-bulk">
                       <SearchableModelSelect
                         value={batchModel}
                         models={batchModels}
                         disabled={busy || saving}
-                        emptyLabel="选一个模型…"
+                        emptyLabel="批量设为…"
                         onChange={(value) => { setBatchModel(value); setBatchNotice(''); }}
                       />
                       <button
@@ -809,7 +804,7 @@ export function ApiKeyFallbackProvidersModal({
                         type="button"
                         disabled={busy || saving || !batchModel.trim()}
                         onClick={applyBatchModel}
-                        title="把选中的模型写给下面每一个有此模型的备选"
+                        title="把选中的模型写给每一个有此模型的备选"
                       >
                         应用到全部
                       </button>
@@ -820,51 +815,46 @@ export function ApiKeyFallbackProvidersModal({
                         onClick={clearAllOverrides}
                         title="清掉所有固定模型，全部改为自动"
                       >
-                        全部留空
+                        留空
                       </button>
-                      <span className="api-key-fallback-models-batch-hint" title={batchNotice || undefined}>
-                        {batchNotice || `${selectedProviders.length} 个备选 · 只写给有此模型的`}
-                      </span>
                     </div>
                   ) : null}
-                  {selectedProviders.map((provider) => {
-                    const providerModels = models.filter((model) => model.providerId === provider.id);
-                    const crossProtocol = !sameProtocol(provider);
-                    const chosen = (overrides[provider.id] || '').trim();
-                    // 单行三列：Provider 名 / 模型下拉 / 刷新。
-                    // 原先每行是「名字一行 + 下拉一行 + 刷新按钮飘在右边」，一行占两行高，
-                    // 220px 的滚动区只看得见两条半；跨协议说明还再占第三行。现在收成一行，
-                    // 列宽固定后下拉彼此对齐，同屏能看全大半张清单。
-                    // 跨协议那句话进 title：它只在「未固定模型」时才有意义，不该常驻占行。
-                    const rowHint = crossProtocol
-                      ? (chosen ? '跨协议备选：网关会自动转换协议' : '跨协议备选：不固定模型时使用请求模型或该 Provider 默认模型（网关自动转换协议）')
-                      : (chosen ? `固定使用 ${chosen}` : '留空时沿用请求模型或该 Provider 默认模型');
-                    return (
-                      <div className="api-key-fallback-models-row" key={provider.id} title={rowHint}>
-                        <ProviderLabel provider={provider} size={16} />
-                        <SearchableModelSelect
-                          value={overrides[provider.id] || ''}
-                          models={providerModels}
-                          disabled={busy || saving}
-                          emptyLabel="自动（沿用请求模型）"
-                          onChange={(value) => setProviderModel(provider.id, value)}
-                        />
-                        <button
-                          className="icon-btn"
-                          type="button"
-                          disabled={busy || saving || testingProviderID === provider.id}
-                          onClick={() => void onRefreshModels(provider.id, provider.name)}
-                          title="刷新该 Provider 的模型列表"
-                          aria-label="刷新该 Provider 的模型列表"
-                        >
-                          {testingProviderID === provider.id ? '…' : '↻'}
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-              </details>
-            ) : null}
+                  {batchNotice ? <div className="api-key-fallback-models-notice">{batchNotice}</div> : null}
+                  <div className="api-key-fallback-models-list">
+                    {selectedProviders.map((provider) => {
+                      const providerModels = models.filter((model) => model.providerId === provider.id);
+                      const crossProtocol = !sameProtocol(provider);
+                      const chosen = (overrides[provider.id] || '').trim();
+                      const rowHint = crossProtocol
+                        ? (chosen ? '跨协议备选：网关会自动转换协议' : '跨协议备选：不固定模型时使用请求模型或该 Provider 默认模型（网关自动转换协议）')
+                        : (chosen ? `固定使用 ${chosen}` : '留空时沿用请求模型或该 Provider 默认模型');
+                      return (
+                        <div className="api-key-fallback-models-row" key={provider.id} title={rowHint}>
+                          <ProviderLabel provider={provider} size={16} />
+                          <SearchableModelSelect
+                            value={overrides[provider.id] || ''}
+                            models={providerModels}
+                            disabled={busy || saving}
+                            emptyLabel="自动"
+                            onChange={(value) => setProviderModel(provider.id, value)}
+                          />
+                          <button
+                            className="icon-btn"
+                            type="button"
+                            disabled={busy || saving || testingProviderID === provider.id}
+                            onClick={() => void onRefreshModels(provider.id, provider.name)}
+                            title="刷新该 Provider 的模型列表"
+                            aria-label="刷新该 Provider 的模型列表"
+                          >
+                            {testingProviderID === provider.id ? '…' : '↻'}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </section>
+              ) : null}
+            />
           </>
         )}
         {error ? <div className="hint-line error">{error}</div> : null}

@@ -88,12 +88,17 @@ function ProviderRowFace({provider}: {provider: Provider}) {
  * 排序用指针拖拽（与备选流水线同一套手感：按下后移动超过 4px 才算拖），另外
  * 保留 ↑/↓ 键盘路径——拖动对触屏和键盘都不友好。
  */
-export function FallbackProviderPicker({providers, selectedIds, sameProtocol, onChange}: {
+export function FallbackProviderPicker({providers, selectedIds, sameProtocol, onChange, thirdColumn}: {
   providers: Provider[];
   selectedIds: string[];
   /** 判断备选与首选是否同协议；跨协议由网关自动转换，不强制锁定模型。 */
   sameProtocol: (provider: Provider) => boolean;
   onChange: (next: string[]) => void;
+  /**
+   * 第三列（可选）。调用方用它把「固定模型替换」放进同一行，而不是在双栏下面再叠
+   * 一大块——上下叠起来时页面上会出现两个一模一样的大下拉，还得再附一个滚轮。
+   */
+  thirdColumn?: React.ReactNode;
 }) {
   const [query, setQuery] = React.useState('');
   const [brand, setBrand] = React.useState('');
@@ -382,6 +387,7 @@ export function FallbackProviderPicker({providers, selectedIds, sameProtocol, on
             </button>
           </footer>
         </section>
+        {thirdColumn}
       </div>
     </div>
   );

@@ -2007,7 +2007,7 @@ html[data-theme="dark"] .models-search-input { background-image: url("data:image
 .fpp-chip-count { color: var(--subtle); font-family: var(--mono); font-size: var(--fs-xs); }
 .fpp-chip.active .fpp-chip-count { color: var(--accent-strong); }
 
-.fpp-cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; align-items: stretch; }
+.fpp-cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.05fr); gap: 12px; align-items: stretch; }
 /* 窄屏上下排，免得两栏都挤成省略号。 */
 @media (max-width: 720px) { .fpp-cols { grid-template-columns: 1fr; } }
 .fpp-col {
@@ -2034,7 +2034,7 @@ html[data-theme="dark"] .models-search-input { background-image: url("data:image
   font: inherit; font-size: var(--fs-sm); font-weight: 600; cursor: pointer;
 }
 .fpp-link:disabled { color: var(--subtle); cursor: default; }
-.fpp-list { flex: 1 1 auto; min-height: 180px; max-height: 320px; overflow: auto; padding: 4px; display: grid; align-content: start; gap: 2px; }
+.fpp-list { flex: 1 1 auto; min-height: 0; padding: 4px; display: grid; align-content: start; gap: 2px; }
 .fpp-empty { padding: 28px 12px; color: var(--muted); font-size: var(--fs-base); text-align: center; line-height: 1.5; }
 .fpp-row {
   display: flex; align-items: center; gap: 6px;
@@ -2121,39 +2121,38 @@ body.fpp-dragging, body.fpp-dragging * { cursor: grabbing !important; user-selec
 .fpp-batch:disabled { opacity: 0.45; cursor: default; }
 
 /* 固定模型替换：默认收起，给选择器让出竖向空间。 */
-.api-key-fallback-models {
-  border: 1px solid var(--border); border-radius: var(--r-md);
-  background: var(--surface);
-}
-.api-key-fallback-models > summary {
-  display: flex; align-items: center; gap: 8px;
-  padding: 7px 10px; cursor: pointer; list-style: none;
-  font-size: var(--fs-base); font-weight: 600; color: var(--text-muted);
-}
-.api-key-fallback-models > summary::-webkit-details-marker { display: none; }
-.api-key-fallback-models > summary::before {
-  content: ""; flex: 0 0 auto;
-  width: 0; height: 0;
-  border-left: 4px solid var(--subtle);
-  border-top: 3.5px solid transparent;
-  border-bottom: 3.5px solid transparent;
-  transition: transform 0.16s ease;
-}
-.api-key-fallback-models[open] > summary::before { transform: rotate(90deg); }
-.api-key-fallback-models[open] > summary { border-bottom: 1px solid var(--border); background: var(--surface-soft); }
-.api-key-fallback-models-note { color: var(--subtle); font-weight: 500; font-size: var(--fs-sm); }
+/* 固定模型替换：现在是「可选 / 备选链」旁边的第三列（.fpp-col），不再是双栏下面
+   另起的一段折叠区。旧的 details/summary 样式随之作废——保留 .note 与 .missing 两个
+   仍在用的修饰类。 */
+.api-key-fallback-models-note { color: var(--subtle); font-weight: 500; font-size: var(--fs-sm); margin-left: auto; }
 .api-key-fallback-models-missing {
   margin-left: auto; padding: 0 6px; height: 17px;
   display: inline-flex; align-items: center;
   border-radius: 999px; background: var(--red-soft); color: var(--red-text);
   font-size: var(--fs-xs); font-weight: 700;
 }
+/* 列内不再有自己的滚动：整张弹窗只留一个滚轮（列表去掉了 max-height/overflow）。
+   列内三段：批量条（固定）/ 结果提示 / 行列表（可伸展）。 */
+.api-key-fallback-models-bulk {
+  display: flex; align-items: center; gap: 6px; min-width: 0;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-soft);
+}
+.api-key-fallback-models-bulk > .searchable-select,
+.api-key-fallback-models-bulk > *:first-child { flex: 1 1 auto; min-width: 0; }
+.api-key-fallback-models-bulk .mini-btn { flex: none; }
+.api-key-fallback-models-notice {
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted); font-size: var(--fs-sm); line-height: 1.45;
+}
 /* 固定模型替换：一行一个备选的三列表格。
    原先每行是「Provider 名一行 + 模型下拉一行 + 刷新按钮飘在右下」，一行占两行高，
    220px 的滚动区只看得见两条半；跨协议说明还会再占第三行。现在按列对齐：
    名字（可截断） / 下拉（吃掉剩余宽度） / 刷新图标，一行 ~34px，同屏能看八条。
    滚动区同步加高，让「备选多」这件事靠滚动解决，而不是靠一屏只显示两条。 */
-.api-key-fallback-models-list { display: grid; gap: 4px; padding: 8px 10px; max-height: 320px; overflow: auto; }
+.api-key-fallback-models-list { flex: 1 1 auto; display: grid; gap: 4px; padding: 6px 8px; align-content: start; min-height: 0; }
 .api-key-fallback-models-row {
   display: grid;
   grid-template-columns: minmax(120px, 0.9fr) minmax(0, 1.6fr) auto;
@@ -2165,29 +2164,6 @@ body.fpp-dragging, body.fpp-dragging * { cursor: grabbing !important; user-selec
 .api-key-fallback-models-row > .provider-label,
 .api-key-fallback-models-row > *:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .api-key-fallback-models-row .icon-btn { width: 26px; height: 26px; flex: none; }
-/* 批量条：单行。备选一多（同一家 N 个账号 = N 行下拉），逐个点等于把同一件事做 N 遍；
-   但它自己不能再占两三行，所以只留「批量 / 下拉 / 应用 / 清空」一行，说明进 title。 */
-.api-key-fallback-models-batch {
-  position: sticky; top: -8px; z-index: 1;
-  display: flex; align-items: center; gap: 8px; min-width: 0;
-  margin: -8px -10px 4px;
-  padding: 7px 10px;
-  background: var(--surface-soft);
-  border-bottom: 1px solid var(--border);
-}
-.api-key-fallback-models-batch-label {
-  flex: none;
-  font-size: var(--fs-sm); font-weight: 700; color: var(--muted);
-  letter-spacing: 0.02em;
-}
-.api-key-fallback-models-batch > .searchable-select,
-.api-key-fallback-models-batch > *:nth-child(2) { flex: 1 1 auto; min-width: 0; max-width: 320px; }
-.api-key-fallback-models-batch .mini-btn { flex: none; }
-.api-key-fallback-models-batch-hint {
-  flex: 1 1 auto; min-width: 0;
-  font-size: var(--fs-sm); color: var(--subtle);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
 .api-key-fallback-summary-text { margin-right: auto; color: var(--subtle); font-size: var(--fs-sm); }
 
 .api-key-fallback-list { display: grid; gap: 8px; max-height: 360px; overflow: auto; padding-right: 4px; }
