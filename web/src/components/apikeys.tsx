@@ -756,9 +756,9 @@ export function ApiKeyFallbackProvidersModal({
   return (
     <Modal
       title="配置备选 Provider"
-      description="左边挑 Provider，右边是降级顺序（#1 最先试）。同协议直接转发，跨协议由网关自动转换；固定模型是可选项，留空时自动沿用请求模型或使用该 Provider 的默认模型。"
+      description="左侧挑选要串进降级链的 Provider（#1 最先试），中间是当前顺序，右侧给每个备选固定模型（可选）。同协议直接转发，跨协议由网关自动转换；固定模型留空时自动沿用请求模型或该 Provider 的默认模型。"
       onClose={onClose}
-      size="wide"
+      size="xwide"
     >
       <div className="api-key-fallback-modal">
         {staleCount > 0 ? (

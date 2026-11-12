@@ -512,7 +512,7 @@ export function ensureModalEscapeListener() {
   });
 }
 
-export function Modal({ title, description, children, onClose, size = 'default', blocking = true }: { title: string; description: string; children: React.ReactNode; onClose: () => void; size?: 'default' | 'wide'; blocking?: boolean }) {
+export function Modal({ title, description, children, onClose, size = 'default', blocking = true }: { title: string; description: string; children: React.ReactNode; onClose: () => void; size?: 'default' | 'wide' | 'xwide'; blocking?: boolean }) {
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
   const layerRef = useRef<{ id: number; zIndex: number } | null>(null);
@@ -603,7 +603,7 @@ export function Modal({ title, description, children, onClose, size = 'default',
     >
       <div
         ref={cardRef}
-        className={`modal-card${size === 'wide' ? ' wide' : ''}`}
+        className={`modal-card${size === 'wide' ? ' wide' : ''}${size === 'xwide' ? ' xwide' : ''}`}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleID.current}

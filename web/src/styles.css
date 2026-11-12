@@ -2007,14 +2007,31 @@ html[data-theme="dark"] .models-search-input { background-image: url("data:image
 .fpp-chip-count { color: var(--subtle); font-family: var(--mono); font-size: var(--fs-xs); }
 .fpp-chip.active .fpp-chip-count { color: var(--accent-strong); }
 
-.fpp-cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.05fr); gap: 12px; align-items: stretch; }
+/* 三栏并排，并且**这一块自己限高、自己滚动**。
+   之前两个极端都不对：
+     · 最初每栏各带 max-height:320px + 另有弹窗滚动 → 屏幕上同时出现几个滚轮；
+     · 上一版把内层滚动全删掉 → 48 个可选 Provider 把弹窗顶到 1200px 长。
+   现在只留一个滚动口：.fpp-cols 限高 + overflow-y:auto，三栏跟着一起滚；栏头 sticky
+   钉住，滚动时仍知道自己在看哪一栏，整张弹窗因此不再需要滚动。
+   注意 .fpp-col 的 overflow 必须是 visible —— 祖先带 hidden 会让 sticky 失效。 */
+.fpp-cols {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.05fr);
+  gap: 12px; align-items: stretch;
+  max-height: min(58vh, 560px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 2px;
+}
 /* 窄屏上下排，免得两栏都挤成省略号。 */
-@media (max-width: 720px) { .fpp-cols { grid-template-columns: 1fr; } }
+@media (max-width: 720px) { .fpp-cols { grid-template-columns: 1fr; max-height: min(62vh, 560px); } }
 .fpp-col {
   display: flex; flex-direction: column; min-width: 0;
   border: 1px solid var(--border); border-radius: var(--r-md);
-  background: var(--surface); overflow: hidden;
+  background: var(--surface); overflow: visible;
 }
+/* 栏头/栏脚钉在滚动容器上：滚到第 30 行时仍看得见「可选 Provider 48」和底部批量按钮。 */
+.fpp-col-head { position: sticky; top: 0; z-index: 2; }
+.fpp-col-foot { position: sticky; bottom: 0; z-index: 2; }
 .fpp-col-head {
   display: flex; align-items: center; gap: 8px;
   padding: 7px 10px;
@@ -3911,6 +3928,10 @@ details:not([open]) > *:not(summary) { display: none !important; }
   to { opacity: 1; transform: translateY(0) scale(1); }
 }
 .modal-card.wide { width: min(860px, calc(100vw - 36px)); }
+/* 三栏并排的表单（备选 Provider 配置）：860px 分三栏后每栏只有 254px，
+   模型名与 Provider 名互相挤成省略号。这一档给到 1240px，每栏约 380px。
+   上限仍用 100vw - 36px，窄屏不会溢出。 */
+.modal-card.xwide { width: min(1240px, calc(100vw - 36px)); }
 .modal-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
 .modal-header h2 { margin: 0; font-size: var(--fs-xl); font-weight: 700; letter-spacing: -0.015em; color: var(--text-strong); }
 .modal-header p { margin: 6px 0 0; color: var(--muted); font-size: var(--fs-md); line-height: 1.55; }
