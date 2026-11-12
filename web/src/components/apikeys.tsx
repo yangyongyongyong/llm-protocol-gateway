@@ -696,6 +696,64 @@ export function ApiKeyFallbackProvidersModal({
     setOverrides((current) => ({ ...current, [id]: model }));
   }
 
+  // 批量设置固定模型。
+  //
+  // 这块以前只能一个个点：备选一多（同一家的多个账号就是 N 行），要设成同一个模型就得
+  // 点 N 次下拉、每次还要在同一个清单里翻一遍。下面这条批量栏把「选一次，落一片」做掉：
+  //   · 候选模型取所选备选清单的并集（同厂商多账号共用一个清单，这是最常见的情况）；
+  //   · 应用时只写给「模型清单里确实有它」的 Provider，跳过的条数如实报出来 ——
+  //     写一个该 Provider 不认的模型，等于把那一跳彻底弄坏，比不设更糟。
+  const [batchModel, setBatchModel] = useState('');
+  const [batchNotice, setBatchNotice] = useState('');
+  const batchModels = (() => {
+    const seen = new Set<string>();
+    const out: Model[] = [];
+    for (const provider of selectedProviders) {
+      for (const model of models.filter((item) => item.providerId === provider.id)) {
+        const id = (model.id || '').trim();
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        out.push(model);
+      }
+    }
+    return out.sort((a, b) => (a.id || '').localeCompare(b.id || ''));
+  })();
+
+  const applyBatchModel = () => {
+    const target = batchModel.trim();
+    if (!target) {
+      setBatchNotice('先选一个模型，或用「全部留空」清掉所有固定模型。');
+      return;
+    }
+    setError('');
+    let applied = 0;
+    const skipped: string[] = [];
+    setOverrides((current) => {
+      const next = { ...current };
+      for (const provider of selectedProviders) {
+        const has = models.some((model) => model.providerId === provider.id && (model.id || '').trim() === target);
+        if (has) {
+          next[provider.id] = target;
+          applied += 1;
+        } else {
+          skipped.push(provider.name);
+        }
+      }
+      return next;
+    });
+    setBatchNotice(
+      skipped.length === 0
+        ? `已把 ${applied} 个备选设为 ${target}`
+        : `已设置 ${applied} 个；${skipped.length} 个没有该模型，已跳过（${skipped.slice(0, 3).join('、')}${skipped.length > 3 ? '…' : ''}）`,
+    );
+  };
+
+  const clearAllOverrides = () => {
+    setError('');
+    setOverrides({});
+    setBatchNotice('已清空全部固定模型：每个备选都沿用请求模型或各自默认模型。');
+  };
+
   return (
     <Modal
       title="配置备选 Provider"
@@ -736,6 +794,41 @@ export function ApiKeyFallbackProvidersModal({
                   </span>
                 </summary>
                 <div className="api-key-fallback-models-list">
+                  {selectedProviders.length > 1 ? (
+                    <div className="api-key-fallback-models-batch">
+                      <span className="api-key-fallback-models-batch-label">批量设置</span>
+                      <div className="field-inline">
+                        <SearchableModelSelect
+                          value={batchModel}
+                          models={batchModels}
+                          disabled={busy || saving}
+                          emptyLabel="选一个模型，应用到下面全部备选"
+                          onChange={(value) => { setBatchModel(value); setBatchNotice(''); }}
+                        />
+                        <button
+                          className="mini-btn"
+                          type="button"
+                          disabled={busy || saving || !batchModel.trim()}
+                          onClick={applyBatchModel}
+                          title="把选中的模型写给下面每一个有此模型的备选"
+                        >
+                          应用到全部
+                        </button>
+                        <button
+                          className="mini-btn"
+                          type="button"
+                          disabled={busy || saving}
+                          onClick={clearAllOverrides}
+                          title="清掉所有固定模型，全部改为自动"
+                        >
+                          全部留空
+                        </button>
+                      </div>
+                      <span className="api-key-fallback-models-batch-hint">
+                        {batchNotice || `共 ${selectedProviders.length} 个备选；只写给模型清单里有它的 Provider`}
+                      </span>
+                    </div>
+                  ) : null}
                   {selectedProviders.map((provider) => {
                     const providerModels = models.filter((model) => model.providerId === provider.id);
                     const crossProtocol = !sameProtocol(provider);

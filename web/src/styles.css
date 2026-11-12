@@ -2149,6 +2149,24 @@ body.fpp-dragging, body.fpp-dragging * { cursor: grabbing !important; user-selec
   font-size: var(--fs-xs); font-weight: 700;
 }
 .api-key-fallback-models-list { display: grid; gap: 8px; padding: 8px 10px; max-height: 220px; overflow: auto; }
+/* 批量设置条：备选一多（同一家 N 个账号 = N 行下拉），逐个点相当于把同一件事做 N 遍。
+   这条栏黏在清单顶部，滚动时不跟着走 —— 否则滚到第 8 行想批量，还得先滚回顶部。 */
+.api-key-fallback-models-batch {
+  position: sticky; top: -8px; z-index: 1;
+  display: grid; gap: 6px; min-width: 0;
+  margin: -8px -10px 0;
+  padding: 8px 10px;
+  background: var(--surface-soft);
+  border-bottom: 1px solid var(--border);
+}
+.api-key-fallback-models-batch-label {
+  font-size: var(--fs-sm); font-weight: 700; color: var(--muted);
+  letter-spacing: 0.02em;
+}
+.api-key-fallback-models-batch-hint {
+  font-size: var(--fs-sm); color: var(--subtle);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .api-key-fallback-models-row { display: grid; gap: 4px; min-width: 0; }
 .api-key-fallback-summary-text { margin-right: auto; color: var(--subtle); font-size: var(--fs-sm); }
 
