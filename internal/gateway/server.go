@@ -626,6 +626,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /__peer-upstreams", s.handleRegisterPeerUpstream)
 	mux.HandleFunc("POST /__peer-upstreams/{id}/refresh", s.handleRefreshPeerUpstream)
 	mux.HandleFunc("POST /__peer-upstreams/{id}/reconnect", s.handleReconnectPeerUpstream)
+	// 断开一条上游＝删掉它这一组的全部成员行（见 handleDisconnectPeerUpstream）。
+	mux.HandleFunc("DELETE /__peer-upstreams/{id}", s.handleDisconnectPeerUpstream)
 	// RBAC: roles, the permission catalog, resource grant targets, and the
 	// signed-in user's own profile (display name + avatar).
 	mux.HandleFunc("GET /__roles", s.handleListRoles)

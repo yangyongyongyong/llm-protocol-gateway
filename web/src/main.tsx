@@ -5474,30 +5474,28 @@ function App() {
               ) : filteredProviders.length === 0 ? (
                 <div className="empty-state">没有匹配的 Provider，请调整检索词或连接方式过滤。</div>
               ) : (
-                <>
-                  {providerRenderGroups.regular.length > 0 ? (
-                    <div className={providerCardDensity === 'compact' ? 'provider-list' : 'provider-card-grid'}>
-                      {providerCardDensity === 'compact' ? providerListHead : null}
-                      {providerRenderGroups.regular.map(renderProviderCard)}
-                    </div>
-                  ) : null}
+                // 本地 Provider 与上游网关的成员行放在同一个网格里：它们本来就是
+                // 一类东西（都能单独绑定 API 密钥）。原先上游单独起一段 section，
+                // 自带一组标题与第二个网格，于是「全部连接方式」下这一块自身成段、
+                // 只有一张卡却占满整行，看着像被切开的另一半。分组信息改成网格里的
+                // 一行分隔条：仍然是「一条上游一组」，但视觉上属于同一张列表。
+                <div className={providerCardDensity === 'compact' ? 'provider-list' : 'provider-card-grid'}>
+                  {providerCardDensity === 'compact' ? providerListHead : null}
+                  {providerRenderGroups.regular.map(renderProviderCard)}
                   {providerRenderGroups.peerGroups.map((group) => (
-                    <section className="peer-provider-group" key={group.key}>
-                      <div className="peer-provider-group-head">
+                    <React.Fragment key={group.key}>
+                      <div className="provider-grid-divider" title={`由「网关互联」页维护：${group.title}`}>
                         <Badge tone="cyan">上游网关</Badge>
-                        <span className="peer-provider-group-title" title={group.title}>{group.title}</span>
-                        {group.parentId ? <code className="peer-gateway-code" title="上游网关身份">{group.parentId}</code> : null}
-                        <span className="hint-text peer-provider-group-hint">
-                          上游授权的 Provider，和本地 Provider 一样可以单独绑进 API 密钥（含备选）；地址、凭据与授权由「网关互联」页维护。
+                        <span className="provider-grid-divider-name">{group.title}</span>
+                        {group.parentId ? <code className="peer-gateway-code">{group.parentId}</code> : null}
+                        <span className="provider-grid-divider-meta">
+                          {group.items.length} 个 Provider · 地址与授权在「网关互联」页
                         </span>
                       </div>
-                      <div className={providerCardDensity === 'compact' ? 'provider-list' : 'provider-card-grid'}>
-                        {providerCardDensity === 'compact' ? providerListHead : null}
-                        {group.items.map(renderProviderCard)}
-                      </div>
-                    </section>
+                      {group.items.map(renderProviderCard)}
+                    </React.Fragment>
                   ))}
-                </>
+                </div>
               )}
               {selectedProvider && !isNormalUser ? <div className="hint-text">{`当前 Provider 被 ${activeProviderRouteCount} 个 API 密钥引用（含备选）。删除时这些密钥的 Provider 绑定会自动重置为空。`}</div> : null}
               <ProviderCatalogDialog

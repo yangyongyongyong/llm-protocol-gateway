@@ -284,8 +284,29 @@ export function PeersPage({
     }
   };
 
-  const saveCidrs = async (value: string) => {
+  // 断开一条上游：删的是「这一组」，不是一个协议的那一行。一次注册会落下多条
+  // 成员行（每个协议一条），只删一条会留下半条链路——界面还连着、模型却少一半。
+  // 本地断开不会让上游忘记这台下游，那要在上游自己的「网关互联」页里吊销，所以
+  // 确认文案里把这层说清楚，免得以为删完就两边都干净了。
+  const disconnectUpstream = async (upstream: PeerUpstream) => {
+    const members = upstream.memberCount || 1;
+    const ok = await confirmDialog(
+      `断开「${upstream.name}」？\n本机会删掉这条上游的 ${members} 条成员行（可恢复），绑在它们上面的 API 密钥绑定会重置为空。\n上游那边的注册记录不会消失——要让上游也忘掉这台下游，请在上游的「网关互联」页吊销。`,
+      { confirmLabel: '断开', danger: true },
+    );
+    if (!ok) return;
+    setBusyId(upstream.providerId);
     try {
+      await jsonRequest(`${API_BASE}/__peer-upstreams/${encodeURIComponent(upstream.providerId)}`, { method: 'DELETE' });
+      await refreshAll();
+    } catch (error) {
+      setUpstreamsError((error as Error).message);
+    } finally {
+      setBusyId('');
+    }
+  };
+
+  const saveCidrs = async (value: string) => {    try {
       const payload = await jsonRequest<{ cidrs: string }>(`${API_BASE}/__settings/peer-registration-cidrs`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -333,9 +354,7 @@ export function PeersPage({
           <div>
             <h2 className="panel-title">网关互联</h2>
             <p className="panel-desc">
-              把本机接到另一个网关，或者管理注册到本机的下游网关。透传的请求由上游用它自己的凭据转发、记在它的账上；
-              本机从不接触上游的凭据。上游授权给你的每个 Provider 都会在「输入 Provider」页按上游分组，各占一条、
-              可以单独绑进 API 密钥（含备选）——地址与凭据仍由本页维护，改授权只在上游那边改。
+              把本机接到另一个网关，或管理注册到本机的下游网关。透传的请求由上游用自己的凭据转发、记在它的账上，本机不接触上游凭据。
             </p>
           </div>
           <div className="panel-header-actions">
@@ -379,6 +398,11 @@ export function PeersPage({
                   </div>
                   <div className="peer-upstream-url" title={upstream.parentUrl}>{upstream.parentUrl}</div>
                   <div className="peer-upstream-meta">
+                    {upstream.memberCount && upstream.memberCount > 1 ? (
+                      <span title="一次注册按协议落下多条本机 Provider 行；「断开」删的是整组">
+                        {upstream.memberCount} 条成员
+                      </span>
+                    ) : null}
                     {upstream.peerUsername ? <span>上游账号 {upstream.peerUsername}</span> : null}
                     {upstream.grantsSynced ? (
                       <span title={grantedProviderTitles(upstream)}>上游授权 {upstream.grantCount} 个 Provider</span>
@@ -439,6 +463,15 @@ export function PeersPage({
                         }}
                       >
                         重新注册
+                      </button>
+                      <button
+                        className="mini-btn danger"
+                        type="button"
+                        disabled={busy(upstream.providerId)}
+                        title="删掉这条上游在本机的全部成员行（可恢复）；上游那边的注册记录需在上游吊销"
+                        onClick={() => void disconnectUpstream(upstream)}
+                      >
+                        断开
                       </button>
                     </>
                   ) : null}

@@ -912,6 +912,63 @@ func (s *Server) handleRefreshPeerUpstream(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, map[string]any{"upstream": s.peerUpstreamSummaryOf(provider.ID)})
 }
 
+// handleDisconnectPeerUpstream 断开一条上游：把它落在本机的整组成员行一起删掉。
+//
+// 一条上游授权了 N 个 provider，本机就有 N 条成员行，它们共享同一个 UpstreamKey。
+// 按「一行删一条」处理会留下半条链路：界面还显示连着，请求却只剩某个协议的成员，
+// 而且成员行之间的凭据必须是同一把，删一半等于留下一组自相矛盾的记录。所以这个
+// 接口以「上游」为单位工作，删的是组。
+//
+// 删除沿用 provider 的软删除（可恢复），与本机其它 provider 一致；上游那边的注册
+// 记录不会因此消失——要让上游也忘掉这台下游，得去上游的「网关互联」页吊销。
+func (s *Server) handleDisconnectPeerUpstream(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePermission(w, r, domain.PermPeersManage) {
+		return
+	}
+	provider, ok := s.peerUpstreamByID(w, r)
+	if !ok {
+		return
+	}
+	upstreamKey := peerGroupKeyForProvider(provider)
+	memberIDs := make([]string, 0, 4)
+	for _, candidate := range s.router.State().Providers {
+		if candidate.AuthType != domain.AuthTypePeer || candidate.Deleted {
+			continue
+		}
+		if peerGroupKeyForProvider(candidate) != upstreamKey {
+			continue
+		}
+		memberIDs = append(memberIDs, candidate.ID)
+	}
+	if len(memberIDs) == 0 {
+		writeOpenAIError(w, http.StatusNotFound, "这条上游已经没有成员行了")
+		return
+	}
+	removed := make([]string, 0, len(memberIDs))
+	for _, id := range memberIDs {
+		if err := s.router.DeleteProvider(id); err != nil {
+			// 已经删掉的成员不该让整组失败：把剩下的继续删完，最后如实报告删了哪些。
+			s.logs.AddApp("warn", "peer upstream member delete failed", fmt.Sprintf("provider=%s: %v", id, err))
+			continue
+		}
+		removed = append(removed, id)
+	}
+	if len(removed) == 0 {
+		writeOpenAIError(w, http.StatusConflict, "这一组成员行都没能删除，请检查是否有 API 密钥绑定")
+		return
+	}
+	if err := s.saveState(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+		return
+	}
+	s.logs.AddApp("info", "peer upstream disconnected", fmt.Sprintf("upstream=%s removed=%d/%d", upstreamKey, len(removed), len(memberIDs)))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"disconnected": true,
+		"removed":      len(removed),
+		"total":        len(memberIDs),
+	})
+}
+
 // handleReconnectPeerUpstream 用用户名密码把一条已有的上游链路重新注册一次。
 //
 // 它换发一把新凭据，上游那边旧的立刻失效——这正是「怀疑凭据泄漏」或「上游

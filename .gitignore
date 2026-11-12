@@ -73,3 +73,7 @@ bin/
 
 # 发版产物
 /dist/
+
+# 本机 agent 状态：Claude Code 的工作副本、本地设置与指向 skill 的软链接，
+# 因机器而异，不进版本库。skill 本体在 .agents/skills（由 skills-lock.json 锁定）。
+/.claude/
