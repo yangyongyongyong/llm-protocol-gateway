@@ -844,7 +844,7 @@ function PeerGrantsModal({ peer, onClose, onSaved, onToast }: {
     <Modal
       title={`调整下游网关授权：${label}`}
       description="选择下游能透传的 Provider。动态全部模式会自动包含以后新增的 Provider，不需要重新调节授权。"
-      size="wide"
+      size="xwide"
       onClose={onClose}
     >
       <div className="peer-grant-mode-grid" role="radiogroup" aria-label="Provider 授权模式">

@@ -505,7 +505,7 @@ export function UserEditorModal({ user, roleOptions, onClose, onSaved, onToast }
       description={creating
         ? '创建控制台账号：设置用户名、初始密码并分配角色。'
         : '修改账号资料、角色与启停状态；角色变更立即生效，无需对方重新登录。'}
-      size="wide"
+      size="xwide"
       onClose={onClose}
     >
       <form
