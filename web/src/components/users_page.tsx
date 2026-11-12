@@ -4,6 +4,7 @@ import {Avatar, AvatarUploader} from './avatar';
 import {Badge, Modal, Switch} from './ui';
 import {confirmDialog} from '../dialogs';
 import {scopeLabel} from './roles_page';
+import {ProviderGrantPicker} from './provider_grant_picker';
 import type {ConsoleUser, GrantTarget, RoleOption, UserDraft} from './rbac_types';
 
 async function errorTextFrom(response: Response): Promise<string> {
@@ -408,7 +409,6 @@ export function UserEditorModal({ user, roleOptions, onClose, onSaved, onToast }
   const [avatarUrl, setAvatarUrl] = useState(user.avatarUrl);
   const [granted, setGranted] = useState<string[]>(user.grantedProviderIds);
   const [grantTargets, setGrantTargets] = useState<GrantTarget[]>([]);
-  const [grantKeyword, setGrantKeyword] = useState('');
   const [grantLoading, setGrantLoading] = useState(false);
   const [grantError, setGrantError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -432,31 +432,9 @@ export function UserEditorModal({ user, roleOptions, onClose, onSaved, onToast }
     return () => { cancelled = true; };
   }, [canAssignProviders]);
 
-  const grantedSet = useMemo(() => new Set(granted), [granted]);
+  // 搜索、全选、勾选全部收进 ProviderGrantPicker 了：这些状态只服务于那一个控件，
+  // 留在这里会让「谁能改 granted」散落在两个文件里。
 
-  // 搜索按名字和归属账号匹配；「全选」只作用于搜出来的这批，
-  // 否则一搜一勾就把看不见的几百个也勾上了。
-  const visibleGrantTargets = useMemo(() => {
-    const word = grantKeyword.trim().toLowerCase();
-    if (!word) return grantTargets;
-    return grantTargets.filter((target) =>
-      target.name.toLowerCase().includes(word) || target.ownerName.toLowerCase().includes(word));
-  }, [grantTargets, grantKeyword]);
-  const visibleGrantedCount = visibleGrantTargets.filter((target) => grantedSet.has(target.id)).length;
-  const allVisibleSelected = visibleGrantTargets.length > 0 && visibleGrantedCount === visibleGrantTargets.length;
-
-  function toggleGrant(id: string, on: boolean) {
-    setGranted((current) => on
-      ? Array.from(new Set([...current, id]))
-      : current.filter((item) => item !== id));
-  }
-
-  function toggleAllVisible(on: boolean) {
-    const ids = visibleGrantTargets.map((target) => target.id);
-    setGranted((current) => (on
-      ? Array.from(new Set([...current, ...ids]))
-      : current.filter((id) => !ids.includes(id))));
-  }
 
   async function submit() {
     const name = username.trim();
@@ -597,69 +575,19 @@ export function UserEditorModal({ user, roleOptions, onClose, onSaved, onToast }
               <span>已选 {granted.length} / 共 {grantTargets.length}</span>
             </div>
             <p className="hint-text">
-              勾选后，该用户除了自己的 Provider，还能使用下面这些；取消勾选立即收回。角色与权限不变。
+              授权后，该用户除了自己的 Provider，还能使用下面这些；收回立即生效。角色与权限不变。
             </p>
-            {grantLoading ? <div className="empty-state compact">加载中…</div> : null}
-            {grantError ? <div className="rbac-form-error">{grantError}</div> : null}
-            {!grantLoading && !grantError && grantTargets.length === 0 ? (
-              <div className="empty-state compact">暂无可授权的输入 Provider。</div>
-            ) : null}
-            {grantTargets.length > 0 ? (
-              <>
-                <div className="rbac-grant-toolbar">
-                  <div className="rbac-search">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                      <circle cx="11" cy="11" r="8" />
-                      <line x1="21" y1="21" x2="16.65" y2="16.65" />
-                    </svg>
-                    <input
-                      type="search"
-                      value={grantKeyword}
-                      placeholder="搜索名称或归属账号…"
-                      aria-label="搜索可授权的输入 Provider"
-                      autoComplete="off"
-                      onChange={(event) => setGrantKeyword(event.target.value)}
-                    />
-                    {grantKeyword ? (
-                      <button type="button" className="rbac-search-clear" title="清空搜索" onClick={() => setGrantKeyword('')}>×</button>
-                    ) : null}
-                  </div>
-                  <button
-                    type="button"
-                    className="btn secondary rbac-grant-all"
-                    disabled={visibleGrantTargets.length === 0}
-                    title={grantKeyword.trim() ? '只作用于当前搜索到的结果' : '勾选全部可授权的 Provider'}
-                    onClick={() => toggleAllVisible(!allVisibleSelected)}
-                  >
-                    {allVisibleSelected ? '取消全选' : '全选'}
-                    {grantKeyword.trim() ? `（${visibleGrantTargets.length}）` : ''}
-                  </button>
-                </div>
-                {visibleGrantTargets.length === 0 ? (
-                  <div className="empty-state compact">没有匹配「{grantKeyword.trim()}」的 Provider。</div>
-                ) : (
-                  <div className="rbac-grant-list">
-                    {visibleGrantTargets.map((target) => {
-                      const checked = grantedSet.has(target.id);
-                      return (
-                        <button
-                          key={target.id}
-                          type="button"
-                          role="checkbox"
-                          aria-checked={checked}
-                          className={`rbac-grant-item${checked ? ' checked' : ''}`}
-                          onClick={() => toggleGrant(target.id, !checked)}
-                        >
-                          <span className={`provider-checklist-box${checked ? ' on' : ''}`} aria-hidden="true">{checked ? '✓' : ''}</span>
-                          <span className="rbac-grant-name" title={target.name}>{target.name}</span>
-                          <span className="rbac-grant-owner" title={`归属：${target.ownerName}`}>归属 {target.ownerName}</span>
-                        </button>
-                      );
-                    })}
-                  </div>
-                )}
-              </>
-            ) : null}
+            {/* 统一的授权选择器：左「可选」右「已授权」，与「配置备选 Provider」同一套交互。
+                替换掉原来的复选框网格——那片网格把可选与已选混在一起，"给了几项"要数勾，
+                而且用户管理页与网关授权页各写了一遍，两处措辞还不一致。 */}
+            <ProviderGrantPicker
+              targets={grantTargets}
+              granted={granted}
+              onChange={(next) => setGranted(next)}
+              loading={grantLoading}
+              error={grantError}
+              emptyText="暂无可授权的输入 Provider。"
+            />
           </div>
         ) : null}
 

@@ -482,7 +482,9 @@ export function TimeLine({ hint, className = 'claude-usage-reset', compact }: { 
       {/* 紧凑卡片里进度条下面那一行就是重置时间，前缀词让位给时刻本身 */}
       {!compact && hint.label ? <span className="time-label">{hint.label}</span> : null}
       <span className="time-when">{hint.when}</span>
-      <span className="time-relative">· {hint.relative}</span>
+      {/* 分隔不用「·」：紧凑卡里整行会折行，折下来时那个点会孤零零地挂在行首
+          （「· 2 小时 25 分钟后」）。改用 CSS 间距分隔，折行后也不会留下悬空的符号。 */}
+      <span className="time-relative">{hint.relative}</span>
     </div>
   );
 }

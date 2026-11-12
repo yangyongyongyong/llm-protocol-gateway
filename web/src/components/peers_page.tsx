@@ -4,6 +4,7 @@ import {Badge, Field, Modal} from './ui';
 import {confirmDialog} from '../dialogs';
 import {IconSelect, IconSelectOption} from './selects';
 import type {GrantTarget} from './rbac_types';
+import {ProviderGrantPicker} from './provider_grant_picker';
 import type {PeerGateway, PeerUpstream, PeerUpstreamsResponse, PeersResponse, Protocol} from '../types';
 
 async function errorTextFrom(response: Response): Promise<string> {
@@ -803,7 +804,6 @@ function PeerGrantsModal({ peer, onClose, onSaved, onToast }: {
   const [granted, setGranted] = useState<string[]>(peer.grantedProviderIds || []);
   const [grantMode, setGrantMode] = useState<'selected' | 'all'>(peer.grantMode === 'all' ? 'all' : 'selected');
   const [targets, setTargets] = useState<GrantTarget[]>([]);
-  const [keyword, setKeyword] = useState('');
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [saving, setSaving] = useState(false);
@@ -820,27 +820,7 @@ function PeerGrantsModal({ peer, onClose, onSaved, onToast }: {
     return () => { cancelled = true; };
   }, []);
 
-  const grantedSet = useMemo(() => new Set(granted), [granted]);
-  const visibleTargets = useMemo(() => {
-    const word = keyword.trim().toLowerCase();
-    if (!word) return targets;
-    return targets.filter((target) =>
-      target.name.toLowerCase().includes(word) || target.ownerName.toLowerCase().includes(word));
-  }, [targets, keyword]);
-  const allVisibleSelected = visibleTargets.length > 0 && visibleTargets.every((target) => grantedSet.has(target.id));
-
-  function toggleGrant(id: string, on: boolean) {
-    setGranted((current) => on
-      ? Array.from(new Set([...current, id]))
-      : current.filter((item) => item !== id));
-  }
-
-  function toggleAllVisible(on: boolean) {
-    const ids = visibleTargets.map((target) => target.id);
-    setGranted((current) => (on
-      ? Array.from(new Set([...current, ...ids]))
-      : current.filter((id) => !ids.includes(id))));
-  }
+  // 搜索、全选、勾选全部收进 ProviderGrantPicker：与用户管理页同一个控件。
 
   async function submit() {
     setSaving(true);
@@ -916,60 +896,19 @@ function PeerGrantsModal({ peer, onClose, onSaved, onToast }: {
       ) : null}
       {grantMode === 'selected' && targets.length > 0 ? (
         <>
-          <div className="rbac-grant-toolbar">
-            <div className="rbac-search">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                <circle cx="11" cy="11" r="8" />
-                <line x1="21" y1="21" x2="16.65" y2="16.65" />
-              </svg>
-              <input
-                type="search"
-                value={keyword}
-                placeholder="搜索名称或归属账号…"
-                aria-label="搜索可授权的输入 Provider"
-                autoComplete="off"
-                onChange={(event) => setKeyword(event.target.value)}
-              />
-              {keyword ? (
-                <button type="button" className="rbac-search-clear" title="清空搜索" onClick={() => setKeyword('')}>×</button>
-              ) : null}
-            </div>
-            <button
-              type="button"
-              className="btn secondary rbac-grant-all"
-              disabled={visibleTargets.length === 0}
-              title={keyword.trim() ? '只作用于当前搜索到的结果' : '勾选全部可授权的 Provider'}
-              onClick={() => toggleAllVisible(!allVisibleSelected)}
-            >
-              {allVisibleSelected ? '取消全选' : '全选'}
-              {keyword.trim() ? `（${visibleTargets.length}）` : ''}
-            </button>
-          </div>
-          {visibleTargets.length === 0 ? (
-            <div className="empty-state compact">没有匹配「{keyword.trim()}」的 Provider。</div>
-          ) : (
-            <div className="rbac-grant-list">
-              {visibleTargets.map((target) => {
-                const checked = grantedSet.has(target.id);
-                return (
-                  <button
-                    key={target.id}
-                    type="button"
-                    role="checkbox"
-                    aria-checked={checked}
-                    className={`rbac-grant-item${checked ? ' checked' : ''}`}
-                    onClick={() => toggleGrant(target.id, !checked)}
-                  >
-                    <span className={`provider-checklist-box${checked ? ' on' : ''}`} aria-hidden="true">{checked ? '✓' : ''}</span>
-                    <span className="rbac-grant-name" title={target.name}>{target.name}</span>
-                    <span className="rbac-grant-owner" title={`归属：${target.ownerName}`}>归属 {target.ownerName}</span>
-                  </button>
-                );
-              })}
-            </div>
-          )}
+          {/* 与用户管理页同一个授权选择器：左「可选」右「已授权」。
+              这里原来是一片三列复选框网格，和用户管理页各写一遍、措辞还不一样；
+              统一之后两处的交互、计数、批量动作完全一致。 */}
+          <ProviderGrantPicker
+            targets={targets}
+            granted={granted}
+            onChange={(next) => setGranted(next)}
+            loading={loading}
+            error={loadError}
+            emptyText="本机还没有可授权的输入 Provider。"
+          />
           {granted.length === 0 ? (
-            <div className="hint-text">不勾选任何 Provider 并保存 = 收回全部授权：它送来的透传请求将拿不到任何 Provider。</div>
+            <div className="hint-text">不授权任何 Provider 并保存 = 收回全部授权：它送来的透传请求将拿不到任何 Provider。</div>
           ) : null}
         </>
       ) : null}

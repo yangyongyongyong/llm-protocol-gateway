@@ -2007,31 +2007,30 @@ html[data-theme="dark"] .models-search-input { background-image: url("data:image
 .fpp-chip-count { color: var(--subtle); font-family: var(--mono); font-size: var(--fs-xs); }
 .fpp-chip.active .fpp-chip-count { color: var(--accent-strong); }
 
-/* 三栏并排，并且**这一块自己限高、自己滚动**。
-   之前两个极端都不对：
-     · 最初每栏各带 max-height:320px + 另有弹窗滚动 → 屏幕上同时出现几个滚轮；
-     · 上一版把内层滚动全删掉 → 48 个可选 Provider 把弹窗顶到 1200px 长。
-   现在只留一个滚动口：.fpp-cols 限高 + overflow-y:auto，三栏跟着一起滚；栏头 sticky
-   钉住，滚动时仍知道自己在看哪一栏，整张弹窗因此不再需要滚动。
-   注意 .fpp-col 的 overflow 必须是 visible —— 祖先带 hidden 会让 sticky 失效。 */
+/* 三栏并排，**每栏各自滚动**（用户选的 B 方案）。
+   历史：最初每栏自滚 + 弹窗也滚 → 多个滚轮同时出现；改成一个共享滚轮后，三个列表
+   长度不同（可选 44 条 / 备选 8 条 / 模型 8 条），滚到中段短栏先滚完、只剩空白。
+   现在：.fpp-cols 只负责限高（不滚），每栏内部 .fpp-list 自己滚，滚轮跟着鼠标所在栏。
+   这样长短不一也不会互相拖累，栏头/栏脚本来就固定在栏的上下两端。
+   整张弹窗仍然不滚动（.fpp-cols 的 max-height 把总高压住）。 */
 .fpp-cols {
   display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.05fr);
   gap: 12px; align-items: stretch;
   max-height: min(58vh, 560px);
-  overflow-y: auto;
-  overscroll-behavior: contain;
   padding-right: 2px;
 }
 /* 窄屏上下排，免得两栏都挤成省略号。 */
-@media (max-width: 720px) { .fpp-cols { grid-template-columns: 1fr; max-height: min(62vh, 560px); } }
+@media (max-width: 720px) { .fpp-cols { grid-template-columns: 1fr; max-height: none; } }
 .fpp-col {
   display: flex; flex-direction: column; min-width: 0;
   border: 1px solid var(--border); border-radius: var(--r-md);
-  background: var(--surface); overflow: visible;
+  background: var(--surface);
+  /* 关键：栏自身要高过内容才能把高度让给列表去滚 */
+  max-height: inherit;
+  overflow: hidden;
 }
-/* 栏头/栏脚钉在滚动容器上：滚到第 30 行时仍看得见「可选 Provider 48」和底部批量按钮。 */
-.fpp-col-head { position: sticky; top: 0; z-index: 2; }
-.fpp-col-foot { position: sticky; bottom: 0; z-index: 2; }
+.fpp-col-head { flex: none; }
+.fpp-col-foot { flex: none; }
 .fpp-col-head {
   display: flex; align-items: center; gap: 8px;
   padding: 7px 10px;
@@ -2045,13 +2044,19 @@ html[data-theme="dark"] .models-search-input { background-image: url("data:image
   border-radius: 999px; background: var(--surface-sunken); color: var(--muted);
   font-family: var(--mono); font-size: var(--fs-xs); font-weight: 700;
 }
+/* 栏标题：授权选择器（两栏）与备选选择器（三栏）共用。 */
+.fpp-col-title { font-weight: 600; color: var(--text); }
+/* 两栏变体：用户管理 / 网关授权用的授权选择器只需要「可选 / 已选」两栏，
+   不用三栏那套 1:1:1.05 的比例，否则每栏过宽、行内一半是空白。 */
+.fpp-cols-2 { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); max-height: min(52vh, 460px); }
+@media (max-width: 720px) { .fpp-cols-2 { grid-template-columns: 1fr; max-height: none; } }
 .fpp-link {
   margin-left: auto; padding: 0;
   border: 0; background: none; color: var(--accent-strong);
   font: inherit; font-size: var(--fs-sm); font-weight: 600; cursor: pointer;
 }
 .fpp-link:disabled { color: var(--subtle); cursor: default; }
-.fpp-list { flex: 1 1 auto; min-height: 0; padding: 4px; display: grid; align-content: start; gap: 2px; }
+.fpp-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 4px; display: grid; align-content: start; gap: 2px; }
 .fpp-empty { padding: 28px 12px; color: var(--muted); font-size: var(--fs-base); text-align: center; line-height: 1.5; }
 .fpp-row {
   display: flex; align-items: center; gap: 6px;
@@ -2169,7 +2174,7 @@ body.fpp-dragging, body.fpp-dragging * { cursor: grabbing !important; user-selec
    220px 的滚动区只看得见两条半；跨协议说明还会再占第三行。现在按列对齐：
    名字（可截断） / 下拉（吃掉剩余宽度） / 刷新图标，一行 ~34px，同屏能看八条。
    滚动区同步加高，让「备选多」这件事靠滚动解决，而不是靠一屏只显示两条。 */
-.api-key-fallback-models-list { flex: 1 1 auto; display: grid; gap: 4px; padding: 6px 8px; align-content: start; min-height: 0; }
+.api-key-fallback-models-list { flex: 1 1 auto; display: grid; gap: 4px; padding: 6px 8px; align-content: start; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
 .api-key-fallback-models-row {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
@@ -3632,9 +3637,11 @@ html[data-theme="dark"] .usage-calendar-day.edge { background: var(--accent); co
 /* 重置时间已经过了：这不是一个"待办"，压暗，别让它继续抢进度条的注意力 */
 .claude-usage-reset.passed, .subscription-expiry.passed { color: var(--subtle); }
 /* 一行时间拆两段：绝对时刻可被窄卡片截掉，「还有多久」留着 */
-.usage-time { display: flex; align-items: baseline; gap: 4px; min-width: 0; }
+.usage-time { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; row-gap: 1px; min-width: 0; }
 .usage-time .time-label { flex: none; }
 .usage-time .time-when { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 相对时间（「2 小时 25 分钟后」）与时刻之间靠间距分隔，不再用「·」：
+   紧凑卡里这一行会折行，折下来时那个点会挂在行首，看起来像排版错误。 */
 .usage-time .time-relative { flex: none; color: var(--subtle); }
 /* 账号级的到期行（Qoder 套餐有效期 / WorkBuddy 哪批积分先过期） */
 .subscription-expiry {
