@@ -911,8 +911,13 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
   const oauthBadgeLabel = isQoderPAT ? (provider?.qoderPat?.signInMode === 'pat' ? 'PAT' : 'OAuth') : 'OAuth';
   // 探测到的、除当前协议之外还支持的那些协议。空清单 = 还没探过（老记录），
   // 那时什么都不显示，而不是显示"都不支持"。
+  //
+  // 比较只对着 provider.protocol（原始的 "claude" / "openai_chat"），不能对着
+  // protocol 这个 prop —— 那是给人看的显示名（"Claude Messages"），拿它跟原始值
+  // 比永远不相等，于是当前协议也会被当成"额外支持的"重复显示一遍。
+  const currentProtocol = provider?.protocol || '';
   const extraProtocols = (provider?.protocolSupport || [])
-    .filter((item) => item && item !== protocol && item !== provider?.protocol)
+    .filter((item) => item && item !== currentProtocol)
     .map((item) => ({
       value: item,
       label: item === 'claude' ? 'Claude' : item === 'openai_responses' ? 'Responses' : 'OpenAI Chat',

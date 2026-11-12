@@ -34,6 +34,14 @@ import (
 // 也就是说，**404 是唯一的否定证据**。这也正是 cc-switch 那套路径分流的前提：
 // 每条协议一条路径，路径存在与否是静态事实，跟凭据无关。
 
+// protocolProbeTimeout 是单条候选协议的探测上限。
+//
+// 40s 而不是 15s：探测发出的请求必然会被上游拒掉，但「拒掉」之前它可能要先过一层
+// 边缘鉴权、再做路由判定，跨境线路上十几秒被卡断很常见。15s 时 OpenCode Go 的两条
+// OpenAI 路径被探成「连接失败」，而同样的地址用 curl 单独打是通的——把「慢」误判成
+// 「不存在」，比不探更糟。
+const protocolProbeTimeout = 40 * time.Second
+
 // protocolProbe 是一次探测的目标：协议 + 该协议的根地址 + 用来探的路径。
 type protocolProbe struct {
 	Protocol domain.Protocol
@@ -110,6 +118,9 @@ type protocolDetection struct {
 	Supported bool   `json:"supported"`
 	Status    int    `json:"status"`
 	Detail    string `json:"detail,omitempty"`
+	// Unknown 表示这次没结论（连不上、超时）。它既不是"支持"也不是"不支持"，
+	// 写回结论时要原样保留上一次的判断，而不是把这条抹掉。
+	Unknown bool `json:"unknown,omitempty"`
 	// Current 标出上游配置里选中的那一条，界面上好对照。
 	Current bool `json:"current,omitempty"`
 }
@@ -124,7 +135,10 @@ func classifyProtocolProbe(status int) bool {
 	case http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusNotImplemented:
 		return false
 	}
-	// 0 表示连不上：不能据此断言不存在，宁可报"未知"由调用方当作不支持。
+	// 0 表示这次没连上（超时、TLS 断开、域名解析失败）。这不能当成「不存在」：
+	// 真正不存在的路径会老老实实回 404，而"连不上"什么也没证明。调用方据此把这条
+	// 记成"未知"，绝不写进「不支持」——一次网络抖动不该让一台上游的某个协议从
+	// 卡片上消失，更不该让它从此不再参与同协议直通的挑选。
 	if status == 0 {
 		return false
 	}
@@ -145,6 +159,7 @@ func (s *Server) detectProviderProtocols(ctx context.Context, provider domain.Pr
 		result.Status = status
 		result.Detail = detail
 		result.Supported = classifyProtocolProbe(status)
+		result.Unknown = status == 0
 		out = append(out, result)
 	}
 	return out
@@ -166,7 +181,11 @@ func (s *Server) probeOneProtocol(ctx context.Context, provider domain.Provider,
 		body = []byte(`{"model":"` + firstNonEmpty(provider.DefaultModel, "probe") + `","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":1}`)
 	}
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	// 探测超时给足：这条请求会真的把一个「注定失败」的请求送到上游，而不少上游
+	// 要先做一层鉴权/路由再决定拒掉的理由，跨境访问时十几秒很容易被卡掉。
+	// 15s 那条曾经把 OpenCode Go 的两条 OpenAI 路径探成「连接失败」——同样的地址
+	// 用 curl 单独打是通的，只是慢。
+	timeoutCtx, cancel := context.WithTimeout(ctx, protocolProbeTimeout)
 	defer cancel()
 	request, err := http.NewRequestWithContext(timeoutCtx, http.MethodPost, candidate.URL, bytes.NewReader(body))
 	if err != nil {
@@ -180,7 +199,7 @@ func (s *Server) probeOneProtocol(ctx context.Context, provider domain.Provider,
 	applyRequestAdapterHeaders(request, provider, provider.DefaultModel)
 	applyProviderAuth(request, provider, "")
 
-	response, err := (&http.Client{Timeout: 15 * time.Second}).Do(request)
+	response, err := (&http.Client{Timeout: protocolProbeTimeout}).Do(request)
 	if err != nil {
 		return 0, err.Error()
 	}
@@ -215,6 +234,9 @@ func (s *Server) handleDetectProviderProtocols(w http.ResponseWriter, r *http.Re
 }
 
 // supportedProtocols 把探测结果压成协议名清单（只留可用的）。
+//
+// 这次没探出结论的（Unknown：超时、连不上）不算"不支持"：它们既不该被加进来，
+// 也不该让上一轮已经探到的结论消失。合并由 mergeProtocolSupport 负责。
 func supportedProtocols(results []protocolDetection) []string {
 	out := make([]string, 0, len(results))
 	for _, item := range results {
@@ -225,11 +247,57 @@ func supportedProtocols(results []protocolDetection) []string {
 	return out
 }
 
+// mergeProtocolSupport 把这一轮探测结果并进已有结论。
+//
+// 规则只有一条：**已知的覆盖，未知的保留**。超时是网络现象，不是上游说"我没有这个
+// 协议"；一次跨境抖动不该让一张卡片上的协议徽标无声消失，更不该让它从此不再参与
+// 同协议直通的挑选。真正的"不支持"（404）才会把它移除。
+func mergeProtocolSupport(previous []string, results []protocolDetection) []string {
+	keep := make(map[string]bool, len(previous))
+	for _, item := range previous {
+		keep[item] = true
+	}
+	for _, item := range results {
+		if item.Unknown {
+			continue
+		}
+		name := string(item.Protocol)
+		if item.Supported {
+			keep[name] = true
+		} else {
+			delete(keep, name)
+		}
+	}
+	// 按候选顺序输出，保证同样的输入得到同样的顺序（界面和日志都好对照）。
+	ordered := make([]string, 0, len(keep))
+	for _, item := range results {
+		name := string(item.Protocol)
+		if keep[name] {
+			ordered = append(ordered, name)
+			delete(keep, name)
+		}
+	}
+	for _, name := range previous {
+		if keep[name] {
+			ordered = append(ordered, name)
+			delete(keep, name)
+		}
+	}
+	return ordered
+}
+
 // persistProtocolSupport 把探测结论写回 provider，并落盘。
+//
+// 写回的是「上一轮 + 这一轮」的合并结果，不是这一轮单独的结果：这一轮超时的那条
+// 会保留上次的判断（见 mergeProtocolSupport）。
 //
 // 失败只记日志：探测是个附加信息，不该因为它写不进去就让建 provider 这件事失败。
 func (s *Server) persistProtocolSupport(providerID string, results []protocolDetection) {
-	protocols := supportedProtocols(results)
+	var previous []string
+	if existing, err := s.router.ProviderByID(providerID); err == nil {
+		previous = existing.ProtocolSupport
+	}
+	protocols := mergeProtocolSupport(previous, results)
 	if _, err := s.router.SetProviderProtocolSupport(providerID, protocols); err != nil {
 		s.logs.AddApp("warn", "protocol support not saved", fmt.Sprintf("provider=%s: %v", providerID, err))
 		return
@@ -266,7 +334,10 @@ func (s *Server) autoDetectProviderProtocols(provider domain.Provider) {
 				s.logs.AddApp("error", "protocol detection panicked", fmt.Sprintf("provider=%s: %v", provider.ID, rec))
 			}
 		}()
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		// 总预算要容得下「抓模型 + 三条候选各一次探测」：单条探测上限是
+		// protocolProbeTimeout，三条依次跑就是它的三倍，再给抓模型留一点。
+		// 以前写死 60s，放宽探测超时之后会把第三条乃至第二条直接掐掉。
+		ctx, cancel := context.WithTimeout(context.Background(), 3*protocolProbeTimeout+30*time.Second)
 		defer cancel()
 
 		s.autoFetchProviderModels(ctx, provider)
@@ -277,15 +348,13 @@ func (s *Server) autoDetectProviderProtocols(provider domain.Provider) {
 			current = refreshed
 		}
 		results := s.detectProviderProtocols(ctx, current)
-		protocols := supportedProtocols(results)
-		if len(protocols) == 0 {
-			// 一条都没探到，多半是这台机器此刻连不上上游（或被 Cloudflare 挡）。
-			// 不要把空结论写进去——那会把"没探成"记成"什么都不支持"。
-			s.logs.AddApp("warn", "protocol detection found nothing", fmt.Sprintf("provider=%s baseUrl=%s", provider.ID, provider.BaseURL))
-			return
-		}
+		// 合并写回：这一轮超时的协议保留上次结论，不会因为一次网络抖动就从卡片上
+		// 消失（见 mergeProtocolSupport）。
 		s.persistProtocolSupport(provider.ID, results)
-		s.logs.AddApp("info", "protocol support detected", fmt.Sprintf("provider=%s protocols=%s", provider.ID, strings.Join(protocols, ",")))
+		if saved, err := s.router.ProviderByID(provider.ID); err == nil {
+			s.logs.AddApp("info", "protocol support detected", fmt.Sprintf(
+				"provider=%s protocols=%s", provider.ID, strings.Join(saved.ProtocolSupport, ",")))
+		}
 	}()
 }
 
