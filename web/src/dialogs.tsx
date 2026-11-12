@@ -123,13 +123,17 @@ export function DialogHost() {
     <Modal title={title || '提示'} description="" onClose={() => settle(false)}>
       {body.length > 0 ? <p className="dialog-message">{body.join('\n')}</p> : null}
       <div className="actions modal-actions">
+        {/* 焦点落在「取消」而不是确认按钮上。
+            原先确认按钮带 autoFocus —— 危险操作（删除 Provider / 吊销对端）时，弹窗
+            一出现光标就压在红色按钮上，一次误按回车就是不可逆动作。取消放前面并
+            接收初始焦点：确认仍只有一步，但需要主动移过去。 */}
         {head.kind === 'confirm' ? (
-          <button className="btn" onClick={() => settle(false)}>{head.cancelLabel}</button>
+          <button className="btn" onClick={() => settle(false)} autoFocus>{head.cancelLabel}</button>
         ) : null}
         <button
           className={`btn ${head.danger ? 'danger' : 'primary'}`}
           onClick={() => settle(true)}
-          autoFocus
+          autoFocus={head.kind !== 'confirm'}
         >
           {head.confirmLabel}
         </button>

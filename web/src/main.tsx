@@ -751,6 +751,9 @@ function App() {
   const [providersSearchQuery, setProvidersSearchQuery] = useState('');
   const [providersConnectFilter, setProvidersConnectFilter] = useState<'' | ProviderConnectKind>('');
   const [providersStatusFilter, setProvidersStatusFilter] = useState<'all' | 'healthy' | 'unavailable' | 'disabled' | 'oauth'>('all');
+  // 排序口径。默认仍是「近 3 日请求量」——但那个顺序此前在界面上既看不见也改不了：
+  // 卡片不显示请求量、也没有排序控件，唯一的说明还藏在两行截断的描述里。
+  const [providersSortMode, setProvidersSortMode] = useState<'requests' | 'name' | 'status'>('requests');
   // 卡片密度只影响本机视觉，持久化在 localStorage（与主题/侧边栏一致）。
   const [providerCardDensity, setProviderCardDensity] = useState(readStoredProviderDensity);
   const chooseProviderDensity = (next: 'standard' | 'compact') => {
@@ -879,22 +882,40 @@ function App() {
   };
 
   const sortedProviders = useMemo(() => {
+    const byName = (a: Provider, b: Provider) => a.name.localeCompare(b.name, 'zh');
+    // 状态序：把「需要处理」的放前面（异常 → 已停用 → 其它），同档按名字。
+    const statusRank = (provider: Provider) => {
+      if (provider.healthStatus === 'unavailable' && !provider.disabled) return 0;
+      if (provider.disabled) return 1;
+      return 2;
+    };
+    let ordered: Provider[];
     if (providerOrder != null) {
       const byID = new Map(state.providers.map((provider) => [provider.id, provider]));
       const ranked = providerOrder.map((id) => byID.get(id)).filter((provider): provider is Provider => provider != null);
       const rankedIDs = new Set(ranked.map((provider) => provider.id));
       // 快照之后新加的 Provider 接在后面，按名字排，同样不因轮询换位。
-      const added = state.providers.filter((provider) => !rankedIDs.has(provider.id)).sort((a, b) => a.name.localeCompare(b.name, 'zh'));
-      return [...ranked, ...added];
+      const added = state.providers.filter((provider) => !rankedIDs.has(provider.id)).sort(byName);
+      ordered = [...ranked, ...added];
+    } else {
+      // 还没排过（统计请求没回来）：沿用上个会话缓存的计数排，首次绘制后不再跳。
+      ordered = [...state.providers].sort((a, b) => {
+        const ca = cachedProviderRanks.get(a.id) || 0;
+        const cb = cachedProviderRanks.get(b.id) || 0;
+        if (ca !== cb) return cb - ca;
+        return byName(a, b);
+      });
     }
-    // 还没排过（统计请求没回来）：沿用上个会话缓存的计数排，首次绘制后不再跳。
-    return [...state.providers].sort((a, b) => {
-      const ca = cachedProviderRanks.get(a.id) || 0;
-      const cb = cachedProviderRanks.get(b.id) || 0;
-      if (ca !== cb) return cb - ca;
-      return a.name.localeCompare(b.name, 'zh');
-    });
-  }, [state.providers, providerOrder, cachedProviderRanks]);
+    // 用户显式选了别的口径就照用户的：请求量（默认，保持上面的顺序）、名字、状态。
+    if (providersSortMode === 'name') return [...ordered].sort(byName);
+    if (providersSortMode === 'status') {
+      return [...ordered].sort((a, b) => {
+        const ra = statusRank(a); const rb = statusRank(b);
+        return ra !== rb ? ra - rb : byName(a, b);
+      });
+    }
+    return ordered;
+  }, [state.providers, providerOrder, cachedProviderRanks, providersSortMode]);
 
   const providersSearch = useMemo(() => {
     const query = providersSearchQuery.trim();
@@ -1038,6 +1059,9 @@ function App() {
     const usedCount = (state.apiKeys || []).filter((key) => (
       apiKeyReferencesProvider(key, state.routes, provider.id)
     )).length;
+    // 排序口径是「近 3 日请求量」，那这个数就得出现在卡上：否则顺序无从验证，
+    // 操作员只能每次从头扫一遍。0 也照常显示——"没有流量"同样是有用的信息。
+    const requestCount = recentProviderRequestCounts.get(provider.id) || 0;
     // 上游网关的成员行按上游给自己的名字原样展示（分组标题已经写着属于哪条上游），
     // 账号位留空——它没有账号，把上游名再写一遍只是重复标题。
     const peer = providerConnectKind(provider) === 'peer';
@@ -1055,6 +1079,7 @@ function App() {
         defaultModel={provider.defaultModel}
         modelCount={(provider.models || []).length}
         usedCount={usedCount}
+        requestCount={requestCount}
         healthStatus={provider.healthStatus || 'unchecked'}
         nextRetryAt={provider.nextRetryAt}
         testing={testingProviderID === provider.id}
@@ -5579,30 +5604,58 @@ function App() {
                     </button>
                   ) : null}
                   {(() => {
-                    // 只列真的配了的连接方式：0 个的胶囊筛出来是空列表，留着只是噪音。
+                    // 连接方式：只列真的配了的。这里原先铺成 16 枚同形胶囊（带计数与
+                    // 品牌图标），把「后端枚举」直接变成了界面控件：决策点从 4 个跳到
+                    // 16 个，其中 7 对只差一个后缀（Qoder / Qoder CN、WorkBuddy /
+                    // WorkBuddy AI…），每次进来都要重读一遍。改成带标签的下拉：一个控件、
+                    // 键盘可达、当前值一眼可见，枚举多长都不再占用横向空间。
                     const counts = new Map<string, number>();
                     for (const provider of sortedProviders) {
                       const kind = providerConnectKind(provider);
                       counts.set(kind, (counts.get(kind) || 0) + 1);
                     }
                     const visible = PROVIDER_CONNECT_FILTERS.filter((item) => item.id === '' || (counts.get(item.id) || 0) > 0);
-                    return visible.map((item) => {
-                      const icon = providerConnectIcon(item.id);
-                      const count = item.id === '' ? sortedProviders.length : (counts.get(item.id) || 0);
-                      return (
-                        <button
-                          key={item.id || 'all'}
-                          type="button"
-                          className={`models-filter-chip${icon ? ' with-icon' : ''} ${providersConnectFilter === item.id ? 'active' : ''}`}
-                          onClick={() => setProvidersConnectFilter(item.id)}
+                    const current = visible.find((item) => item.id === providersConnectFilter);
+                    return (
+                      <label className="providers-connect-select" title="按连接方式筛选">
+                        <span className="providers-connect-select-label">连接方式</span>
+                        <select
+                          value={providersConnectFilter}
+                          onChange={(event) => setProvidersConnectFilter(event.target.value as '' | ProviderConnectKind)}
                         >
-                          {icon ? <BrandIcon icon={icon} name={item.label} size={14} /> : null}
-                          <span>{item.label}</span>
-                          <span className="models-filter-chip-count">({count})</span>
-                        </button>
-                      );
-                    });
+                          {visible.map((item) => {
+                            const count = item.id === '' ? sortedProviders.length : (counts.get(item.id) || 0);
+                            return (
+                              <option key={item.id || 'all'} value={item.id}>
+                                {item.label}（{count}）
+                              </option>
+                            );
+                          })}
+                        </select>
+                        {current && current.id !== '' ? (
+                          <button
+                            type="button"
+                            className="providers-connect-select-clear"
+                            onClick={() => setProvidersConnectFilter('')}
+                            title="清除连接方式筛选"
+                          >✕</button>
+                        ) : null}
+                      </label>
+                    );
                   })()}
+                  {/* 排序口径：默认「近 3 日请求量」，但顺序必须能被看见、能被改。
+                      原先只有排序结果，没有任何控件说明它按什么排。 */}
+                  <label className="providers-connect-select" title="列表排序口径">
+                    <span className="providers-connect-select-label">排序</span>
+                    <select
+                      value={providersSortMode}
+                      onChange={(event) => setProvidersSortMode(event.target.value as 'requests' | 'name' | 'status')}
+                    >
+                      <option value="requests">近 3 日请求量</option>
+                      <option value="status">状态（异常优先）</option>
+                      <option value="name">名称</option>
+                    </select>
+                  </label>
                 </div>
                 {isNormalUser || !canDo('providers.create') ? (
                   <div className="models-toolbar-meta">
@@ -5675,11 +5728,46 @@ function App() {
               ) : filteredProviders.length === 0 ? (
                 <div className="empty-state">没有匹配的 Provider，请调整检索词或连接方式过滤。</div>
               ) : (
-                // 本地 Provider 与上游网关的成员行放在同一个网格里：它们本来就是
-                // 一类东西（都能单独绑定 API 密钥）。原先上游单独起一段 section，
-                // 自带一组标题与第二个网格，于是「全部连接方式」下这一块自身成段、
-                // 只有一张卡却占满整行，看着像被切开的另一半。分组信息改成网格里的
-                // 一行分隔条：仍然是「一条上游一组」，但视觉上属于同一张列表。
+                <>
+                {/* 「需要处理」带：这页真正要回答的是「哪个上游要出事了」，
+                    此前只能靠自己把 38 张等权卡片从头扫一遍。这里把异常与已停用的
+                    数量提到网格上方，点一下就是对应的筛选——其余卡片保持中性。 */}
+                {(() => {
+                  const unhealthy = sortedProviders.filter((provider) => !provider.disabled && provider.healthStatus === 'unavailable').length;
+                  const disabled = sortedProviders.filter((provider) => !!provider.disabled).length;
+                  if (unhealthy === 0 && disabled === 0) return null;
+                  return (
+                    <div className="providers-attention">
+                      <span className="providers-attention-label">需要处理</span>
+                      {unhealthy > 0 ? (
+                        <button
+                          type="button"
+                          className={`providers-attention-item danger ${providersStatusFilter === 'unavailable' ? 'active' : ''}`}
+                          onClick={() => setProvidersStatusFilter(providersStatusFilter === 'unavailable' ? 'all' : 'unavailable')}
+                          title="只看异常待试的 Provider"
+                        >
+                          <b>{unhealthy}</b> 个异常待试
+                        </button>
+                      ) : null}
+                      {disabled > 0 ? (
+                        <button
+                          type="button"
+                          className={`providers-attention-item ${providersStatusFilter === 'disabled' ? 'active' : ''}`}
+                          onClick={() => setProvidersStatusFilter(providersStatusFilter === 'disabled' ? 'all' : 'disabled')}
+                          title="只看已停用的 Provider"
+                        >
+                          <b>{disabled}</b> 个已停用
+                        </button>
+                      ) : null}
+                      <span className="providers-attention-hint">点数字直接筛出这些条目</span>
+                    </div>
+                  );
+                })()}
+                {/* 本地 Provider 与上游网关的成员行放在同一个网格里：它们本来就是
+                    一类东西（都能单独绑定 API 密钥）。原先上游单独起一段 section，
+                    自带一组标题与第二个网格，于是「全部连接方式」下这一块自身成段、
+                    只有一张卡却占满整行，看着像被切开的另一半。分组信息改成网格里的
+                    一行分隔条：仍然是「一条上游一组」，但视觉上属于同一张列表。 */}
                 <div className={providerCardDensity === 'compact' ? 'provider-list' : 'provider-card-grid'}>
                   {providerCardDensity === 'compact' ? providerListHead : null}
                   {providerRenderGroups.regular.map(renderProviderCard)}
@@ -5697,6 +5785,7 @@ function App() {
                     </React.Fragment>
                   ))}
                 </div>
+                </>
               )}
               {selectedProvider && !isNormalUser ? <div className="hint-text">{`当前 Provider 被 ${activeProviderRouteCount} 个 API 密钥引用（含备选）。删除时这些密钥的 Provider 绑定会自动重置为空。`}</div> : null}
               <ProviderCatalogDialog

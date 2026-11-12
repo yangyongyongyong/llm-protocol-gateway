@@ -70,9 +70,18 @@ function showPanelToast(text: string, duration = 3000) {
 
 export function RouteCard({ active, name, tone, status, meta, flow, onClick, onTest, onEdit, onClone, onDelete }: { active?: boolean; name: string; tone: BadgeTone; status: string; meta: string; flow: string[]; onClick: () => void; onTest: () => void; onEdit: () => void; onClone: () => void; onDelete: () => void }) {
   return (
-    <div className={`route-card clickable ${active ? 'active' : ''}`} onClick={onClick} role="button" tabIndex={0} onKeyDown={(event) => { if (event.key === 'Enter') onClick(); }}>
+    // 与 Provider 卡片同理：容器不声明 role="button"（内部有动作按钮），
+    // 键盘入口交给名字那一行。
+    <div className={`route-card clickable ${active ? 'active' : ''}`} onClick={onClick}>
       <div className="route-top">
-        <div className="route-name">{name}</div>
+        <button
+          type="button"
+          className="route-name provider-name-btn"
+          onClick={(event) => { event.stopPropagation(); onClick(); }}
+          title={`选中 ${name}`}
+        >
+          {name}
+        </button>
         <div className="route-actions">
           <Badge tone={tone}>{status}</Badge>
           <button className="icon-btn" onClick={(event) => { event.stopPropagation(); onEdit(); }} title="编辑路由">编辑</button>
@@ -988,7 +997,7 @@ function MatchText({ text, query }: { text: string; query?: string }) {
   );
 }
 
-export function ProviderCard({ active, selected, name, providerId, protocol, tone, url, defaultModel, modelCount, usedCount, healthStatus, nextRetryAt, testing, chatTesting, readOnly, selectable, providerDisabled, onToggleEnabled, onToggleRTK, subtitle, icon, provider, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, isQoderPAT, qoderPATConnected, isWorkBuddy, workBuddyConnected, cursorBridge, ownerName, groupName, highlightQuery, onToggleSelect, onClick, onTest, onChatTest, onConformance, onEdit, onClone, onDelete, layout = 'card' }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; defaultModel?: string; modelCount?: number; usedCount: number; healthStatus: string; nextRetryAt?: string; testing: boolean; chatTesting?: boolean; readOnly?: boolean; selectable?: boolean; providerDisabled?: boolean; onToggleEnabled?: () => void; onToggleRTK?: () => void; subtitle?: string; icon?: string; provider?: Provider; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; isQoderPAT?: boolean; qoderPATConnected?: boolean; isWorkBuddy?: boolean; workBuddyConnected?: boolean; cursorBridge?: CursorBridgeRuntime; ownerName?: string; groupName?: string; highlightQuery?: string; onToggleSelect: () => void; onClick: () => void; onTest?: () => void; onChatTest?: () => void; onConformance?: () => void; onEdit?: () => void; onClone?: () => void; onDelete?: () => void; layout?: 'card' | 'list' }) {
+export function ProviderCard({ active, selected, name, providerId, protocol, tone, url, defaultModel, modelCount, usedCount, requestCount, healthStatus, nextRetryAt, testing, chatTesting, readOnly, selectable, providerDisabled, onToggleEnabled, onToggleRTK, subtitle, icon, provider, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, isQoderPAT, qoderPATConnected, isWorkBuddy, workBuddyConnected, cursorBridge, ownerName, groupName, highlightQuery, onToggleSelect, onClick, onTest, onChatTest, onConformance, onEdit, onClone, onDelete, layout = 'card' }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; defaultModel?: string; modelCount?: number; usedCount: number; requestCount?: number; healthStatus: string; nextRetryAt?: string; testing: boolean; chatTesting?: boolean; readOnly?: boolean; selectable?: boolean; providerDisabled?: boolean; onToggleEnabled?: () => void; onToggleRTK?: () => void; subtitle?: string; icon?: string; provider?: Provider; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; isQoderPAT?: boolean; qoderPATConnected?: boolean; isWorkBuddy?: boolean; workBuddyConnected?: boolean; cursorBridge?: CursorBridgeRuntime; ownerName?: string; groupName?: string; highlightQuery?: string; onToggleSelect: () => void; onClick: () => void; onTest?: () => void; onChatTest?: () => void; onConformance?: () => void; onEdit?: () => void; onClone?: () => void; onDelete?: () => void; layout?: 'card' | 'list' }) {
   // 订阅类（ZCode / Trae）由后端返回的凭证对象决定卡片显示什么：整张 Provider 传进来
   // 比再加六个布尔参数更省事，也不会漏掉以后新增的连接方式。
   const connectKind = provider ? providerConnectKind(provider) : 'api_key';
@@ -1069,7 +1078,7 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
   );
   if (layout === 'list') {
     return (
-      <div className={`provider-list-row${active ? ' active' : ''}${selected ? ' selected' : ''}${providerDisabled ? ' provider-disabled' : ''}`} onClick={onClick} role="button" tabIndex={0} onKeyDown={(event) => { if (event.key === 'Enter') onClick(); }}>
+      <div className={`provider-list-row${active ? ' active' : ''}${selected ? ' selected' : ''}${providerDisabled ? ' provider-disabled' : ''}`} onClick={onClick}>
         {selectable ? (
           <label className="provider-list-check" onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
             <input type="checkbox" checked={!!selected} onChange={onToggleSelect} aria-label={`选择 ${name}`} />
@@ -1078,7 +1087,14 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
         <span className="provider-list-icon"><BrandIcon icon={icon} name={name} size={18} /></span>
         <div className="provider-list-id">
           <div className="provider-list-title">
-            <span className="provider-list-name" title={name}><MatchText text={name} query={highlightQuery} /></span>
+            <button
+              type="button"
+              className="provider-list-name provider-name-btn"
+              onClick={(event) => { event.stopPropagation(); onClick(); }}
+              title={`选中 ${name}`}
+            >
+              <MatchText text={name} query={highlightQuery} />
+            </button>
             <span className="provider-list-sub" title={subtitleText}><MatchText text={subtitleText} query={highlightQuery} /></span>
           </div>
           <div className="provider-list-badges">
@@ -1124,14 +1140,27 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
     );
   }
   return (
-    <div className={`provider-card clickable ${active ? 'active' : ''} ${selected ? 'selected' : ''} ${providerDisabled ? 'provider-disabled' : ''}`} onClick={onClick} role="button" tabIndex={0} onKeyDown={(event) => { if (event.key === 'Enter') onClick(); }}>
+    // 卡片容器不再声明 role="button"/tabIndex：它内部有选择框、刷新与动作按钮，
+    // 而 ARIA 规定 button 的子节点是 presentational —— 读屏会把整卡念成一个按钮，
+    // 里面的控件就消失了。键盘入口改由标题按钮承担（.provider-name-btn），
+    // 鼠标仍然可以点整卡。
+    <div className={`provider-card clickable ${active ? 'active' : ''} ${selected ? 'selected' : ''} ${providerDisabled ? 'provider-disabled' : ''}`} onClick={onClick}>
       <div className="provider-head">
         {/* 品牌图标：一屏十几张卡时，认图比认字快；匹配不到厂商就退回名称首字。 */}
         <span className="provider-icon">
           <BrandIcon icon={icon} name={name} size={20} />
         </span>
         <div className="provider-title-block">
-          <div className="provider-name"><MatchText text={name} query={highlightQuery} /></div>
+          {/* 卡片的键盘入口：整卡可点（鼠标），但焦点落在这个真按钮上。
+              Enter / Space 由浏览器原生处理，读屏也能念出它打开的是哪一条。 */}
+          <button
+            type="button"
+            className="provider-name provider-name-btn"
+            onClick={(event) => { event.stopPropagation(); onClick(); }}
+            title={`选中 ${name}`}
+          >
+            <MatchText text={name} query={highlightQuery} />
+          </button>
           {/* 副标题只放账号/ID：协议已由徽章表达，不再重复拼接 */}
           <div className="provider-subtitle" title={subtitleText}><MatchText text={subtitleText} query={highlightQuery} /></div>
         </div>
@@ -1194,6 +1223,8 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
       ) : null}
       <div className="provider-foot" onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
         <div className="provider-foot-meta">
+          {/* 排序口径就是它：不显示这个数，按请求量排的列表就无法自证。 */}
+          <span title="近 3 日请求量（列表默认按它降序）">近 3 日 <b>{requestCount ?? 0}</b></span>
           <span><b>{usedCount}</b> 个 API Key</span>
           {ownerName ? <span>创建者 <b><MatchText text={ownerName} query={highlightQuery} /></b></span> : null}
         </div>

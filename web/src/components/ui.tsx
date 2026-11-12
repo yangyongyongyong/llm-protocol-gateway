@@ -173,11 +173,28 @@ export function MoreMenu({ items, label = '更多操作' }: { items: MoreMenuIte
       setOpen(false);
     };
     // stopPropagation：菜单开着时 Escape 只关菜单，不穿透到下层弹窗
+    // 方向键在菜单项之间移动（role=menu 承诺了这个行为）：菜单是 portal 到 body 的，
+    // 不接管的话 Tab 会直接离开菜单、方向键毫无反应，键盘用户等于打不开这个菜单。
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         event.stopPropagation();
         setOpen(false);
+        triggerRef.current?.focus({ preventScroll: true });
+        return;
       }
+      if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp' && event.key !== 'Home' && event.key !== 'End') return;
+      const menu = menuRef.current;
+      if (!menu) return;
+      const entries = Array.from(menu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not([disabled])'));
+      if (entries.length === 0) return;
+      event.preventDefault();
+      const active = document.activeElement as HTMLElement | null;
+      const index = entries.findIndex((entry) => entry === active);
+      let next = 0;
+      if (event.key === 'ArrowDown') next = index < 0 ? 0 : (index + 1) % entries.length;
+      else if (event.key === 'ArrowUp') next = index < 0 ? entries.length - 1 : (index - 1 + entries.length) % entries.length;
+      else if (event.key === 'End') next = entries.length - 1;
+      entries[next].focus({ preventScroll: true });
     };
     const onClose = () => setOpen(false);
     document.addEventListener('mousedown', onDocMouseDown);
@@ -205,6 +222,19 @@ export function MoreMenu({ items, label = '更多操作' }: { items: MoreMenuIte
         onClick={() => {
           if (!open) place();
           setOpen((value) => !value);
+        }}
+        onKeyDown={(event) => {
+          // 键盘打开时直接把焦点送进菜单（首项），与原生菜单一致；
+          // 鼠标打开则保持焦点在触发按钮上，不打断鼠标用户的视线。
+          if (event.key === 'ArrowDown' || event.key === 'Enter' || event.key === ' ') {
+            if (open) return;
+            event.preventDefault();
+            place();
+            setOpen(true);
+            window.requestAnimationFrame(() => {
+              menuRef.current?.querySelector<HTMLButtonElement>('[role="menuitem"]:not([disabled])')?.focus({ preventScroll: true });
+            });
+          }
         }}
       >
         ⋯
@@ -486,6 +516,8 @@ export function Modal({ title, description, children, onClose, size = 'default',
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
   const layerRef = useRef<{ id: number; zIndex: number } | null>(null);
+  const cardRef = useRef<HTMLDivElement | null>(null);
+  const titleID = useRef(`modal-title-${Math.random().toString(36).slice(2, 9)}`);
 
   if (!layerRef.current) {
     ensureModalEscapeListener();
@@ -515,6 +547,52 @@ export function Modal({ title, description, children, onClose, size = 'default',
     };
   }, []);
 
+  // 焦点管理：打开时把焦点移进弹窗（优先标题上的 tabIndex=-1，读屏会先念标题），
+  // 关闭时还原到触发它的那个元素；Tab / Shift+Tab 在弹窗内循环，遮罩后面的内容
+  // 不参与 Tab 序列。没有这段时，读屏不会宣布「弹窗出现了」，Tab 还能走到背景里。
+  useEffect(() => {
+    const opener = document.activeElement as HTMLElement | null;
+    const card = cardRef.current;
+    if (card) {
+      const target = card.querySelector<HTMLElement>('[data-modal-initial-focus]') ?? card;
+      target.focus({ preventScroll: true });
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Tab' || !card) return;
+      const focusables = Array.from(card.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      )).filter((el) => el.offsetParent !== null || el === document.activeElement);
+      if (focusables.length === 0) {
+        event.preventDefault();
+        card.focus({ preventScroll: true });
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement as HTMLElement | null;
+      const inside = active ? card.contains(active) : false;
+      if (!inside) {
+        event.preventDefault();
+        first.focus({ preventScroll: true });
+        return;
+      }
+      if (event.shiftKey && active === first) {
+        event.preventDefault();
+        last.focus({ preventScroll: true });
+      } else if (!event.shiftKey && active === last) {
+        event.preventDefault();
+        first.focus({ preventScroll: true });
+      }
+    };
+    document.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown, true);
+      if (opener && typeof opener.focus === 'function' && document.contains(opener)) {
+        opener.focus({ preventScroll: true });
+      }
+    };
+  }, []);
+
   // Portal 到 body：.card / .sidebar 上的 backdrop-filter 会让它们成为 fixed
   // 定位的包含块，弹窗若留在卡片内部渲染，遮罩会被卡片裁剪并错位。
   return createPortal(
@@ -523,10 +601,18 @@ export function Modal({ title, description, children, onClose, size = 'default',
       style={{ zIndex: layerRef.current.zIndex }}
       onMouseDown={blocking ? () => onCloseRef.current() : undefined}
     >
-      <div className={`modal-card${size === 'wide' ? ' wide' : ''}`} onMouseDown={(event) => event.stopPropagation()}>
+      <div
+        ref={cardRef}
+        className={`modal-card${size === 'wide' ? ' wide' : ''}`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleID.current}
+        tabIndex={-1}
+        onMouseDown={(event) => event.stopPropagation()}
+      >
         <div className="modal-header">
           <div>
-            <h2>{title}</h2>
+            <h2 id={titleID.current} data-modal-initial-focus tabIndex={-1}>{title}</h2>
             <p>{description}</p>
           </div>
           <button className="icon-btn modal-close" onClick={() => onCloseRef.current()} aria-label="关闭弹窗">✕</button>
