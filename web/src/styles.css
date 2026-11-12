@@ -284,6 +284,10 @@ html[data-theme="dark"] *:hover::-webkit-scrollbar-thumb { background: rgba(152,
 .sidebar {
   position: sticky;
   top: 16px;
+  /* 网格项默认 min-width: auto —— 内容（尤其手机档不换行的导航）会把列撑宽，
+     实测 390px 视口下侧栏 min-content 到 400，页面因此溢出 20px。让它可收缩，
+     内部自己滚动。 */
+  min-width: 0;
   height: calc(100vh - 32px);
   /* 移动端浏览器地址栏收放时 100vh 偏大，dvh 修正；旧浏览器回落到上一行 */
   height: calc(100dvh - 32px);
@@ -4834,7 +4838,11 @@ details:not([open]) > *:not(summary) { display: none !important; }
   /* 品牌不显示 */
   .sidebar .brand { display: none; }
   .sidebar .status-pill { display: none; }
-  .sidebar .nav { display: flex; flex-direction: row; flex-wrap: nowrap; gap: 6px; overflow: visible; }
+  /* nowrap 决定「组内一行不折」，但 overflow 必须是 auto 而不是 visible：
+     visible 时导航的 min-content 会把侧栏（进而整个网格列）撑到视口之外，
+     实测 390px 下页面横向溢出 20px。改成 auto：一行仍然不折，超出部分在导航条
+     内部横向滚动，页面本身不再溢出。 */
+  .sidebar .nav { display: flex; flex-direction: row; flex-wrap: nowrap; gap: 6px; overflow-x: auto; overflow-y: hidden; min-width: 0; }
   /* 三个分组按项数分宽（4/3/5），组内一行不折。900 档写的是 `.sidebar .nav-group { display: contents }`，
      基础规则里还有同为 0,3,0 的 flex-direction: column；显式写回 row + flex 才能让每组变成横排的一条。 */
   .sidebar .nav-group { display: flex; flex-direction: row; flex-wrap: nowrap; flex: 4 1 0; gap: 2px; min-width: 0; }
