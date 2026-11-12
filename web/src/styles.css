@@ -449,6 +449,14 @@ html[data-theme="dark"] *:hover::-webkit-scrollbar-thumb { background: rgba(152,
 .badge.red { color: var(--red); background: var(--red-soft); }
 .badge.purple { color: var(--purple); background: var(--purple-soft); }
 .badge.slate { color: var(--slate); background: var(--slate-soft); }
+/* 浅色主题的徽章文字：语义色本身是按「填充/圆点」选的亮色，用作 11px 小字时在
+   各自的 soft 底上过不了 AA。深色主题早就单独调过（下面那组），浅色一直沿用原值，
+   实测 #16a34a on #e3f5ea 只有 2.91:1、#d97706 on #fdf1d6 只有 2.84:1。
+   这里只调文字色，不动 --green/--amber/--red 本身（进度条与状态点仍用亮色）。 */
+html[data-theme="light"] .badge.green, :root:not([data-theme="dark"]) .badge.green { color: #166534; }
+html[data-theme="light"] .badge.amber, :root:not([data-theme="dark"]) .badge.amber { color: #92400e; }
+html[data-theme="light"] .badge.red,   :root:not([data-theme="dark"]) .badge.red   { color: #b91c1c; }
+html[data-theme="light"] .badge.cyan,  :root:not([data-theme="dark"]) .badge.cyan  { color: #155e75; }
 html[data-theme="dark"] .badge.green { color: #6ee7b7; }
 html[data-theme="dark"] .badge.blue { color: #93c5fd; }
 html[data-theme="dark"] .badge.cyan { color: #67e8f9; }
