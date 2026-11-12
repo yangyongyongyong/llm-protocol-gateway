@@ -3043,7 +3043,11 @@ function App() {
       defaultModel: '',
       defaultThinkingDepth: '',
       authType: preset.authType,
-      requestAdapterJSON: '',
+      // 预置自带的必需请求头（OpenCode Go 的 x-opencode-session 这类）直接落进
+      // 「请求适配器」，仍然可见可改——但用户不必自己知道还缺什么。
+      requestAdapterJSON: preset.headers && Object.keys(preset.headers).length > 0
+        ? JSON.stringify({headers: preset.headers}, null, 2)
+        : '',
       teamOrganizationId: '',
       teamProjectId: '',
     });

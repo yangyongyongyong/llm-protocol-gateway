@@ -3587,6 +3587,10 @@ func (s *Server) executeProviderChatHTTP(r *http.Request, provider domain.Provid
 		}
 		applyProviderAuth(request, provider, r.Header.Get("Authorization"))
 		applyOpenCodeZenHeaders(request, provider, requestBody)
+		// per-provider 自定义头。漏了这一句，「对话测试」测的就不是真实转发那条
+		// 路径：OpenCode Go 要求每个请求带 x-opencode-session，配好了也发不出去，
+		// 只换来 400 MissingSessionID —— 而真实流量其实是好的，最难查的一类差异。
+		applyRequestAdapterHeaders(request, provider, resolvedModel)
 		if trae {
 			applyTraeHeaders(request, provider)
 		}
