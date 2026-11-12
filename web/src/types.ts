@@ -1431,6 +1431,16 @@ export type ProviderPreset = {
    * <img> 渲染；否则是 currentColor 单色版，必须用 CSS mask 才能跟着主题着色。
    */
   icon?: string;
+  /**
+   * 这条上游要求、但表单里没有专门输入框的额外请求头。
+   *
+   * 存在的原因很实际：有些上游不给默认可用，少一个头就整条不能用，而用户从预置
+   * 建 provider 时并不知道自己还缺什么。OpenCode Go 要求每个请求带
+   * x-opencode-session，缺了直接 400 MissingSessionID —— 填了 key 也没用。
+   *
+   * 点选预置时它会落进表单的「请求适配器」里，用户仍然看得见、改得动。
+   */
+  headers?: Record<string, string>;
 };
 
 export type LegacyRequestStatsSnapshot = {

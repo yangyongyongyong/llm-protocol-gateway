@@ -239,12 +239,17 @@ func (s *Server) persistProtocolSupport(providerID string, results []protocolDet
 	}
 }
 
-// autoDetectProviderProtocols 在 provider 建好或 baseUrl 变更之后，后台探一遍
-// 它支持哪些协议。
+// autoDetectProviderProtocols 在 provider 建好或 baseUrl 变更之后，后台做两件事：
+// 探一遍它支持哪些协议，再抓一次模型清单。
 //
-// 为什么是后台而不是同步：探测要真的往上游发请求，慢起来能到十几秒（每条候选
-// 一个 15s 超时）。让「保存 provider」等它，等于给一个本来瞬时的操作绑上网络
-// 延迟。所以这里起一个 goroutine，结论写完才出现在控制台上。
+// 为什么是后台而不是同步：两件事都要真的往上游发请求，慢起来能到几十秒（协议
+// 探测每条候选一个 15s 超时）。让「保存 provider」等它们，等于给一个本来瞬时的
+// 操作绑上网络延迟。所以这里起一个 goroutine，结论写完才出现在控制台上。
+//
+// 为什么连模型一起抓：不抓的话新 provider 的目录是空的，而对话测试、监控探测
+// 这些"不指定模型"的路径全都得靠目录给出一个真实模型名。留着空目录直接测试，
+// 发出去的是占位符 request-model-not-set，换回上游一句莫名其妙的 400 —— 用户
+// 明明刚填对了 key，看起来却像没填对。
 //
 // 只对 api_key 型上游做：OAuth 订阅、对端网关、各种专有客户端（Qoder/Cursor/
 // 自注册）的地址不是"一条 baseUrl 派生多条协议路径"的形态，探也是白探。
@@ -263,7 +268,15 @@ func (s *Server) autoDetectProviderProtocols(provider domain.Provider) {
 		}()
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
-		results := s.detectProviderProtocols(ctx, provider)
+
+		s.autoFetchProviderModels(ctx, provider)
+
+		// 抓模型可能已经改了内存里的 provider（默认模型被回填），重新取一份再探。
+		current := provider
+		if refreshed, err := s.router.ProviderByID(provider.ID); err == nil {
+			current = refreshed
+		}
+		results := s.detectProviderProtocols(ctx, current)
 		protocols := supportedProtocols(results)
 		if len(protocols) == 0 {
 			// 一条都没探到，多半是这台机器此刻连不上上游（或被 Cloudflare 挡）。
@@ -274,5 +287,35 @@ func (s *Server) autoDetectProviderProtocols(provider domain.Provider) {
 		s.persistProtocolSupport(provider.ID, results)
 		s.logs.AddApp("info", "protocol support detected", fmt.Sprintf("provider=%s protocols=%s", provider.ID, strings.Join(protocols, ",")))
 	}()
+}
+
+// autoFetchProviderModels 在后台抓一次模型清单，成功就落到 provider 上。
+//
+// 与「获取模型」按钮共用同一条实现（fetchProviderModels），所以凭据、自定义头、
+// 各订阅类型的特殊取法全都一致；差别只是它可以自己发起。
+func (s *Server) autoFetchProviderModels(ctx context.Context, provider domain.Provider) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "/__providers/"+provider.ID+"/test", nil)
+	if err != nil {
+		return
+	}
+	result := s.fetchProviderModels(request, provider, time.Now())
+	if !result.Success {
+		s.logs.AddApp("info", "provider models not fetched automatically", fmt.Sprintf(
+			"provider=%s: %s", provider.ID, result.Error))
+		return
+	}
+	if len(result.Models) == 0 {
+		return
+	}
+	if _, err := s.router.UpdateProviderModels(provider.ID, result.Models, "healthy"); err != nil {
+		s.logs.AddApp("warn", "provider models not saved", fmt.Sprintf("provider=%s: %v", provider.ID, err))
+		return
+	}
+	if err := s.saveState(); err != nil {
+		s.logs.AddApp("warn", "provider models not persisted", fmt.Sprintf("provider=%s: %v", provider.ID, err))
+		return
+	}
+	s.logs.AddApp("info", "provider models fetched automatically", fmt.Sprintf(
+		"provider=%s models=%d", provider.ID, len(result.Models)))
 }
 
