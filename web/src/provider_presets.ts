@@ -66,7 +66,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
   { id: 'yylx', name: '鱼鱼连线', section: 'relay', authType: 'api_key', protocol: 'openai_chat', baseUrl: 'https://app.yylx.io/v1', website: 'https://yylx.io', icon: 'yylx' },
   { id: 'commandcode', name: 'Command Code', section: 'relay', authType: 'api_key', protocol: 'openai_chat', baseUrl: 'https://api.commandcode.ai/provider/v1', website: 'https://commandcode.ai/docs/provider', icon: 'commandcode' },
   { id: 'opencode-zen', name: 'OpenCode Zen', section: 'relay', authType: 'api_key', protocol: 'openai_chat', baseUrl: 'https://opencode.ai/zen/v1', website: 'https://opencode.ai/zen', note: '部分模型无需密钥', icon: 'opencode' },
-  { id: 'opencode-go', name: 'OpenCode Go', section: 'relay', authType: 'api_key', protocol: 'openai_chat', baseUrl: 'https://opencode.ai/zen/go/v1', website: 'https://opencode.ai/docs/go', icon: 'opencode', headers: {'x-opencode-session': 'lpg-gateway-session'}, note: '需填密钥；已自动带上它要求的 x-opencode-session 头' },
+  { id: 'opencode-go', name: 'OpenCode Go', section: 'relay', authType: 'api_key', protocol: 'openai_chat', baseUrl: 'https://opencode.ai/zen/go/v1', website: 'https://opencode.ai/docs/go', icon: 'opencode', headers: {'x-opencode-session': 'lpg-gateway-session'}, note: '需填密钥；卡片展示 5 小时 / 周 / 月额度，并自动带上 x-opencode-session 头' },
   { id: 'kilo', name: 'Kilo Gateway', section: 'relay', authType: 'api_key', protocol: 'openai_chat', baseUrl: 'https://api.kilo.ai/api/openrouter', note: '部分模型无需密钥', icon: 'kilo' },
   { id: 'clinepass', name: 'ClinePass', section: 'relay', authType: 'api_key', protocol: 'openai_chat', baseUrl: 'https://api.cline.bot/api/v1', website: 'https://docs.cline.bot/getting-started/clinepass', icon: 'cline' },
   { id: 'pipellm', name: 'PipeLLM', section: 'relay', authType: 'api_key', protocol: 'openai_chat', baseUrl: 'https://api.pipellm.ai/openai/v1', website: 'https://www.pipellm.ai', icon: 'pipellm-color' },
@@ -89,9 +89,36 @@ export function findProviderPreset(id: string): ProviderPreset | undefined {
  * 匹配不中（自建反代、换过域名的厂商）返回空，由 BrandIcon 退回名称首字。
  */
 export function resolveProviderIcon(provider: Provider): string {
+  // 网关互联成员继承父端卡片图标；否则 peer provider 的 baseUrl 是父网关，
+  // 按主机名永远匹配不到真正的 WorkBuddy / Claude / Qoder 品牌。
+  const inheritedVendor = (provider.peerGrants?.card?.vendor || '').trim().toLowerCase();
+  if (inheritedVendor) {
+    const inheritedIcon = PROVIDER_ICON_BY_VENDOR[inheritedVendor];
+    if (inheritedIcon) return inheritedIcon;
+  }
   const preset = PROVIDER_PRESETS.find((item) => item.icon && presetMatchesProvider(item, provider));
   return preset?.icon || '';
 }
+
+const PROVIDER_ICON_BY_VENDOR: Record<string, string> = {
+  anthropic: 'anthropic',
+  chatgpt: 'codex-color',
+  claude: 'claude-color',
+  cursor: 'cursor',
+  deepseek: 'deepseek-color',
+  minimax: 'minimax-color',
+  moonshot: 'moonshot',
+  opencode: 'opencode',
+  qoder: 'qoder',
+  qwen: 'qwen-color',
+  stepfun: 'stepfun-color',
+  trae: 'trae',
+  volcengine: 'volcengine-color',
+  workbuddy: 'workbuddy-color',
+  zai: 'zai',
+  zhipu: 'zhipu-color',
+  zcode: 'zcode.png',
+};
 
 /**
  * 连接方式（订阅账号类）的品牌图标：从订阅预设里反查，和目录弹窗、Provider 卡

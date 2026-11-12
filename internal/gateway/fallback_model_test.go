@@ -11,7 +11,7 @@ import (
 	"github.com/luca/llm-protocol-gateway/internal/monitor"
 )
 
-func TestFallbackModelOverrideOnlyRequiredAcrossProtocols(t *testing.T) {
+func TestFallbackModelOverrideOptionalAcrossProtocols(t *testing.T) {
 	t.Parallel()
 	router := NewRouter(domain.GatewayState{
 		Providers: []domain.Provider{
@@ -59,6 +59,77 @@ func TestFallbackModelOverrideOnlyRequiredAcrossProtocols(t *testing.T) {
 		FallbackProviderIDs: []string{"p-claude"},
 	}); err != nil {
 		t.Fatalf("update to a cross-protocol fallback without a model override should be accepted: %v", err)
+	}
+}
+
+// 跨协议备选没有 fallbackModelOverrides 时也必须能接管：网关自动转换协议，
+// 模型按备选自己的目录/默认模型解析，不把“锁模型”当成可用性的前置条件。
+func TestFailoverCrossProtocolWithoutModelOverrideUsesFallbackDefault(t *testing.T) {
+	modelCh := make(chan string, 1)
+	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" {
+			t.Errorf("fallback path = %q, want /v1/messages", r.URL.Path)
+		}
+		var payload map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		if model, _ := payload["model"].(string); model != "" {
+			modelCh <- model
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "msg_backup", "type": "message", "role": "assistant", "model": "claude-backup",
+			"content":     []any{map[string]any{"type": "text", "text": "ok"}},
+			"stop_reason": "end_turn",
+			"usage":       map[string]any{"input_tokens": 1, "output_tokens": 1},
+		})
+	}))
+	defer live.Close()
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":{"message":"upstream unavailable"}}`))
+	}))
+	defer down.Close()
+
+	preferred := domain.Provider{
+		ID: "p-chat", Name: "p-chat", Protocol: domain.ProtocolOpenAIChat,
+		AuthType: domain.AuthTypeAPIKey, BaseURL: down.URL + "/v1", APIKeySource: "sk-a", HealthStatus: "healthy",
+	}
+	backup := domain.Provider{
+		ID: "p-claude", Name: "p-claude", Protocol: domain.ProtocolClaude,
+		AuthType: domain.AuthTypeAPIKey, BaseURL: live.URL + "/v1", APIKeySource: "sk-b", HealthStatus: "healthy",
+		DefaultModel: "claude-backup",
+		Models:       []domain.Model{{ID: "claude-backup", ProviderID: "p-claude", Protocol: domain.ProtocolClaude}},
+	}
+	route := domain.Route{ID: "r-cross", Name: "r-cross", ProviderID: preferred.ID, OutputProtocol: domain.ProtocolOpenAIChat, Mode: domain.RouteModeAuto, Enabled: true}
+	apiKey := domain.APIKey{
+		ID: "k-cross", Name: "k-cross", Key: "sk-gw-test-cross-protocol", RouteID: route.ID,
+		Enabled: true, StreamEnabled: true,
+		FallbackProviderIDs: []string{backup.ID},
+	}
+	router := NewRouter(domain.GatewayState{
+		Providers: []domain.Provider{preferred, backup},
+		Routes:    []domain.Route{route},
+		APIKeys:   []domain.APIKey{apiKey},
+	})
+	server := NewServer(router, monitor.NewStore())
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-requested","stream":false,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer "+apiKey.Key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected the cross-protocol fallback to serve without a locked model, got %d: %s", rec.Code, rec.Body.String())
+	}
+	select {
+	case got := <-modelCh:
+		if got != "claude-backup" {
+			t.Fatalf("fallback should receive its own default model, got %q", got)
+		}
+	default:
+		t.Fatal("cross-protocol fallback provider was never called")
 	}
 }
 

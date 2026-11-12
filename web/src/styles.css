@@ -1040,6 +1040,45 @@ html[data-theme="dark"] .badge.slate { color: #cbd5e1; }
 .providers-toolbar-meta { color: var(--muted); font-size: 12px; font-weight: 600; }
 .providers-filter-toolbar { display: grid; gap: 10px; margin-bottom: 12px; }
 .providers-toolbar-actions { display: inline-flex; gap: 8px; margin-left: auto; }
+/* 管理员 Provider 分组：只做筛选与批量归类，不承载任何权限语义。 */
+.provider-group-toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; min-width: 0; }
+.provider-group-chips { display: flex; align-items: center; gap: 6px; min-width: 0; overflow-x: auto; padding: 1px 0 3px; scrollbar-width: thin; }
+.provider-group-chip {
+  display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto;
+  height: 28px; padding: 0 10px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--surface); color: var(--muted);
+  font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap;
+}
+.provider-group-chip span { color: var(--subtle); font-family: var(--mono); font-size: 10.5px; }
+.provider-group-chip:hover { border-color: var(--border-strong); color: var(--text); }
+.provider-group-chip.active { border-color: var(--accent-border); background: var(--accent-soft); color: var(--accent-strong); }
+.provider-group-chip.active span { color: inherit; }
+.provider-group-chip.muted { border-style: dashed; }
+.provider-group-batch-select {
+  height: 28px; max-width: 150px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--surface); color: var(--text); font: inherit; font-size: 11.5px; padding: 0 8px;
+}
+.provider-group-create { display: flex; gap: 8px; margin: 4px 0 14px; }
+.provider-group-create input, .provider-group-manage-row input {
+  min-width: 0; height: var(--control-h); padding: 0 10px; border: 1px solid var(--border); border-radius: var(--r-sm);
+  background: var(--surface); color: var(--text); font: inherit;
+}
+.provider-group-create input { flex: 1 1 auto; }
+.provider-group-manage-list { display: flex; flex-direction: column; gap: 8px; max-height: 48vh; overflow-y: auto; padding-right: 2px; }
+.provider-group-manage-row {
+  display: grid; grid-template-columns: 28px minmax(140px, 1fr) auto auto; align-items: center; gap: 8px;
+  padding: 8px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface-subtle);
+}
+.provider-group-manage-index { color: var(--subtle); font-family: var(--mono); font-size: 11px; }
+.provider-group-manage-count { color: var(--muted); font-size: 11px; white-space: nowrap; }
+.provider-group-manage-actions { display: inline-flex; align-items: center; gap: 5px; flex-wrap: wrap; justify-content: flex-end; }
+.provider-group-manage-hint { margin-top: 12px; color: var(--muted); font-size: 11.5px; line-height: 1.6; }
+@media (max-width: 760px) {
+  .provider-group-toolbar { align-items: flex-start; flex-direction: column; }
+  .provider-group-chips { width: 100%; }
+  .provider-group-manage-row { grid-template-columns: 24px minmax(0, 1fr); }
+  .provider-group-manage-count, .provider-group-manage-actions { grid-column: 2; justify-content: flex-start; }
+}
 /* 卡片等高（stretch）：卡片内配额面板已压缩为单行横排（.claude-usage-panel.compact），
    高度差缩小后 stretch 不再产生大片空白，同排卡片底部对齐 */
 .provider-card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; align-items: stretch; }
@@ -1058,6 +1097,7 @@ html[data-theme="dark"] .badge.slate { color: #cbd5e1; }
   .section-full.providers-page { height: calc(100dvh - 32px); }
   .section-full.providers-page > .card.panel { flex: 1 1 auto; min-height: 0; }
   .section-full.providers-page > .card.panel > .panel-header,
+  .section-full.providers-page > .card.panel > .provider-group-toolbar,
   .section-full.providers-page > .card.panel > .providers-filter-toolbar,
   .section-full.providers-page > .card.panel > .providers-toolbar,
   .section-full.providers-page > .card.panel > .hint-text { flex: 0 0 auto; }
@@ -2217,6 +2257,7 @@ body.fpp-dragging, body.fpp-dragging * { cursor: grabbing !important; user-selec
 }
 .test-result-card.ok { border-color: rgba(22, 163, 74, 0.28); background: rgba(220, 252, 231, 0.35); }
 .test-result-card.fail { border-color: rgba(220, 38, 38, 0.26); background: rgba(254, 226, 226, 0.32); }
+.test-result-card.canceled { border-color: var(--border-strong); background: var(--surface-subtle); }
 html[data-theme="dark"] .test-result-card.ok { background: rgba(34, 197, 94, 0.1); border-color: rgba(34, 197, 94, 0.3); }
 html[data-theme="dark"] .test-result-card.fail { background: rgba(239, 68, 68, 0.12); border-color: rgba(239, 68, 68, 0.32); }
 .test-result-head {
@@ -3430,6 +3471,14 @@ html[data-theme="dark"] .usage-calendar-day.edge { background: var(--accent); co
 .claude-usage-panel.compact .claude-usage-title { font-size: 11.5px; font-weight: 600; min-width: 0; }
 /* 卡片上"更新于"时间戳最次要，隐藏换取标题/状态的空间（完整面板仍显示） */
 .claude-usage-panel.compact .claude-usage-status { display: none; }
+.peer-inherited-usage-panel .peer-inherited-balance {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+  padding: 8px 10px; border-radius: var(--r-sm); background: var(--surface);
+  color: var(--muted); font-size: 12px;
+}
+.peer-inherited-usage-panel .peer-inherited-balance b { color: var(--text-strong); font-size: 16px; font-weight: 700; }
+.peer-inherited-hint { color: var(--muted); font-size: 10.5px; line-height: 1.4; }
+.claude-usage-panel.compact .peer-inherited-hint { display: none; }
 /* 卡片上的额度格子：auto-fit 让三四个窗口自然排开——放得下就一行，
    放不下就换行。原先用 grid-auto-flow: column 强行排成一行，Claude 多出
    「7 天 Fable」这第四个窗口时每格被挤到几十像素，标签和重置时间一起被裁到
@@ -5532,6 +5581,12 @@ html[data-theme="dark"] .output-curl-head {
   color: var(--green);
   box-shadow: 0 0 0 1px rgba(22, 163, 74, 0.4);
 }
+.traffic-status-chip.slate.active {
+  background: var(--surface-sunken);
+  border-color: var(--border-strong);
+  color: var(--text);
+  box-shadow: 0 0 0 1px var(--border-strong);
+}
 .traffic-status-chip.amber.active {
   background: var(--amber-soft);
   border-color: rgba(217, 119, 6, 0.4);
@@ -5985,6 +6040,12 @@ html[data-theme="dark"] .traffic-log-row.has-error {
   color: var(--green);
   box-shadow: 0 0 0 1px rgba(22, 163, 74, 0.4);
 }
+.traffic-status-chip.slate.active {
+  background: var(--surface-sunken);
+  border-color: var(--border-strong);
+  color: var(--text);
+  box-shadow: 0 0 0 1px var(--border-strong);
+}
 .traffic-status-chip.amber.active {
   background: var(--amber-soft);
   border-color: rgba(217, 119, 6, 0.4);
@@ -6307,6 +6368,12 @@ html[data-theme="dark"] .traffic-log-row.has-error {
   border-color: rgba(22, 163, 74, 0.4);
   color: var(--green);
   box-shadow: 0 0 0 1px rgba(22, 163, 74, 0.4);
+}
+.traffic-status-chip.slate.active {
+  background: var(--surface-sunken);
+  border-color: var(--border-strong);
+  color: var(--text);
+  box-shadow: 0 0 0 1px var(--border-strong);
 }
 .traffic-status-chip.amber.active {
   background: var(--amber-soft);
@@ -6672,6 +6739,14 @@ html[data-theme="dark"] .traffic-log-row.has-error {
 .log-status-banner.warning {
   border-color: rgba(245, 158, 11, 0.3);
   background: rgba(245, 158, 11, 0.06);
+}
+.log-status-banner.canceled {
+  border-color: var(--border-strong);
+  background: var(--surface-subtle);
+}
+.log-status-banner.canceled .log-status-banner-error {
+  color: var(--muted);
+  background: var(--surface);
 }
 .log-status-banner.ok {
   border-color: rgba(16, 185, 129, 0.25);
@@ -7710,6 +7785,8 @@ html[data-theme="dark"] .quota-next { background: var(--surface-strong); }
 .tlog-row:focus-visible { outline: 2px solid var(--accent-border); outline-offset: -2px; }
 .tlog-row.error { background: rgba(220, 38, 38, 0.05); }
 .tlog-row.error:hover { background: rgba(220, 38, 38, 0.09); }
+.tlog-row.canceled { background: var(--surface-subtle); }
+.tlog-row.canceled:hover { background: var(--surface-sunken); }
 
 /* 新日志进场：行高从 0 撑开（下方的行跟着平滑下滑，不是瞬间顶一格），
    同时淡入 + 轻微下滑，再用强调色从左侧铺一遍渐隐。
@@ -7751,6 +7828,7 @@ html[data-theme="dark"] .quota-next { background: var(--surface-strong); }
 }
 .tlog-time { color: var(--muted); font-family: var(--mono); font-size: 11.5px; }
 .tlog-row.error .tlog-time { color: var(--red); }
+.tlog-row.canceled .tlog-time { color: var(--muted); }
 .tlog-key {
   display: inline-flex; align-items: center; gap: 6px; min-width: 0;
   color: var(--muted);
@@ -7788,6 +7866,8 @@ html[data-theme="dark"] .quota-next { background: var(--surface-strong); }
 }
 .tlog-status i { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
 .tlog-status.ok i { background: var(--green); }
+.tlog-status.canceled i { background: var(--muted); }
+.tlog-status.canceled { color: var(--muted); }
 .tlog-status.bad i { background: var(--red); }
 .tlog-status.bad { color: var(--red); }
 .tlog-model.effective { color: var(--muted); }

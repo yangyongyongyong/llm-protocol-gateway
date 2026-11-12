@@ -545,7 +545,7 @@ func TestScheduleModeSpreadDropsTheReservationWhenNothingServed(t *testing.T) {
 	if rec := f.requestWithSession(t, "chat-down"); rec.Code == http.StatusOK {
 		t.Fatal("expected the turn to fail when both accounts are down")
 	}
-	sessionKey := sessionAffinityKey(nil, map[string]any{"session_id": "chat-down"}, "k-sched")
+	sessionKey := sessionAffinityKey(nil, map[string]any{"session_id": "chat-down"}, "k-sched", f.preferredID, scheduleModeSpread, f.backupID)
 	if pinned := f.server.pinStore().sessionPin(sessionKey); pinned != "" {
 		t.Fatalf("a failed turn must not pin the conversation, got %q", pinned)
 	}
@@ -569,7 +569,7 @@ func TestAServedRefusalDoesNotPinTheConversation(t *testing.T) {
 	if rec := f.requestWithSession(t, "chat-refused"); rec.Code == http.StatusOK {
 		t.Fatal("expected the turn to fail")
 	}
-	sessionKey := sessionAffinityKey(nil, map[string]any{"session_id": "chat-refused"}, "k-sched")
+	sessionKey := sessionAffinityKey(nil, map[string]any{"session_id": "chat-refused"}, "k-sched", f.preferredID, "", f.backupID)
 	if pinned := f.server.pinStore().sessionPin(sessionKey); pinned != "" {
 		t.Fatalf("a refusal must not pin the conversation, got %q", pinned)
 	}

@@ -69,6 +69,9 @@ func TestPeerUpstreamRegisterCreatesProvider(t *testing.T) {
 	if !strings.HasPrefix(peerUpstreamToken(created), peerTokenPrefix) {
 		t.Fatalf("apiKeySource 必须存的是对端凭据，实际 %q", created.APIKeySource)
 	}
+	if !strings.HasPrefix(created.PeerRefreshToken, peerRefreshTokenPrefix) {
+		t.Fatalf("peer provider 必须存下自动续签凭据，实际 %q", created.PeerRefreshToken)
+	}
 	if len(created.Models) != 1 || created.Models[0].ID != "claude-sonnet-4-5" {
 		t.Fatalf("模型清单应当来自上游授权：%+v", created.Models)
 	}
@@ -82,12 +85,34 @@ func TestPeerUpstreamRegisterCreatesProvider(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	// 模拟父网关重启后流量 bearer 失效（续签凭据仍在）。子网关下一次请求应当
+	// 自动换发并重放，而不是把 401 抛给用户或要求重新注册。
+	users, err := parent.userStore.ListUsers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, user := range users {
+		if !user.IsPeer() {
+			continue
+		}
+		if err := parent.router.ReplacePeerKeys(
+			domain.APIKey{ID: "broken-traffic", Name: "broken", Key: peerTokenPrefix + "expired", OwnerUserID: user.ID, Enabled: true},
+			domain.APIKey{ID: "refresh", Name: "refresh", Key: created.PeerRefreshToken, OwnerUserID: user.ID, Enabled: true},
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
 	chat := chatThroughChild(t, child, key.Key, `{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}]}`)
 	if chat.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", chat.Code, chat.Body.String())
 	}
 	if !strings.Contains(chat.Body.String(), "from parent") {
 		t.Fatalf("父网关的回答必须回到客户端：%s", chat.Body.String())
+	}
+	refreshedPeers := child.peerUpstreamMembers(peerGroupKeyForProvider(created))
+	if len(refreshedPeers) == 0 || peerUpstreamToken(refreshedPeers[0]) == peerUpstreamToken(created) {
+		t.Fatalf("自动续签后成员行应当持有新的流量凭据：%+v", refreshedPeers)
 	}
 }
 
@@ -181,6 +206,118 @@ func TestPeerUpstreamRefreshPicksUpChangedGrants(t *testing.T) {
 	members := child.peerUpstreamMembers(peerGroupKeyForProvider(rows[0]))
 	if len(members) != 2 {
 		t.Fatalf("新授权的 provider 应当落成一条新成员行，members = %+v", members)
+	}
+}
+
+// 父网关启用动态全量后，子网关的后台同步应当自动发现新增 Provider，不依赖
+// 用户再次点击「测试连接」。这条测试直接跑定时任务使用的那条刷新路径。
+func TestPeerUpstreamBackgroundRefreshPicksUpDynamicProviders(t *testing.T) {
+	parent := newPeerTestServer(t,
+		domain.Provider{
+			ID: "p-a", Name: "p-a", Protocol: domain.ProtocolOpenAIChat, BaseURL: "https://parent.example.com",
+			Models: []domain.Model{{ID: "m-a", ProviderID: "p-a", InMenu: true}},
+		},
+	)
+	parent.SetGatewayID(otherID)
+	parentHTTP := httptest.NewServer(parent.Handler())
+	defer parentHTTP.Close()
+
+	child := newPeerTestServer(t)
+	child.SetGatewayID(gwID)
+	registration, granted, err := child.registerWithParent(
+		httptest.NewRequest(http.MethodGet, "/__probe", nil),
+		parentHTTP.URL, "vps1", "sub-gw", "a-strong-password", []string{"p-a"},
+	)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	rows, err := child.createPeerUpstreamProviders(httptest.NewRequest(http.MethodPost, "/__peer-upstreams", nil), "vps1", domain.ProtocolOpenAIChat, registration, granted)
+	if err != nil {
+		t.Fatalf("create providers: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("initial members = %d, want 1", len(rows))
+	}
+
+	users, err := parent.userStore.ListUsers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, user := range users {
+		if user.IsPeer() {
+			if err := parent.setPeerAllProviders(user.ID); err != nil {
+				t.Fatalf("enable dynamic all-provider grant: %v", err)
+			}
+		}
+	}
+	parent.router.AddProvider(domain.Provider{
+		ID: "p-b", Name: "p-b", Protocol: domain.ProtocolOpenAIChat, BaseURL: "https://parent.example.com",
+		Models: []domain.Model{{ID: "m-b", ProviderID: "p-b", InMenu: true}},
+	})
+
+	child.refreshAllPeerUpstreams()
+
+	members := child.peerUpstreamMembers(peerGroupKeyForProvider(rows[0]))
+	if len(members) != 2 {
+		t.Fatalf("background refresh should add p-b automatically, members = %+v", members)
+	}
+	seen := map[string]bool{}
+	for _, member := range members {
+		seen[peerGrantedProviderID(member)] = true
+	}
+	if !seen["p-a"] || !seen["p-b"] {
+		t.Fatalf("granted member ids = %v, want p-a and p-b", seen)
+	}
+}
+
+// 升级前注册的链路只有流量 bearer。父端更新后，子端后台刷新会先用当前 bearer
+// 自动补发续签凭据，用户不需要再打开注册表单。
+func TestPeerUpstreamBootstrapsRefreshCredentialForLegacyLink(t *testing.T) {
+	parent := newPeerTestServer(t, domain.Provider{
+		ID: "p-a", Name: "p-a", Protocol: domain.ProtocolOpenAIChat, BaseURL: "https://parent.example.com",
+		Models: []domain.Model{{ID: "m-a", ProviderID: "p-a", InMenu: true}},
+	})
+	parent.SetGatewayID(otherID)
+	parentHTTP := httptest.NewServer(parent.Handler())
+	defer parentHTTP.Close()
+
+	child := newPeerTestServer(t)
+	child.SetGatewayID(gwID)
+	registration, granted, err := child.registerWithParent(
+		httptest.NewRequest(http.MethodGet, "/__probe", nil),
+		parentHTTP.URL, "vps1", "sub-gw", "a-strong-password", []string{"p-a"},
+	)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	rows, err := child.createPeerUpstreamProviders(httptest.NewRequest(http.MethodPost, "/__peer-upstreams", nil), "vps1", domain.ProtocolOpenAIChat, registration, granted)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("create providers: %v rows=%+v", err, rows)
+	}
+	// 模拟旧记录：父端没有 refresh key，子端 provider 也没有续签凭据。
+	parent.router.ReplacePeerKeys(domain.APIKey{
+		ID: "legacy-traffic", Name: "legacy", Key: registration.Token, OwnerUserID: registration.UserID, Enabled: true,
+	})
+	if _, err := child.router.SetPeerUpstreamCredentials(rows[0].ID, registration.Token, ""); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := child.router.ProviderByID(rows[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, status, err := child.refreshPeerUpstream(t.Context(), legacy); err != nil {
+		t.Fatalf("legacy refresh status=%d err=%v", status, err)
+	}
+	upgraded, err := child.router.ProviderByID(rows[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(upgraded.PeerRefreshToken, peerRefreshTokenPrefix) {
+		t.Fatalf("legacy link did not gain a refresh credential: %q", upgraded.PeerRefreshToken)
+	}
+	if peerUpstreamToken(upgraded) == registration.Token {
+		t.Fatal("bootstrap should rotate the traffic credential")
 	}
 }
 

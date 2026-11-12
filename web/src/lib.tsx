@@ -594,6 +594,7 @@ export const defaultPublicAccess: PublicAccessSettings = {
 };
 
 export const fallbackState: GatewayState = {
+  providerGroups: [],
   providers: [],
   endpoints: [],
   routes: [],
@@ -610,6 +611,7 @@ export function normalizeGatewayState(data: Partial<GatewayState> | null | undef
   return {
     ...base,
     ...data,
+    providerGroups: data?.providerGroups ?? [],
     providers: data?.providers ?? [],
     endpoints: data?.endpoints ?? [],
     routes: data?.routes ?? [],
@@ -764,7 +766,15 @@ export function trafficLogProviderLabel(log: LogEntry, providers: Provider[]) {
   );
 }
 
+export function isTrafficLogCanceled(log: Pick<LogEntry, 'status'>) {
+  // 499 是客户端主动断开：它是一条正常的连接结束记录，不是上游或网关故障。
+  return log.status === 499;
+}
+
 export function isTrafficLogError(log: LogEntry) {
+  // 客户端主动取消单独显示为「已取消」，不参与红色错误态；否则用户点一次
+  // Stop、切换会话或客户端超时，都会在日志和用量页制造假故障。
+  if (isTrafficLogCanceled(log)) return false;
   // 历史数据里可能有成功响应被写成字符串 "<nil>"（Responses 的 error:null），
   // 那不是错误；保留这个判断，避免旧日志一直显示成红色。
   const description = log.errorDescription?.trim() || '';
@@ -1001,6 +1011,7 @@ export type ReplayPlan = {
  */
 export function replayPlan(log: LogEntry): ReplayPlan | null {
   if (!log.requestBody?.trim()) return null;
+  if (log.action === 'count_tokens_stub') return null;
   const flow = log.protocolFlow || '';
   const index = flow.lastIndexOf('->');
   const output = (index >= 0 ? flow.slice(index + 2) : flow).trim();
@@ -1391,6 +1402,7 @@ export function protocolIcon(label: string): string {
 
 export function actionLabel(action: string) {
   if (action === 'not_configured') return '未配置';
+  if (action === 'count_tokens_stub') return '本地计数';
   if (action === 'pass_through' || action.includes('pass')) return '透传';
   if (action === 'convert' || action.includes('convert')) return '转换';
   return action;
@@ -1878,8 +1890,29 @@ export function providerAccountLabel(provider: Provider): string {
     // 上游网关的"账号"就是它属于哪一条上游：备选和下拉里必须能看出这一条是
     // 哪个上游授权来的，只写上游自己的名字（成员行的名字）不够——同一个上游
     // 落下来的好几条成员行会看起来像互不相干的 Provider。
-    case 'peer': return peerUpstreamName(provider);
+    case 'peer': return provider.peerGrants?.card?.accountLabel?.trim() || peerUpstreamName(provider);
     default: return '';
+  }
+}
+
+/** 继承自上游的卡片连接类型，翻译成与上游卡片一致的短标签。 */
+export function peerProviderCardAuthLabel(provider: Provider): string {
+  const kind = provider.peerGrants?.card?.authType?.trim().toLowerCase() || '';
+  switch (kind) {
+    case 'claude_oauth': return 'Claude OAuth';
+    case 'cursor_oauth': return 'Cursor OAuth';
+    case 'chatgpt_oauth': return 'ChatGPT OAuth';
+    case 'qoder_pat': return 'Qoder';
+    case 'qoder_cn': return 'Qoder CN';
+    case 'workbuddy': return 'WorkBuddy';
+    case 'workbuddy_ai': return 'WorkBuddy AI';
+    case 'zcode': return 'GLM Coding Plan';
+    case 'zcode_bigmodel': return 'GLM Coding Plan';
+    case 'trae_cn': return 'Trae CN';
+    case 'trae_global': return 'Trae';
+    case 'opencode_zen_free': return 'OpenCode Zen';
+    case 'api_key': return '';
+    default: return kind;
   }
 }
 
@@ -2105,6 +2138,20 @@ function urlHost(value?: string): string {
 
 const urlHostCache = new Map<string, string>();
 
+/** 判断一个 Base URL 是否指向 OpenCode Go 的套餐端点。 */
+export function isOpenCodeGoBaseURL(value?: string): boolean {
+  const raw = (value || '').trim();
+  if (!raw) return false;
+  try {
+    const parsed = new URL(raw);
+    const host = parsed.hostname.toLowerCase();
+    const openCodeHost = host === 'opencode.ai' || host.endsWith('.opencode.ai');
+    return openCodeHost && /^\/zen\/go(?:\/|$)/i.test(parsed.pathname);
+  } catch {
+    return false;
+  }
+}
+
 export function providerConnectLabel(kind: ProviderConnectKind): string {
   switch (kind) {
     case 'claude_oauth': return '登录 Claude 账号 (OAuth)';
@@ -2329,13 +2376,23 @@ export function promoteApiKeyProvider(
   promoteProviderId: string,
   fallbacks: { providerIds: string[]; modelOverrides: Record<string, string> },
   currentPrimaryProviderId: string,
-): { providerId: string; fallbackProviderIds: string[]; fallbackModelOverrides: Record<string, string> } {
+  currentPrimaryModelOverride = '',
+): { providerId: string; modelOverride: string; fallbackProviderIds: string[]; fallbackModelOverrides: Record<string, string> } {
   const ids = fallbacks.providerIds.slice();
   const index = ids.indexOf(promoteProviderId);
+  const primaryModel = (currentPrimaryModelOverride || fallbacks.modelOverrides[currentPrimaryProviderId] || '').trim();
   if (index < 0) {
     // 不是备选（界面上不会出现这个按钮）：原样交回，宁可不动也别拆掉别人。
-    return { providerId: promoteProviderId, fallbackProviderIds: ids, fallbackModelOverrides: { ...fallbacks.modelOverrides } };
+    return {
+      providerId: promoteProviderId,
+      modelOverride: primaryModel,
+      fallbackProviderIds: ids,
+      fallbackModelOverrides: { ...fallbacks.modelOverrides },
+    };
   }
+  // 被提升 Provider 在备选侧的固定模型，要成为新的首选模型覆盖；否则它会随着
+  // 从备选数组移除而一起消失。
+  const promotedModelOverride = (fallbacks.modelOverrides[promoteProviderId] || '').trim();
   if (currentPrimaryProviderId && currentPrimaryProviderId !== promoteProviderId) {
     // 位次守恒：旧首选站在被提升者原来的位置，其余相对顺序不变。
     ids[index] = currentPrimaryProviderId;
@@ -2344,12 +2401,19 @@ export function promoteApiKeyProvider(
   }
   const overrides: Record<string, string> = {};
   for (const id of ids) {
-    const model = (fallbacks.modelOverrides[id] || '').trim();
+    const model = (id === currentPrimaryProviderId && primaryModel
+      ? primaryModel
+      : (fallbacks.modelOverrides[id] || '')).trim();
     if (model) overrides[id] = model;
   }
   // 旧首选的固定模型跟着它搬到备选位置上：后端会丢掉不属于任何备选的条目，
   // 不搬就等于把原首选锁的模型顺手清空。
-  return { providerId: promoteProviderId, fallbackProviderIds: ids, fallbackModelOverrides: overrides };
+  return {
+    providerId: promoteProviderId,
+    modelOverride: promotedModelOverride,
+    fallbackProviderIds: ids,
+    fallbackModelOverrides: overrides,
+  };
 }
 
 export function formatTokenSummary(stats: Pick<APIKeyDayStats, 'inputTokens' | 'outputTokens' | 'cacheTokens'>) {
@@ -2656,11 +2720,11 @@ function codexCatalogEntry(input: {
 
 export function buildApiKeyCodexConfig(key: APIKey, route: Route | undefined, endpoints: OutputEndpoint[], publicBase: string, provider?: Provider, keepOfficialLogin?: boolean) {
   const providerID = sanitizeClientConfigID(key.name);
-  // 模型名固定写 "default"：真正用哪个模型由网关按这把 Key 的配置解析（别名 →
-  // 固定模型 → provider 默认模型），和 Claude 侧同一个思路。这样换模型、换
-  // provider 都在平台上完成，Codex 的 config.toml 不用反复重写，也不会因为
-  // 客户端记着一个早就换掉的真名而发请求出去。
-  const model = 'default';
+  // 模型名固定写 "default[1m]"：真正用哪个模型由网关按这把 Key 的配置解析
+  // （别名 → 固定模型 → provider 默认模型），同时让 Codex 按 1M 窗口计算
+  // 上下文。这样换模型、换 provider 都在平台上完成，Codex 的 config.toml
+  // 不用反复重写，也不会因为客户端记着一个早就换掉的真名而发请求出去。
+  const model = 'default[1m]';
   const effort = resolveCodexReasoningEffort(key);
   const baseURL = `${apiKeyGatewayRoot(endpoints, publicBase)}/openai/v1`;
   const warning = !route || route.outputProtocol !== 'openai_responses'
@@ -2720,7 +2784,9 @@ export function withClaude1MContext(model: string) {
 }
 
 export function buildApiKeyClaudeConfig(key: APIKey, route: Route | undefined, endpoints: OutputEndpoint[], publicBase: string, provider?: Provider) {
-  const model = withClaude1MContext(resolveApiKeyModel(key, provider));
+  // 与 Codex 和 Claude Code 一键接入保持一致：客户端只认保留别名，真实模型由
+  // 网关按这把 Key 选择；默认带 [1m]，让客户端按 100 万上下文窗口计算。
+  const model = 'default[1m]';
   const baseURL = `${apiKeyGatewayRoot(endpoints, publicBase)}/anthropic`;
   const config = {
     env: {
@@ -2736,9 +2802,10 @@ export function buildApiKeyClaudeConfig(key: APIKey, route: Route | undefined, e
 /**
  * Claude Code「一次配置、平台换模型」的环境变量。
  *
- * 思路：客户端只认一个保留模型名 `default`，真正用哪个模型由网关按这把 Key 的
- * 配置解析。于是换 Provider / 换模型 / 换协议全在平台上完成，客户端配置一个字
- * 都不用改，也就不用像 ccswitch / magpie 那样每次改完重启客户端。
+ * 思路：客户端只认保留模型名 `default` / `default[1m]`，真正用哪个模型由网关
+ * 按这把 Key 的配置解析。一键配置默认选择 `default[1m]`，于是换 Provider /
+ * 换模型 / 换协议全在平台上完成，客户端配置一个字都不用改，也就不用像
+ * ccswitch / magpie 那样每次改完重启客户端。
  *
  * `[1m]` 是 Claude Code 的「扩展上下文」标记，不是模型名的一部分：客户端发出前
  * 会把它去掉（2.1.322 实测），改成请求头 `anthropic-beta: context-1m-2025-08-07`。
@@ -2748,8 +2815,9 @@ export function buildApiKeyClaudeConfig(key: APIKey, route: Route | undefined, e
  * 为什么要连 tier 变量一起钉死：Claude Code 内置子 agent 的模型是硬编码的
  * （`claude-code-guide` 用 haiku、`statusline-setup` 用 sonnet），只设
  * ANTHROPIC_MODEL 时这些子 agent 仍会带着 haiku/sonnet 打上来，上游没有这个模型
- * 就直接失败。把 opus/sonnet/haiku/fable 四个档位一起指到 default，子 agent 才会
- * 跟着平台配置走。CLAUDE_CODE_SUBAGENT_MODEL 再兜一层自定义子 agent。
+ * 就直接失败。把 opus/sonnet/haiku/fable 四个档位一起指到 default/default[1m]
+ * 这组保留别名，子 agent 才会跟着平台配置走。CLAUDE_CODE_SUBAGENT_MODEL 再兜
+ * 一层自定义子 agent。
  *
  * haiku / small-fast 故意不带 [1m]：这两档只做摘要与分类，带上 1M beta 没有收益。
  */
@@ -2823,7 +2891,7 @@ export function buildClaudeCodeSwitcherScript(
     'data.setdefault("model", NEW["model"])',
     'FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")',
     'print(f"已写入: {FILE}")',
-    'print("模型已固定为 default，之后在网关平台换模型 / 换 Provider 都不用改这里。")',
+    'print("模型已固定为 default[1m]，之后在网关平台换模型 / 换 Provider 都不用改这里。")',
     'print("环境变量只在客户端启动时读取：请重开一次 claude（或桌面端）。")',
   ].join('\n');
   return wrapMacPythonScript(py, '修改脚本（把 Claude Code 接到本网关；只更新 env 里本工具管理的键，保留你其它配置）');
@@ -3564,6 +3632,7 @@ export function actionTone(action: string): BadgeTone {
 export function statusTone(status?: number): BadgeTone {
   if (!status) return 'slate';
   if (status >= 200 && status < 300) return 'green';
+  if (status === 499) return 'slate';
   if (status === 501) return 'amber';
   if (status >= 400) return 'red';
   return 'slate';

@@ -40,6 +40,8 @@ export type ConsoleUser = {
   avatarUrl?: string;
   /** 仅 scope=granted 时有意义：管理员分配给该用户的 Provider。 */
   grantedProviderIds?: string[];
+  /** 子网关专用：动态可见当前及未来新增的全部 Provider。 */
+  allProviders?: boolean;
   enabled: boolean;
   createdAt: string;
   lastLoginAt?: string;
@@ -540,6 +542,22 @@ export type ZhipuUsageReport = {
   resets?: ZhipuResetCredits;
 };
 
+export type OpenCodeGoUsageBucket = {
+  status?: string;
+  utilization: number;
+  resets_at?: string;
+};
+
+/** OpenCode Go 套餐额度：rolling / weekly / monthly 三个窗口。 */
+export type OpenCodeGoUsageReport = {
+  available: boolean;
+  error?: string;
+  fetchedAt?: string;
+  five_hour?: OpenCodeGoUsageBucket;
+  weekly?: OpenCodeGoUsageBucket;
+  monthly?: OpenCodeGoUsageBucket;
+};
+
 /** DeepSeek 余额：金额为十进制字符串，保持原样不转 number 以免丢精度。 */
 export type DeepSeekBalanceInfo = {
   currency: string;
@@ -618,6 +636,13 @@ export type RequestAdapter = {
   curlExample?: string;
 };
 
+/** 管理员侧 Provider 分组；只用于归类、筛选和批量操作，不参与权限判定。 */
+export type ProviderGroup = {
+  id: string;
+  name: string;
+  position: number;
+};
+
 export type Provider = {
   id: string;
   name: string;
@@ -638,6 +663,8 @@ export type Provider = {
   // 创建该 Provider 的控制台用户；空 = 管理员创建。普通用户对自己创建的
   // Provider 拥有编辑/克隆/删除/对话测试/获取模型权限。
   ownerUserId?: string;
+  /** 管理员侧分组 ID；普通用户状态中为空，分组不参与任何权限判定。 */
+  groupId?: string;
   // 管理员禁用开关：禁用后普通用户不可见、不可绑定、请求会被拒绝；
   // 新建 Provider 默认启用（字段缺省 = 启用）。
   disabled?: boolean;
@@ -845,6 +872,8 @@ export type PeerGateway = {
   /** 吊销后用户行还在（保留授权），凭据已删，两者分开显示。 */
   keyEnabled: boolean;
   grantedProviderIds: string[];
+  /** selected = 手工勾选；all = 动态包含当前及未来新增的全部 Provider。 */
+  grantMode?: 'selected' | 'all';
   /** 最近这段时间它送进来的请求数，用来一眼看出活跃/挂空。 */
   ingressRequests: number;
 };
@@ -880,6 +909,8 @@ export type PeerUpstream = {
    * grantsSynced 为 false 时这个数是零值，不代表"授权了 0 个"。
    */
   grantCount: number;
+  /** 已保存续签凭据：父网关重启或凭据轮换后可自动恢复，无需重新注册。 */
+  autoRenew?: boolean;
   /** grantCount 是不是真的问到过上游。false = 还没同步过，别说"0 个"。 */
   grantsSynced: boolean;
   /** 授权快照的取得时间（RFC3339）；从未同步过时为空。 */
@@ -902,6 +933,33 @@ export type PeerGrantedProvider = {
   name?: string;
   protocol?: Protocol;
   models?: string[];
+  /** 上游卡片的安全展示快照（账号、厂商、额度），不含凭据。 */
+  card?: PeerProviderCard;
+};
+
+export type PeerProviderUsageBucket = {
+  label: string;
+  utilization: number;
+  note?: string;
+  resetsAt?: string;
+};
+
+export type PeerProviderUsage = {
+  title?: string;
+  plan?: string;
+  message?: string;
+  balance?: string;
+  fetchedAt?: string;
+  buckets?: PeerProviderUsageBucket[];
+};
+
+/** 父网关随 Provider 清单下发的只读卡片信息。 */
+export type PeerProviderCard = {
+  authType?: string;
+  vendor?: string;
+  accountLabel?: string;
+  connected?: boolean;
+  usage?: PeerProviderUsage;
 };
 
 /** 一条 peer provider 上的授权快照（后端 Provider.PeerGrants 的投影）。 */
@@ -918,6 +976,8 @@ export type PeerUpstreamGrants = {
   /** 这一行对应上游的哪个 provider；空 = 整条上游链路（升级前的老记录）。 */
   grantedProviderId?: string;
   syncedAt?: string;
+  /** 这条 Provider 在父网关上的卡片快照。 */
+  card?: PeerProviderCard;
 };
 
 export type PeerUpstreamsResponse = {
@@ -928,6 +988,7 @@ export type PeerUpstreamsResponse = {
 };
 
 export type GatewayState = {
+  providerGroups: ProviderGroup[];
   providers: Provider[];
   endpoints: OutputEndpoint[];
   routes: Route[];

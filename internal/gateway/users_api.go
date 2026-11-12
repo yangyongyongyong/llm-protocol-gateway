@@ -39,10 +39,11 @@ func (s *Server) requirePrincipal(w http.ResponseWriter, r *http.Request) (princ
 // its granted resource ids, so the console renders one row without extra calls.
 type consoleUser struct {
 	domain.User
-	RoleName    string   `json:"roleName"`
-	RoleScope   string   `json:"roleScope"`
-	ProviderIDs []string `json:"providerIds,omitempty"`
-	Grants      []string `json:"grantedProviderIds,omitempty"`
+	RoleName     string   `json:"roleName"`
+	RoleScope    string   `json:"roleScope"`
+	ProviderIDs  []string `json:"providerIds,omitempty"`
+	Grants       []string `json:"grantedProviderIds,omitempty"`
+	AllProviders bool     `json:"allProviders,omitempty"`
 }
 
 func (s *Server) handleListUsers(w http.ResponseWriter, r *http.Request) {
@@ -67,7 +68,11 @@ func (s *Server) handleListUsers(w http.ResponseWriter, r *http.Request) {
 		}
 		role := s.roleByID(user.RoleID)
 		item := consoleUser{User: user, RoleName: role.Name, RoleScope: string(role.EffectiveScope())}
-		item.Grants = grants[user.ID]
+		if user.IsPeer() {
+			item.AllProviders, item.Grants = s.peerGrantState(user.ID)
+		} else {
+			item.Grants = grants[user.ID]
+		}
 		if item.Grants == nil {
 			item.Grants = []string{}
 		}

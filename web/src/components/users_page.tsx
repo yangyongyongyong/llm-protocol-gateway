@@ -282,7 +282,11 @@ export function UsersPage({ canManage, canView, onToast, onChanged, roleOptions,
                         子网关
                       </Badge>
                     ) : null}
-                    {user.role !== 'admin' && user.roleScope !== 'all' ? (
+                    {user.role !== 'admin' && user.roleScope !== 'all' && user.allProviders ? (
+                      <Badge tone="green" title="当前及以后新增的 Provider 都会自动授权给这个下游网关">
+                        全部 Provider · 动态
+                      </Badge>
+                    ) : user.role !== 'admin' && user.roleScope !== 'all' ? (
                       <button
                         type="button"
                         className={`rbac-grant-chip${grantedCount > 0 ? '' : ' empty'}`}

@@ -46,6 +46,8 @@
 
 同一个密钥可保存多套完整方案（首选 Provider、备选链、模型映射、思考深度），点选即时生效；右侧四个页签分别管理转发方案与容灾链路、绑定关系与模型覆写、客户端配置与调用示例、额度与用量治理。
 
+Codex 与 Claude Code 的一键配置默认使用保留别名 `default[1m]`：客户端按 1M 上下文计算，实际模型仍由网关按 API Key 的模型覆写或 Provider 默认模型解析；需要普通窗口时仍可显式选择 `default`。
+
 ![API 密钥](docs/images/api-keys.png)
 
 ### 接入地址：四种协议的端点与试跑命令
@@ -62,7 +64,9 @@ OpenAI Chat、OpenAI Responses、Claude、Gemini 四个端点集中展示，附�
 
 ### API 日志：全链路逐请求追踪
 
-记录密钥、请求/实际模型、推理强度、账号、协议、输入输出、缓存读写、耗时与成本；顶部给出当前页的调度决策摘要（尝试、失败、未发请求）。
+记录密钥、请求/实际模型、推理强度、账号、协议、输入输出、缓存读写、耗时与成本；顶部给出当前页的调度决策摘要（尝试、失败、未发请求）。客户端主动断开记为 `499`，在日志中以中性「已取消」展示并单独筛选，不计入 4xx 异常。
+
+输入 Provider 支持管理员侧分组：分组只用于归类、筛选和批量移动，不影响 Provider 可见性或用户授权；普通用户仍由用户在「用户管理」中直接分配具体 Provider。详见 [Provider 分组](docs/provider-groups.md)。
 
 ![API 日志](docs/images/traffic-logs.png)
 
@@ -115,8 +119,13 @@ OpenAI Chat、OpenAI Responses、Claude、Gemini 四个端点集中展示，附�
 | ZCode / ZCode BigModel | Z.ai / 智谱的 GLM Coding Plan，含重置卡展示与消费 |
 | Trae CN / Trae Global | 字节 Trae 国内外版订阅，含免费档 |
 | OpenCode Zen Free | Zen 免费模型无需密钥，填入密钥可同卡访问付费模型 |
+| OpenCode Go | API Key 套餐，卡片展示 5 小时 / 周 / 月三档额度与重置时间 |
 
 添加 Provider 时提供 60 个预设（24 个厂商、16 个中转、12 个订阅、4 个本地），也可选「自定义」手填 Base URL。**密钥与 OAuth 令牌只留在网关进程里，任何页面都不会下发。**
+
+Base URL 支持 `{model}` 占位符（例如 Azure OpenAI 的
+`/openai/deployments/{model}/chat/completions?api-version=...`）。这类 deployment
+端点不能通过 `/models` 枚举，控制台的「获取模型」会沿用 Provider 已配置的模型目录，不会误把账号标成异常。
 
 ### 3. 调度与容灾
 
@@ -125,6 +134,7 @@ OpenAI Chat、OpenAI Responses、Claude、Gemini 四个端点集中展示，附�
 - **冷却与回切**：软失败按梯度冷却，冷却期结束自动回切；异常账号的探测只走轻量请求，健康账号不产生额外流量。
 - **限流闸门**：每个 Provider 可设最大并发、首包超时与 RPM，账号级 `LaneGroup` 把多个模型归并到同一配额池。
 - **备选链**：首选 Provider 限流 / 5xx / 鉴权失败 / 连接错误时自动切下一个，并在日志里留下调度轨迹。
+- **固定模型跟随 Provider**：备选「设为首选」按交换处理，新首选的备选模型进入主模型覆盖，旧首选的原主模型进入备选覆盖；同时清空 Key 级粘滞位，按完整 Provider 链路隔离旧会话 affinity，下一次请求立即使用新首选。协议直通只优化备选顺序，不会越过显式首选。
 
 ### 4. 成本账本与每密钥额度
 
@@ -148,6 +158,7 @@ OpenAI Chat、OpenAI Responses、Claude、Gemini 四个端点集中展示，附�
 - **一键发布**：`deploy/release-all.sh` 一条命令完成「提交 → 推两个仓库 → 打 vX.Y.Z tag → Docker 蓝绿（sjc）+ 裸机部署（gc）→ 等新版本上线」；支持 `--dry-run`、`--bump`、`--skip-gc`、`--skip-sjc`。
 - **WorkBuddy 任务中心**：成长任务列表、一键完成可自动任务（按动作表逐项推进，只有服务端确认领奖才算完成）、活跃上报、保活（续期令牌 + 活跃上报 + 签到 + 补领达标未领的奖励），外加「每日自动任务」「每日保活」两个开关；小程序专属任务与专家召唤链一并覆盖，国际版账号只读。
 - **用户与角色**：管理员可用全部 Provider；普通用户只看到输入 Provider、模型列表、API 密钥、API 日志、用量统计、额度保活六个页面，且只能操作自己的数据。
+- **网关互联授权**：父网关可给下游指定 Provider，也可选择「全部 Provider · 动态」；下游成员卡片继承上游的账号、连接类型与额度快照，流量 bearer 与自动续签凭据分离，重启后自动恢复。
 - **登录**：远程首次访问需设置管理员密码，本机 `127.0.0.1` 直连免密（SSH 端口转发同样可用）。
 
 ---

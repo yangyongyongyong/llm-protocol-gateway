@@ -63,17 +63,27 @@ const pollers = await import(pathToFileURL(join(outDir, 'pollers.js')).href);
 const usagePoll = await import(pathToFileURL(join(outDir, 'usage_poll.js')).href);
 const modelMerge = await import(pathToFileURL(join(outDir, 'model_merge.js')).href);
 
+test('GatewayState 归一化：Provider 分组缺省为空数组', () => {
+  const state = lib.normalizeGatewayState({providers: [{id: 'p1', name: 'p1', groupId: 'g1'}]});
+  assert.deepEqual(state.providerGroups, []);
+  assert.equal(state.providers[0].groupId, 'g1');
+  assert.deepEqual(lib.normalizeGatewayState({providerGroups: [{id: 'g1', name: 'G', position: 0}], providers: []}).providerGroups, [{id: 'g1', name: 'G', position: 0}]);
+});
+
 test('cloudflareAuthPollOutcome: 授权成功就收尾，不再等待', () => {
   assert.equal(lib.cloudflareAuthPollOutcome({authorized: true, elapsedMs: 0, timeoutMs: 600000}), 'authorized');
   // 超时与授权同时成立时，授权优先：用户刚点完授权不该被判超时。
   assert.equal(lib.cloudflareAuthPollOutcome({authorized: true, elapsedMs: 700000, timeoutMs: 600000}), 'authorized');
 });
 
-test('isTrafficLogError: 成功响应里的 <nil> 不算错误', () => {
+test('isTrafficLogError: 成功响应里的 <nil> 和客户端 499 都不算错误', () => {
   assert.equal(lib.isTrafficLogError({status: 200, errorDescription: '<nil>'}), false);
   assert.equal(lib.isTrafficLogError({status: 200, errorDescription: ''}), false);
   assert.equal(lib.isTrafficLogError({status: 200, errorDescription: 'boom'}), true);
   assert.equal(lib.isTrafficLogError({status: 500}), true);
+  assert.equal(lib.isTrafficLogCanceled({status: 499}), true);
+  assert.equal(lib.isTrafficLogError({status: 499, errorDescription: 'context canceled'}), false);
+  assert.equal(lib.statusTone(499), 'slate');
 });
 
 test('cloudflareAuthPollOutcome: 没授权且未超时继续等，超过时限收尾', () => {
@@ -209,6 +219,40 @@ test('resetHint 把向下取整的剩余时间接在「后」前', () => {
   const now = new Date('2026-10-26T12:00:00Z');
   const hint = lib.resetHint(new Date(now.getTime() + 91 * 60_000).toISOString(), now);
   assert.ok(hint && hint.text.includes('1 小时 31 分钟后'), hint && hint.text);
+});
+
+test('isOpenCodeGoBaseURL 只匹配 OpenCode Go 的 /zen/go 路径', () => {
+  assert.equal(lib.isOpenCodeGoBaseURL('https://opencode.ai/zen/go/v1'), true);
+  assert.equal(lib.isOpenCodeGoBaseURL('https://opencode.ai/zen/go'), true);
+  assert.equal(lib.isOpenCodeGoBaseURL('https://opencode.ai/zen/v1'), false);
+  assert.equal(lib.isOpenCodeGoBaseURL('https://relay.example.com/zen/go/v1'), false);
+  assert.equal(lib.isOpenCodeGoBaseURL('not a url'), false);
+});
+
+test('count_tokens 本地兜底不显示成透传，也不提供重放', () => {
+  assert.equal(lib.actionLabel('count_tokens_stub'), '本地计数');
+  const plan = lib.replayPlan({
+    id: 1,
+    action: 'count_tokens_stub',
+    protocolFlow: 'Claude -> Claude',
+    path: '/v1/messages/count_tokens',
+    requestBody: '{"model":"x","messages":[]}',
+  });
+  assert.equal(plan, null);
+});
+
+test('网关互联成员继承上游卡片的账号标签和连接类型', () => {
+  const provider = {
+    id: 'peer-member',
+    name: 'vps-shouzeMini · WorkBuddy 订阅-陌',
+    authType: 'peer',
+    peerGrants: {
+      upstreamName: 'vps-shouzeMini',
+      card: {authType: 'workbuddy', accountLabel: '陌', connected: true},
+    },
+  };
+  assert.equal(lib.providerAccountLabel(provider), '陌');
+  assert.equal(lib.peerProviderCardAuthLabel(provider), 'WorkBuddy');
 });
 
 // ── Provider 额度面板的轮询调度（usage_poll.ts）────────────────────────────
@@ -419,6 +463,7 @@ test('promoteApiKeyProvider：首选与备选交换，位次守恒，其余顺�
     'a',
   );
   assert.equal(swap.providerId, 'b', '被提升的 Provider 成为首选');
+  assert.equal(swap.modelOverride, 'm-b', '新首选接住它原来的备选固定模型');
   assert.deepEqual(swap.fallbackProviderIds, ['a', 'c', 'd'], '旧首选回到被提升者原来的位次，节点总数不变');
   assert.deepEqual(swap.fallbackModelOverrides, {d: 'm-d'}, '新首选的备选固定模型不再留在备选里');
 });
@@ -430,8 +475,22 @@ test('promoteApiKeyProvider：旧首选带着自己的固定模型进入备选',
     'a',
   );
   assert.deepEqual(swap.fallbackProviderIds, ['a', 'c']);
+  assert.equal(swap.modelOverride, 'm-b', '新首选保留备选模型覆盖');
   assert.equal(swap.fallbackModelOverrides.a, 'm-a', '旧首选锁定的模型要跟着它搬进备选条目');
   assert.equal(swap.fallbackModelOverrides.b, undefined, '新首选的固定模型交给首选侧');
+});
+
+test('promoteApiKeyProvider：首选模型与备选模型双向搬运，不会一起清空', () => {
+  const swap = lib.promoteApiKeyProvider(
+    'b',
+    {providerIds: ['b', 'c'], modelOverrides: {b: 'm-b'}},
+    'a',
+    'm-a',
+  );
+  assert.equal(swap.providerId, 'b');
+  assert.equal(swap.modelOverride, 'm-b');
+  assert.deepEqual(swap.fallbackProviderIds, ['a', 'c']);
+  assert.deepEqual(swap.fallbackModelOverrides, {a: 'm-a'});
 });
 
 test('promoteApiKeyProvider：没有旧首选时只移除自己，不凭空塞节点', () => {
@@ -557,7 +616,7 @@ test('buildSelfRegistrationPrompt：以控制台选中的协议为主，不再�
   assert.ok(chat.includes('生成注册令牌'), '没有原始令牌时用占位提示，不编一个');
 });
 
-test('Claude Code 一键接入：模型钉死 default，四个档位与子 agent 全部跟随', () => {
+test('Claude Code 一键接入：默认模型钉死 default[1m]，四个档位与子 agent 全部跟随', () => {
   const env = lib.buildClaudeCodeSwitcherEnv({baseURL: 'https://gw.example.com/anthropic', token: 'sk-gw-x'});
   assert.equal(env.ANTHROPIC_MODEL, 'default[1m]', '默认要 1M 变体（客户端按 1M 算窗口）');
   // 内置子 agent 的模型是硬编码的（claude-code-guide→haiku、statusline-setup→sonnet），
@@ -707,13 +766,23 @@ test('Codex 模型目录：手填的 contextOverride 压过上游报的窗口', 
   assert.equal(entry.context_window, 1000000, '运维手填的 1M 必须生效');
 });
 
-test('Codex 配置：model 固定写 default，换模型不用重写 config.toml', () => {
+test('Codex 配置：model 固定写 default[1m]，换模型不用重写 config.toml', () => {
   const key = {name: 'k', key: 'sk-gw-x', modelOverride: 'some-real-model'};
   const route = {id: 'r1', providerId: 'p1', outputProtocol: 'openai_responses'};
   const text = lib.buildApiKeyCodexConfig(key, route, [], 'https://gw.example.com');
-  assert.match(text, /^model = "default"$/m, 'model 必须固定为 default');
+  assert.match(text, /^model = "default\[1m\]"$/m, 'model 必须固定为 default[1m]');
   assert.doesNotMatch(text, /some-real-model/, '不该把真实模型名写进客户端配置');
   assert.match(text, /requires_openai_auth = false/, '凭据走 bearer 时必须写 false');
+});
+
+test('Claude 配置：model 固定写 default[1m]，换模型不用重写 settings.json', () => {
+  const key = {name: 'k', key: 'sk-gw-x', modelOverride: 'some-real-model'};
+  const route = {id: 'r1', providerId: 'p1', outputProtocol: 'claude'};
+  const text = lib.buildApiKeyClaudeConfig(key, route, [], 'https://gw.example.com');
+  const parsed = JSON.parse(text);
+  assert.equal(parsed.model, 'default[1m]');
+  assert.equal(parsed.env.ANTHROPIC_MODEL, 'default[1m]');
+  assert.doesNotMatch(text, /some-real-model/, '不该把真实模型名写进客户端配置');
 });
 
 test('API 日志协议缩写：oc / or / cl，不再共用首字母 O', () => {

@@ -223,6 +223,15 @@ type TunnelRuntime struct {
 	PID         int    `json:"pid,omitempty"`
 }
 
+// ProviderGroup 是管理员侧的 Provider 归类维度，不参与任何权限判定。
+// 普通用户看不到分组，管理员想把 Provider 授权给用户仍然走用户管理里的
+// user_resource_grants 直接授权。
+type ProviderGroup struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Position int    `json:"position"`
+}
+
 type Provider struct {
 	ID                   string   `json:"id"`
 	Name                 string   `json:"name"`
@@ -243,6 +252,9 @@ type Provider struct {
 	// admin-created. A normal user owns the providers they create and may
 	// edit/clone/delete/test them; admins have full access to every provider.
 	OwnerUserID string `json:"ownerUserId,omitempty"`
+	// GroupID is the administrator-only Provider 分组。它只用于控制台归类、
+	// 筛选与批量操作，不参与可见性、路由或 API Key 授权；空值表示未分组。
+	GroupID string `json:"groupId,omitempty"`
 	// Disabled is the admin-only kill switch. Zero value (false) means enabled,
 	// so newly created providers and legacy rows/exports default to enabled.
 	// While disabled, normal users cannot see, bind, or send traffic through
@@ -374,6 +386,10 @@ type Provider struct {
 	// 的 provider 有意义（见 domain.PeerUpstreamGrants）。它只用来显示：
 	// 真实鉴权永远由上游按当下授权决定，本机从不拿这份快照放行任何请求。
 	PeerGrants *PeerUpstreamGrants `json:"peerGrants,omitempty"`
+	// PeerRefreshToken 是网关互联的续签凭据，只对 AuthType == "peer" 有意义。
+	// 它不能用于模型流量，只允许调用父网关 /__peer/renew 换取新的对端 bearer。
+	// 这是秘密：json:"-" 保证它不会进入控制台、导出包或 Provider API 响应。
+	PeerRefreshToken string `json:"-"`
 }
 
 // ProviderSelfRegistration is the server-side state backing the self-register
@@ -435,6 +451,9 @@ type PeerUpstreamGrants struct {
 	// SyncedAt 是这份快照是什么时候取的（RFC3339）。空 = 从未同步过，
 	// 界面据此区分"确实授权了 0 个"和"还没问过上游"。
 	SyncedAt string `json:"syncedAt,omitempty"`
+	// Card 是上游这一条 Provider 的卡片展示元数据与最近一次额度快照。
+	// 只含可安全展示的字段，不含 base URL、API key、OAuth token 等秘密。
+	Card *PeerProviderCard `json:"card,omitempty"`
 }
 
 // PeerGrantedProvider 是上游授权清单里的一项，原样照抄上游的 /__peer/providers。
@@ -446,6 +465,48 @@ type PeerGrantedProvider struct {
 	Name     string   `json:"name,omitempty"`
 	Protocol string   `json:"protocol,omitempty"`
 	Models   []string `json:"models,omitempty"`
+	// Card is the same safe presentation snapshot as the member provider uses.
+	Card *PeerProviderCard `json:"card,omitempty"`
+}
+
+// PeerProviderCard 是沿网关互联链路透传的 Provider 卡片展示信息。
+// 它只描述“长什么样、当前额度大约是多少”，绝不携带连接凭据或真实端点。
+type PeerProviderCard struct {
+	AuthType     string             `json:"authType,omitempty"`
+	Vendor       string             `json:"vendor,omitempty"`
+	AccountLabel string             `json:"accountLabel,omitempty"`
+	Connected    bool               `json:"connected,omitempty"`
+	Usage        *PeerProviderUsage `json:"usage,omitempty"`
+}
+
+// PeerProviderUsage 是上游额度面板的只读投影。子网关只展示，不负责刷新；
+// 数据由父网关已有的额度缓存/后台采集更新。
+type PeerProviderUsage struct {
+	Title     string                    `json:"title,omitempty"`
+	Plan      string                    `json:"plan,omitempty"`
+	Message   string                    `json:"message,omitempty"`
+	Balance   string                    `json:"balance,omitempty"`
+	FetchedAt string                    `json:"fetchedAt,omitempty"`
+	Buckets   []PeerProviderUsageBucket `json:"buckets,omitempty"`
+}
+
+// PeerProviderUsageBucket 是卡片上的一个额度窗口。
+type PeerProviderUsageBucket struct {
+	Label       string  `json:"label"`
+	Utilization float64 `json:"utilization"`
+	Note        string  `json:"note,omitempty"`
+	ResetsAt    string  `json:"resetsAt,omitempty"`
+}
+
+// Clone 深拷贝卡片中的额度桶，避免父子两侧共享底层切片。
+func (c PeerProviderCard) Clone() PeerProviderCard {
+	out := c
+	if c.Usage != nil {
+		usage := *c.Usage
+		usage.Buckets = append([]PeerProviderUsageBucket(nil), c.Usage.Buckets...)
+		out.Usage = &usage
+	}
+	return out
 }
 
 // Clone 深拷贝一份，包括切片的元素。
@@ -460,7 +521,15 @@ func (g PeerUpstreamGrants) Clone() PeerUpstreamGrants {
 		for index, provider := range g.GrantedProviders {
 			out.GrantedProviders[index] = provider
 			out.GrantedProviders[index].Models = append([]string(nil), provider.Models...)
+			if provider.Card != nil {
+				card := provider.Card.Clone()
+				out.GrantedProviders[index].Card = &card
+			}
 		}
+	}
+	if g.Card != nil {
+		card := g.Card.Clone()
+		out.Card = &card
 	}
 	return out
 }
@@ -1056,14 +1125,15 @@ type DataPaths struct {
 }
 
 type GatewayState struct {
-	Providers    []Provider           `json:"providers"`
-	Endpoints    []OutputEndpoint     `json:"endpoints"`
-	Routes       []Route              `json:"routes"`
-	Models       []Model              `json:"models"`
-	APIKeys      []APIKey             `json:"apiKeys"`
-	Metrics      MetricsSnapshot      `json:"metrics"`
-	PublicAccess PublicAccessSettings `json:"publicAccess"`
-	LogLevel     string               `json:"logLevel,omitempty"`
+	ProviderGroups []ProviderGroup      `json:"providerGroups"`
+	Providers      []Provider           `json:"providers"`
+	Endpoints      []OutputEndpoint     `json:"endpoints"`
+	Routes         []Route              `json:"routes"`
+	Models         []Model              `json:"models"`
+	APIKeys        []APIKey             `json:"apiKeys"`
+	Metrics        MetricsSnapshot      `json:"metrics"`
+	PublicAccess   PublicAccessSettings `json:"publicAccess"`
+	LogLevel       string               `json:"logLevel,omitempty"`
 	// RequestLogRetentionDays controls how long request_logs are kept (default 7).
 	RequestLogRetentionDays int `json:"requestLogRetentionDays,omitempty"`
 	// Log2xxBodies controls whether successful (2xx) requests store their request

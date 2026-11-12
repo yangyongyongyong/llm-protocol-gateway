@@ -8,6 +8,7 @@ import {
     compactProtocolFlow,
     formatBytes,
     formatCostMicros,
+    isTrafficLogCanceled,
     isTrafficLogError,
     providerDisplayLabel,
     replayPlan,
@@ -272,6 +273,7 @@ export function TrafficLogTable({ logs, providers, routes, apiKeys, onOpen, fres
           <span>状态</span>
         </div>
         {logs.map((log, index) => {
+          const canceled = isTrafficLogCanceled(log);
           const error = isTrafficLogError(log);
           const ok = log.status >= 200 && log.status < 300;
           const latency = latencyCell(log.latencyMs);
@@ -288,7 +290,7 @@ export function TrafficLogTable({ logs, providers, routes, apiKeys, onOpen, fres
           const isFresh = freshKeys?.has(rowKey) ?? false;
           return (
             <div
-              className={`tlog-grid tlog-row${error ? ' error' : ''}${isFresh ? ' is-new' : ''}`}
+              className={`tlog-grid tlog-row${error ? ' error' : canceled ? ' canceled' : ''}${isFresh ? ' is-new' : ''}`}
               key={rowKey}
               data-log-key={rowKey}
               // 一次来几条时逐条错开，别糊成一片。
@@ -332,9 +334,12 @@ export function TrafficLogTable({ logs, providers, routes, apiKeys, onOpen, fres
                     口径见 types.ts：缺省即未计价，绝不等于 $0。 */}
                 {log.costMicros == null ? '—' : log.priced === false ? '未计价' : formatCostMicros(log.costMicros)}
               </span>
-              <span className={`tlog-status ${ok ? 'ok' : 'bad'}`} title={`HTTP ${log.status}${log.errorDescription ? ` · ${log.errorDescription}` : ''}`}>
+              <span
+                className={`tlog-status ${ok ? 'ok' : canceled ? 'canceled' : 'bad'}`}
+                title={`HTTP ${log.status}${canceled ? ' · 客户端主动取消' : ''}${log.errorDescription ? ` · ${log.errorDescription}` : ''}`}
+              >
                 <i />
-                {ok ? '成功' : '失败'}
+                {ok ? '成功' : canceled ? '已取消' : '失败'}
               </span>
             </div>
           );

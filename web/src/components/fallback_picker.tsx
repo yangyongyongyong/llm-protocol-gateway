@@ -91,7 +91,7 @@ function ProviderRowFace({provider}: {provider: Provider}) {
 export function FallbackProviderPicker({providers, selectedIds, sameProtocol, onChange}: {
   providers: Provider[];
   selectedIds: string[];
-  /** 与首选同协议的备选可以留空模型，跨协议的必须锁一个模型。 */
+  /** 判断备选与首选是否同协议；跨协议由网关自动转换，不强制锁定模型。 */
   sameProtocol: (provider: Provider) => boolean;
   onChange: (next: string[]) => void;
 }) {
@@ -356,7 +356,7 @@ export function FallbackProviderPicker({providers, selectedIds, sameProtocol, on
                   />
                   <span className="fpp-rank" title="降级顺序：数字越小越先试">#{position + 1}</span>
                   <ProviderRowFace provider={provider} />
-                  {crossProtocol ? <span className="fpp-flag" title="与首选协议不同，必须为它锁定一个模型">需锁模型</span> : null}
+                  {crossProtocol ? <span className="fpp-flag" title="网关会自动做协议转换；固定模型是可选项">跨协议自动转换</span> : null}
                   <span className="fpp-order">
                     <button type="button" className="fpp-order-btn" title="上移" disabled={position <= 0} onClick={() => move(provider.id, -1)}>↑</button>
                     <button type="button" className="fpp-order-btn" title="下移" disabled={position >= selected.length - 1} onClick={() => move(provider.id, 1)}>↓</button>

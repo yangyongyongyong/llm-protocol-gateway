@@ -42,6 +42,7 @@ export const CHART_PALETTE = [
 /** 状态码语义配色 */
 export const STATUS_COLORS: Record<string, string> = {
   '2xx': '#10b981', // 成功 绿
+  '499': '#64748b', // 客户端主动取消 灰：正常连接结束，不是错误
   '4xx': '#f59e0b', // 客户端 橙
   '5xx': '#ef4444', // 服务端 红
   other: '#64748b', // 其他 灰
@@ -1516,7 +1517,11 @@ export function UsageStatusChart({
 }) {
   const total = Math.max(0, items.reduce((sum, item) => sum + item.requestCount, 0));
   const success2xx = items.find((i) => i.class === '2xx')?.requestCount || 0;
-  const successRate = total > 0 ? `${((success2xx / total) * 100).toFixed(1)}%` : '—';
+  // 成功率只看有效请求：499 已经完成协议交互，只是调用方主动结束，不能拉低
+  // 上游/模型成功率。
+  const canceled = items.find((i) => i.class === '499')?.requestCount || 0;
+  const measuredTotal = Math.max(0, total - canceled);
+  const successRate = measuredTotal > 0 ? `${((success2xx / measuredTotal) * 100).toFixed(1)}%` : '—';
 
   const chartItems = items.map((it) => ({
     label: it.class,

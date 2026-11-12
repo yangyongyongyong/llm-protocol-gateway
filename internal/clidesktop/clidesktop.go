@@ -37,6 +37,10 @@ type Endpoint struct {
 	Model string
 }
 
+// defaultClientModel 是网关生成配置时的默认保留别名：客户端按 1M 上下文
+// 计算窗口，真实模型仍由网关按 API Key / Provider 解析。
+const defaultClientModel = "default[1m]"
+
 // Result 汇总一次写入做了什么，供界面展示。
 type Result struct {
 	// CLI 相关
@@ -267,7 +271,9 @@ func applyCLI(home string, e Endpoint) (cliResult, error) {
 func envFor(e Endpoint) map[string]string {
 	model := strings.TrimSpace(e.Model)
 	if model == "" {
-		model = "default"
+		// 网关生成的客户端配置默认使用 1M 保留别名；显式传入 default 时仍可
+		// 回退到普通窗口。
+		model = defaultClientModel
 	}
 	big := model
 	small := stripContextTag(model)

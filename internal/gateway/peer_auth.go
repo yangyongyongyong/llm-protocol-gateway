@@ -24,6 +24,11 @@ import (
 // 也方便日志和告警按前缀归类。
 const peerTokenPrefix = "gwpeer-"
 
+// peerRefreshTokenPrefix 是网关互联的续签凭据。它只能调用
+// POST /__peer/renew，不能作为模型请求的 Bearer，也不能进入下游 Provider 的
+// apiKeySource。
+const peerRefreshTokenPrefix = "gwrefresh-"
+
 // peerUsernamePrefix 只是一个默认前缀，给界面上的示例和旧数据留个可辨识的
 // 习惯写法。对端账号名不强制带它：注册时用哪个用户名完全由下游运维自己定，
 // 上游原样存下来——重复注册之所以幂等，靠的是网关身份（gatewayId），不是名字。
@@ -51,6 +56,15 @@ func generatePeerToken() (string, error) {
 		return "", err
 	}
 	return peerTokenPrefix + hex.EncodeToString(buf), nil
+}
+
+// generatePeerRefreshToken 生成一把续签凭据，用途与生命周期独立于流量 bearer。
+func generatePeerRefreshToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return peerRefreshTokenPrefix + hex.EncodeToString(buf), nil
 }
 
 // peerTokenHash 与 APIKeyByToken 的比对口径一致：都是对明文取一次 sha256，
@@ -88,8 +102,20 @@ func (a peerAccount) gatewayIDValue() string {
 // 凭据比对用 sha256 + constant-time：和 APIKeyByToken 同一套口径，避免在
 // 这条路径上引入另一种（可能更弱的）比较方式。
 func (s *Server) authenticatePeer(r *http.Request) (peerAccount, error) {
+	return s.authenticatePeerCredential(r, peerTokenPrefix)
+}
+
+// authenticatePeerRefresh 校验续签凭据。它比流量 bearer 多一个前缀约束：
+// 即使 bearer 泄漏，也不能反过来调用续签接口把自己无限续下去。
+func (s *Server) authenticatePeerRefresh(r *http.Request) (peerAccount, error) {
+	return s.authenticatePeerCredential(r, peerRefreshTokenPrefix)
+}
+
+// authenticatePeerCredential 是两种对端凭据共用的校验路径：前缀、摘要、
+// 所属 peer 账号与账号启用状态都一致，只有允许的前缀不同。
+func (s *Server) authenticatePeerCredential(r *http.Request, prefix string) (peerAccount, error) {
 	raw := bearerToken(r)
-	if raw == "" || !strings.HasPrefix(raw, peerTokenPrefix) {
+	if raw == "" || !strings.HasPrefix(raw, prefix) {
 		return peerAccount{}, errPeerTokenInvalid
 	}
 	if s.userStore == nil {
@@ -101,7 +127,7 @@ func (s *Server) authenticatePeer(r *http.Request) (peerAccount, error) {
 	// 直接比字符串就够，不必再解回字节。
 	var candidates []domain.APIKey
 	for _, key := range s.router.State().APIKeys {
-		if key.Key == "" || !strings.HasPrefix(key.Key, peerTokenPrefix) {
+		if key.Key == "" || !strings.HasPrefix(key.Key, prefix) {
 			continue
 		}
 		if subtle.ConstantTimeCompare([]byte(peerTokenHash(key.Key)), []byte(wanted)) == 1 {

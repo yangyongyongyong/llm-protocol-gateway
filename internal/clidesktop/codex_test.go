@@ -54,6 +54,23 @@ func TestApplyCodexWritesProviderBlock(t *testing.T) {
 	}
 }
 
+// 后端接口没有传模型时也必须写 default[1m]，避免 UI 与底层 API 的默认值分叉。
+func TestApplyCodexDefaultsToDefault1M(t *testing.T) {
+	home := withHome(t)
+	e := codexEndpoint()
+	e.Model = ""
+	if _, err := ApplyCodex(e); err != nil {
+		t.Fatalf("ApplyCodex: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `model = "default[1m]"`) {
+		t.Fatalf("model 默认值应为 default[1m]：\n%s", raw)
+	}
+}
+
 // 顶层键必须排在所有 [table] 之前，否则 TOML 会把 model_provider 读成上一个
 // 表的字段。用户文件里本来就有 [features] 这类表时这一点才会暴露。
 func TestApplyCodexPutsTopLevelKeysBeforeUserTables(t *testing.T) {

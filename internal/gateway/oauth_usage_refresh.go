@@ -170,6 +170,11 @@ func (s *Server) refreshAllOAuthUsage(ctx context.Context) {
 				s.refreshWorkBuddyUsage(provider.ID)
 			}
 		default:
+			// OpenCode Go 是 API Key Provider，但它的套餐额度也由厂商接口
+			// 提供；缓存预热后额度面板和 quota 调度都能直接读。
+			if isOpenCodeGoProvider(provider) && strings.TrimSpace(resolveProviderAuth(provider)) != "" {
+				s.refreshOpenCodeGoUsage(provider.ID)
+			}
 			// api_key Zhipu (bigmodel / z.ai) providers expose a coding-plan
 			// quota endpoint; keep it warm like the OAuth reports.
 			if isZhipuBaseURL(provider.BaseURL) && strings.TrimSpace(resolveProviderAuth(provider)) != "" {
@@ -180,6 +185,53 @@ func (s *Server) refreshAllOAuthUsage(ctx context.Context) {
 				s.refreshDeepSeekBalance(provider.ID)
 			}
 		}
+	}
+}
+
+// refreshOpenCodeGoUsage 强制刷新一次 OpenCode Go 额度缓存。
+func (s *Server) refreshOpenCodeGoUsage(providerID string) {
+	cacheKey := s.oauthUsageCacheKeyFor("opencode-go", providerID)
+	unlock := s.lockOAuthUsageFetch(cacheKey)
+	defer unlock()
+	s.refreshOpenCodeGoUsageHoldingLock(providerID)
+}
+
+// maybeRefreshOpenCodeGoUsageAsync 在缓存过期时后台刷新，不阻塞当前请求。
+func (s *Server) maybeRefreshOpenCodeGoUsageAsync(providerID string) {
+	cacheKey := s.oauthUsageCacheKeyFor("opencode-go", providerID)
+	if !s.oauthUsageCache.needsRefresh(cacheKey) {
+		return
+	}
+	if !s.tryLockOAuthUsageFetch(cacheKey) {
+		return
+	}
+	go func() {
+		defer s.unlockOAuthUsageFetch(cacheKey)
+		s.refreshOpenCodeGoUsageHoldingLock(providerID)
+	}()
+}
+
+// refreshOpenCodeGoUsageHoldingLock 在调用方已持有同一缓存锁时刷新额度。
+func (s *Server) refreshOpenCodeGoUsageHoldingLock(providerID string) {
+	cacheKey := s.oauthUsageCacheKeyFor("opencode-go", providerID)
+	provider, err := s.router.ProviderByID(providerID)
+	if err != nil || provider.Disabled || !isOpenCodeGoProvider(provider) {
+		return
+	}
+	apiKey := resolveProviderAuth(provider)
+	if strings.TrimSpace(apiKey) == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	report, err := fetchOpenCodeGoUsage(ctx, provider.BaseURL, apiKey)
+	if err != nil {
+		s.oauthUsageCache.setFailureForAccount(cacheKey, oauthUsageAccountID(provider), err)
+		return
+	}
+	s.oauthUsageCache.clearFailure(cacheKey)
+	if report.Available {
+		s.oauthUsageCache.setForAccount(cacheKey, oauthUsageAccountID(provider), report)
 	}
 }
 
@@ -352,6 +404,7 @@ func (s *Server) refreshWorkBuddyUsage(providerID string) {
 		slog.Debug("workbuddy quota sweep failed", "provider", providerID, "error", quota.Error)
 		return
 	}
+	s.oauthUsageCache.setForAccount(cacheKey, oauthUsageAccountID(provider), quota)
 	if latest, latestErr := s.router.ProviderByID(providerID); latestErr == nil && latest.WorkBuddy != nil && latest.WorkBuddy.AccessToken != before {
 		slog.Info("workbuddy token refreshed after the quota meter refused it", "provider", providerID)
 	}

@@ -35,6 +35,9 @@ type peerRegistration struct {
 	ParentURL string `json:"parentUrl"`
 	// Token 是上游发的对端凭据（gwpeer-…）。
 	Token string `json:"token"`
+	// RefreshToken 是独立的续签凭据（gwrefresh-…）。它不用于模型请求，
+	// 只在 bearer 失效时换发新的一组凭据。
+	RefreshToken string `json:"refreshToken"`
 	// UserID / Username 是上游为这台机器建的账号，排查时能直接对上。
 	UserID   string `json:"userId"`
 	Username string `json:"username"`
@@ -91,7 +94,8 @@ func trimPeerParentURL(raw string) (string, bool) {
 	// https://host/__peer/register/__peer/register 这种地址。
 	for _, suffix := range []string{
 		peerEndpointPrefix + "register", peerEndpointPrefix + "probe", peerEndpointPrefix + "me",
-		peerEndpointPrefix + "providers", peerEndpointPrefix + "chat/completions",
+		peerEndpointPrefix + "providers", peerEndpointPrefix + "renew", peerEndpointPrefix + "refresh-token",
+		peerEndpointPrefix + "chat/completions",
 	} {
 		if strings.HasSuffix(value, suffix) {
 			value = strings.TrimSuffix(value, suffix)
@@ -126,16 +130,52 @@ func (c *peerClient) register(ctx context.Context, parentURL, selfID, name, user
 	if err := c.postJSON(ctx, root+peerEndpointPrefix+"register", "", payload, &response); err != nil {
 		return peerRegistration{}, err
 	}
+	return peerRegistrationFromResponse(root, response), nil
+}
+
+// peerRegistrationFromResponse 把父网关的注册/续签响应折成本机保存的记录。
+func peerRegistrationFromResponse(root string, response peerRegisterResponse) peerRegistration {
 	return peerRegistration{
 		ParentURL:          root,
 		Token:              response.Token,
+		RefreshToken:       response.RefreshToken,
 		UserID:             response.UserID,
 		Username:           response.Username,
 		GrantedProviderIDs: response.GrantedProviderIDs,
 		// 上游自己的身份，界面显示出来，运维才能核对上游那一侧到底是哪台机器。
 		// 注册响应里的 GatewayID 是本机身份，两个方向别拿反。
 		ParentGatewayID: response.ParentGatewayID,
-	}, nil
+	}
+}
+
+// renew 用独立的续签凭据换取新的 bearer + refresh 凭据。父网关会先校验
+// gatewayId 与凭据 owner 一致，再一次性轮换两把凭据。
+func (c *peerClient) renew(ctx context.Context, parentURL, selfID, refreshToken string) (peerRegistration, error) {
+	root, err := normalizePeerParentURL(parentURL)
+	if err != nil {
+		return peerRegistration{}, err
+	}
+	var response peerRegisterResponse
+	payload := peerRenewRequest{GatewayID: strings.TrimSpace(selfID)}
+	if err := c.postJSON(ctx, root+peerEndpointPrefix+"renew", strings.TrimSpace(refreshToken), payload, &response); err != nil {
+		return peerRegistration{}, err
+	}
+	return peerRegistrationFromResponse(root, response), nil
+}
+
+// issueRefreshToken 是旧记录的一次性升级：用仍有效的流量 bearer 换一组带
+// gwrefresh- 的新凭据。父网关在已存在续签凭据时返回 409，绝不重复轮换。
+func (c *peerClient) issueRefreshToken(ctx context.Context, parentURL, selfID, trafficToken string) (peerRegistration, error) {
+	root, err := normalizePeerParentURL(parentURL)
+	if err != nil {
+		return peerRegistration{}, err
+	}
+	var response peerRegisterResponse
+	payload := peerRenewRequest{GatewayID: strings.TrimSpace(selfID)}
+	if err := c.postJSON(ctx, root+peerEndpointPrefix+"refresh-token", strings.TrimSpace(trafficToken), payload, &response); err != nil {
+		return peerRegistration{}, err
+	}
+	return peerRegistrationFromResponse(root, response), nil
 }
 
 // peerProbeResult 是上游 /__peer/probe 的回答：能连上、且注册这条路通不通。
@@ -210,7 +250,7 @@ func (c *peerClient) providers(ctx context.Context, parentURL, token string) ([]
 		return nil, err
 	}
 	if httpResponse.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("上游返回 %d: %s", httpResponse.StatusCode, peerErrorText(body))
+		return nil, &peerHTTPError{Status: httpResponse.StatusCode, Message: peerErrorText(body)}
 	}
 	var payload struct {
 		Providers []peerProviderView `json:"providers"`
@@ -245,12 +285,24 @@ func (c *peerClient) postJSON(ctx context.Context, url, token string, payload an
 		return err
 	}
 	if httpResponse.StatusCode != http.StatusOK {
-		return fmt.Errorf("上游返回 %d: %s", httpResponse.StatusCode, peerErrorText(body))
+		return &peerHTTPError{Status: httpResponse.StatusCode, Message: peerErrorText(body)}
 	}
 	if out == nil {
 		return nil
 	}
 	return json.Unmarshal(body, out)
+}
+
+// peerHTTPError 保留上游状态码，让自动续签能只对 401/403 这一种失败做恢复；
+// 网络错误、5xx 不应该误触发凭据轮换。
+type peerHTTPError struct {
+	Status  int
+	Message string
+}
+
+// Error 输出与控制台原有文案一致的可读错误。
+func (e *peerHTTPError) Error() string {
+	return fmt.Sprintf("上游返回 %d: %s", e.Status, e.Message)
 }
 
 // peerErrorText 从上游的错误正文里取出可读的那一句。

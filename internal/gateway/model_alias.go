@@ -43,10 +43,11 @@ func resolveAPIKeyModelAlias(aliases map[string]string, requestModel string) (st
 }
 
 // defaultModelAlias is the reserved model name a client sends when it wants the
-// platform to pick the model. It exists so a Claude Code session can pin
-// ANTHROPIC_MODEL=default once and never touch its config again: the client
-// stops naming a model, and switching the model on the gateway (per API key, or
-// per provider) takes effect on the next request without a client restart.
+// platform to pick the model. It exists so a Claude Code or Codex session can pin
+// the reserved alias once and never touch its config again: the client stops
+// naming a model, and switching the model on the gateway (per API key, or per
+// provider) takes effect on the next request without a client restart. Gateway-
+// generated client configs default to the 1M spelling, "default[1m]".
 //
 // "default" is not a model id any provider serves, so it can never collide with
 // a real one. Claude Code also spells it "default[1m]" when the user wants the

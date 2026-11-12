@@ -205,6 +205,7 @@ func TestProviderVendorKey(t *testing.T) {
 		{domain.Provider{AuthType: domain.AuthTypeAPIKey, BaseURL: "https://api.anthropic.com"}, "anthropic"},
 		{domain.Provider{AuthType: domain.AuthTypeAPIKey, BaseURL: "HTTPS://API.DEEPSEEK.COM/v1"}, "deepseek"},
 		{domain.Provider{AuthType: domain.AuthTypeAPIKey, BaseURL: "https://api.minimaxi.com/v1"}, "minimax"},
+		{domain.Provider{AuthType: domain.AuthTypeAPIKey, BaseURL: "https://opencode.ai/zen/go/v1"}, "opencode"},
 		{domain.Provider{AuthType: domain.AuthTypeAPIKey, BaseURL: "https://relay.example.com/v1"}, ""},
 	}
 	for _, tc := range cases {

@@ -384,6 +384,7 @@ func (rt *Runtime) Start(cfg Config) error {
 		server.BackfillClaudeOAuthAccountLabels()
 		server.BackfillQoderAccountLabels()
 		server.StartCursorModelBackgroundRefresh(context.Background())
+		server.StartPeerUpstreamBackgroundRefresh(context.Background())
 		// The monitoring center replaces the legacy alert scanner: multi-IP and
 		// concurrent-IP rules are evaluated by its collector, which also folds
 		// the frozen `alerts` history into the event stream on startup.

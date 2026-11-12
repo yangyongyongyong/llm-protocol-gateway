@@ -1,6 +1,6 @@
 import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import type {LogEntry, Provider, StatusBucketStats, UsageAnalysisResponse} from '../types';
-import {API_BASE, formatBytes, formatCostMicros, formatTokenCount, localDateToRFC3339, providerUsageLabel} from '../lib';
+import {API_BASE, formatBytes, formatCostMicros, formatTokenCount, isTrafficLogCanceled, localDateToRFC3339, providerUsageLabel} from '../lib';
 import {downloadCSV, UsageDonutChart, UsageStatusChart} from './charts';
 import {ProviderRefLabel} from './provider_label';
 import {IconSelect} from './selects';
@@ -103,7 +103,9 @@ function CostCell({log}: {log: LogEntry}) {
 function statusBuckets(rows: LogEntry[]): StatusBucketStats[] {
   const counts = new Map<string, number>();
   for (const row of rows) {
-    const bucket = row.status ? `${Math.floor(row.status / 100)}xx` : '未知';
+    // 499 是客户端主动取消，单独成桶；归进 4xx 会让状态环形图和成功率
+    // 把正常 Stop/切会话显示成异常。
+    const bucket = isTrafficLogCanceled(row) ? '499' : row.status ? `${Math.floor(row.status / 100)}xx` : '未知';
     counts.set(bucket, (counts.get(bucket) || 0) + 1);
   }
   return [...counts].sort(([a], [b]) => a.localeCompare(b)).map(([label, requestCount]) => ({class: label, requestCount}));
@@ -186,7 +188,7 @@ export function RequestAnalysisPanel({rows, providers, onOpenLogs}: {rows: LogEn
   }, [providers, providersInRows]);
   const keys = useMemo(() => [...new Map(rows.filter(r => r.apiKeyId).map(r => [r.apiKeyId!, r.apiKeyName || r.apiKeyId!])).entries()], [rows]);
   const reasoningOptions = useMemo(() => [...new Set(rows.map(r => r.reasoningEffort).filter((v): v is string => !!v))].sort(), [rows]);
-  const filtered = useMemo(() => rows.filter(r => (!model || r.model === model) && (!provider || r.providerId === provider) && (!key || r.apiKeyId === key) && (!reasoning || r.reasoningEffort === reasoning) && (!status || Math.floor(r.status / 100).toString() === status) && `${r.model} ${r.apiKeyName} ${r.protocolFlow}`.toLowerCase().includes(search.toLowerCase())), [rows, model, provider, key, reasoning, status, search]);
+  const filtered = useMemo(() => rows.filter(r => (!model || r.model === model) && (!provider || r.providerId === provider) && (!key || r.apiKeyId === key) && (!reasoning || r.reasoningEffort === reasoning) && (!status || (status === '499' ? isTrafficLogCanceled(r) : Math.floor(r.status / 100).toString() === status)) && `${r.model} ${r.apiKeyName} ${r.protocolFlow}`.toLowerCase().includes(search.toLowerCase())), [rows, model, provider, key, reasoning, status, search]);
   const latencies = filtered.map(r => r.latencyMs).filter(n => n > 0);
   // Captured logs know whether the call streamed. Legacy logs predate analysis
   // capture and store ttft == latency for non-stream calls, so a strictly
@@ -195,7 +197,7 @@ export function RequestAnalysisPanel({rows, providers, onOpenLogs}: {rows: LogEn
   const streamed = filtered.filter(streamSample);
   const ttft = streamed.map(r => r.ttftMs!);
   const speeds = streamed.filter(r => r.outputTokens > 0).map(r => Math.round(r.outputTokens * 1000 / (r.latencyMs - r.ttftMs!)));
-  const errors = filtered.filter(r => r.status >= 400).length;
+  const errors = filtered.filter(r => r.status >= 400 && !isTrafficLogCanceled(r)).length;
   const success = filtered.filter(r => r.status >= 200 && r.status < 300).length;
   const selects = (label: string, value: string, update: (v: string) => void, options: [string, string][]) => <select aria-label={label} value={value} onChange={e => update(e.target.value)}><option value="">全部{label}</option>{options.map(([id, name]) => <option key={id} value={id}>{name}</option>)}</select>;
   const exportRows = () => downloadCSV('gateway-requests.csv', [['时间', '模型', 'Provider', '密钥名称', '状态', '输入', '输出', '缓存读取', '缓存写入', '成本USD', '已计价', '耗时ms', '首字ms', '推理设置'], ...filtered.map(r => [r.time, r.model, providerUsageLabel(r.providerId, providers), r.apiKeyName || '', r.status, r.inputTokens, r.outputTokens, r.cacheTokens || 0, r.cacheWriteTokens || 0, r.priced ? (r.costMicros || 0) / 1_000_000 : '', r.priced ? 'y' : '', r.latencyMs, streamed.includes(r) ? r.ttftMs! : '', r.reasoningEffort || ''])].map(r => r.map(csv).join(',')).join('\r\n'));
@@ -204,7 +206,7 @@ export function RequestAnalysisPanel({rows, providers, onOpenLogs}: {rows: LogEn
     provider: provider || undefined,
     apiKeyId: key || undefined,
     apiKeyName: keys.find(([id]) => id === key)?.[1],
-    status: status ? `${status}xx` : undefined,
+    status: status === '499' ? '499' : status ? `${status}xx` : undefined,
     keyword: search.trim() || undefined,
   });
   return <>
@@ -228,7 +230,7 @@ export function RequestAnalysisPanel({rows, providers, onOpenLogs}: {rows: LogEn
         />
       </div>
       {selects('密钥', key, setKey, keys)}
-      {selects('状态', status, setStatus, [['2', '2xx 成功'], ['4', '4xx 请求错误'], ['5', '5xx 上游错误']])}
+      {selects('状态', status, setStatus, [['2', '2xx 成功'], ['499', '499 客户端取消'], ['4', '4xx 请求异常'], ['5', '5xx 上游错误']])}
       {selects('推理设置', reasoning, setReasoning, reasoningOptions.map(v => [v, v]))}
       <button className="mini-btn usage-export-btn" onClick={exportRows}>导出筛选结果</button>
     </div>

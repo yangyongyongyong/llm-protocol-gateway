@@ -195,6 +195,17 @@ func (s *Server) providerQuotaHeadroom(providerID string) (float64, bool) {
 				values = append(values, report.Weekly.Utilization)
 			}
 			return utilizationHeadroom(values)
+		case OpenCodeGoUsageReport:
+			if !report.Available {
+				continue
+			}
+			values := make([]float64, 0, 3)
+			for _, bucket := range []*OpenCodeGoUsageBucket{report.FiveHour, report.Weekly, report.Monthly} {
+				if bucket != nil {
+					values = append(values, bucket.Utilization)
+				}
+			}
+			return utilizationHeadroom(values)
 		case DeepSeekBalanceReport:
 			if !report.Available || report.Unsupported {
 				continue
@@ -210,7 +221,7 @@ func (s *Server) providerQuotaHeadroom(providerID string) (float64, bool) {
 	return 0, false
 }
 
-var quotaReportPrefixes = []string{"claude", "chatgpt", "cursor", "zhipu", "deepseek"}
+var quotaReportPrefixes = []string{"claude", "chatgpt", "cursor", "zhipu", "deepseek", "opencode-go"}
 
 func clauseUtilizations(report ClaudeOAuthUsageReport) []float64 {
 	values := make([]float64, 0, 4)
@@ -253,6 +264,8 @@ func quotaReportIsFresh(cached any) bool {
 	case CursorOAuthUsageReport:
 		stamp = report.FetchedAt
 	case ZhipuUsageReport:
+		stamp = report.FetchedAt
+	case OpenCodeGoUsageReport:
 		stamp = report.FetchedAt
 	case DeepSeekBalanceReport:
 		stamp = report.FetchedAt

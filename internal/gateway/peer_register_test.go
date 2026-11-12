@@ -433,6 +433,73 @@ func TestPeerTokenPersistedToAPIKeyStore(t *testing.T) {
 	}
 }
 
+// 父网关完全从 SQLite 重新加载后，下游的流量凭据仍应直接可用；流量 bearer
+// 被轮换或失效时，独立续签凭据可以在不输入用户名密码的情况下换回一组新凭据。
+func TestPeerCredentialsSurviveRestartAndAutoRenew(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	first := NewServer(NewRouter(domain.GatewayState{}), monitor.NewStore(), db)
+	first.SetGatewayID(gwID)
+	first.userStore = db
+	first.roles = db
+	_, registered := peerRegister(t, first, peerRegisterPayload(nil))
+	if !strings.HasPrefix(registered.RefreshToken, peerRefreshTokenPrefix) {
+		t.Fatalf("registration refresh token = %q", registered.RefreshToken)
+	}
+
+	state, err := db.Load(domain.GatewayState{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted := NewServer(NewRouter(state), monitor.NewStore(), db)
+	restarted.SetGatewayID(gwID)
+	restarted.userStore = db
+	restarted.roles = db
+
+	me := func(token string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodGet, peerEndpointPrefix+"me", nil)
+		request.Header.Set("Authorization", "Bearer "+token)
+		request.RemoteAddr = "127.0.0.1:40000"
+		recorder := httptest.NewRecorder()
+		restarted.Handler().ServeHTTP(recorder, request)
+		return recorder
+	}
+	if recorder := me(registered.Token); recorder.Code != http.StatusOK {
+		t.Fatalf("traffic credential must survive restart: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	renewBody, _ := json.Marshal(map[string]any{"gatewayId": otherID})
+	renew := httptest.NewRequest(http.MethodPost, peerEndpointPrefix+"renew", bytes.NewReader(renewBody))
+	renew.Header.Set("Authorization", "Bearer "+registered.RefreshToken)
+	renew.Header.Set("Content-Type", "application/json")
+	renew.RemoteAddr = "127.0.0.1:40000"
+	renewRecorder := httptest.NewRecorder()
+	restarted.Handler().ServeHTTP(renewRecorder, renew)
+	if renewRecorder.Code != http.StatusOK {
+		t.Fatalf("renew status=%d body=%s", renewRecorder.Code, renewRecorder.Body.String())
+	}
+	var renewed peerRegisterResponse
+	if err := json.Unmarshal(renewRecorder.Body.Bytes(), &renewed); err != nil {
+		t.Fatal(err)
+	}
+	if renewed.Token == registered.Token || renewed.RefreshToken == registered.RefreshToken {
+		t.Fatalf("renew must rotate both credentials: old=%+v new=%+v", registered, renewed)
+	}
+	if recorder := me(renewed.Token); recorder.Code != http.StatusOK {
+		t.Fatalf("renewed traffic credential unusable: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if recorder := me(registered.Token); recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("old traffic credential must be revoked after renew, got %d", recorder.Code)
+	}
+	if _, ok := restarted.router.APIKeyByToken(renewed.RefreshToken); ok {
+		t.Fatal("a refresh credential must never authenticate as a model API key")
+	}
+}
+
 // 对端能看到哪些 provider，完全由上游的授权集决定，和它请求的清单无关。
 func TestPeerProvidersFollowGrants(t *testing.T) {
 	server := newPeerTestServer(t,

@@ -29,6 +29,8 @@ func TestRequestSessionID(t *testing.T) {
 		// A bare user id is shared by several conversations, so it must never
 		// become one session (that would move unrelated chats together).
 		{name: "bare user id is not a session", body: map[string]any{"metadata": map[string]any{"user_id": "user-42"}}},
+		{name: "codex client metadata session", body: map[string]any{"client_metadata": map[string]any{"session_id": "codex-s-1"}}, want: "codex-s-1"},
+		{name: "codex client metadata thread fallback", body: map[string]any{"client_metadata": map[string]any{"thread_id": "codex-t-1"}}, want: "codex-t-1"},
 		{name: "prompt cache key", body: map[string]any{"prompt_cache_key": "codex-conv-1"}, want: "codex-conv-1"},
 		{name: "blank values ignored", body: map[string]any{"session_id": "  ", "prompt_cache_key": "pk"}, want: "pk"},
 	}
@@ -48,14 +50,50 @@ func TestRequestSessionID(t *testing.T) {
 	}
 	// The same conversation on two different gateway keys must not share a pin.
 	req := map[string]any{"session_id": "same"}
-	if sessionAffinityKey(nil, req, "key-a") == sessionAffinityKey(nil, req, "key-b") {
+	if sessionAffinityKey(nil, req, "key-a", "p1", "") == sessionAffinityKey(nil, req, "key-b", "p1", "") {
 		t.Fatal("pin key must be scoped to the gateway key")
 	}
-	if sessionAffinityKey(nil, req, "key-a") != sessionAffinityKey(nil, req, "key-a") {
+	if sessionAffinityKey(nil, req, "key-a", "p1", "") != sessionAffinityKey(nil, req, "key-a", "p1", "") {
 		t.Fatal("pin key must be stable")
 	}
-	if got := sessionAffinityKey(nil, map[string]any{}, "key-a"); got != "" {
+	if got := sessionAffinityKey(nil, map[string]any{}, "key-a", "p1", ""); got != "" {
 		t.Fatalf("no session id must mean no pin, got %q", got)
+	}
+	if sessionAffinityKey(nil, req, "key-a", "p1", "") == sessionAffinityKey(nil, req, "key-a", "p2", "") {
+		t.Fatal("changing the primary provider must start a fresh session-pin namespace")
+	}
+	if sessionAffinityKey(nil, req, "key-a", "p1", "", "b1") == sessionAffinityKey(nil, req, "key-a", "p1", "") {
+		t.Fatal("adding a fallback provider must start a fresh session-pin namespace")
+	}
+	if sessionAffinityKey(nil, req, "key-a", "p1", "", "b1") == sessionAffinityKey(nil, req, "key-a", "p1", "", "b2") {
+		t.Fatal("changing the fallback provider must start a fresh session-pin namespace")
+	}
+	if sessionAffinityKey(nil, req, "key-a", "p1", "", "b1", "b2") == sessionAffinityKey(nil, req, "key-a", "p1", "", "b2", "b1") {
+		t.Fatal("fallback order must be part of the session-pin namespace")
+	}
+	if sessionAffinityKey(nil, req, "key-a", "p1", "") != sessionAffinityKey(nil, req, "key-a", "p1", "order") {
+		t.Fatal("empty and explicit order modes must share one session-pin namespace")
+	}
+	if sessionAffinityKey(nil, req, "key-a", "p1", "order") == sessionAffinityKey(nil, req, "key-a", "p1", "spread") {
+		t.Fatal("changing the schedule mode must start a fresh session-pin namespace")
+	}
+	if sessionAffinityKey(nil, req, "key-a", "p1", "spread") == sessionAffinityKey(nil, req, "key-a", "p1", "rotate") {
+		t.Fatal("every scheduling mode change must invalidate the old pin namespace")
+	}
+}
+
+// 链路配置变化后，旧会话 pin 不能再影响新链：首选、备选或备选顺序任一变化
+// 都会生成新的命名空间。
+func TestChangingProviderChainInvalidatesSessionPin(t *testing.T) {
+	t.Parallel()
+	s := NewServer(NewRouter(domain.GatewayState{}), monitor.NewStore())
+	req := map[string]any{"session_id": "chain-change"}
+	oldKey := sessionAffinityKey(nil, req, "k1", "p-primary", "", "p-old-fallback")
+	newKey := sessionAffinityKey(nil, req, "k1", "p-primary", "", "p-new-fallback")
+	s.setSessionPin(oldKey, "p-old-fallback")
+	attempts, pinned := s.applySessionPin(newKey, []string{"p-primary", "p-new-fallback"})
+	if pinned != "" || strings.Join(attempts, ",") != "p-primary,p-new-fallback" {
+		t.Fatalf("old chain pin leaked into the new chain: attempts=%v pinned=%q", attempts, pinned)
 	}
 }
 
@@ -173,7 +211,7 @@ func TestSessionAffinityIgnoresAnonymousRequests(t *testing.T) {
 func TestApplySessionPinDropsAnUnusablePin(t *testing.T) {
 	t.Parallel()
 	s := NewServer(NewRouter(domain.GatewayState{}), monitor.NewStore())
-	sessionKey := sessionAffinityKey(nil, map[string]any{"session_id": "x"}, "k1")
+	sessionKey := sessionAffinityKey(nil, map[string]any{"session_id": "x"}, "k1", "p1", "")
 	s.setSessionPin(sessionKey, "gone")
 	attempts, pinned := s.applySessionPin(sessionKey, []string{"a", "b"})
 	if pinned != "" || strings.Join(attempts, ",") != "a,b" {
@@ -234,7 +272,7 @@ func TestSessionPinsAreNotGlobalState(t *testing.T) {
 	t.Parallel()
 	first := NewServer(NewRouter(domain.GatewayState{}), monitor.NewStore())
 	second := NewServer(NewRouter(domain.GatewayState{}), monitor.NewStore())
-	sessionKey := sessionAffinityKey(nil, map[string]any{"session_id": "shared"}, "same-key")
+	sessionKey := sessionAffinityKey(nil, map[string]any{"session_id": "shared"}, "same-key", "p1", "")
 	first.setSessionPin(sessionKey, "p1")
 	if got := second.pinStore().sessionPin(sessionKey); got != "" {
 		t.Fatalf("the second server should not see the first one's pin, got %q", got)
