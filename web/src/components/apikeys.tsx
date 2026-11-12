@@ -821,7 +821,7 @@ export function ApiKeyFallbackProvidersModal({
                   ) : null}
                   {batchNotice ? <div className="api-key-fallback-models-notice">{batchNotice}</div> : null}
                   <div className="api-key-fallback-models-list">
-                    {selectedProviders.map((provider) => {
+                    {selectedProviders.map((provider, index) => {
                       const providerModels = models.filter((model) => model.providerId === provider.id);
                       const crossProtocol = !sameProtocol(provider);
                       const chosen = (overrides[provider.id] || '').trim();
@@ -829,8 +829,12 @@ export function ApiKeyFallbackProvidersModal({
                         ? (chosen ? '跨协议备选：网关会自动转换协议' : '跨协议备选：不固定模型时使用请求模型或该 Provider 默认模型（网关自动转换协议）')
                         : (chosen ? `固定使用 ${chosen}` : '留空时沿用请求模型或该 Provider 默认模型');
                       return (
-                        <div className="api-key-fallback-models-row" key={provider.id} title={rowHint}>
-                          <ProviderLabel provider={provider} size={16} />
+                        <div className="api-key-fallback-models-row" key={provider.id} title={`#${index + 1} ${provider.name} — ${rowHint}`}>
+                          {/* 用编号当这一列的行标识，而不是重复 Provider 名：
+                              名字在左边的「备选链」列已经写着，两列靠 #N 对齐即可。
+                              267px 的列宽里如果既放名字又放下拉，两者都会被压成省略号
+                              （实测：名字只剩「Qoder 账…」、下拉只剩「Qwen」）。 */}
+                          <span className="fpp-rank" title={provider.name}>#{index + 1}</span>
                           <SearchableModelSelect
                             value={overrides[provider.id] || ''}
                             models={providerModels}

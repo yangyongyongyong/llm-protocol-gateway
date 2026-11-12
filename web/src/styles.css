@@ -2155,14 +2155,13 @@ body.fpp-dragging, body.fpp-dragging * { cursor: grabbing !important; user-selec
 .api-key-fallback-models-list { flex: 1 1 auto; display: grid; gap: 4px; padding: 6px 8px; align-content: start; min-height: 0; }
 .api-key-fallback-models-row {
   display: grid;
-  grid-template-columns: minmax(120px, 0.9fr) minmax(0, 1.6fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 10px;
   min-width: 0;
   padding: 3px 0;
 }
-.api-key-fallback-models-row > .provider-label,
-.api-key-fallback-models-row > *:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.api-key-fallback-models-row > .fpp-rank { flex: none; }
 .api-key-fallback-models-row .icon-btn { width: 26px; height: 26px; flex: none; }
 .api-key-fallback-summary-text { margin-right: auto; color: var(--subtle); font-size: var(--fs-sm); }
 
