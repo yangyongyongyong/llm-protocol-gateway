@@ -379,3 +379,25 @@ func TestUsageStatsRangeForKeysUsesDayBucketsNotOnlyMemoryLogs(t *testing.T) {
 		t.Fatalf("yesterday daily=%+v", yesterdayPoint)
 	}
 }
+
+// 客户端主动取消必须和普通 4xx 分开筛选，否则日志页的「4xx 限流/异常」
+// 会把用户主动 Stop 也统计成错误。
+func TestStatusClassMatchesSeparatesClientCanceled(t *testing.T) {
+	cases := []struct {
+		class  string
+		status int
+		want   bool
+	}{
+		{class: "499", status: 499, want: true},
+		{class: "499", status: 429, want: false},
+		{class: "4xx", status: 429, want: true},
+		{class: "4xx", status: 499, want: false},
+		{class: "2xx", status: 200, want: true},
+		{class: "5xx", status: 500, want: true},
+	}
+	for _, tc := range cases {
+		if got := statusClassMatches(tc.class, tc.status); got != tc.want {
+			t.Fatalf("statusClassMatches(%q, %d) = %v, want %v", tc.class, tc.status, got, tc.want)
+		}
+	}
+}

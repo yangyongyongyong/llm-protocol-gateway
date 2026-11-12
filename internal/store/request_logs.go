@@ -384,8 +384,10 @@ func (s *Store) QueryRequestLogs(query monitor.RequestLogQuery) (monitor.Request
 	switch strings.ToLower(strings.TrimSpace(query.Status)) {
 	case "2xx":
 		where = append(where, "status >= 200 AND status < 300")
+	case "499":
+		where = append(where, "status = 499")
 	case "4xx":
-		where = append(where, "status >= 400 AND status < 500")
+		where = append(where, "status >= 400 AND status < 500 AND status <> 499")
 	case "5xx":
 		where = append(where, "status >= 500 AND status < 600")
 	}

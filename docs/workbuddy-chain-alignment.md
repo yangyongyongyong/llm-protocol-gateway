@@ -8,6 +8,18 @@
 
 本文记录两件事：**这一轮把哪些链路差异真正对齐了**，以及**还有哪些没对齐、值不值得做**。
 
+## 当前协议能力（2026-11-12）
+
+- **国内版**：`/v2/chat/completions` 覆盖主要模型；同账号根另有 `/v1/messages`，但只实测支持
+  `claude-opus-5.5` / `claude-sonnet-5.5` / `claude-opus-5` / `claude-opus-4.8-1m` 四个 Claude
+  模型，且仅限流式。其它模型即使发到 Messages 路由也会 400/500。
+- **国际版 WorkBuddy AI**：没有 `/v1/messages`，该路径恒为 404，只能走 OpenAI Chat。
+- **本仓识别方式**：通用协议探测针对 API Key / 对端 Provider 的“同一 baseUrl 派生多条路径”
+  生效；WorkBuddy OAuth 不加入通用探测，因为它的 Messages 能力是**模型级 + 仅流式**，
+  不能用一个 Provider 级协议徽标表示。WorkBuddy 单独由 `workBuddyMessagesApplies` 按
+  “国内版 + 白名单模型 + stream=true”分流。下游继承的 peer Provider 只能看到上游实际
+  透传的 `protocolSupport`，不会自行猜测 WorkBuddy 具备全模型多协议。
+
 对齐的判定口径是「出站字节形态」和「上游是否接受」，不是功能多少：头集合对上、头顺序
 对上、TLS 指纹对上、请求体形态对上、审核黑名单漂白对上，才算一条链对齐。
 
@@ -183,7 +195,7 @@ bash/WSL，原脚本跑不了）：交叉编译 `linux/amd64` + `npm run build` 
 | 流式链路（SSE） | **200，1422ms**，事件序列完整 | `message_start → content_block_start/delta/stop → message_delta → message_stop`，21 个 `thinking_delta` 正常透出 |
 
 未在本轮验证的：付费模型（避免消耗账号额度）、模型级冷却与免费日窗（需触发限流才有数据）、
-`/v1/messages` 直连路由（尚未实现，见 3.3 第 1 条）。
+`/v1/messages` 直连路由（当时未实现；后续第八次发布已补齐，见 3.3 第 1 条）。
 
 ## 六、配置
 
@@ -234,7 +246,7 @@ Provider 行上的 `proxyUrl` 现在对 WorkBuddy chat 生效（`http://`、`htt
 正文为空（`text_len=0`）——续写只能续思考。这属于「预算分配」问题而非续写缺陷，需要单独决策（抬 `max_tokens` 或压 reasoning 档位）。
 
 
-1. `/v1/messages` 直连路由：国内版 Claude 模型（`claude-opus-5.5` 等）走该路由才吃
+1. `/v1/messages` 直连路由（后续已实现）：国内版 Claude 模型（`claude-opus-5.5` 等）走该路由才吃
    `output_config.effort`。**当前目标账号 `workbuddy-订阅-陌` 的 17 个模型里没有 Claude 系**，
    这条路由在本账号上无法验证，需要一个有 Claude 模型的国内账号才能量出效果。
 2. 续写（continue）：空回复 / `finish_reason=length` 时续 3 段。

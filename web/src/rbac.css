@@ -278,7 +278,118 @@ img.rbac-avatar { background: var(--surface-sunken); box-shadow: none; }
 .rbac-grant-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
 .rbac-grant-owner { flex-shrink: 0; color: var(--muted); font-size: 11px; }
 
+/* 网关互联：授权范围的两种语义。卡片本身是单选项，动态全量模式用一条
+   低调的强调色说明「未来新增也自动包含」，避免和普通全选混淆。 */
+.peer-grant-mode-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.peer-grant-mode-card {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  min-height: 88px;
+  padding: 13px 38px 13px 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+}
+.peer-grant-mode-card:hover { border-color: var(--accent-border); background: var(--hover); }
+.peer-grant-mode-card.active {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 16%, transparent) inset;
+}
+.peer-grant-mode-card.dynamic.active {
+  background:
+    radial-gradient(circle at 100% 0%, color-mix(in srgb, var(--accent) 14%, transparent), transparent 46%),
+    var(--accent-soft);
+}
+.peer-grant-mode-icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 34px;
+  width: 34px;
+  height: 34px;
+  border-radius: 11px;
+  background: var(--surface-sunken);
+  color: var(--muted);
+  font-size: 19px;
+  font-weight: 800;
+  line-height: 1;
+}
+.peer-grant-mode-card.active .peer-grant-mode-icon { background: var(--accent); color: var(--on-accent, #fff); }
+.peer-grant-mode-copy { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.peer-grant-mode-copy b { color: var(--text-strong); font-size: 13px; }
+.peer-grant-mode-copy small { color: var(--muted); font-size: 11.5px; line-height: 1.55; }
+.peer-grant-recommended {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 5px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  color: var(--accent-strong);
+  font-size: 10px;
+  font-weight: 700;
+  vertical-align: 1px;
+}
+.peer-grant-mode-check {
+  position: absolute;
+  top: 11px;
+  right: 11px;
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--on-accent, #fff);
+  font-size: 11px;
+  font-weight: 800;
+}
+.peer-grant-mode-card.active .peer-grant-mode-check { border-color: var(--accent); background: var(--accent); }
+.peer-grant-dynamic-panel {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 15px 16px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--r-lg);
+  background:
+    radial-gradient(circle at 0% 50%, color-mix(in srgb, var(--accent) 12%, transparent), transparent 38%),
+    var(--surface-soft);
+}
+.peer-grant-dynamic-panel strong { color: var(--text-strong); font-size: 13px; }
+.peer-grant-dynamic-panel p { margin: 4px 0 0; color: var(--muted); font-size: 12px; line-height: 1.65; }
+.peer-grant-dynamic-orbit {
+  display: grid;
+  place-items: center;
+  flex: 0 0 44px;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  border: 1px solid var(--accent-border);
+  background: var(--surface);
+  color: var(--accent-strong);
+  font-size: 24px;
+  font-weight: 800;
+  box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent) 7%, transparent);
+}
+.peer-grant-all-summary { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; }
+
 @media (max-width: 640px) {
   .rbac-user-meta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .rbac-perm-modules { grid-template-columns: 1fr; max-height: none; }
+  .peer-grant-mode-grid { grid-template-columns: 1fr; }
+  .peer-grant-dynamic-panel { align-items: flex-start; }
 }

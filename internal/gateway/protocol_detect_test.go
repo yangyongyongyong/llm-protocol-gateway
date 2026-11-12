@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/luca/llm-protocol-gateway/internal/domain"
@@ -87,8 +88,9 @@ func TestClassifyProtocolProbe(t *testing.T) {
 	}
 }
 
-// 链上存在同协议节点时，把它提到最前——直通代替转换。
-func TestPreferNativeProtocolPromotesMatchingNode(t *testing.T) {
+// 协议直通只能优化备选顺序，不能越过显式首选。首选需要转换、备选可直通时，
+// 仍应先试首选；首选失败后才轮到同协议备选。
+func TestPreferNativeProtocolKeepsPrimaryFirst(t *testing.T) {
 	t.Parallel()
 	server := NewServer(NewRouter(domain.GatewayState{
 		Providers: []domain.Provider{
@@ -98,8 +100,26 @@ func TestPreferNativeProtocolPromotesMatchingNode(t *testing.T) {
 	}), monitor.NewStore())
 
 	got := server.preferNativeProtocol([]string{"p-claude", "p-openai"}, domain.ProtocolOpenAIChat, "")
-	if len(got) != 2 || got[0] != "p-openai" || got[1] != "p-claude" {
-		t.Fatalf("chain = %v, want openai first", got)
+	if len(got) != 2 || got[0] != "p-claude" || got[1] != "p-openai" {
+		t.Fatalf("chain = %v, want the configured primary first", got)
+	}
+}
+
+// 三节点链里只调整备选：首个备选需要转换，第二个备选可直通时，把后者提到
+// 备选首位，但 chain[0] 永远不动。
+func TestPreferNativeProtocolPromotesOnlyFallbackTail(t *testing.T) {
+	t.Parallel()
+	server := NewServer(NewRouter(domain.GatewayState{
+		Providers: []domain.Provider{
+			{ID: "p-primary", Name: "primary", Protocol: domain.ProtocolOpenAIChat},
+			{ID: "p-fallback", Name: "fallback", Protocol: domain.ProtocolOpenAIChat},
+			{ID: "p-native", Name: "native", Protocol: domain.ProtocolOpenAIChat, AuthType: domain.AuthTypeAPIKey, ProtocolSupport: []string{"openai_chat", "openai_responses"}},
+		},
+	}), monitor.NewStore())
+
+	got := server.preferNativeProtocol([]string{"p-primary", "p-fallback", "p-native"}, domain.ProtocolOpenAIResponses, "")
+	if strings.Join(got, ",") != "p-primary,p-native,p-fallback" {
+		t.Fatalf("chain = %v, want primary unchanged and native fallback next", got)
 	}
 }
 

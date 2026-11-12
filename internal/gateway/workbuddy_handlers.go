@@ -109,5 +109,9 @@ func (s *Server) handleWorkBuddyUsage(w http.ResponseWriter, r *http.Request) {
 	quota := s.workBuddyQuota(ctx, refreshed)
 	view := s.checkinViewFor(refreshed)
 	quota.Checkin = &view
+	if quota.Error == "" {
+		cacheKey := s.oauthUsageCacheKeyFor("workbuddy", providerID)
+		s.oauthUsageCache.setForAccount(cacheKey, oauthUsageAccountID(refreshed), quota)
+	}
 	writeJSON(w, http.StatusOK, quota)
 }

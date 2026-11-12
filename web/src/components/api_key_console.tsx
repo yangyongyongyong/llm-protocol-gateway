@@ -1913,7 +1913,7 @@ function ClientTab({
         token: keyItem.key,
         providerID: sanitizeClientConfigID(keyItem.name),
         providerName: keyItem.name || 'LLM Gateway',
-        model: keyItem.modelOverride || primary?.defaultModel || 'gpt-5.6-terra',
+        model: 'default[1m]',
         reasoningEffort: resolveCodexReasoningEffort(keyItem),
         catalogPath: codexCatalogPathForHome(),
         catalog: buildApiKeyCodexModelCatalogJSON(keyItem, primary),
@@ -2007,16 +2007,16 @@ function ClientTab({
               </button>
             ))}
             {/* 第四种按钮不走 clientConfigsForProtocol：它是「一次配置、平台换模型」的
-                固定入口，模型名恒为 default，因此不依赖当前 Provider 选了哪个模型，
-                也不受输出协议变化影响（协议在平台上换，客户端不用重配）。 */}
+                固定入口，模型名恒为 default[1m]，因此不依赖当前 Provider 选了哪个
+                模型，也不受输出协议变化影响（协议在平台上换，客户端不用重配）。 */}
             <button
               type="button"
               className={`akc-client-btn${copied === 'claude-switcher' ? ' copied' : ''}`}
               disabled={!route}
-              title="把内置模型名固定为 default，模型与 Provider 之后全在平台上切"
+              title="把内置模型名固定为 default[1m]，模型与 Provider 之后全在平台上切"
               onClick={() => onCopy(
                 buildClaudeCodeSwitcherScript(keyItem, endpoints, publicBase),
-                '已复制 Claude Code 一键接入脚本（模型固定为 default，粘贴到终端执行）',
+                '已复制 Claude Code 一键接入脚本（模型固定为 default[1m]，粘贴到终端执行）',
                 'claude-switcher',
               )}
             >
@@ -2030,7 +2030,7 @@ function ClientTab({
               type="button"
               className={`akc-client-btn${copied === 'claude-local' ? ' copied' : ''}`}
               disabled={!route || applyingClients}
-              title="在本机直接写入 Claude Code CLI 与桌面端的配置（模型固定为 default）；走 /anthropic 端点，与 Codex 的配置互不影响"
+              title="在本机直接写入 Claude Code CLI 与桌面端的配置（模型固定为 default[1m]）；走 /anthropic 端点，与 Codex 的配置互不影响"
               onClick={() => void applyLocally()}
             >
               <BrandIcon icon="claude-color" name="claude" size={15} />
@@ -2042,7 +2042,7 @@ function ClientTab({
               type="button"
               className={`akc-client-btn${copied === 'codex-local' ? ' copied' : ''}`}
               disabled={!route || applyingClients}
-              title="在本机写入 ~/.codex（config.toml + auth.json + 模型目录），Codex CLI 与 Desktop 同时生效；走 /openai/v1 端点，与 Claude 的配置互不影响"
+              title="在本机写入 ~/.codex（config.toml + auth.json + 模型目录，模型固定为 default[1m]），Codex CLI 与 Desktop 同时生效；走 /openai/v1 端点，与 Claude 的配置互不影响"
               onClick={() => void applyCodexLocally()}
             >
               <BrandIcon icon="codex-color" name="codex" size={15} />
@@ -2059,8 +2059,9 @@ function ClientTab({
             <li><b>发一条消息验证</b>：在「在线调试沙箱」里点发送，能看到状态、时延和协议转换结果。</li>
           </ol>
           <div className="akc-hint">
-            <b>Claude Code 一键接入</b>：模型名固定成 <code>default</code>（<code>default[1m]</code> 表示 1M 上下文），
-            并把 opus / sonnet / haiku / fable 四个内置档位与子 agent 一起钉到 <code>default</code>。
+            <b>Claude Code 一键接入</b>：默认模型名固定成 <code>default[1m]</code>（客户端按 1M 上下文计算；
+            需要 200K 档时可改用 <code>default</code>），并把 opus / sonnet / haiku / fable 四个内置档位与子 agent
+            一起钉到保留别名。
             之后换 Provider、换模型、换上游协议都在平台完成，客户端不用再改配置，也不用像改配置工具那样重启。
             脚本会先备份、只改 <code>env</code> 里这几个键，其余配置原样保留；环境变量只在启动时读取，
             所以第一次执行后重开一次客户端。
@@ -2178,7 +2179,10 @@ export function buildClientConfigText(
   provider?: Provider,
 ) {
   const base = `${gatewayURL}${route.outputProtocol === 'claude' ? '/anthropic' : route.outputProtocol === 'openai_responses' ? '/openai/v1' : '/v1'}`;
-  const model = keyItem.modelOverride?.trim() || provider?.defaultModel?.trim() || 'auto';
+  const realModel = keyItem.modelOverride?.trim() || provider?.defaultModel?.trim() || 'auto';
+  // Codex 与 Claude Code 都使用网关的保留别名，默认选择 1M 窗口；真实模型由
+  // API Key 的模型覆写或 Provider 默认模型决定。OpenCode 仍需要具体模型名。
+  const model = client === 'opencode' ? realModel : 'default[1m]';
   if (client === 'claude') {
     return JSON.stringify({env: {ANTHROPIC_BASE_URL: base, ANTHROPIC_AUTH_TOKEN: keyItem.key, ANTHROPIC_MODEL: model}}, null, 2);
   }

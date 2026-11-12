@@ -436,7 +436,7 @@ type ClientSetupInput struct {
 	// GatewayURL 是 Claude Desktop 的 3p 模式用的地址（不含 /anthropic）。
 	GatewayURL string `json:"gatewayUrl"`
 	Token      string `json:"token"`
-	// Model 固定为 default 或 default[1m]，留空按 default 处理。
+	// Model 固定为 default 或 default[1m]，留空按 default[1m] 处理。
 	Model string `json:"model"`
 }
 

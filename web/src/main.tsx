@@ -72,11 +72,13 @@ import {
     httpStatusLabel,
     isFollowingTodayRange,
     isFreeModel,
+    isOpenCodeGoBaseURL,
     isQoderConnectKind,
     isRemoteOrigin,
     isSubscriptionConnectKind,
     isThinkingModel,
     isTraeConnectKind,
+    isTrafficLogCanceled,
     isTrafficLogError,
     isVisionModel,
     isWorkBuddyConnectKind,
@@ -161,6 +163,7 @@ import {
     DeepSeekBalancePanel,
     formatClaudeUsageResetAt,
     isPageVisible,
+    OpenCodeGoUsagePanel,
     ProviderCard,
     WorkBuddyUsagePanel,
     ZhipuUsagePanel
@@ -174,6 +177,7 @@ import {QuotaKeeperPanel} from './components/quota_keeper';
 import {ReplayPanel, ScheduleTracePanel, trafficLogRowKey, TrafficLogTable} from './components/traffic_log';
 import {IconSelect} from './components/selects';
 import {ProviderCatalogDialog} from './components/provider_catalog';
+import {ProviderGroupsDialog} from './components/provider_groups';
 import {ModelContextCell, ModelContextDialog} from './components/model_context';
 import {PROVIDER_CONNECT_CHOICES, providerConnectIcon, resolveProviderIcon} from './provider_presets';
 import {
@@ -242,6 +246,8 @@ import {
 
 // 「全部 Provider」筛选项的哨兵值：日志筛选的 providerId 为空串，下拉里得有个能选中的项。
 const ALL_PROVIDERS_VALUE = '__all_providers__';
+// Provider 分组筛选里的「未分组」哨兵；真实分组 ID 不会用双下划线开头。
+const UNGROUPED_PROVIDER_GROUP = '__ungrouped_provider_group__';
 
 // 日志第 1 页走增量追加（新行插到表头），所以单独用更短的节奏，不受面板轮询的 15 秒影响。
 const LOGS_LIVE_POLL_MS = 5000;
@@ -373,7 +379,7 @@ function App() {
   const [logsFreshKeys, setLogsFreshKeys] = useState<Set<string>>(() => new Set());
   // 「调度决策」面板默认收起（它只是日志表的辅助说明，不值得常驻几十像素）。
   const [decisionPanelOpen, setDecisionPanelOpen] = useState<boolean>(() => readStoredDecisionPanelOpen());
-  const [logsStatusFilter, setLogsStatusFilter] = useState<'all' | '2xx' | '4xx' | '5xx'>('all');
+  const [logsStatusFilter, setLogsStatusFilter] = useState<'all' | '2xx' | '499' | '4xx' | '5xx'>('all');
   const [logsApiKeyName, setLogsApiKeyName] = useState('');
   const [logsUsageTarget, setLogsUsageTarget] = useState<{ type: 'model' | 'apiKey'; value: string; label: string } | null>(null);
   const [logsProviderFilter, setLogsProviderFilter] = useState('');
@@ -550,6 +556,9 @@ function App() {
   const backendFailStreakRef = useRef(0);
   const [backendReconnecting, setBackendReconnecting] = useState(false);
   const [authStatus, setAuthStatus] = useState<AdminAuthStatus | null>(() => bootSession.auth);
+  // 角色判断只依赖 authStatus；提前声明，Provider 分组筛选的 useMemo 也要用。
+  const isNormalUser = Boolean(authStatus?.authenticated && authStatus.role === 'user');
+  const isAdminUser = Boolean(authStatus?.authenticated && authStatus.role === 'admin');
   // 权限点：管理员为 ['*']；旧会话没有列表时 navVisibleFor 回退到旧白名单。
   const permissions = authStatus?.permissions;
   const legacyUser = isLegacyUserAuth(authStatus);
@@ -624,6 +633,10 @@ function App() {
   const [importingProviders, setImportingProviders] = useState(false);
   const [testingProviderID, setTestingProviderID] = useState('');
   const [providerModalOpen, setProviderModalOpen] = useState(false);
+  const [providerGroupsOpen, setProviderGroupsOpen] = useState(false);
+  const [providerGroupsBusy, setProviderGroupsBusy] = useState(false);
+  const [providerGroupFilter, setProviderGroupFilter] = useState('all');
+  const [batchProviderGroupID, setBatchProviderGroupID] = useState('');
   const [editingProviderID, setEditingProviderID] = useState('');
   const [routeModalOpen, setRouteModalOpen] = useState(false);
   const [editingRouteID, setEditingRouteID] = useState('');
@@ -661,6 +674,7 @@ function App() {
     defaultModel: '',
     defaultThinkingDepth: '',
     authType: 'api_key' as ProviderAuthType,
+    groupId: '',
     requestAdapterJSON: '',
     teamOrganizationId: '',
     teamProjectId: '',
@@ -735,7 +749,8 @@ function App() {
   // 模型可能上百个：网格先渲一屏，其余按需追加，避免一次挂上全部卡片。
   const [modelsVisibleCount, setModelsVisibleCount] = useState(60);
   const [providersSearchQuery, setProvidersSearchQuery] = useState('');
-  const [providersConnectFilter, setProvidersConnectFilter] = useState<'' | ProviderConnectKind>('');  const [providersStatusFilter, setProvidersStatusFilter] = useState<'all' | 'healthy' | 'unavailable' | 'disabled' | 'oauth'>('all');
+  const [providersConnectFilter, setProvidersConnectFilter] = useState<'' | ProviderConnectKind>('');
+  const [providersStatusFilter, setProvidersStatusFilter] = useState<'all' | 'healthy' | 'unavailable' | 'disabled' | 'oauth'>('all');
   // 卡片密度只影响本机视觉，持久化在 localStorage（与主题/侧边栏一致）。
   const [providerCardDensity, setProviderCardDensity] = useState(readStoredProviderDensity);
   const chooseProviderDensity = (next: 'standard' | 'compact') => {
@@ -905,6 +920,29 @@ function App() {
     if (!stillThere) setProvidersConnectFilter('');
   }, [providersConnectFilter, state.providers]);
 
+  const orderedProviderGroups = useMemo(
+    () => [...(state.providerGroups || [])].sort((a, b) => a.position - b.position || a.name.localeCompare(b.name, 'zh')),
+    [state.providerGroups],
+  );
+  const providerGroupByID = useMemo(
+    () => new Map(orderedProviderGroups.map((group) => [group.id, group])),
+    [orderedProviderGroups],
+  );
+  const providerGroupCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const provider of sortedProviders) {
+      const groupID = (provider.groupId || '').trim();
+      if (groupID) counts[groupID] = (counts[groupID] || 0) + 1;
+    }
+    return counts;
+  }, [sortedProviders]);
+
+  // 分组被删除或切换账号后，别把筛选停在一个已经不存在的 ID 上。
+  useEffect(() => {
+    if (providerGroupFilter === 'all' || providerGroupFilter === UNGROUPED_PROVIDER_GROUP) return;
+    if (!providerGroupByID.has(providerGroupFilter)) setProviderGroupFilter('all');
+  }, [providerGroupFilter, providerGroupByID]);
+
   const filteredProviders = useMemo(() => {
     // 索引里除了名称/ID/协议，还放账号标签、创建者与它提供的模型：
     // 「按账号找」「按创建人找」「按模型找」是同一张卡上真实的三个入口。
@@ -936,6 +974,12 @@ function App() {
       if (providersConnectFilter && providerConnectKind(provider) !== providersConnectFilter) {
         return false;
       }
+      if (isAdminUser && providerGroupFilter !== 'all') {
+        const groupID = (provider.groupId || '').trim();
+        if (providerGroupFilter === UNGROUPED_PROVIDER_GROUP ? groupID !== '' : groupID !== providerGroupFilter) {
+          return false;
+        }
+      }
       if (!providersSearch.matcher) return true;
       const haystack = [
         provider.name,
@@ -945,11 +989,12 @@ function App() {
         protocolLabel(provider.protocol),
         providerAccountLabel(provider) || '',
         ownerLabelOf(provider),
+        providerGroupByID.get((provider.groupId || '').trim())?.name || '',
         modelsByProvider.get(provider.id) || '',
       ].join(' ');
       return providersSearch.matcher(haystack);
     });
-  }, [sortedProviders, providersStatusFilter, providersConnectFilter, providersSearch, consoleUsers, state.models]);
+  }, [sortedProviders, providersStatusFilter, providersConnectFilter, providersSearch, consoleUsers, state.models, isAdminUser, providerGroupFilter, providerGroupByID]);
 
   /**
    * 「输入 Provider」页的渲染分组。
@@ -1019,7 +1064,9 @@ function App() {
         providerDisabled={!!provider.disabled}
         onToggleEnabled={!isNormalUser && canDo('providers.toggle') ? () => void toggleProviderEnabled(provider) : undefined}
         onToggleRTK={!isNormalUser && canDo('providers.toggle') ? () => void toggleProviderRTK(provider) : undefined}
-        subtitle={peer ? undefined : (providerAccountLabel(provider) || undefined)}
+        subtitle={peer
+          ? (provider.peerGrants?.card?.accountLabel?.trim() || undefined)
+          : (providerAccountLabel(provider) || undefined)}
         icon={resolveProviderIcon(provider)}
         isClaudeOAuth={provider.authType === 'claude_oauth'}
         claudeOAuthConnected={provider.claudeOAuth?.connected}
@@ -1034,6 +1081,7 @@ function App() {
         provider={provider}
         cursorBridge={provider.authType === 'cursor_oauth' ? state.cursorBridge : undefined}
         ownerName={authStatus?.scope === 'all' || canDo('usage.all') ? providerOwnerName(provider) : undefined}
+        groupName={isAdminUser ? providerGroupByID.get((provider.groupId || '').trim())?.name : undefined}
         highlightQuery={providersSearchQuery}
         onToggleSelect={() => toggleExportProviderSelection(provider.id)}
         onClick={() => {
@@ -3001,6 +3049,102 @@ function App() {
     return true;
   }
 
+  async function createProviderGroup(name: string) {
+    setProviderGroupsBusy(true);
+    try {
+      const response = await fetch(`${API_BASE}/__provider-groups`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name}),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      await refreshState(false);
+      showToast(`已创建 Provider 分组：${name.trim()}`);
+    } catch (error) {
+      showToast(`创建 Provider 分组失败：${String(error)}`);
+    } finally {
+      setProviderGroupsBusy(false);
+    }
+  }
+
+  async function renameProviderGroup(groupID: string, name: string) {
+    setProviderGroupsBusy(true);
+    try {
+      const response = await fetch(`${API_BASE}/__provider-groups/${encodeURIComponent(groupID)}`, {
+        method: 'PATCH',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name}),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      await refreshState(false);
+      showToast(`分组已重命名为：${name.trim()}`);
+    } catch (error) {
+      showToast(`重命名分组失败：${String(error)}`);
+    } finally {
+      setProviderGroupsBusy(false);
+    }
+  }
+
+  async function deleteProviderGroup(groupID: string) {
+    setProviderGroupsBusy(true);
+    try {
+      const response = await fetch(`${API_BASE}/__provider-groups/${encodeURIComponent(groupID)}`, {method: 'DELETE'});
+      if (!response.ok) throw new Error(await response.text());
+      const result = await response.json() as {ungroupedProviderCount?: number};
+      if (providerGroupFilter === groupID) setProviderGroupFilter('all');
+      if (batchProviderGroupID === groupID) setBatchProviderGroupID('');
+      await refreshState(false);
+      showToast(result.ungroupedProviderCount ? `分组已删除，${result.ungroupedProviderCount} 个 Provider 已移回未分组` : '分组已删除');
+    } catch (error) {
+      showToast(`删除分组失败：${String(error)}`);
+    } finally {
+      setProviderGroupsBusy(false);
+    }
+  }
+
+  async function moveProviderGroup(groupID: string, direction: -1 | 1) {
+    const groups = [...orderedProviderGroups];
+    const index = groups.findIndex((group) => group.id === groupID);
+    const target = index + direction;
+    if (index < 0 || target < 0 || target >= groups.length) return;
+    [groups[index], groups[target]] = [groups[target], groups[index]];
+    setProviderGroupsBusy(true);
+    try {
+      const response = await fetch(`${API_BASE}/__provider-groups/reorder`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ids: groups.map((group) => group.id)}),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      await refreshState(false);
+    } catch (error) {
+      showToast(`调整分组顺序失败：${String(error)}`);
+    } finally {
+      setProviderGroupsBusy(false);
+    }
+  }
+
+  async function moveSelectedProvidersToGroup() {
+    if (selectedExportProviderIDs.length === 0) return;
+    setSaving(true);
+    try {
+      const response = await fetch(`${API_BASE}/__provider-groups/assign`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({providerIds: selectedExportProviderIDs, groupId: batchProviderGroupID}),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const result = await response.json() as {updated?: number; groupId?: string};
+      const target = orderedProviderGroups.find((group) => group.id === result.groupId);
+      await refreshState(false);
+      showToast(`已把 ${result.updated || selectedExportProviderIDs.length} 个 Provider 移到「${target?.name || '未分组'}」`);
+    } catch (error) {
+      showToast(`移动 Provider 分组失败：${String(error)}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
   function openProviderModal() {
     if (denyAction('providers.create')) return;
     setEditingProviderID('');
@@ -3012,6 +3156,7 @@ function App() {
       defaultModel: '',
       defaultThinkingDepth: '',
       authType: 'api_key',
+      groupId: '',
       requestAdapterJSON: '',
       teamOrganizationId: '',
       teamProjectId: '',
@@ -3043,6 +3188,7 @@ function App() {
       defaultModel: '',
       defaultThinkingDepth: '',
       authType: preset.authType,
+      groupId: '',
       // 预置自带的必需请求头（OpenCode Go 的 x-opencode-session 这类）直接落进
       // 「请求适配器」，仍然可见可改——但用户不必自己知道还缺什么。
       requestAdapterJSON: preset.headers && Object.keys(preset.headers).length > 0
@@ -3074,6 +3220,7 @@ function App() {
       defaultModel: provider.defaultModel || '',
       defaultThinkingDepth: provider.defaultThinkingDepth || '',
       authType: resolveProviderAuthType(provider),
+      groupId: provider.groupId || '',
       requestAdapterJSON: provider.requestAdapter ? JSON.stringify({
         urlTemplate: provider.requestAdapter.urlTemplate || '',
         headers: provider.requestAdapter.headers || {},
@@ -3108,6 +3255,7 @@ function App() {
       defaultModel: provider.defaultModel || '',
       defaultThinkingDepth: provider.defaultThinkingDepth || '',
       authType: cloneAuthType,
+      groupId: provider.groupId || '',
       requestAdapterJSON: provider.requestAdapter ? JSON.stringify({
         urlTemplate: provider.requestAdapter.urlTemplate || '',
         headers: provider.requestAdapter.headers || {},
@@ -3240,6 +3388,8 @@ function App() {
         defaultModel: providerDraft.defaultModel,
         defaultThinkingDepth: providerDraft.defaultThinkingDepth,
         authHeader: providerDraft.protocol === 'claude' ? 'x-api-key' : 'Authorization',
+        // 管理员编辑/创建时可带分组；后端仍会再次校验管理员身份和分组存在性。
+        groupId: providerDraft.groupId || '',
         // Qoder 两个站点是两种连接方式，直接把草稿里选定的那种交回去，
         // 不能让「选了 Qoder CN、存成 qoder_pat」把账号签到错的站点上。
         authType: isClaudeOAuth ? 'claude_oauth' : isCursorOAuth ? 'cursor_oauth' : isChatGPTOAuth ? 'chatgpt_oauth' : isQoder ? providerDraft.authType
@@ -4253,6 +4403,7 @@ function App() {
         modelOverrides: key.fallbackModelOverrides || {},
       },
       currentPrimaryId,
+      key.modelOverride || '',
     );
     setSaving(true);
     try {
@@ -4262,9 +4413,9 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(buildApiKeyPatchBody(key, {
           routeId: route.id,
-          // 首选换了 Provider：固定模型只跟输入 Provider 相关，旧的值留在旧首选
-          // 现在所在的备选条目里，首选侧清空。
-          modelOverride: '',
+          // 固定模型跟着 Provider 双向搬运：新首选接住它原来的备选模型，
+          // 旧首选带着原主模型进入备选，两边都不会被清空。
+          modelOverride: swap.modelOverride,
           fallbackProviderIds: swap.fallbackProviderIds,
           fallbackModelOverrides: swap.fallbackModelOverrides,
         })),
@@ -4859,7 +5010,6 @@ function App() {
   const isExplicitLoginPage = typeof window !== 'undefined' && window.location.pathname === '/login';
   const needsAuthGate = Boolean((authChecked && authStatus?.requireAuth && !authStatus.authenticated) || isExplicitLoginPage);
   const authSetupMode = Boolean(needsAuthGate && authStatus && !authStatus.configured);
-  const isNormalUser = Boolean(authStatus?.authenticated && authStatus.role === 'user');
   // 侧栏模型：按权限点过滤后的分层分组（隐藏项不渲染，空分组整组不渲染），
   // 再按搜索词同时匹配菜单名与分组名。搜索时命中的分组强制展开，不写回折叠状态。
   const navSearch = navQuery.trim().toLowerCase();
@@ -5312,6 +5462,40 @@ function App() {
                   </div>
                 ) : null}
               </div>
+              {isAdminUser ? (
+                <div className="provider-group-toolbar">
+                  <div className="provider-group-chips" role="group" aria-label="Provider 分组筛选">
+                    <button
+                      type="button"
+                      className={`provider-group-chip ${providerGroupFilter === 'all' ? 'active' : ''}`}
+                      onClick={() => setProviderGroupFilter('all')}
+                    >
+                      全部 <span>{sortedProviders.length}</span>
+                    </button>
+                    {orderedProviderGroups.map((group) => (
+                      <button
+                        key={group.id}
+                        type="button"
+                        className={`provider-group-chip ${providerGroupFilter === group.id ? 'active' : ''}`}
+                        onClick={() => setProviderGroupFilter(group.id)}
+                        title={`${group.name} · ${providerGroupCounts[group.id] || 0} 个 Provider`}
+                      >
+                        {group.name} <span>{providerGroupCounts[group.id] || 0}</span>
+                      </button>
+                    ))}
+                    {sortedProviders.some((provider) => !(provider.groupId || '').trim()) ? (
+                      <button
+                        type="button"
+                        className={`provider-group-chip muted ${providerGroupFilter === UNGROUPED_PROVIDER_GROUP ? 'active' : ''}`}
+                        onClick={() => setProviderGroupFilter(UNGROUPED_PROVIDER_GROUP)}
+                      >
+                        未分组 <span>{sortedProviders.filter((provider) => !(provider.groupId || '').trim()).length}</span>
+                      </button>
+                    ) : null}
+                  </div>
+                  <button className="mini-btn" type="button" onClick={() => setProviderGroupsOpen(true)}>管理分组</button>
+                </div>
+              ) : null}
               <div className="providers-filter-toolbar">
                 <div className="models-search-row">
                   {/* Chrome 会无视 autoComplete="off"（尤其同页存在密码框时），把这类
@@ -5426,6 +5610,7 @@ function App() {
                     {providersStatusFilter !== 'all' ? ` · 状态「${providersStatusFilter === 'healthy' ? '运行健康' : providersStatusFilter === 'unavailable' ? '异常待试' : providersStatusFilter === 'disabled' ? '已停用' : 'OAuth'}」` : ''}
                     {providersSearchQuery.trim() ? ` · 检索「${providersSearchQuery.trim()}」` : ''}
                     {providersConnectFilter ? ` · ${providerConnectLabel(providersConnectFilter)}` : ''}
+                    {isAdminUser && providerGroupFilter !== 'all' ? ` · 分组「${providerGroupFilter === UNGROUPED_PROVIDER_GROUP ? '未分组' : (providerGroupByID.get(providerGroupFilter)?.name || '未知')}」` : ''}
                   </div>
                 ) : null}
               </div>
@@ -5455,9 +5640,25 @@ function App() {
                     {providersStatusFilter !== 'all' ? ` · 状态「${providersStatusFilter === 'healthy' ? '运行健康' : providersStatusFilter === 'unavailable' ? '异常待试' : providersStatusFilter === 'disabled' ? '已停用' : 'OAuth'}」` : ''}
                     {providersSearchQuery.trim() ? ` · 检索「${providersSearchQuery.trim()}」` : ''}
                     {providersConnectFilter ? ` · ${providerConnectLabel(providersConnectFilter)}` : ''}
+                    {isAdminUser && providerGroupFilter !== 'all' ? ` · 分组「${providerGroupFilter === UNGROUPED_PROVIDER_GROUP ? '未分组' : (providerGroupByID.get(providerGroupFilter)?.name || '未知')}」` : ''}
                   </span>
                   {selectedExportProviderIDs.length > 0 ? (
                     <span className="providers-toolbar-actions">
+                      {isAdminUser ? (
+                        <>
+                          <select
+                            className="provider-group-batch-select"
+                            value={batchProviderGroupID}
+                            disabled={saving}
+                            onChange={(event) => setBatchProviderGroupID(event.target.value)}
+                            title="选择要移动到的 Provider 分组"
+                          >
+                            <option value="">未分组</option>
+                            {orderedProviderGroups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}
+                          </select>
+                          <button className="mini-btn" type="button" disabled={saving} onClick={() => void moveSelectedProvidersToGroup()}>移入分组</button>
+                        </>
+                      ) : null}
                       <button className="mini-btn" type="button" disabled={saving} onClick={() => void batchTestSelectedProviders()}>批量探测</button>
                       <button className="mini-btn" type="button" disabled={saving} onClick={() => void batchToggleSelectedProviders(true)}>批量启用</button>
                       <button className="mini-btn" type="button" disabled={saving} onClick={() => void batchToggleSelectedProviders(false)}>批量停用</button>
@@ -5686,7 +5887,7 @@ function App() {
                     : null);
                 setLogsProviderFilter(filters.provider || '');
                 setLogsApiKeyName('');
-                setLogsStatusFilter((filters.status as 'all' | '2xx' | '4xx' | '5xx') || 'all');
+                setLogsStatusFilter((filters.status as 'all' | '2xx' | '499' | '4xx' | '5xx') || 'all');
                 setLogsPage(1);
                 setLogsOwnerFilter('');
                 goToPage('traffic-tokens');
@@ -6434,6 +6635,7 @@ function App() {
                   {([
                     { id: 'all', label: '全部状态', tone: '' },
                     { id: '2xx', label: '2xx 正常', tone: 'green' },
+                    { id: '499', label: '499 客户端取消', tone: 'slate' },
                     { id: '4xx', label: '4xx 限流/异常', tone: 'amber' },
                     { id: '5xx', label: '5xx 熔断/故障', tone: 'red' },
                   ] as const).map((chip) => (
@@ -6895,6 +7097,7 @@ function App() {
 
       {trafficLogDetail && (() => {
         const statusInfo = explainHttpStatus(trafficLogDetail.status);
+        const canceled = isTrafficLogCanceled(trafficLogDetail);
         const hasReqBody = Boolean(trafficLogDetail.requestBody?.trim());
         const hasRespBody = Boolean(trafficLogDetail.responseBody?.trim());
         const isRespSSE = hasRespBody && (trafficLogDetail.responseBody!.trim().startsWith('data:') || trafficLogDetail.responseBody!.includes('\ndata:'));
@@ -6914,10 +7117,12 @@ function App() {
           title={isTrafficLogError(trafficLogDetail) ? '请求异常排错诊断' : '请求链路审计详情'}
           description={isTrafficLogError(trafficLogDetail)
             ? '查看完整的错误分类原因、出入报文、全链路 APM 耗时与排错诊断。'
-            : '查看全链路 APM 耗时指标、完整出入报文审计与元数据。'}
+            : canceled
+              ? '客户端主动取消属于正常连接结束；这里保留取消时的链路、耗时与报文供审计。'
+              : '查看全链路 APM 耗时指标、完整出入报文审计与元数据。'}
           onClose={() => setTrafficLogDetail(null)}
         >
-          <div className={`test-result-card ${isTrafficLogError(trafficLogDetail) ? 'fail' : 'pass'}`}>
+          <div className={`test-result-card ${isTrafficLogError(trafficLogDetail) ? 'fail' : canceled ? 'canceled' : 'pass'}`}>
             <div className="test-result-head">
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                 <Badge tone={statusTone(trafficLogDetail.status)}>HTTP {trafficLogDetail.status}</Badge>
@@ -6948,17 +7153,17 @@ function App() {
               </span>
             </div>
 
-            {/* 状态解读横幅：异常/499 时完整展开（含错误摘要与排错建议）；
+            {/* 状态解读横幅：异常/499 时完整展开（含原因与排错建议）；
                 正常请求压成一行次要说明，别让大绿框占掉弹窗的第一屏。 */}
-            {isTrafficLogError(trafficLogDetail) || trafficLogDetail.status === 499 ? (
-              <div className={`log-status-banner ${isTrafficLogError(trafficLogDetail) ? 'error' : 'warning'}`}>
+            {isTrafficLogError(trafficLogDetail) || canceled ? (
+              <div className={`log-status-banner ${isTrafficLogError(trafficLogDetail) ? 'error' : canceled ? 'canceled' : 'warning'}`}>
                 <div className="log-status-banner-title">
                   <strong>{statusInfo.title}</strong>
                   <span className="log-status-banner-desc">{statusInfo.description}</span>
                 </div>
                 {trafficLogDetail.errorDescription ? (
                   <div className="log-status-banner-error">
-                    <strong>错误摘要：</strong>
+                    <strong>{canceled ? '取消原因：' : '错误摘要：'}</strong>
                     <code>{trafficLogDetail.errorDescription}</code>
                   </div>
                 ) : null}
@@ -7217,13 +7422,13 @@ function App() {
                       </pre>
                     )}
                   </>
-                ) : trafficLogDetail.status === 499 ? (
-                  <div className="log-body-empty-notice warning">
+                ) : canceled ? (
+                  <div className="log-body-empty-notice info">
                     <div className="log-body-notice-icon">
-                      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+                      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
                     </div>
                     <div>
-                      <strong style={{ fontSize: 14 }}>客户端主动切断连接 (HTTP 499)</strong>
+                      <strong style={{ fontSize: 14 }}>客户端主动取消 (HTTP 499)</strong>
                       <p style={{ margin: '6px 0 0', color: 'var(--muted)', maxWidth: 460, fontSize: 13, lineHeight: 1.5 }}>
                         客户端（如 Cursor、网页或 IDE）提前断开了 HTTP/SSE 连接，请求在传输中被主动取消 (Context Canceled)。上游生成被中途掐断，因此未生成完整响应包体。
                       </p>
@@ -7382,10 +7587,31 @@ function App() {
       })()}
 
 
+      <ProviderGroupsDialog
+        open={providerGroupsOpen}
+        groups={orderedProviderGroups}
+        providerCounts={providerGroupCounts}
+        busy={providerGroupsBusy}
+        onClose={() => setProviderGroupsOpen(false)}
+        onCreate={createProviderGroup}
+        onRename={renameProviderGroup}
+        onDelete={deleteProviderGroup}
+        onMove={moveProviderGroup}
+      />
+
       {providerModalOpen && (
         <Modal title={editingProviderID ? '编辑输入 Provider' : '创建输入 Provider'} description={editingProviderID ? '修改后保存即生效。' : '选好连接方式与接入地址即可；订阅类保存后在下方登录一次。'} onClose={() => { setProviderModalOpen(false); setEditingProviderID(''); resetClaudeOAuthFlowState(); resetCursorOAuthFlowState(); resetChatGPTOAuthFlowState(); resetQoderPATFlowState(); resetWorkBuddyOAuthFlowState(); resetSelfRegistrationState(); }}>
           <div className="form-grid modal-form provider-form">
             <Field fullWidth label="Provider 名称" value={providerDraft.name} onChange={(value) => setProviderDraft((current) => ({ ...current, name: value }))} />
+            {isAdminUser ? (
+              <div className="field field-full">
+                <label>Provider 分组</label>
+                <select value={providerDraft.groupId} onChange={(event) => setProviderDraft((current) => ({...current, groupId: event.target.value}))}>
+                  <option value="">未分组</option>
+                  {orderedProviderGroups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}
+                </select>
+              </div>
+            ) : null}
             {(() => {
               // 连接方式与它的展示文案都取自 lib 里的那一张表：目录磁贴、筛选条与
               // 这个下拉框共用同一份标签，新增一种订阅不用再改这里。
@@ -7533,6 +7759,12 @@ function App() {
             <div className="claude-oauth-panel">
               <div className="hint-text">DeepSeek 账户余额（来自官方 /user/balance 接口）</div>
               <DeepSeekBalancePanel providerId={editingProviderID} accountKey={`provider:${editingProviderID}`} />
+            </div>
+          )}
+          {editingProviderID && providerDraft.authType === 'api_key' && isOpenCodeGoBaseURL(providerDraft.baseUrl) && (
+            <div className="claude-oauth-panel">
+              <div className="hint-text">OpenCode Go 套餐额度（5 小时 / 周 / 月）</div>
+              <OpenCodeGoUsagePanel providerId={editingProviderID} accountKey={`provider:${editingProviderID}`} />
             </div>
           )}
           {providerDraft.protocol === 'claude' && providerDraft.authType === 'claude_oauth' && (

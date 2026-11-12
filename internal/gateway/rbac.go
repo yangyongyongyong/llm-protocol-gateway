@@ -28,7 +28,10 @@ type principal struct {
 	Role     domain.UserRole
 	RoleID   string
 	IsAdmin  bool
-	Grants   []string
+	// IsPeer 表示这是下游网关账号。动态「全部 Provider」授权只对 peer
+	// 生效，避免同一个内部标记泄漏到普通用户后扩大其资源范围。
+	IsPeer bool
+	Grants []string
 	// perms is nil for admins, who hold domain.PermAll.
 	perms map[domain.Permission]bool
 	scope domain.ResourceScope
@@ -85,6 +88,7 @@ func (s *Server) principalFor(identity sessionIdentity) principal {
 	p.Grants = s.resourceGrants()[identity.UserID]
 	if s.userStore != nil {
 		if user, err := s.userStore.UserByID(identity.UserID); err == nil {
+			p.IsPeer = user.IsPeer()
 			p.Grants = append(append([]string{}, p.Grants...), user.AllowedResourceIDs...)
 		}
 	}

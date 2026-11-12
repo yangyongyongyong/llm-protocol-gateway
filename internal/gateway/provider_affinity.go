@@ -335,16 +335,37 @@ func (store *sessionPinStore) maxOrDefault() int {
 	return sessionAffinityMaxPins
 }
 
-// sessionAffinityKey is the pin table's key: the conversation's own session id
-// scoped to the gateway key that sent it, so two clients of one key that happen
-// to use the same session string never share a pin. Empty means the request
-// carries no conversation identity and stays on the key-level stickiness.
-func sessionAffinityKey(r *http.Request, req map[string]any, keyID string) string {
+// sessionAffinityKey 是会话 pin 表的键：会话身份先按发送它的 Gateway Key
+// 隔离，再按完整的 Provider 链路签名隔离。空串表示请求没有会话身份，继续走
+// Key 级粘滞。
+//
+// 为什么要把首选、备选和调度模式一起放进命名空间：用户调整 Provider、改首选、
+// 换备选、改变备选顺序或切换调度策略后，旧 pin 只代表旧配置，不应继续压过新
+// 配置。否则会话 affinity 会一直把请求拉回旧节点，直到 TTL 到期，表现为
+// “配置已经改了但流量不切”。空的默认模式与显式 order 视为同一种，避免无意义
+// 地重置所有会话。
+func sessionAffinityKey(r *http.Request, req map[string]any, keyID, primaryProviderID, scheduleMode string, fallbackProviderIDs ...string) string {
 	session := requestSessionID(r, req)
 	if session == "" || strings.TrimSpace(keyID) == "" {
 		return ""
 	}
-	digest := sha256.Sum256([]byte(strings.TrimSpace(keyID) + "\x00" + session))
+	mode, err := normalizeScheduleMode(scheduleMode)
+	if err != nil {
+		mode = strings.ToLower(strings.TrimSpace(scheduleMode))
+	}
+	if mode == "" {
+		mode = scheduleModeOrder
+	}
+	parts := make([]string, 0, 4+len(fallbackProviderIDs))
+	parts = append(parts, strings.TrimSpace(keyID), strings.TrimSpace(primaryProviderID), mode)
+	for _, providerID := range fallbackProviderIDs {
+		if trimmed := strings.TrimSpace(providerID); trimmed != "" {
+			parts = append(parts, trimmed)
+		}
+	}
+	parts = append(parts, session)
+	material := strings.Join(parts, "\x00")
+	digest := sha256.Sum256([]byte(material))
 	return hex.EncodeToString(digest[:16])
 }
 
@@ -368,6 +389,17 @@ func requestSessionID(r *http.Request, req map[string]any) string {
 	if value, ok := req["session_id"].(string); ok {
 		if trimmed := strings.TrimSpace(value); trimmed != "" {
 			return trimmed
+		}
+	}
+	// Codex Responses 把线程身份放在顶层 client_metadata 里；只读 metadata 会让
+	// 多个 Codex 会话共用（或丢失）同一个 pin，spread 模式便无法按会话分账号。
+	if clientMeta, ok := req["client_metadata"].(map[string]any); ok {
+		for _, key := range []string{"session_id", "thread_id"} {
+			if value, ok := clientMeta[key].(string); ok {
+				if trimmed := strings.TrimSpace(value); trimmed != "" {
+					return trimmed
+				}
+			}
 		}
 	}
 	if meta, ok := req["metadata"].(map[string]any); ok {

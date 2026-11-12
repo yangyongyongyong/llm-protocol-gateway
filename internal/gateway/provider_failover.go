@@ -1376,7 +1376,7 @@ func (s *Server) executeProtocolFlowWithFailover(
 	// A conversation stays on the account that has its prompt cache, even when
 	// another conversation on this same key has moved the key-level sticky
 	// provider somewhere else.
-	sessionKey := sessionAffinityKey(r, req, matchedKey.ID)
+	sessionKey := sessionAffinityKey(r, req, matchedKey.ID, route.ProviderID, matchedKey.ScheduleMode, matchedKey.FallbackProviderIDs...)
 	attempts := s.failoverAttemptOrder(scheduleInput{
 		chain:   chain,
 		active:  matchedKey.ActiveProviderID,

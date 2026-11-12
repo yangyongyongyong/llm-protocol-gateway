@@ -145,7 +145,7 @@ type AlertQuery struct {
 type RequestLogQuery struct {
 	From       time.Time
 	To         time.Time
-	Status     string // all | 2xx | 4xx | 5xx
+	Status     string // all | 2xx | 499 | 4xx | 5xx
 	APIKeyName string // substring match against api_key_name (case-insensitive)
 	// ProviderID filters to the exact input provider id (empty means no filter).
 	ProviderID string
@@ -524,8 +524,12 @@ func statusClassMatches(class string, status int) bool {
 		return true
 	case "2xx":
 		return status >= 200 && status < 300
+	case "499":
+		// 499 是客户端主动取消，单独成类；不能混进“4xx 限流/异常”，否则正常的
+		// Stop/切换会话会被统计成错误。
+		return status == 499
 	case "4xx":
-		return status >= 400 && status < 500
+		return status >= 400 && status < 500 && status != 499
 	case "5xx":
 		return status >= 500 && status < 600
 	default:

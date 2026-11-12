@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -31,28 +32,47 @@ func (s *Server) sendPeerDoor(ctx context.Context, r *http.Request, provider dom
 	if err != nil {
 		return nil, err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, resolveProviderChatURL(provider, model), bytes.NewReader(wrapped))
-	if err != nil {
-		return nil, err
+	send := func(current domain.Provider) (*http.Response, error) {
+		request, requestErr := http.NewRequestWithContext(ctx, http.MethodPost, resolveProviderChatURL(current, model), bytes.NewReader(wrapped))
+		if requestErr != nil {
+			return nil, requestErr
+		}
+		request.Header.Set("Content-Type", "application/json")
+		if accept != "" {
+			request.Header.Set("Accept", accept)
+		} else {
+			request.Header.Set("Accept", "application/json")
+		}
+		// 凭据只用自己的那一把。applyProviderAuth 只认 provider 配置的 apiKeySource，
+		// 传空 incomingAuth 等于把「客户端带来的 Authorization」彻底排除在这条路
+		// 之外：客户端的密钥漏到父网关，和父网关的凭据漏回客户端，都是这条分支要
+		// 防的事。
+		applyProviderAuth(request, current, "")
+		// 链路头整段替换而不是追加：客户端自带的那份不可信（见 extendGatewayHop）。
+		for key, value := range extendGatewayHop(parseGatewayHop(r), s.GatewayID()) {
+			request.Header.Set(key, value)
+		}
+		return doHTTPWithTiming(ctx, &http.Client{Timeout: 0}, request)
 	}
-	request.Header.Set("Content-Type", "application/json")
-	if accept != "" {
-		request.Header.Set("Accept", accept)
-	} else {
-		request.Header.Set("Accept", "application/json")
-	}
-	// 凭据只用自己的那一把。applyProviderAuth 只认 provider 配置的 apiKeySource，
-	// 传空 incomingAuth 等于把「客户端带来的 Authorization」彻底排除在这条路
-	// 之外：客户端的密钥漏到父网关，和父网关的凭据漏回客户端，都是这条分支要
-	// 防的事。
-	applyProviderAuth(request, provider, "")
-	// 链路头整段替换而不是追加：客户端自带的那份不可信（见 extendGatewayHop）。
-	for key, value := range extendGatewayHop(parseGatewayHop(r), s.GatewayID()) {
-		request.Header.Set(key, value)
-	}
-	response, err := doHTTPWithTiming(ctx, &http.Client{Timeout: 0}, request)
+	response, err := send(provider)
 	if response == nil {
 		return nil, err
+	}
+	// 父网关重启、凭据轮换或旧版本误删 bearer 后，第一次请求可能只回 401。
+	// 有续签凭据时在这里静默换一组并重放一次，用户不会看到一次失败、更不会
+	// 被要求重新登录。只有 401 触发；5xx / 网络错误不能误轮换凭据。
+	if response.StatusCode == http.StatusUnauthorized && strings.TrimSpace(provider.PeerRefreshToken) != "" {
+		renewed, renewErr := s.renewPeerUpstreamCredential(ctx, provider)
+		if renewErr == nil {
+			_ = response.Body.Close()
+			provider = renewed
+			response, err = send(provider)
+			if response == nil {
+				return nil, err
+			}
+		} else {
+			s.logs.AddApp("warn", "peer request auto renew failed", fmt.Sprintf("provider=%s: %v", provider.ID, renewErr))
+		}
 	}
 	// 响应头里的网关身份是本机唯一能可靠得知「门后面是谁」的时刻：注册响应回显
 	// 的是本机自己的 ID，本地也不另存父网关身份。拿不到就不写，宁可日志少一列，

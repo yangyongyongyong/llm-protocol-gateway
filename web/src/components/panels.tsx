@@ -12,10 +12,12 @@ import {
     healthTone,
     highlightSegments,
     isQoderConnectKind,
+    isOpenCodeGoBaseURL,
     isTraeConnectKind,
     isZCodeConnectKind,
     OAUTH_USAGE_POLL_MS,
     OAUTH_USAGE_STORAGE_PREFIX,
+    peerProviderCardAuthLabel,
     providerConnectKind,
     resetHint,
     retrySecondsLabel,
@@ -33,6 +35,8 @@ import {
     CursorBridgeRuntime,
     CursorOAuthUsageReport,
     DeepSeekBalanceReport,
+    OpenCodeGoUsageReport,
+    PeerProviderUsage,
     Provider,
     SubscriptionCheckin,
     TimeHint,
@@ -375,7 +379,7 @@ export function UsagePanelShell({ panelClass, compact, subtitle, title, planName
   stateMessage?: string;
   loading: boolean;
   fetchedAt?: string;
-  onRefresh: () => void;
+  onRefresh?: () => void;
   children: React.ReactNode;
 }) {
   const planSuffix = planName ? ` · ${planName}` : '';
@@ -392,22 +396,64 @@ export function UsagePanelShell({ panelClass, compact, subtitle, title, planName
         <span className="claude-usage-actions">
           {stateMessage === '可用' ? <span className="claude-usage-state ok"><i className="live-dot" aria-hidden="true" />可用</span> : null}
           {loading ? <span className="claude-usage-status">刷新中…</span> : fetchedAt ? <span className="claude-usage-status">更新于 {formatClaudeUsageResetAt(fetchedAt)}</span> : null}
-          <button
-            type="button"
-            className="btn btn-tiny"
-            disabled={loading}
-            onClick={(event) => {
-              event.stopPropagation();
-              onRefresh();
-            }}
-          >
-            刷新
-          </button>
+          {onRefresh ? (
+            <button
+              type="button"
+              className="btn btn-tiny"
+              disabled={loading}
+              onClick={(event) => {
+                event.stopPropagation();
+                onRefresh();
+              }}
+            >
+              刷新
+            </button>
+          ) : null}
         </span>
       </div>
       {warnMessage ? <div className="claude-usage-state warn">{warnMessage}</div> : null}
       {children}
     </div>
+  );
+}
+
+/** 上游网关继承下来的只读额度卡片。样式与本地额度卡片一致，但不自行轮询。 */
+export function PeerInheritedUsagePanel({ usage, compact, subtitle }: {
+  usage: PeerProviderUsage;
+  compact?: boolean;
+  subtitle?: string;
+}) {
+  const buckets = usage.buckets || [];
+  return (
+    <UsagePanelShell
+      panelClass="peer-inherited-usage-panel"
+      compact={compact}
+      subtitle={subtitle}
+      title={usage.title || '上游账号额度'}
+      planName={usage.plan}
+      stateMessage={usage.message}
+      loading={false}
+      fetchedAt={usage.fetchedAt}
+    >
+      {usage.balance ? (
+        <div className="peer-inherited-balance"><span>可用余额</span><b>{usage.balance}</b></div>
+      ) : null}
+      {buckets.length > 0 ? (
+        <div className="claude-usage-grid">
+          {buckets.map((bucket, index) => (
+            <UsageBucketRow
+              key={`${bucket.label}-${index}`}
+              label={bucket.label}
+              percent={Math.min(100, Math.max(0, bucket.utilization))}
+              note={bucket.note || ''}
+              reset={resetHint(bucket.resetsAt)}
+              compact={compact}
+            />
+          ))}
+        </div>
+      ) : null}
+      <div className="peer-inherited-hint">数据来自上游网关，只读</div>
+    </UsagePanelShell>
   );
 }
 
@@ -610,6 +656,52 @@ export function ZhipuUsagePanel({ providerId, accountKey, compact, subtitle }: {
           <span className="zhipu-reset-credits-hint">到 bigmodel.cn / z.ai 使用</span>
         </div>
       ) : null}
+    </UsagePanelShell>
+  );
+}
+
+/**
+ * OpenCode Go 套餐额度面板：展示 5 小时、7 天、月三个百分比窗口。
+ * 接口字段来自 OpenCode /zen/go/v1/usage；窗口缺失时不补 0，避免误导。
+ */
+export function OpenCodeGoUsagePanel({ providerId, accountKey, compact, subtitle }: { accountKey?: string; providerId: string; compact?: boolean; subtitle?: string }) {
+  const request = React.useMemo(() => usageAccountRequest(`/__providers/${encodeURIComponent(providerId)}/opencode-go/usage`), [providerId, accountKey]);
+  const { report, loading, refresh } = useAccountUsageReport<OpenCodeGoUsageReport>(
+    true,
+    accountUsageKey('opencode-go', accountKey, providerId),
+    request,
+  );
+
+  // 卡片上拉取失败不占位；编辑弹窗里保留错误，方便排查 Key 或端点问题。
+  if (compact && !report?.available) return null;
+
+  const buckets = [
+    { key: 'five_hour', label: '5 小时额度', bucket: report?.five_hour },
+    { key: 'weekly', label: '周额度', bucket: report?.weekly },
+    { key: 'monthly', label: '月额度', bucket: report?.monthly },
+  ].filter((item) => item.bucket);
+
+  return (
+    <UsagePanelShell panelClass="opencode-go-usage-panel" compact={compact} subtitle={subtitle} title="OpenCode Go 套餐额度" loading={loading} fetchedAt={report?.fetchedAt} onRefresh={refresh}>
+      {!report ? (
+        <div className="claude-usage-empty">{loading ? '正在拉取额度…' : '暂无额度数据'}</div>
+      ) : !report.available ? (
+        <div className="claude-usage-empty error">{report.error || '额度不可用'}</div>
+      ) : buckets.length === 0 ? (
+        <div className="claude-usage-empty">未返回额度窗口</div>
+      ) : (
+        <div className="claude-usage-grid">
+          {buckets.map(({ key, label, bucket }) => (
+            <UsageBucketRow
+              key={key}
+              label={label}
+              percent={Math.min(100, Math.max(0, bucket?.utilization ?? 0))}
+              reset={resetHint(bucket?.resets_at)}
+              compact={compact}
+            />
+          ))}
+        </div>
+      )}
     </UsagePanelShell>
   );
 }
@@ -896,10 +988,12 @@ function MatchText({ text, query }: { text: string; query?: string }) {
   );
 }
 
-export function ProviderCard({ active, selected, name, providerId, protocol, tone, url, defaultModel, modelCount, usedCount, healthStatus, nextRetryAt, testing, chatTesting, readOnly, selectable, providerDisabled, onToggleEnabled, onToggleRTK, subtitle, icon, provider, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, isQoderPAT, qoderPATConnected, isWorkBuddy, workBuddyConnected, cursorBridge, ownerName, highlightQuery, onToggleSelect, onClick, onTest, onChatTest, onConformance, onEdit, onClone, onDelete, layout = 'card' }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; defaultModel?: string; modelCount?: number; usedCount: number; healthStatus: string; nextRetryAt?: string; testing: boolean; chatTesting?: boolean; readOnly?: boolean; selectable?: boolean; providerDisabled?: boolean; onToggleEnabled?: () => void; onToggleRTK?: () => void; subtitle?: string; icon?: string; provider?: Provider; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; isQoderPAT?: boolean; qoderPATConnected?: boolean; isWorkBuddy?: boolean; workBuddyConnected?: boolean; cursorBridge?: CursorBridgeRuntime; ownerName?: string; highlightQuery?: string; onToggleSelect: () => void; onClick: () => void; onTest?: () => void; onChatTest?: () => void; onConformance?: () => void; onEdit?: () => void; onClone?: () => void; onDelete?: () => void; layout?: 'card' | 'list' }) {
+export function ProviderCard({ active, selected, name, providerId, protocol, tone, url, defaultModel, modelCount, usedCount, healthStatus, nextRetryAt, testing, chatTesting, readOnly, selectable, providerDisabled, onToggleEnabled, onToggleRTK, subtitle, icon, provider, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, isQoderPAT, qoderPATConnected, isWorkBuddy, workBuddyConnected, cursorBridge, ownerName, groupName, highlightQuery, onToggleSelect, onClick, onTest, onChatTest, onConformance, onEdit, onClone, onDelete, layout = 'card' }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; defaultModel?: string; modelCount?: number; usedCount: number; healthStatus: string; nextRetryAt?: string; testing: boolean; chatTesting?: boolean; readOnly?: boolean; selectable?: boolean; providerDisabled?: boolean; onToggleEnabled?: () => void; onToggleRTK?: () => void; subtitle?: string; icon?: string; provider?: Provider; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; isQoderPAT?: boolean; qoderPATConnected?: boolean; isWorkBuddy?: boolean; workBuddyConnected?: boolean; cursorBridge?: CursorBridgeRuntime; ownerName?: string; groupName?: string; highlightQuery?: string; onToggleSelect: () => void; onClick: () => void; onTest?: () => void; onChatTest?: () => void; onConformance?: () => void; onEdit?: () => void; onClone?: () => void; onDelete?: () => void; layout?: 'card' | 'list' }) {
   // 订阅类（ZCode / Trae）由后端返回的凭证对象决定卡片显示什么：整张 Provider 传进来
   // 比再加六个布尔参数更省事，也不会漏掉以后新增的连接方式。
   const connectKind = provider ? providerConnectKind(provider) : 'api_key';
+  const inheritedCard = connectKind === 'peer' ? provider?.peerGrants?.card : undefined;
+  const inheritedAuthLabel = provider && inheritedCard ? peerProviderCardAuthLabel(provider) : '';
   const zcodeConnected = !!provider?.zcodeOAuth?.connected;
   const traeConnected = !!provider?.traeOAuth?.connected;
   const isSubscriptionOAuth = isZCodeConnectKind(connectKind) || isTraeConnectKind(connectKind);
@@ -948,6 +1042,8 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
       {isQoderConnectKind(connectKind) && qoderPATConnected && !providerDisabled ? <SubscriptionUsagePanel providerId={providerId} accountKey={usageAccountKeyFor(providerId)} kind={connectKind} connected compact subtitle={subtitle} title="Qoder 积分" /> : null}
       {!providerDisabled && !isClaudeOAuth && !isCursorOAuth && !isChatGPTOAuth && !isQoderPAT && !isWorkBuddy && !isSubscriptionOAuth && /(?:bigmodel\.cn|z\.ai)/i.test(url) ? <ZhipuUsagePanel providerId={providerId} accountKey={usageAccountKeyFor(providerId)} compact subtitle={subtitle} /> : null}
       {!providerDisabled && !isClaudeOAuth && !isCursorOAuth && !isChatGPTOAuth && !isQoderPAT && !isWorkBuddy && /deepseek\.com/i.test(url) ? <DeepSeekBalancePanel providerId={providerId} accountKey={usageAccountKeyFor(providerId)} compact subtitle={subtitle} /> : null}
+      {!providerDisabled && !isClaudeOAuth && !isCursorOAuth && !isChatGPTOAuth && !isQoderPAT && !isWorkBuddy && isOpenCodeGoBaseURL(url) ? <OpenCodeGoUsagePanel providerId={providerId} accountKey={usageAccountKeyFor(providerId)} compact subtitle={subtitle} /> : null}
+      {connectKind === 'peer' && inheritedCard?.usage ? <PeerInheritedUsagePanel usage={inheritedCard.usage} compact subtitle={subtitle} /> : null}
     </>
   );
   // 回调缺省＝没有该权限：对应按钮/菜单项不渲染（由父组件按权限点传入）
@@ -987,9 +1083,15 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
           </div>
           <div className="provider-list-badges">
             {providerDisabled ? <Badge tone="red">已禁用</Badge> : null}
+            {groupName ? <Badge tone="slate" title="管理员侧 Provider 分组，不影响用户授权">{groupName}</Badge> : null}
             {/* 对端 provider 不是一台上游服务，而是父网关的一扇门：不标出来，
                 运维会拿它的 baseUrl 当真实上游地址去排障。 */}
             {connectKind === 'peer' ? <Badge tone="cyan">上游网关</Badge> : null}
+            {connectKind === 'peer' && inheritedAuthLabel ? (
+              <Badge tone="purple" title="继承自上游 Provider 卡片的连接类型">
+                {inheritedAuthLabel}{inheritedCard?.connected ? ' 已连接' : ''}
+              </Badge>
+            ) : null}
             {provider?.rtkCompress ? (
               <span title="RTK 工具输出压缩已开启：转发前过滤 tool_result 里的命令输出">
                 <Badge tone="green">RTK</Badge>
@@ -1041,9 +1143,15 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
       </div>
       <div className="provider-badges">
         {providerDisabled ? <Badge tone="red">已禁用</Badge> : null}
+        {groupName ? <Badge tone="slate" title="管理员侧 Provider 分组，不影响用户授权">{groupName}</Badge> : null}
         {/* 对端 provider 不是一台上游服务，而是父网关的一扇门：不标出来，
             运维会拿它的 baseUrl 当真实上游地址去排障。 */}
         {connectKind === 'peer' ? <Badge tone="cyan" title="本机注册到上游网关后自动创建：地址、凭据与模型由「网关互联」页维护">上游网关</Badge> : null}
+        {connectKind === 'peer' && inheritedAuthLabel ? (
+          <Badge tone="purple" title="继承自上游 Provider 卡片的连接类型">
+            {inheritedAuthLabel}{inheritedCard?.connected ? ' 已连接' : ''}
+          </Badge>
+        ) : null}
         {provider?.rtkCompress ? (
           <span title="RTK 工具输出压缩已开启：转发前过滤 tool_result 里的命令输出">
             <Badge tone="green">RTK</Badge>

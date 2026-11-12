@@ -382,6 +382,73 @@ func TestPeerGrantsEditableAfterRegistration(t *testing.T) {
 	}
 }
 
+// 「全部 Provider」是动态语义：授权表里只存一个内部标记，读取时按当前
+// Provider 集合展开。新增 Provider 后，同一把下游凭据立刻就能看到它。
+func TestPeerAllProvidersGrantIsDynamic(t *testing.T) {
+	server := newPeerTestServer(t,
+		domain.Provider{ID: "p-a", Name: "p-a", Protocol: domain.ProtocolOpenAIChat, BaseURL: "https://a.example.com"},
+		domain.Provider{ID: "p-b", Name: "p-b", Protocol: domain.ProtocolClaude, BaseURL: "https://b.example.com"},
+	)
+	_, response := peerRegister(t, server, peerRegisterPayload(map[string]any{
+		"requestedProviderIds": []string{"p-a"},
+	}))
+
+	recorder := adminCall(t, server.handleSetPeerGrants, http.MethodPatch, "/__peers/{id}/grants",
+		map[string]any{"grantMode": "all"}, map[string]string{"id": response.UserID})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("all grants status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	raw, err := server.roles.ListResourceGrants()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids := raw[response.UserID]; len(ids) != 1 || ids[0] != peerAllProvidersGrant {
+		t.Fatalf("raw all-provider grant = %v, want the internal dynamic marker", ids)
+	}
+	all, ids := server.peerGrantState(response.UserID)
+	if !all || len(ids) != 2 {
+		t.Fatalf("dynamic grant = all:%v ids:%v, want all current providers", all, ids)
+	}
+
+	// 父网关后续新增一个 Provider：没有改授权表，但下游下一次查询就能看到。
+	if _, err := server.router.AddProvider(domain.Provider{
+		ID: "p-future", Name: "p-future", Protocol: domain.ProtocolOpenAIChat, BaseURL: "https://future.example.com",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+	granted, err := newPeerClient().providers(context.Background(), httpServer.URL, response.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, provider := range granted {
+		seen[provider.ID] = true
+	}
+	if !seen["p-a"] || !seen["p-b"] || !seen["p-future"] {
+		t.Fatalf("dynamic all-provider list = %+v, want current + future providers", granted)
+	}
+
+	// 同一个内部标记落在普通用户身上不能扩权：只有 peer principal 才解释它。
+	normal := principal{UserID: "normal-user", scope: domain.ScopeOwn, Grants: []string{peerAllProvidersGrant}}
+	if allowed := server.allowedProviderIDsForPrincipal(normal); len(allowed) != 0 {
+		t.Fatalf("the dynamic marker leaked to a normal user: %v", allowed)
+	}
+
+	// 切回指定 Provider：标记消失，恢复精确授权。
+	recorder = adminCall(t, server.handleSetPeerGrants, http.MethodPatch, "/__peers/{id}/grants",
+		map[string]any{"grantMode": "selected", "providerIds": []string{"p-a"}},
+		map[string]string{"id": response.UserID})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("selected grants status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	all, ids = server.peerGrantState(response.UserID)
+	if all || len(ids) != 1 || ids[0] != "p-a" {
+		t.Fatalf("selected grant = all:%v ids:%v, want p-a only", all, ids)
+	}
+}
+
 // adminCall 直接调 handler 并注入管理员身份（withAdminAuth 正是这样注入的）。
 //
 // 不走 Handler()：那一层还要求先设好管理密码，而这里要验的是 handler 自己

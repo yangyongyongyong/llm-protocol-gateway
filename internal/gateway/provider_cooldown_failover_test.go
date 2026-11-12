@@ -31,8 +31,7 @@ func TestFailoverHonoursUpstreamRetryAfter(t *testing.T) {
 			BaseURL: upstream.URL, AuthType: "api_key", APIKeySource: "static",
 		}, {
 			// 备选刻意与首选同协议：这条测试要钉的是「Retry-After 有没有进冷缩」，
-			// 不是协议选择。一旦两边协议不同，preferNativeProtocol 会把同协议的那
-			// 个提到前面，冷缩算术跟着换节点，测的就不是原来那件事了。
+			// 不是协议选择。两边协议相同也能避免测试把失败归因到协议转换。
 			ID: "cooldown-backup", Name: "cooldown-backup", Protocol: domain.ProtocolOpenAIChat,
 			BaseURL: upstream.URL, AuthType: "api_key", APIKeySource: "static",
 		}},

@@ -78,6 +78,7 @@ func (s *Server) principalForUserID(userID string) principal {
 					Username: user.Username,
 					Role:     user.Role,
 					RoleID:   user.RoleID,
+					IsPeer:   user.IsPeer(),
 					// ScopeOwn with no grants: allowedProviderIDsForPrincipal
 					// then returns an empty set, so every provider on the key's
 					// chain is filtered out and the request is refused rather
@@ -115,15 +116,21 @@ func (s *Server) allowedProviderIDsForPrincipal(p principal) map[string]bool {
 		return out
 	}
 	granted := map[string]bool{}
+	allPeerProviders := false
 	for _, id := range p.Grants {
-		granted[strings.TrimSpace(id)] = true
+		id = strings.TrimSpace(id)
+		if p.IsPeer && id == peerAllProvidersGrant {
+			allPeerProviders = true
+			continue
+		}
+		granted[id] = true
 	}
 	for _, provider := range s.router.State().Providers {
 		if provider.Disabled || provider.Deleted {
 			continue
 		}
 		owns := strings.TrimSpace(provider.OwnerUserID) == p.UserID
-		if owns || granted[provider.ID] {
+		if allPeerProviders || owns || granted[provider.ID] {
 			out[provider.ID] = true
 		}
 	}
@@ -534,6 +541,8 @@ func (s *Server) stateForUser(identity sessionIdentity, state domain.GatewayStat
 	state.Routes = routes
 	state.Models = models
 	state.APIKeys = keysVisibleTo(p, state.APIKeys)
+	// Provider 分组只服务于管理员侧归类，普通用户不应感知。
+	stripProviderGroupsForUser(&state)
 	// 普通用户看不到未授权的 Provider：把「在服务」里指向它们的那一项按未设置处理，
 	// 否则界面会拿着一个不存在的 id 去画绿点。
 	for index := range state.APIKeys {

@@ -36,7 +36,7 @@ type CodexEndpoint struct {
 	BaseURL string
 	// Token 是 API 密钥。
 	Token string
-	// Model 是写进 model 的模型名。
+	// Model 是写进 model 的模型名；留空时使用 default[1m]。
 	Model string
 	// ReasoningEffort 是 model_reasoning_effort，空则不写这一行。
 	ReasoningEffort string
@@ -91,6 +91,11 @@ func ApplyCodex(e CodexEndpoint) (CodexResult, error) {
 	res := CodexResult{}
 	if strings.TrimSpace(e.BaseURL) == "" || strings.TrimSpace(e.Token) == "" {
 		return res, errors.New("Codex 的网关地址与密钥都不能为空")
+	}
+	if strings.TrimSpace(e.Model) == "" {
+		// 与网关生成的配置保持一致：默认让 Codex 按 1M 窗口计算上下文，
+		// 真实模型仍由网关按 API Key / Provider 解析。
+		e.Model = defaultClientModel
 	}
 	providerID := strings.TrimSpace(e.ProviderID)
 	if providerID == "" {

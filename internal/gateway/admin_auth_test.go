@@ -222,6 +222,7 @@ func TestIsUserAllowedPathProviderUsage(t *testing.T) {
 		{http.MethodPost, "/__providers/p1/cursor-oauth/disconnect", true},
 		{http.MethodDelete, "/__providers/p1/claude-oauth/start", false},
 		{http.MethodGet, "/__providers/p1/chatgpt-oauth/usage", true},
+		{http.MethodGet, "/__providers/p1/opencode-go/usage", true},
 		// 自助注册令牌管理走普通会话（owner/admin 校验在 handler 内）；
 		// 真正的机器人端点 PATCH .../self-register 完全绕过本中间件，见
 		// TestIsSelfRegisterPath。

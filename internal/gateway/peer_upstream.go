@@ -1,7 +1,9 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -68,6 +70,9 @@ type peerUpstreamSummary struct {
 	// 但它们确实被授权了。界面要能告诉运维「上游授权了 3 个，其中 1 个是本协议
 	// 的」，靠的就是这两个数的差。
 	GrantCount int `json:"grantCount"`
+	// AutoRenew 表示本机已保存续签凭据，父网关重启或流量凭据轮换后可以
+	// 静默恢复，不需要用户再次填写用户名密码。
+	AutoRenew bool `json:"autoRenew,omitempty"`
 	// GrantsSynced 表示 GrantCount 是不是真的问到过上游。false 时它是零值，
 	// 界面要显示「还没同步」而不是「授权了 0 个」——后者是一个会误导人的
 	// 结论。老数据（升级前注册的链路）就是 false，点一次「测试连接」即可。
@@ -171,6 +176,9 @@ func (s *Server) peerUpstreamSummaries() []peerUpstreamSummary {
 		}
 		summary.Protocols = appendUnique(summary.Protocols, string(provider.Protocol))
 		summary.Models = append(summary.Models, modelsByProvider[provider.ID]...)
+		if strings.TrimSpace(provider.PeerRefreshToken) != "" {
+			summary.AutoRenew = true
+		}
 		// 授权快照是注册/刷新时存下来的（见 domain.PeerUpstreamGrants）。
 		// 没有快照 = 还没问过上游，GrantCount 保持 0 但 GrantsSynced 是 false，
 		// 界面据此说「还没同步」而不是「授权了 0 个」。
@@ -398,15 +406,16 @@ func (s *Server) createPeerUpstreamProviders(r *http.Request, name string, proto
 	created := make([]domain.Provider, 0, len(plans))
 	for _, plan := range plans {
 		provider := domain.Provider{
-			Name:            plan.Name,
-			Protocol:        plan.Protocol,
-			ProtocolSupport: plan.ProtocolSupport,
-			BaseURL:         registration.ParentURL,
-			APIKeySource:    "literal:" + registration.Token,
-			AuthType:        domain.AuthTypePeer,
-			Models:          plan.Models,
-			HealthStatus:    "healthy",
-			OwnerUserID:     ownerID,
+			Name:             plan.Name,
+			Protocol:         plan.Protocol,
+			ProtocolSupport:  plan.ProtocolSupport,
+			BaseURL:          registration.ParentURL,
+			APIKeySource:     "literal:" + registration.Token,
+			PeerRefreshToken: registration.RefreshToken,
+			AuthType:         domain.AuthTypePeer,
+			Models:           plan.Models,
+			HealthStatus:     "healthy",
+			OwnerUserID:      ownerID,
 		}
 		// 每一条都带上同一份授权快照（同一把凭据、同一个上游），只改"我对应
 		// 上游的哪一个"。列表接口靠这份快照显示「上游授权了几个」，透传靠
@@ -416,6 +425,10 @@ func (s *Server) createPeerUpstreamProviders(r *http.Request, name string, proto
 			snapshot.UpstreamKey = upstreamKey
 			snapshot.UpstreamName = name
 			snapshot.GrantedProviderID = plan.GrantedProviderID
+			if plan.Card != nil {
+				card := plan.Card.Clone()
+				snapshot.Card = &card
+			}
 			provider.PeerGrants = &snapshot
 		}
 		// 默认模型只是给"客户端不带 model"的情形兜一个底，不强制：这条 provider
@@ -443,6 +456,7 @@ type peerProviderPlan struct {
 	ProtocolSupport   []string
 	Models            []domain.Model
 	GrantedProviderID string
+	Card              *domain.PeerProviderCard
 }
 
 // peerProviderPlans 把上游的授权清单摊成要落的 provider 行。
@@ -478,6 +492,7 @@ func peerProviderPlans(name string, protocol domain.Protocol, granted []peerProv
 			ProtocolSupport:   peerProtocolSupport(view.ProtocolSupport, memberProtocol),
 			Models:            models,
 			GrantedProviderID: id,
+			Card:              view.Card,
 		})
 	}
 	if len(plans) > 0 {
@@ -550,7 +565,11 @@ func peerUpstreamKey(grants *domain.PeerUpstreamGrants, parentURL string) string
 // 刷新变化的字段（账号名 / 账号 ID / 上游身份）。刷新只重新要授权清单，
 // 不会再拿到一遍账号信息，所以沿用注册时存下的那份。
 func peerRegistrationFromProvider(provider domain.Provider) peerRegistration {
-	registration := peerRegistration{ParentURL: resolvePeerParentURL(provider), Token: peerUpstreamToken(provider)}
+	registration := peerRegistration{
+		ParentURL:    resolvePeerParentURL(provider),
+		Token:        peerUpstreamToken(provider),
+		RefreshToken: provider.PeerRefreshToken,
+	}
 	if grants := provider.PeerGrants; grants != nil {
 		registration.Username = grants.Username
 		registration.UserID = grants.UserID
@@ -683,11 +702,12 @@ func (s *Server) reconcilePeerUpstreamMembers(anchor domain.Provider, registrati
 				defaultModel = plan.Models[0].ID
 			}
 			if _, err := s.router.UpdateProvider(member.ID, domain.Provider{
-				Name:         plan.Name,
-				Protocol:     plan.Protocol,
-				BaseURL:      registration.ParentURL,
-				APIKeySource: "literal:" + token,
-				DefaultModel: defaultModel,
+				Name:             plan.Name,
+				Protocol:         plan.Protocol,
+				BaseURL:          registration.ParentURL,
+				APIKeySource:     "literal:" + token,
+				PeerRefreshToken: registration.RefreshToken,
+				DefaultModel:     defaultModel,
 			}); err != nil {
 				return updated, err
 			}
@@ -701,6 +721,10 @@ func (s *Server) reconcilePeerUpstreamMembers(anchor domain.Provider, registrati
 			}
 			snapshot := grants.Clone()
 			snapshot.GrantedProviderID = plan.GrantedProviderID
+			if plan.Card != nil {
+				card := plan.Card.Clone()
+				snapshot.Card = &card
+			}
 			if _, err := s.router.SetPeerGrants(member.ID, snapshot); err != nil {
 				return updated, err
 			}
@@ -709,21 +733,26 @@ func (s *Server) reconcilePeerUpstreamMembers(anchor domain.Provider, registrati
 		}
 		// 新授权：落一条新的成员行。
 		provider := domain.Provider{
-			Name:            plan.Name,
-			Protocol:        plan.Protocol,
-			ProtocolSupport: plan.ProtocolSupport,
-			BaseURL:         registration.ParentURL,
-			APIKeySource:    "literal:" + registration.Token,
-			AuthType:        domain.AuthTypePeer,
-			Models:          plan.Models,
-			HealthStatus:    "healthy",
-			OwnerUserID:     anchor.OwnerUserID,
+			Name:             plan.Name,
+			Protocol:         plan.Protocol,
+			ProtocolSupport:  plan.ProtocolSupport,
+			BaseURL:          registration.ParentURL,
+			APIKeySource:     "literal:" + registration.Token,
+			PeerRefreshToken: registration.RefreshToken,
+			AuthType:         domain.AuthTypePeer,
+			Models:           plan.Models,
+			HealthStatus:     "healthy",
+			OwnerUserID:      anchor.OwnerUserID,
 		}
 		if len(plan.Models) > 0 {
 			provider.DefaultModel = plan.Models[0].ID
 		}
 		snapshot := grants.Clone()
 		snapshot.GrantedProviderID = plan.GrantedProviderID
+		if plan.Card != nil {
+			card := plan.Card.Clone()
+			snapshot.Card = &card
+		}
 		provider.PeerGrants = &snapshot
 		saved, err := s.router.AddProvider(provider)
 		if err != nil {
@@ -779,6 +808,7 @@ func peerGrantsFromRegistration(registration peerRegistration, granted []peerPro
 			Name:     strings.TrimSpace(view.Name),
 			Protocol: strings.TrimSpace(view.Protocol),
 			Models:   models,
+			Card:     view.Card,
 		})
 	}
 	// 两份清单按 id 排序：上游响应顺序会变，快照不该跟着抖。
@@ -862,25 +892,67 @@ func (s *Server) handleRefreshPeerUpstream(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
-	token := peerUpstreamToken(provider)
-	if token == "" {
-		writeOpenAIError(w, http.StatusConflict, "这条上游没有存下凭据，请用用户名密码重新注册一次")
+	summary, status, err := s.refreshPeerUpstream(r.Context(), provider)
+	if err != nil {
+		writeOpenAIError(w, status, err.Error())
 		return
 	}
-	granted, err := newPeerClient().providers(r.Context(), provider.BaseURL, token)
+	s.logs.AddApp("info", "peer upstream refreshed", fmt.Sprintf("provider=%s granted=%d", provider.ID, summary.GrantCount))
+	writeJSON(w, http.StatusOK, map[string]any{"upstream": summary})
+}
+
+// refreshPeerUpstream 是手动刷新与后台同步共用的一条路径：向上游重新取
+// 授权 Provider 清单，更新模型、成员行、路由与健康状态。返回的 status 只
+// 给控制台接口用，后台轮询忽略它。
+func (s *Server) refreshPeerUpstream(ctx context.Context, provider domain.Provider) (peerUpstreamSummary, int, error) {
+	s.peerUpstreamSyncMu.Lock()
+	defer s.peerUpstreamSyncMu.Unlock()
+
+	token := peerUpstreamToken(provider)
+	if token == "" {
+		return peerUpstreamSummary{}, http.StatusConflict, fmt.Errorf("这条上游没有存下凭据，请用用户名密码重新注册一次")
+	}
+	root := resolvePeerParentURL(provider)
+	if root == "" {
+		return peerUpstreamSummary{}, http.StatusBadRequest, fmt.Errorf("这条上游没有网关地址")
+	}
+	// 老记录只有流量 bearer。父端新版支持时，先用当前 bearer 一次性换出
+	// 续签凭据；之后重启、轮换都走自动恢复，不再需要用户重新注册。
+	if strings.TrimSpace(provider.PeerRefreshToken) == "" {
+		if upgraded, upgradeErr := s.bootstrapPeerUpstreamRefresh(ctx, provider); upgradeErr == nil {
+			provider = upgraded
+			token = peerUpstreamToken(provider)
+		} else {
+			var httpErr *peerHTTPError
+			if !errors.As(upgradeErr, &httpErr) || httpErr.Status != http.StatusNotFound {
+				s.logs.AddApp("debug", "peer upstream refresh credential not issued", fmt.Sprintf("provider=%s: %v", provider.ID, upgradeErr))
+			}
+		}
+	}
+	granted, err := newPeerClient().providers(ctx, root, token)
+	if err != nil {
+		var httpErr *peerHTTPError
+		if errors.As(err, &httpErr) && httpErr.Status == http.StatusUnauthorized && strings.TrimSpace(provider.PeerRefreshToken) != "" {
+			renewed, renewErr := s.renewPeerUpstreamCredential(ctx, provider)
+			if renewErr == nil {
+				provider = renewed
+				granted, err = newPeerClient().providers(ctx, root, peerUpstreamToken(provider))
+			} else {
+				s.logs.AddApp("warn", "peer upstream auto renew failed", fmt.Sprintf("provider=%s: %v", provider.ID, renewErr))
+			}
+		}
+	}
 	if err != nil {
 		// 拉不到就把它标成异常：界面上的「测试连接」失败必须留下痕迹，
 		// 否则运维只会看到一句转瞬即逝的报错。
 		_, _ = s.router.UpdateProviderModels(provider.ID, provider.Models, "failed")
 		_ = s.saveState()
-		writeOpenAIError(w, http.StatusBadGateway, err.Error())
-		return
+		return peerUpstreamSummary{}, http.StatusBadGateway, err
 	}
 	// 只更模型与健康状态，绝不走 UpdateProvider：那条路径会用 patch 里的
 	// 空 apiKeySource 覆盖掉已存的凭据（见 Router.UpdateProvider）。
 	if _, err := s.router.UpdateProviderModels(provider.ID, peerModelsForProtocol(provider.Protocol, granted), "healthy"); err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, err.Error())
-		return
+		return peerUpstreamSummary{}, http.StatusInternalServerError, err
 	}
 	// 授权快照与成员行一起同步：这次确实问到了上游，所以「授权了 0 个」从此
 	// 是个可信的结论，而不是还没问过。注册时记下的账号信息沿用旧值，本次响应
@@ -895,8 +967,7 @@ func (s *Server) handleRefreshPeerUpstream(w http.ResponseWriter, r *http.Reques
 		}
 		members, memberErr := s.reconcilePeerUpstreamMembers(provider, peerRegistrationFromProvider(provider), granted, upstreamName)
 		if memberErr != nil {
-			writeOpenAIError(w, http.StatusInternalServerError, memberErr.Error())
-			return
+			return peerUpstreamSummary{}, http.StatusInternalServerError, memberErr
 		}
 		for _, member := range members {
 			if routeErr := s.ensurePeerUpstreamRoute(member); routeErr != nil {
@@ -905,11 +976,158 @@ func (s *Server) handleRefreshPeerUpstream(w http.ResponseWriter, r *http.Reques
 		}
 	}
 	if err := s.saveState(); err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
-		return
+		return peerUpstreamSummary{}, http.StatusInternalServerError, fmt.Errorf("failed to save configuration: %w", err)
 	}
-	s.logs.AddApp("info", "peer upstream refreshed", fmt.Sprintf("provider=%s granted=%d", provider.ID, len(granted)))
-	writeJSON(w, http.StatusOK, map[string]any{"upstream": s.peerUpstreamSummaryOf(provider.ID)})
+	return s.peerUpstreamSummaryOf(provider.ID), http.StatusOK, nil
+}
+
+// renewPeerUpstreamCredential 用隐藏的续签凭据换一组新凭据，并更新同一上游
+// 下的全部成员行。并发 401 只会触发一次真实轮换：后到的调用读取到 token 已变，
+// 直接复用新值。
+func (s *Server) renewPeerUpstreamCredential(ctx context.Context, provider domain.Provider) (domain.Provider, error) {
+	s.peerCredentialRenewMu.Lock()
+	defer s.peerCredentialRenewMu.Unlock()
+
+	latest, err := s.router.ProviderByID(provider.ID)
+	if err != nil {
+		return domain.Provider{}, err
+	}
+	if oldToken, currentToken := peerUpstreamToken(provider), peerUpstreamToken(latest); currentToken != "" && currentToken != oldToken {
+		return latest, nil
+	}
+	refreshToken := strings.TrimSpace(latest.PeerRefreshToken)
+	if refreshToken == "" {
+		return domain.Provider{}, fmt.Errorf("这条上游没有续签凭据，请重新注册一次以启用自动续签")
+	}
+	root := resolvePeerParentURL(latest)
+	if root == "" {
+		return domain.Provider{}, fmt.Errorf("这条上游没有网关地址")
+	}
+	renewed, err := newPeerClient().renew(ctx, root, s.GatewayID(), refreshToken)
+	if err != nil {
+		return domain.Provider{}, err
+	}
+	if strings.TrimSpace(renewed.Token) == "" || strings.TrimSpace(renewed.RefreshToken) == "" {
+		return domain.Provider{}, fmt.Errorf("父网关续签响应缺少凭据")
+	}
+	anchor, err := s.updatePeerUpstreamCredentialGroup(latest, renewed)
+	if err != nil {
+		return domain.Provider{}, err
+	}
+	s.logs.AddApp("info", "peer upstream credentials renewed", fmt.Sprintf("provider=%s", latest.ID))
+	return anchor, nil
+}
+
+// bootstrapPeerUpstreamRefresh 为旧版单凭据记录补发续签凭据。它只在当前
+// bearer 仍然有效时成功；已经具备续签凭据的记录直接复用，不发网络请求。
+func (s *Server) bootstrapPeerUpstreamRefresh(ctx context.Context, provider domain.Provider) (domain.Provider, error) {
+	s.peerCredentialRenewMu.Lock()
+	defer s.peerCredentialRenewMu.Unlock()
+
+	latest, err := s.router.ProviderByID(provider.ID)
+	if err != nil {
+		return domain.Provider{}, err
+	}
+	if strings.TrimSpace(latest.PeerRefreshToken) != "" {
+		return latest, nil
+	}
+	token := peerUpstreamToken(latest)
+	if token == "" {
+		return domain.Provider{}, fmt.Errorf("这条上游没有流量凭据")
+	}
+	root := resolvePeerParentURL(latest)
+	if root == "" {
+		return domain.Provider{}, fmt.Errorf("这条上游没有网关地址")
+	}
+	upgraded, err := newPeerClient().issueRefreshToken(ctx, root, s.GatewayID(), token)
+	if err != nil {
+		return domain.Provider{}, err
+	}
+	if strings.TrimSpace(upgraded.Token) == "" || strings.TrimSpace(upgraded.RefreshToken) == "" {
+		return domain.Provider{}, fmt.Errorf("父网关升级响应缺少凭据")
+	}
+	anchor, err := s.updatePeerUpstreamCredentialGroup(latest, upgraded)
+	if err != nil {
+		return domain.Provider{}, err
+	}
+	s.logs.AddApp("info", "peer upstream refresh credential enabled", fmt.Sprintf("provider=%s", latest.ID))
+	return anchor, nil
+}
+
+// updatePeerUpstreamCredentialGroup 把父网关返回的新 bearer/refresh 同时写进
+// 同一 upstreamKey 下的全部成员行，并持久化。调用方负责持有续签锁。
+func (s *Server) updatePeerUpstreamCredentialGroup(latest domain.Provider, renewed peerRegistration) (domain.Provider, error) {
+
+	members := s.peerUpstreamMembers(peerGroupKeyForProvider(latest))
+	if len(members) == 0 {
+		members = []domain.Provider{latest}
+	}
+	var anchor domain.Provider
+	for _, member := range members {
+		updated, updateErr := s.router.SetPeerUpstreamCredentials(member.ID, renewed.Token, renewed.RefreshToken)
+		if updateErr != nil {
+			return domain.Provider{}, updateErr
+		}
+		if member.ID == latest.ID {
+			anchor = updated
+		}
+	}
+	if anchor.ID == "" {
+		restored, err := s.router.ProviderByID(latest.ID)
+		if err != nil {
+			return domain.Provider{}, err
+		}
+		anchor = restored
+	}
+	if err := s.saveState(); err != nil {
+		return domain.Provider{}, err
+	}
+	return anchor, nil
+}
+
+const peerUpstreamRefreshInterval = 5 * time.Minute
+
+// StartPeerUpstreamBackgroundRefresh 周期性同步所有上游网关的 Provider 清单。
+// 父网关开启「全部 Provider · 动态」后，下游不需要用户手动点刷新，也能在
+// 下一轮同步中看到新增的 Provider；普通中英文模型只会多一次轻量清单查询。
+func (s *Server) StartPeerUpstreamBackgroundRefresh(ctx context.Context) {
+	go func() {
+		timer := time.NewTimer(45 * time.Second)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				s.refreshAllPeerUpstreams()
+				timer.Reset(peerUpstreamRefreshInterval)
+			}
+		}
+	}()
+}
+
+// refreshAllPeerUpstreams 按 upstreamKey 每组只刷一次，避免同一上游的多个
+// 成员 Provider 触发 N 次相同请求。
+func (s *Server) refreshAllPeerUpstreams() {
+	seen := map[string]bool{}
+	for _, provider := range s.router.State().Providers {
+		if provider.AuthType != domain.AuthTypePeer || provider.Deleted || provider.Disabled {
+			continue
+		}
+		key := peerGroupKeyForProvider(provider)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_, _, err := s.refreshPeerUpstream(ctx, provider)
+		cancel()
+		if err != nil {
+			s.logs.AddApp("warn", "peer upstream background refresh failed", fmt.Sprintf("provider=%s: %v", provider.ID, err))
+			continue
+		}
+		s.logs.AddApp("debug", "peer upstream background refreshed", provider.ID)
+	}
 }
 
 // handleDisconnectPeerUpstream 断开一条上游：把它落在本机的整组成员行一起删掉。
@@ -1015,10 +1233,11 @@ func (s *Server) handleReconnectPeerUpstream(w http.ResponseWriter, r *http.Requ
 			defaultModel = models[0].ID
 		}
 		if _, err := s.router.UpdateProvider(member.ID, domain.Provider{
-			APIKeySource: "literal:" + registration.Token,
-			BaseURL:      registration.ParentURL,
-			DefaultModel: defaultModel,
-			Models:       models,
+			APIKeySource:     "literal:" + registration.Token,
+			PeerRefreshToken: registration.RefreshToken,
+			BaseURL:          registration.ParentURL,
+			DefaultModel:     defaultModel,
+			Models:           models,
 		}); err != nil {
 			writeOpenAIError(w, http.StatusInternalServerError, err.Error())
 			return

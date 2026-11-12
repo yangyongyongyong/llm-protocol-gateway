@@ -168,6 +168,14 @@ type Server struct {
 	adminAuth      AdminAuthStore
 	userStore      UserStore
 	roles          RoleStore
+	// peerUpstreamSyncMu serializes downstream-side parent inventory refreshes:
+	// the manual "测试连接" button and the periodic background poll must not
+	// reconcile the same peer member group at the same time.
+	peerUpstreamSyncMu sync.Mutex
+	// peerCredentialRenewMu coalesces concurrent 401 recoveries for one peer
+	// group: the first successful renew updates every member row, later callers
+	// re-read the new token instead of each rotating the credential again.
+	peerCredentialRenewMu sync.Mutex
 	// authThrottle counts failed console logins per source IP and account.
 	authThrottle      *authThrottle
 	oauthUsageCache   *oauthUsageCache
@@ -487,6 +495,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /__public/control-token", s.handlePublicAccessControlTokenStatus)
 	mux.HandleFunc("POST /__public/control-token", s.handleGeneratePublicAccessControlToken)
 	mux.HandleFunc("POST /__public/control-token/revoke", s.handleRevokePublicAccessControlToken)
+	mux.HandleFunc("GET /__provider-groups", s.handleListProviderGroups)
+	mux.HandleFunc("POST /__provider-groups", s.handleCreateProviderGroup)
+	mux.HandleFunc("POST /__provider-groups/reorder", s.handleReorderProviderGroups)
+	mux.HandleFunc("POST /__provider-groups/assign", s.handleAssignProviderGroup)
+	mux.HandleFunc("PATCH /__provider-groups/{id}", s.handleUpdateProviderGroup)
+	mux.HandleFunc("DELETE /__provider-groups/{id}", s.handleDeleteProviderGroup)
 	mux.HandleFunc("POST /__providers", s.handleCreateProvider)
 	mux.HandleFunc("PATCH /__providers/{id}", s.handleUpdateProvider)
 	mux.HandleFunc("GET /__providers/export", s.handleExportProviders)
@@ -574,6 +588,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /__providers/{id}/trae-oauth/usage", s.handleTraeUsage)
 	mux.HandleFunc("GET /__providers/{id}/zhipu/usage", s.handleZhipuUsage)
 	mux.HandleFunc("GET /__providers/{id}/deepseek/usage", s.handleDeepSeekBalance)
+	mux.HandleFunc("GET /__providers/{id}/opencode-go/usage", s.handleOpenCodeGoUsage)
 	mux.HandleFunc("DELETE /__providers/{id}", s.handleDeleteProvider)
 	mux.HandleFunc("GET /__providers/deleted", s.handleListDeletedProviders)
 	mux.HandleFunc("POST /__providers/{id}/restore", s.handleRestoreProvider)
@@ -602,6 +617,12 @@ func (s *Server) Handler() http.Handler {
 	// 用户名密码把关；其余端点只认对端凭据。整段前缀在 admin_auth 里被旁路
 	// 掉会话鉴权，见 withAdminAuth。
 	mux.HandleFunc("POST /__peer/register", s.handlePeerRegister)
+	// 流量 bearer 失效时，下游拿独立的 gwrefresh- 凭据静默换发一组新凭据。
+	// 这个入口不接受普通 bearer，也不参与模型转发。
+	mux.HandleFunc("POST /__peer/renew", s.handlePeerRenew)
+	// 老记录第一次升级到双凭据时，用当前仍有效的流量 bearer 换取续签凭据。
+	// 仅当该账号还没有续签凭据时允许，之后只能用 gwrefresh- 走 /renew。
+	mux.HandleFunc("POST /__peer/refresh-token", s.handlePeerIssueRefreshToken)
 	// 注册前的连通性探测：表单上「测试连接」问的就是它。不需要凭据，也不写
 	// 任何状态——此刻还没有账号可言。
 	mux.HandleFunc("GET /__peer/probe", s.handlePeerProbe)
@@ -755,9 +776,14 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	// 身份对所有角色可见：普通用户配"父网关 ID"时也要能复制自己这一侧的 ID。
 	// 它不含机器标识本身，只有派生后的哈希，所以不存在泄漏问题。
 	state.GatewayIdentity = s.GatewayIdentityForConsole()
-	if p := s.requestPrincipal(r); p.scopeOf() != domain.ScopeAll {
+	p := s.requestPrincipal(r)
+	if p.scopeOf() != domain.ScopeAll {
 		writeJSON(w, http.StatusOK, s.stateForUser(identity, state))
 		return
+	}
+	if !p.IsAdmin {
+		// Provider 分组只属于管理员控制台；ScopeAll 的自定义角色也不能看到。
+		stripProviderGroupsForUser(&state)
 	}
 	state.RequestLogRetentionDays = s.RequestLogRetentionDays()
 	state.Log2xxBodies = s.Log2xxBodies()
@@ -2501,6 +2527,8 @@ func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
 		// while every other account's provider is labelled with its own
 		// administrator's account rather than a generic owner.
 		provider.OwnerUserID = p.UserID
+		// Provider 分组是管理员侧的分类元数据，普通用户永远不能设置。
+		provider.GroupID = ""
 		// The RTK switch is an admin-only, host-wide capability.
 		provider.RTKCompress = false
 	} else {
@@ -2509,6 +2537,16 @@ func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
 		// generic "管理员" instead of the real username).
 		if strings.TrimSpace(provider.OwnerUserID) == "" {
 			provider.OwnerUserID = s.adminOwnerID()
+		}
+		if !p.IsAdmin {
+			// ScopeAll 的自定义角色仍不是管理员；分组功能只给真正的管理员权限。
+			provider.GroupID = ""
+		} else {
+			provider.GroupID = strings.TrimSpace(provider.GroupID)
+			if !s.providerGroupExists(provider.GroupID) {
+				writeOpenAIError(w, http.StatusBadRequest, "provider group not found")
+				return
+			}
 		}
 	}
 	if provider.RTKCompress {
@@ -2572,6 +2610,13 @@ func (s *Server) handleImportProviders(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid import json: "+err.Error())
 		return
 	}
+	// 分组不随 Provider 导出；导入到不同网关时，未知 groupId 必须回落到未分组，
+	// 不能留下一个筛选栏里永远选不到的幽灵 ID。
+	for index := range bundle.Providers {
+		if !s.providerGroupExists(bundle.Providers[index].GroupID) {
+			bundle.Providers[index].GroupID = ""
+		}
+	}
 	result := s.router.ImportProviders(bundle)
 	if len(result.Created) == 0 && len(result.Updated) == 0 && len(result.Errors) > 0 {
 		writeJSON(w, http.StatusBadRequest, result)
@@ -2591,8 +2636,23 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 	if !s.requireProviderOwnerForUser(w, r, r.PathValue("id")) {
 		return
 	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "failed to read provider json: "+err.Error())
+		return
+	}
 	var provider domain.Provider
-	if err := json.NewDecoder(r.Body).Decode(&provider); err != nil {
+	if err := json.Unmarshal(body, &provider); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid provider json: "+err.Error())
+		return
+	}
+	// GroupID 用指针单独解一次：字段缺省表示“这次不改分组”，空字符串才是
+	// “移到未分组”。直接看 domain.Provider.GroupID 会把老客户端没传的字段
+	// 当成清空操作。
+	var groupPatch struct {
+		GroupID *string `json:"groupId"`
+	}
+	if err := json.Unmarshal(body, &groupPatch); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid provider json: "+err.Error())
 		return
 	}
@@ -2607,10 +2667,28 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// 分组校验必须放在 Provider 更新之前：UpdateProvider 会直接改内存，
+	// 如果这里先更新再因无效 groupId 返回 400，就会出现“接口失败但内存已变”。
+	groupID := ""
+	groupIDSet := groupPatch.GroupID != nil && s.requestPrincipal(r).IsAdmin
+	if groupIDSet {
+		groupID = strings.TrimSpace(*groupPatch.GroupID)
+		if !s.providerGroupExists(groupID) {
+			writeOpenAIError(w, http.StatusBadRequest, "provider group not found")
+			return
+		}
+	}
 	updated, err := s.router.UpdateProvider(r.PathValue("id"), provider)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if groupIDSet {
+		if _, err := s.router.AssignProvidersToGroup([]string{updated.ID}, groupID); err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		updated, _ = s.router.ProviderByID(updated.ID)
 	}
 	if err := s.saveState(); err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
@@ -3249,6 +3327,67 @@ func (s *Server) handleZhipuUsage(w http.ResponseWriter, r *http.Request) {
 	}
 	// Cache success + unsupported (非编程套餐) so card polling stays quiet.
 	if report.Available || report.Unsupported {
+		s.oauthUsageCache.setForAccount(cacheKey, oauthUsageAccountID(provider), report)
+	}
+	writeJSON(w, http.StatusOK, report)
+}
+
+// handleOpenCodeGoUsage 返回 OpenCode Go 账号的 5 小时、7 天和月额度。
+// 与 Claude/Cursor 等订阅面板一样使用统一缓存，避免多标签页和卡片轮询
+// 同时打上游额度接口。
+func (s *Server) handleOpenCodeGoUsage(w http.ResponseWriter, r *http.Request) {
+	providerID := r.PathValue("id")
+	if !s.requireProviderAccessForUser(w, r, providerID) {
+		return
+	}
+	provider, err := s.router.ProviderByID(providerID)
+	if err != nil {
+		writeOpenAIError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if !isOpenCodeGoProvider(provider) {
+		writeJSON(w, http.StatusOK, OpenCodeGoUsageReport{Available: false, Error: "provider is not an OpenCode Go provider"})
+		return
+	}
+	if provider.Disabled {
+		writeJSON(w, http.StatusOK, OpenCodeGoUsageReport{Available: false, Error: "provider disabled"})
+		return
+	}
+	apiKey := resolveProviderAuth(provider)
+	if strings.TrimSpace(apiKey) == "" {
+		writeJSON(w, http.StatusOK, OpenCodeGoUsageReport{Available: false, Error: "OpenCode Go 未配置 API Key"})
+		return
+	}
+
+	cacheKey := s.oauthUsageCacheKeyFor("opencode-go", providerID)
+	forceRefresh := strings.EqualFold(r.URL.Query().Get("refresh"), "1") || strings.EqualFold(r.URL.Query().Get("refresh"), "true")
+	if forceRefresh {
+		s.oauthUsageCache.invalidate(cacheKey)
+	} else if cached, ok := s.oauthUsageCache.getAllowStale(cacheKey); ok {
+		if report, ok := cached.(OpenCodeGoUsageReport); ok {
+			s.maybeRefreshOpenCodeGoUsageAsync(providerID)
+			writeJSON(w, http.StatusOK, report)
+			return
+		}
+	}
+
+	unlock := s.lockOAuthUsageFetch(cacheKey)
+	defer unlock()
+	if !forceRefresh {
+		if cached, ok := s.oauthUsageCache.get(cacheKey); ok {
+			if report, ok := cached.(OpenCodeGoUsageReport); ok {
+				writeJSON(w, http.StatusOK, report)
+				return
+			}
+		}
+	}
+
+	report, err := fetchOpenCodeGoUsage(r.Context(), provider.BaseURL, apiKey)
+	if err != nil {
+		writeJSON(w, http.StatusOK, OpenCodeGoUsageReport{Available: false, Error: err.Error()})
+		return
+	}
+	if report.Available {
 		s.oauthUsageCache.setForAccount(cacheKey, oauthUsageAccountID(provider), report)
 	}
 	writeJSON(w, http.StatusOK, report)
@@ -4469,7 +4608,7 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if gatewayKeyMatched {
-		decision = s.decisionForAPIKeyProtocol(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID), domain.ProtocolOpenAIChat)
+		decision = s.decisionForAPIKeyProtocol(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID, route.ProviderID, matchedKey.ScheduleMode, matchedKey.FallbackProviderIDs...), domain.ProtocolOpenAIChat)
 	}
 
 	requestModel, _ := req["model"].(string)
@@ -4593,7 +4732,7 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if gatewayKeyMatched {
-		decision = s.decisionForAPIKeyProtocol(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID), domain.ProtocolOpenAIResponses)
+		decision = s.decisionForAPIKeyProtocol(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID, route.ProviderID, matchedKey.ScheduleMode, matchedKey.FallbackProviderIDs...), domain.ProtocolOpenAIResponses)
 	}
 
 	requestModel, _ := req["model"].(string)
@@ -5091,7 +5230,7 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if gatewayKeyMatched {
-		decision = s.decisionForAPIKeyProtocol(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID), domain.ProtocolClaude)
+		decision = s.decisionForAPIKeyProtocol(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID, route.ProviderID, matchedKey.ScheduleMode, matchedKey.FallbackProviderIDs...), domain.ProtocolClaude)
 	}
 
 	requestModel, _ := req["model"].(string)
@@ -5185,7 +5324,7 @@ func (s *Server) handleClaudeCountTokens(w http.ResponseWriter, r *http.Request)
 	// 旧 Key 仍然能拿 token 计数（以及上游账号的额度）。这里补上同一条判定，
 	// 并把 decision 收窄到仍被授权的 Provider。
 	if gatewayKeyMatched {
-		decision = s.decisionForAPIKeyProtocol(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID), domain.ProtocolClaude)
+		decision = s.decisionForAPIKeyProtocol(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID, route.ProviderID, matchedKey.ScheduleMode, matchedKey.FallbackProviderIDs...), domain.ProtocolClaude)
 		if decision.ProviderID == route.ProviderID && !s.providerAllowedForKeyOwner(matchedKey, decision.ProviderID) {
 			if strings.TrimSpace(matchedKey.OwnerUserID) == "" {
 				writeClaudeError(w, http.StatusServiceUnavailable, "no enabled provider on the key's provider chain")
@@ -5215,9 +5354,18 @@ func (s *Server) handleClaudeCountTokens(w http.ResponseWriter, r *http.Request)
 		writeClaudeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	// count_tokens 是 Claude Code 启动/上下文估算用的旁路，不是对话主链路。
+	// 某些 OpenAI 协议上游没有 Anthropic 的 count_tokens 端点，本地返回一个
+	// 计数占位即可；日志也标成本地计数，别让运维误以为真的发生了协议透传。
+	action := "pass_through"
+	protocolFlow := decision.ConversionLabel
+	if shouldStubClaudeCountTokens(provider) {
+		action = "count_tokens_stub"
+		protocolFlow = fmt.Sprintf("%s -> %s", domain.ProtocolClaude.DisplayName(), domain.ProtocolClaude.DisplayName())
+	}
 	status, responseBody, err := s.proxyClaudeCountTokens(r, provider, upstreamBody)
 	if err != nil {
-		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, "pass_through", decision.ConversionLabel, r.URL.Path, http.StatusBadGateway, TokenUsage{}, body, []byte(err.Error()))
+		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, action, protocolFlow, r.URL.Path, http.StatusBadGateway, TokenUsage{}, body, []byte(err.Error()))
 		writeClaudeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
@@ -5226,7 +5374,7 @@ func (s *Server) handleClaudeCountTokens(w http.ResponseWriter, r *http.Request)
 	}
 	w.WriteHeader(status)
 	_, _ = w.Write(responseBody)
-	s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, "pass_through", decision.ConversionLabel, r.URL.Path, status, TokenUsage{}, body, responseBody)
+	s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, decision.ProviderID, logModel, action, protocolFlow, r.URL.Path, status, TokenUsage{}, body, responseBody)
 }
 
 func (s *Server) resolveClaudeConsumerRoute(r *http.Request) (domain.Route, domain.APIKey, bool, error) {
@@ -5256,18 +5404,7 @@ func (s *Server) resolveClaudeConsumerRoute(r *http.Request) (domain.Route, doma
 }
 
 func (s *Server) proxyClaudeCountTokens(r *http.Request, provider domain.Provider, body []byte) (int, []byte, error) {
-	// Cursor OAuth (and other empty-baseURL OpenAI-chat providers) have no Anthropic
-	// count_tokens upstream. Return a lightweight stub so Claude Code startup checks pass.
-	// Qoder needs the same stub but must be named explicitly: it is openai_chat with a
-	// real (non-empty) base URL, so it would otherwise fall through to a genuine
-	// Anthropic count_tokens call against api2-v2.qoder.sh and fail.
-	if provider.AuthType == domain.AuthTypeCursorOAuth ||
-		isQoderProvider(provider) ||
-		isWorkBuddyProvider(provider) ||
-		isOpenCodeZenProvider(provider) ||
-		isZCodeProvider(provider) ||
-		isTraeProvider(provider) ||
-		(provider.Protocol == domain.ProtocolOpenAIChat && strings.TrimSpace(provider.BaseURL) == "") {
+	if shouldStubClaudeCountTokens(provider) {
 		stub, _ := json.Marshal(map[string]any{"input_tokens": 1})
 		return http.StatusOK, stub, nil
 	}
@@ -5323,6 +5460,20 @@ func (s *Server) proxyClaudeCountTokens(r *http.Request, provider domain.Provide
 	return response.StatusCode, responseBody, nil
 }
 
+// shouldStubClaudeCountTokens 判断这台上游是否需要网关本地模拟 Anthropic
+// count_tokens。这些上游没有可用的 /v1/messages/count_tokens，硬拼 URL 只会
+// 得到 404；Claude Code 只需要一个能通过启动检查的输入 token 占位。
+func shouldStubClaudeCountTokens(provider domain.Provider) bool {
+	return provider.AuthType == domain.AuthTypeCursorOAuth ||
+		isQoderProvider(provider) ||
+		isWorkBuddyProvider(provider) ||
+		isOpenCodeZenProvider(provider) ||
+		isOpenCodeGoProvider(provider) ||
+		isZCodeProvider(provider) ||
+		isTraeProvider(provider) ||
+		(provider.Protocol == domain.ProtocolOpenAIChat && strings.TrimSpace(provider.BaseURL) == "")
+}
+
 type providerTestResult struct {
 	Success   bool           `json:"success"`
 	Provider  string         `json:"providerId"`
@@ -5341,6 +5492,23 @@ func (s *Server) fetchProviderModels(r *http.Request, provider domain.Provider, 
 		// 走下面通用的模型发现只会打到父网关的一个 404，然后把这个本来完全
 		// 正常的 provider 标成"异常"、清空它可用的模型清单。
 		return s.fetchPeerUpstreamModels(r, provider, started)
+	}
+	// {model} 模板（Azure OpenAI deployment 最典型）不是可枚举的模型目录：
+	// deployment 已经写在路径里，请求 /models 要么 400，要么返回的不是这个
+	// deployment。此时“获取模型”应沿用 Provider 上已经配置的模型目录，不能把
+	// 一个对话完全正常的 Provider 标成 degraded。
+	if provider.AuthType == domain.AuthTypeAPIKey && strings.Contains(provider.BaseURL, "{model}") {
+		if models := declaredProviderModels(provider); len(models) > 0 {
+			return providerTestResult{
+				Success:   true,
+				Provider:  provider.ID,
+				ModelsURL: provider.BaseURL,
+				Status:    http.StatusOK,
+				LatencyMs: time.Since(started).Milliseconds(),
+				Models:    models,
+				Preview:   "Base URL 使用 {model} 模板，沿用已配置的模型目录",
+			}
+		}
 	}
 	if provider.AuthType == domain.AuthTypeCursorOAuth {
 		baseURL, refreshed, err := s.resolveCursorBridgeBaseURL(r.Context(), provider)
@@ -5557,6 +5725,39 @@ func (s *Server) fetchProviderModels(r *http.Request, provider domain.Provider, 
 		return providerTestResult{Success: false, Provider: provider.ID, ModelsURL: modelsURL, Status: response.StatusCode, LatencyMs: time.Since(started).Milliseconds(), Error: parseErr.Error(), Preview: preview, Models: []domain.Model{}}
 	}
 	return providerTestResult{Success: true, Provider: provider.ID, ModelsURL: modelsURL, Status: response.StatusCode, LatencyMs: time.Since(started).Milliseconds(), Models: models, Preview: preview}
+}
+
+// declaredProviderModels 返回 Provider 配置里已有的模型；旧记录只有一个
+// DefaultModel 时也把它当作目录，避免模板型端点因为无法枚举而看起来“没有模型”。
+func declaredProviderModels(provider domain.Provider) []domain.Model {
+	if len(provider.Models) > 0 {
+		out := make([]domain.Model, 0, len(provider.Models))
+		for _, model := range provider.Models {
+			if strings.TrimSpace(model.ID) == "" {
+				continue
+			}
+			if strings.TrimSpace(model.ProviderID) == "" {
+				model.ProviderID = provider.ID
+			}
+			if model.Protocol == "" {
+				model.Protocol = provider.Protocol
+			}
+			out = append(out, model)
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	if modelID := strings.TrimSpace(provider.DefaultModel); modelID != "" {
+		return []domain.Model{{
+			ID:            modelID,
+			ProviderID:    provider.ID,
+			Protocol:      provider.Protocol,
+			ContextLength: resolveModelContextLength(modelID, 0),
+			InMenu:        true,
+		}}
+	}
+	return nil
 }
 
 func deriveModelsURL(provider domain.Provider) (string, error) {

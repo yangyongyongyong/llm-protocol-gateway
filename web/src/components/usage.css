@@ -177,6 +177,7 @@ html[data-theme="dark"] .usage-page {
 .usage-cost-cell .usage-cell-caption { margin-top: 3px; }
 .usage-status { display: inline-block; background: var(--surface-sunken); border-radius: 5px; padding: 4px 7px; }
 .usage-status.is-error { color: var(--red); font-weight: 600; }
+.usage-status.is-canceled { color: var(--muted); }
 .usage-table-foot { display: flex; gap: 12px; justify-content: space-between; flex-wrap: wrap; padding: 14px 0; color: var(--muted); font-size: 10px; }
 .usage-table-foot > div { display: flex; align-items: center; gap: 10px; }
 .usage-entity-name { display: block; max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
@@ -274,6 +275,7 @@ html[data-theme="dark"] .usage-page {
 .perf-rate.is-good { color: #047857; background: color-mix(in srgb, #10b981 14%, transparent); }
 .perf-rate.is-warn { color: #b45309; background: color-mix(in srgb, #f59e0b 16%, transparent); }
 .perf-rate.is-bad { color: #be123c; background: color-mix(in srgb, #f43f5e 14%, transparent); }
+.perf-rate.is-neutral { color: var(--muted); background: var(--surface-sunken); }
 html[data-theme="dark"] .perf-rate.is-good { color: #6ee7b7; }
 html[data-theme="dark"] .perf-rate.is-warn { color: #fcd34d; }
 html[data-theme="dark"] .perf-rate.is-bad { color: #fda4af; }

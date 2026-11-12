@@ -32,8 +32,28 @@ type peerSummary struct {
 	// 但凭据已删，所以这两者要分开显示。
 	KeyEnabled         bool     `json:"keyEnabled"`
 	GrantedProviderIDs []string `json:"grantedProviderIds"`
+	// GrantMode 是 "selected" 或 "all"。all 表示动态可见当前及未来新增的
+	// Provider；GrantedProviderIDs 这时是当前展开结果，仅用于计数与预览。
+	GrantMode string `json:"grantMode"`
 	// IngressRequests 是最近这段时间它送进来的请求数，用来一眼看出"活跃/挂空"。
 	IngressRequests int64 `json:"ingressRequests"`
+}
+
+const (
+	peerGrantModeSelected = "selected"
+	peerGrantModeAll      = "all"
+)
+
+// normalizePeerGrantMode 归一化授权模式；旧版控制台不带字段时按指定列表处理。
+func normalizePeerGrantMode(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", peerGrantModeSelected:
+		return peerGrantModeSelected, nil
+	case peerGrantModeAll:
+		return peerGrantModeAll, nil
+	default:
+		return "", fmt.Errorf("grantMode 必须是 selected 或 all")
+	}
 }
 
 // handleListPeers 列出所有已注册的下游网关。
@@ -50,7 +70,6 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	grants := s.resourceGrants()
 	keys := map[string]domain.APIKey{}
 	for _, key := range s.router.State().APIKeys {
 		if strings.HasPrefix(key.Key, peerTokenPrefix) {
@@ -62,6 +81,11 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 		if !user.IsPeer() {
 			continue
 		}
+		allProviders, grantedProviderIDs := s.peerGrantState(user.ID)
+		grantMode := peerGrantModeSelected
+		if allProviders {
+			grantMode = peerGrantModeAll
+		}
 		item := peerSummary{
 			UserID:             user.ID,
 			Username:           user.Username,
@@ -69,7 +93,8 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 			Name:               strings.TrimSpace(user.DisplayName),
 			Enabled:            user.Enabled,
 			CreatedAt:          user.CreatedAt,
-			GrantedProviderIDs: grants[user.ID],
+			GrantedProviderIDs: grantedProviderIDs,
+			GrantMode:          grantMode,
 		}
 		if item.GrantedProviderIDs == nil {
 			item.GrantedProviderIDs = []string{}
@@ -275,26 +300,47 @@ func (s *Server) handleSetPeerGrants(w http.ResponseWriter, r *http.Request) {
 	}
 	var payload struct {
 		ProviderIDs *[]string `json:"providerIds"`
+		GrantMode   string    `json:"grantMode,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
-	if payload.ProviderIDs == nil {
-		writeOpenAIError(w, http.StatusBadRequest, "providerIds is required (an empty list revokes all grants)")
+	mode, err := normalizePeerGrantMode(payload.GrantMode)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// 与注册预置同一套校验：不存在的 ID 静默丢弃而不是整单拒绝——授权列表
-	// 本来就不可信（可能来自旧控制台页面缓存），删掉的 provider 不该让管理员
-	// 连合法的部分都存不进去。空列表在这里是"收回全部"，与注册的"不动"区分。
-	if err := s.setPeerGrants(user.ID, *payload.ProviderIDs); err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, err.Error())
-		return
+	if mode == peerGrantModeAll {
+		if err := s.setPeerAllProviders(user.ID); err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	} else {
+		if payload.ProviderIDs == nil {
+			writeOpenAIError(w, http.StatusBadRequest, "providerIds is required when grantMode=selected (an empty list revokes all grants)")
+			return
+		}
+		// 与注册预置同一套校验：不存在的 ID 静默丢弃而不是整单拒绝——授权列表
+		// 本来就不可信（可能来自旧控制台页面缓存），删掉的 provider 不该让管理员
+		// 连合法的部分都存不进去。空列表在这里是"收回全部"，与注册的"不动"区分。
+		if err := s.setPeerGrants(user.ID, *payload.ProviderIDs); err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
-	granted := s.resourceGrants()[user.ID]
+	allProviders, granted := s.peerGrantState(user.ID)
 	if granted == nil {
 		granted = []string{}
 	}
-	s.logs.AddApp("info", "peer grants updated", fmt.Sprintf("%s (%s) → %d 个 provider", user.Username, user.GatewayID, len(granted)))
-	writeJSON(w, http.StatusOK, map[string]any{"userId": user.ID, "grantedProviderIds": granted})
+	if allProviders {
+		s.logs.AddApp("info", "peer grants updated", fmt.Sprintf("%s (%s) → 全部 Provider（动态，当前 %d 个）", user.Username, user.GatewayID, len(granted)))
+	} else {
+		s.logs.AddApp("info", "peer grants updated", fmt.Sprintf("%s (%s) → %d 个 provider", user.Username, user.GatewayID, len(granted)))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"userId":             user.ID,
+		"grantMode":          mode,
+		"grantedProviderIds": granted,
+	})
 }

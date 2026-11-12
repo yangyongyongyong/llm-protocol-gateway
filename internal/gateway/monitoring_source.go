@@ -290,6 +290,19 @@ func (m *monitoringSource) quotaForProvider(ctx context.Context, p domain.Provid
 			return nil, errors.New(quota.Error)
 		}
 		return quotaFromWindows("workbuddy", workBuddyWindowViews(quota.Windows), workBuddyCreditsDeadline(quota.Windows), now), nil
+	case isOpenCodeGoProvider(p):
+		apiKey := resolveProviderAuth(p)
+		if strings.TrimSpace(apiKey) == "" {
+			return nil, errors.New("OpenCode Go 未配置 API Key")
+		}
+		report, err := fetchOpenCodeGoUsage(ctx, p.BaseURL, apiKey)
+		if err != nil {
+			return nil, err
+		}
+		if !report.Available {
+			return nil, errors.New(firstNonEmpty(report.Error, "OpenCode Go 额度不可用"))
+		}
+		return openCodeGoQuotaSnapshot(report, now), nil
 	default:
 		return nil, nil
 	}
@@ -416,6 +429,47 @@ func maxCursorUtilization(report CursorOAuthUsageReport) float64 {
 		}
 	}
 	return math.Min(100, best)
+}
+
+// openCodeGoQuotaSnapshot 把 5 小时、7 天、月三个窗口折叠成监控中心使用的
+// 额度快照：取已用比例最高的窗口作为账号余量，并保留每个窗口的明细。
+func openCodeGoQuotaSnapshot(report OpenCodeGoUsageReport, now time.Time) *monitoring.QuotaSnapshot {
+	type quotaWindow struct {
+		key    string
+		bucket *OpenCodeGoUsageBucket
+	}
+	windows := []quotaWindow{
+		{key: "five_hour", bucket: report.FiveHour},
+		{key: "weekly", bucket: report.Weekly},
+		{key: "monthly", bucket: report.Monthly},
+	}
+
+	snapshot := &monitoring.QuotaSnapshot{Source: "opencode-go", Ratio: -1, ObservedAt: now}
+	worst := -1.0
+	var worstReset time.Time
+	for _, window := range windows {
+		if window.bucket == nil {
+			continue
+		}
+		used := math.Min(100, math.Max(0, window.bucket.Utilization))
+		reset := parseClaudeResetsAt(window.bucket.ResetsAt)
+		snapshot.Windows = append(snapshot.Windows, monitoring.QuotaWindow{
+			Key: window.key, UsedPercent: used, ResetsAt: reset,
+		})
+		if used > worst {
+			worst = used
+			worstReset = reset
+		}
+	}
+	if worst < 0 {
+		return snapshot
+	}
+	ratio := 1 - worst/100
+	snapshot.Remaining = ratio * 100
+	snapshot.Limit = 100
+	snapshot.Ratio = ratio
+	snapshot.ExpiresAt = worstReset
+	return snapshot
 }
 
 // quotaFromUsedPercent folds a percentage window into a 100-unit allowance so
@@ -566,7 +620,8 @@ func providerCredentialExpiry(p domain.Provider) time.Time {
 
 func providerHasQuotaHandler(p domain.Provider) bool {
 	return p.ClaudeOAuth != nil || p.ChatGPTOAuth != nil || p.CursorOAuth != nil ||
-		p.QoderPAT != nil || p.WorkBuddy != nil
+		p.QoderPAT != nil || p.WorkBuddy != nil ||
+		(isOpenCodeGoProvider(p) && strings.TrimSpace(resolveProviderAuth(p)) != "")
 }
 
 func providerHasModelSync(p domain.Provider) bool {

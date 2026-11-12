@@ -84,6 +84,26 @@ func TestApplyCLIPinsEveryTierAndSubagentModel(t *testing.T) {
 	}
 }
 
+// 后端接口没有传模型时要与前端的一键配置保持同一默认：大窗口档位使用
+// default[1m]，短任务档位继续使用不带窗口标记的 default。
+func TestEnvForDefaultsToDefault1M(t *testing.T) {
+	env := envFor(Endpoint{BaseURL: "https://gw.example.com/anthropic", Token: "sk-gw-test"})
+	want := map[string]string{
+		"ANTHROPIC_MODEL":                "default[1m]",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL":   "default[1m]",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL": "default[1m]",
+		"ANTHROPIC_DEFAULT_FABLE_MODEL":  "default[1m]",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL":  "default",
+		"ANTHROPIC_SMALL_FAST_MODEL":     "default",
+		"CLAUDE_CODE_SUBAGENT_MODEL":     "default",
+	}
+	for key, wantValue := range want {
+		if got := env[key]; got != wantValue {
+			t.Errorf("env[%s] = %q, want %q", key, got, wantValue)
+		}
+	}
+}
+
 // 旧版本/其它工具可能留下 ANTHROPIC_API_KEY。两个变量同时存在时 Claude Code
 // 会优先用 API_KEY 并提示冲突，旧 Key 失效时表现为 401。写入 AUTH_TOKEN 时
 // 必须把冲突项清掉，同时保留用户自己的其它配置。

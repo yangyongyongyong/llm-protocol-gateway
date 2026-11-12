@@ -57,7 +57,8 @@ func asAdmin(server *Server, request *http.Request) *http.Request {
 }
 
 func setupRequest(remoteAddr, host string) *http.Request {
-	body := `{"baseUrl":"https://gw.example.com/anthropic","gatewayUrl":"https://gw.example.com","token":"sk-gw-test","model":"default"}`
+	// 不传 model，验证后端默认值；前端当前会显式传 default[1m]，两边应保持一致。
+	body := `{"baseUrl":"https://gw.example.com/anthropic","gatewayUrl":"https://gw.example.com","token":"sk-gw-test"}`
 	request := httptest.NewRequest(http.MethodPost, "/__clients/setup", strings.NewReader(body))
 	request.RemoteAddr = remoteAddr
 	request.Host = host
@@ -138,7 +139,7 @@ func TestSetupClientsWritesBothClientsForLocalAdmin(t *testing.T) {
 	if env["ANTHROPIC_BASE_URL"] != "https://gw.example.com/anthropic" {
 		t.Errorf("CLI base URL = %v", env["ANTHROPIC_BASE_URL"])
 	}
-	if env["ANTHROPIC_MODEL"] != "default" {
+	if env["ANTHROPIC_MODEL"] != "default[1m]" {
 		t.Errorf("CLI model = %v", env["ANTHROPIC_MODEL"])
 	}
 

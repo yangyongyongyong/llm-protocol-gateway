@@ -404,6 +404,7 @@ export function PeersPage({
                       </span>
                     ) : null}
                     {upstream.peerUsername ? <span>上游账号 {upstream.peerUsername}</span> : null}
+                    {upstream.autoRenew ? <span title="已保存续签凭据；重启或 token 轮换后会自动恢复">自动续签已开启</span> : null}
                     {upstream.grantsSynced ? (
                       <span title={grantedProviderTitles(upstream)}>上游授权 {upstream.grantCount} 个 Provider</span>
                     ) : (
@@ -462,7 +463,7 @@ export function PeersPage({
                           });
                         }}
                       >
-                        重新注册
+                        {upstream.autoRenew ? '更新注册凭据' : '启用自动续签'}
                       </button>
                       <button
                         className="mini-btn danger"
@@ -526,7 +527,12 @@ export function PeersPage({
                   </div>
                   <div><code className="peer-gateway-code">{peer.gatewayId || '—'}</code></div>
                   <div className="peer-upstream-models">
-                    {peer.grantedProviderIds.length === 0 ? (
+                    {peer.grantMode === 'all' ? (
+                      <div className="peer-grant-all-summary">
+                        <Badge tone="green">全部 Provider · 动态</Badge>
+                        <span className="hint-text">当前 {peer.grantedProviderIds.length} 个，以后新增自动包含</span>
+                      </div>
+                    ) : peer.grantedProviderIds.length === 0 ? (
                       <span className="hint-text">未授权</span>
                     ) : (
                       <span title={peer.grantedProviderIds.join('、')}>
@@ -697,8 +703,8 @@ function UpstreamDraftModal({
     <Modal
       title={editing ? '重新注册上游网关' : '连接到上游网关'}
       description={editing
-        ? '用第一次注册时填的那组用户名和密码重新注册。用户名和密码都是你自己定的，不是上游发给你的。'
-        : '用户名和密码由你自己定，上游会照此给本机建一个账号。'}
+        ? '用第一次注册时填的那组用户名和密码重新注册。成功后会自动更新续签凭据，之后重启无需再次登录。'
+        : '用户名和密码由你自己定，上游会照此给本机建一个账号。注册成功后本机会保存独立续签凭据，后续重启自动恢复。'}
       onClose={busy ? () => {} : onClose}
     >
       <div className="form-grid">
@@ -795,6 +801,7 @@ function PeerGrantsModal({ peer, onClose, onSaved, onToast }: {
   onToast: (text: string) => void;
 }) {
   const [granted, setGranted] = useState<string[]>(peer.grantedProviderIds || []);
+  const [grantMode, setGrantMode] = useState<'selected' | 'all'>(peer.grantMode === 'all' ? 'all' : 'selected');
   const [targets, setTargets] = useState<GrantTarget[]>([]);
   const [keyword, setKeyword] = useState('');
   const [loading, setLoading] = useState(true);
@@ -841,7 +848,9 @@ function PeerGrantsModal({ peer, onClose, onSaved, onToast }: {
       await jsonRequest(`${API_BASE}/__peers/${encodeURIComponent(peer.userId)}/grants`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ providerIds: granted }),
+        body: JSON.stringify(grantMode === 'all'
+          ? { grantMode: 'all' }
+          : { grantMode: 'selected', providerIds: granted }),
       });
       await onSaved();
     } catch (error) {
@@ -854,16 +863,58 @@ function PeerGrantsModal({ peer, onClose, onSaved, onToast }: {
   return (
     <Modal
       title={`调整下游网关授权：${label}`}
-      description="勾选它能透传到哪些 Provider，取消勾选立即收回。改动立即生效，不需要它重新注册。"
+      description="选择下游能透传的 Provider。动态全部模式会自动包含以后新增的 Provider，不需要重新调节授权。"
       size="wide"
       onClose={onClose}
     >
+      <div className="peer-grant-mode-grid" role="radiogroup" aria-label="Provider 授权模式">
+        <button
+          type="button"
+          role="radio"
+          aria-checked={grantMode === 'selected'}
+          className={`peer-grant-mode-card${grantMode === 'selected' ? ' active' : ''}`}
+          onClick={() => setGrantMode('selected')}
+        >
+          <span className="peer-grant-mode-icon" aria-hidden="true">☷</span>
+          <span className="peer-grant-mode-copy">
+            <b>指定 Provider</b>
+            <small>只授权当前勾选的对象，后续新增需要再次配置</small>
+          </span>
+          <span className="peer-grant-mode-check" aria-hidden="true">{grantMode === 'selected' ? '✓' : ''}</span>
+        </button>
+        <button
+          type="button"
+          role="radio"
+          aria-checked={grantMode === 'all'}
+          className={`peer-grant-mode-card dynamic${grantMode === 'all' ? ' active' : ''}`}
+          onClick={() => setGrantMode('all')}
+        >
+          <span className="peer-grant-mode-icon" aria-hidden="true">∞</span>
+          <span className="peer-grant-mode-copy">
+            <b>全部 Provider <span className="peer-grant-recommended">推荐</span></b>
+            <small>动态包含当前与未来新增，父网关新增后自动对下游可见</small>
+          </span>
+          <span className="peer-grant-mode-check" aria-hidden="true">{grantMode === 'all' ? '✓' : ''}</span>
+        </button>
+      </div>
+      {grantMode === 'all' ? (
+        <div className="peer-grant-dynamic-panel">
+          <div className="peer-grant-dynamic-orbit" aria-hidden="true">∞</div>
+          <div>
+            <strong>动态全量授权已启用</strong>
+            <p>
+              当前覆盖 {targets.length} 个 Provider。之后在父网关新增的 Provider 也会自动纳入，无需重新保存本页授权；
+              下游会周期同步清单，并即时影响新请求可用的 Provider 集合。
+            </p>
+          </div>
+        </div>
+      ) : null}
       {loading ? <div className="empty-state compact">加载中…</div> : null}
       {loadError ? <div className="rbac-form-error">{loadError}</div> : null}
-      {!loading && !loadError && targets.length === 0 ? (
+      {grantMode === 'selected' && !loading && !loadError && targets.length === 0 ? (
         <div className="empty-state compact">本机还没有可授权的输入 Provider。</div>
       ) : null}
-      {targets.length > 0 ? (
+      {grantMode === 'selected' && targets.length > 0 ? (
         <>
           <div className="rbac-grant-toolbar">
             <div className="rbac-search">
@@ -925,7 +976,7 @@ function PeerGrantsModal({ peer, onClose, onSaved, onToast }: {
       <div className="actions modal-actions">
         <button type="button" className="btn" disabled={saving} onClick={onClose}>取消</button>
         <button type="button" className="btn primary" disabled={saving || loading} onClick={() => void submit()}>
-          {saving ? '保存中…' : '保存授权'}
+          {saving ? '保存中…' : grantMode === 'all' ? '保存为全部可见' : '保存授权'}
         </button>
       </div>
     </Modal>

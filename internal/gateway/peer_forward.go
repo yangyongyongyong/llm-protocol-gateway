@@ -76,6 +76,8 @@ type peerProviderView struct {
 	// 「同一台上游的多协议能力」丢掉，跨网关也就无法优先同协议直通。
 	ProtocolSupport []string `json:"protocolSupport,omitempty"`
 	Models          []string `json:"models"`
+	// Card 是卡片展示元数据与最近一次额度快照；只含可安全展示的字段。
+	Card *domain.PeerProviderCard `json:"card,omitempty"`
 }
 
 // handlePeerProviders 列出这个对端当前能用的 provider。
@@ -98,6 +100,7 @@ func (s *Server) handlePeerProviders(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		view := peerProviderView{ID: provider.ID, Name: provider.Name, Protocol: string(provider.Protocol), Models: []string{}}
+		view.Card = s.peerProviderCardFor(provider)
 		if len(provider.ProtocolSupport) > 0 {
 			view.ProtocolSupport = append([]string(nil), provider.ProtocolSupport...)
 		}

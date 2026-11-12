@@ -378,6 +378,177 @@ func publicExposeMatches(expose string, protocol domain.Protocol) bool {
 	}
 }
 
+// ProviderGroups 返回管理员侧 Provider 分组的快照，按 position 排列。
+func (r *Router) ProviderGroups() []domain.ProviderGroup {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return append([]domain.ProviderGroup(nil), r.state.ProviderGroups...)
+}
+
+// ProviderGroupByID 按 ID 查找 Provider 分组。
+func (r *Router) ProviderGroupByID(groupID string) (domain.ProviderGroup, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	groupID = strings.TrimSpace(groupID)
+	for _, group := range r.state.ProviderGroups {
+		if group.ID == groupID {
+			return group, nil
+		}
+	}
+	return domain.ProviderGroup{}, fmt.Errorf("provider group %q not found", groupID)
+}
+
+// AddProviderGroup 创建管理员分组。名称去首尾空白后必须非空且大小写不敏感唯一；
+// ID 从名称派生，后续重命名不会改变已有 Provider 的 groupId 引用。
+func (r *Router) AddProviderGroup(name string) (domain.ProviderGroup, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return domain.ProviderGroup{}, fmt.Errorf("provider group name is required")
+	}
+	for _, group := range r.state.ProviderGroups {
+		if strings.EqualFold(group.Name, name) {
+			return domain.ProviderGroup{}, fmt.Errorf("provider group %q already exists", name)
+		}
+	}
+	group := domain.ProviderGroup{
+		ID: uniqueID(slug(name), func(id string) bool {
+			for _, existing := range r.state.ProviderGroups {
+				if existing.ID == id {
+					return true
+				}
+			}
+			return false
+		}),
+		Name:     name,
+		Position: len(r.state.ProviderGroups),
+	}
+	r.state.ProviderGroups = append(r.state.ProviderGroups, group)
+	return group, nil
+}
+
+// UpdateProviderGroup 重命名管理员分组；ID 与 Provider 归属保持不变。
+func (r *Router) UpdateProviderGroup(groupID, name string) (domain.ProviderGroup, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	groupID = strings.TrimSpace(groupID)
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return domain.ProviderGroup{}, fmt.Errorf("provider group name is required")
+	}
+	index := -1
+	for i := range r.state.ProviderGroups {
+		if r.state.ProviderGroups[i].ID == groupID {
+			index = i
+			continue
+		}
+		if strings.EqualFold(r.state.ProviderGroups[i].Name, name) {
+			return domain.ProviderGroup{}, fmt.Errorf("provider group %q already exists", name)
+		}
+	}
+	if index < 0 {
+		return domain.ProviderGroup{}, fmt.Errorf("provider group %q not found", groupID)
+	}
+	r.state.ProviderGroups[index].Name = name
+	return r.state.ProviderGroups[index], nil
+}
+
+// DeleteProviderGroup 删除管理员分组，并把组内 Provider 重置为未分组。
+// 该操作不删除 Provider，也不改变任何用户授权。
+func (r *Router) DeleteProviderGroup(groupID string) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	groupID = strings.TrimSpace(groupID)
+	index := -1
+	for i := range r.state.ProviderGroups {
+		if r.state.ProviderGroups[i].ID == groupID {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return 0, fmt.Errorf("provider group %q not found", groupID)
+	}
+	r.state.ProviderGroups = append(r.state.ProviderGroups[:index], r.state.ProviderGroups[index+1:]...)
+	for i := range r.state.ProviderGroups {
+		r.state.ProviderGroups[i].Position = i
+	}
+	moved := 0
+	for i := range r.state.Providers {
+		if strings.TrimSpace(r.state.Providers[i].GroupID) == groupID {
+			r.state.Providers[i].GroupID = ""
+			moved++
+		}
+	}
+	return moved, nil
+}
+
+// ReorderProviderGroups 按调用方给出的完整 ID 顺序重排分组；未列出的旧分组
+// 追加到末尾，既容忍前端并发删除，也不会意外丢掉分组。
+func (r *Router) ReorderProviderGroups(ids []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	byID := make(map[string]domain.ProviderGroup, len(r.state.ProviderGroups))
+	for _, group := range r.state.ProviderGroups {
+		byID[group.ID] = group
+	}
+	ordered := make([]domain.ProviderGroup, 0, len(r.state.ProviderGroups))
+	seen := map[string]bool{}
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		group, ok := byID[id]
+		if !ok || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ordered = append(ordered, group)
+	}
+	for _, group := range r.state.ProviderGroups {
+		if !seen[group.ID] {
+			ordered = append(ordered, group)
+		}
+	}
+	for i := range ordered {
+		ordered[i].Position = i
+	}
+	r.state.ProviderGroups = ordered
+}
+
+// AssignProvidersToGroup 批量设置 Provider 的管理员分组。groupID 为空表示移出分组；
+// 该方法只修改 GroupID 元数据，不触碰路由、密钥、授权或 Provider 配置。
+func (r *Router) AssignProvidersToGroup(providerIDs []string, groupID string) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	groupID = strings.TrimSpace(groupID)
+	if groupID != "" {
+		found := false
+		for _, group := range r.state.ProviderGroups {
+			if group.ID == groupID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return 0, fmt.Errorf("provider group %q not found", groupID)
+		}
+	}
+	wanted := make(map[string]bool, len(providerIDs))
+	for _, id := range providerIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			wanted[id] = true
+		}
+	}
+	updated := 0
+	for i := range r.state.Providers {
+		if wanted[r.state.Providers[i].ID] {
+			r.state.Providers[i].GroupID = groupID
+			updated++
+		}
+	}
+	return updated, nil
+}
+
 func (r *Router) AddProvider(provider domain.Provider) (domain.Provider, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -443,6 +614,9 @@ func (r *Router) UpdateProvider(providerID string, patch domain.Provider) (domai
 			updated.BaseURL = strings.TrimSpace(patch.BaseURL)
 		}
 		updated.APIKeySource = strings.TrimSpace(patch.APIKeySource)
+		if strings.TrimSpace(patch.PeerRefreshToken) != "" {
+			updated.PeerRefreshToken = strings.TrimSpace(patch.PeerRefreshToken)
+		}
 		updated.DefaultModel = strings.TrimSpace(patch.DefaultModel)
 		updated.DefaultThinkingDepth = strings.TrimSpace(patch.DefaultThinkingDepth)
 		if strings.TrimSpace(patch.AuthHeader) != "" {
@@ -788,32 +962,54 @@ func (r *Router) AddAPIKey(key domain.APIKey) (domain.APIKey, error) {
 // 只动 kind=peer 账号名下的密钥；名字里带 peerTokenPrefix 但归属本地用户的
 // 行不会被碰——那种行只可能来自手工干预，留给管理员处理而不是悄悄删掉。
 func (r *Router) ReplacePeerKey(key domain.APIKey) error {
+	return r.ReplacePeerKeys(key)
+}
+
+// ReplacePeerKeys 同时换发一组对端凭据（流量 bearer + 续签凭据）。两类
+// 前缀都在这里清掉，避免重注册后旧续签凭据继续有效。
+func (r *Router) ReplacePeerKeys(keys ...domain.APIKey) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	ownerID := strings.TrimSpace(key.OwnerUserID)
+	if len(keys) == 0 {
+		return fmt.Errorf("peer credentials are required")
+	}
+	ownerID := strings.TrimSpace(keys[0].OwnerUserID)
 	if ownerID == "" {
 		return fmt.Errorf("peer key must have an owner")
 	}
-	kept := make([]domain.APIKey, 0, len(r.state.APIKeys)+1)
+	kept := make([]domain.APIKey, 0, len(r.state.APIKeys)+len(keys))
 	for _, existing := range r.state.APIKeys {
-		if strings.TrimSpace(existing.OwnerUserID) == ownerID && strings.HasPrefix(existing.Key, peerTokenPrefix) {
+		if strings.TrimSpace(existing.OwnerUserID) == ownerID && isPeerCredential(existing.Key) {
 			continue
 		}
 		kept = append(kept, existing)
 	}
-	key.Name = strings.TrimSpace(key.Name)
-	if key.Name == "" {
-		key.Name = "网关"
+	for index := range keys {
+		key := keys[index]
+		if strings.TrimSpace(key.OwnerUserID) != ownerID {
+			return fmt.Errorf("peer credentials must all belong to the same owner")
+		}
+		key.Name = strings.TrimSpace(key.Name)
+		if key.Name == "" {
+			key.Name = "网关"
+		}
+		// 对端凭据不绑 route：走哪个 provider 由上游按模型和授权集决定，不是
+		// 一把密钥对应一条固定路由。
+		key.RouteID = ""
+		key.Enabled = true
+		if key.CreatedAt == "" {
+			key.CreatedAt = nowRFC3339()
+		}
+		keys[index] = key
 	}
-	// 对端密钥不绑 route：走哪个 provider 由上游按模型和授权集决定，不是
-	// 一把密钥对应一条固定路由。
-	key.RouteID = ""
-	key.Enabled = true
-	if key.CreatedAt == "" {
-		key.CreatedAt = nowRFC3339()
-	}
-	r.state.APIKeys = append(kept, key)
+	r.state.APIKeys = append(kept, keys...)
 	return nil
+}
+
+// isPeerCredential 判断一把密钥是否属于网关互联的任一凭据类型。
+func isPeerCredential(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	return strings.HasPrefix(raw, peerTokenPrefix) || strings.HasPrefix(raw, peerRefreshTokenPrefix)
 }
 
 // RemovePeerKeys 删掉一个对端名下的全部对端凭据。吊销用它，返回删掉的条数。
@@ -829,7 +1025,7 @@ func (r *Router) RemovePeerKeys(ownerUserID string) error {
 	defer r.mu.Unlock()
 	kept := make([]domain.APIKey, 0, len(r.state.APIKeys))
 	for _, key := range r.state.APIKeys {
-		if strings.TrimSpace(key.OwnerUserID) == ownerUserID && strings.HasPrefix(key.Key, peerTokenPrefix) {
+		if strings.TrimSpace(key.OwnerUserID) == ownerUserID && isPeerCredential(key.Key) {
 			continue
 		}
 		kept = append(kept, key)
@@ -861,6 +1057,10 @@ func (r *Router) UpdateAPIKey(keyID string, patch domain.APIKey) (domain.APIKey,
 			continue
 		}
 		updated := r.state.APIKeys[index]
+		previousPreferredProviderID := ""
+		if route, ok := r.routeLocked(updated.RouteID); ok {
+			previousPreferredProviderID = strings.TrimSpace(route.ProviderID)
+		}
 		if strings.TrimSpace(patch.Name) != "" {
 			updated.Name = strings.TrimSpace(patch.Name)
 		}
@@ -927,6 +1127,12 @@ func (r *Router) UpdateAPIKey(keyID string, patch domain.APIKey) (domain.APIKey,
 			}
 		}
 		updated.ActiveProviderID = sanitizeActiveProviderID(updated.ActiveProviderID, preferredProviderID, updated.FallbackProviderIDs)
+		// 首选 Provider 真的换了时清掉 Key 级粘滞位。旧值即便还留在备选链里，
+		// 也不该继续压过用户刚刚选择的新首选；会话级 pin 由 sessionAffinityKey
+		// 的 primary-provider 命名空间一起失效。
+		if preferredProviderID != "" && preferredProviderID != previousPreferredProviderID {
+			updated.ActiveProviderID = ""
+		}
 		// Keep the active profile's full snapshot in sync with live top-level
 		// routing fields so editing the form is editing the current scheme.
 		if pid := strings.TrimSpace(updated.ActiveProfileID); pid != "" {
@@ -1344,6 +1550,11 @@ func (r *Router) APIKeyByToken(token string) (domain.APIKey, bool) {
 	r.mu.RLock()
 	for _, key := range r.state.APIKeys {
 		if !key.Enabled || key.Key == "" {
+			continue
+		}
+		// 续签凭据也是 api_keys 行（为了重启持久化和统一 CRUD），但它绝不
+		// 能充当客户端模型密钥；只有 /__peer/renew 的专用校验可以接受它。
+		if strings.HasPrefix(key.Key, peerRefreshTokenPrefix) {
 			continue
 		}
 		// 逐一比较全部 Key 的摘要（不提前返回）：比较本身恒定时间，命中的是第几个
@@ -2265,6 +2476,27 @@ func (r *Router) SetPeerGrants(providerID string, grants domain.PeerUpstreamGran
 		snapshot := grants.Clone()
 		r.state.Providers[index].PeerGrants = &snapshot
 		return r.state.Providers[index], nil
+	}
+	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+}
+
+// SetPeerUpstreamCredentials 在一组 peer provider 上原子替换流量 bearer 与
+// 续签凭据。自动续签后所有成员行必须同时换到新凭据：只换一条会让同组其它
+// 成员继续拿旧 token 打父网关。
+func (r *Router) SetPeerUpstreamCredentials(providerID, token, refreshToken string) (domain.Provider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for index := range r.state.Providers {
+		provider := &r.state.Providers[index]
+		if provider.ID != providerID {
+			continue
+		}
+		if provider.AuthType != domain.AuthTypePeer {
+			return domain.Provider{}, fmt.Errorf("provider %q is not a peer gateway", providerID)
+		}
+		provider.APIKeySource = "literal:" + strings.TrimSpace(token)
+		provider.PeerRefreshToken = strings.TrimSpace(refreshToken)
+		return *provider, nil
 	}
 	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
 }

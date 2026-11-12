@@ -630,7 +630,54 @@ func (s *Store) Load(defaultState domain.GatewayState) (domain.GatewayState, err
 			}
 		}
 	}
+	// Provider 分组是纯管理员侧元数据，不参与任何权限判定。和请求适配器一样
+	// 存在 settings 里，避免为一张很小的分类表升级 providers 主表结构。
+	if raw := s.setting("providerGroups"); raw != "" {
+		var groups []domain.ProviderGroup
+		if err := json.Unmarshal([]byte(raw), &groups); err == nil {
+			state.ProviderGroups = normalizeProviderGroups(groups)
+		}
+	}
+	if state.ProviderGroups == nil {
+		state.ProviderGroups = []domain.ProviderGroup{}
+	}
+	validGroups := make(map[string]bool, len(state.ProviderGroups))
+	for _, group := range state.ProviderGroups {
+		validGroups[group.ID] = true
+	}
+	if raw := s.setting("providerGroupAssignments"); raw != "" {
+		var assignments map[string]string
+		if err := json.Unmarshal([]byte(raw), &assignments); err == nil {
+			for index := range state.Providers {
+				groupID := strings.TrimSpace(assignments[state.Providers[index].ID])
+				// 删除分组后残留的 assignment 视为未分组，避免界面出现幽灵分组。
+				if groupID != "" && validGroups[groupID] {
+					state.Providers[index].GroupID = groupID
+				}
+			}
+		}
+	}
 	return state, nil
+}
+
+// normalizeProviderGroups 清洗 settings 中读出的分组：去掉空 ID/空名称，
+// 按 Case-insensitive 去重，并按保存顺序重新编号，保证历史脏数据不会破坏 UI。
+func normalizeProviderGroups(groups []domain.ProviderGroup) []domain.ProviderGroup {
+	out := make([]domain.ProviderGroup, 0, len(groups))
+	seenIDs := map[string]bool{}
+	seenNames := map[string]bool{}
+	for _, group := range groups {
+		group.ID = strings.TrimSpace(group.ID)
+		group.Name = strings.TrimSpace(group.Name)
+		if group.ID == "" || group.Name == "" || seenIDs[group.ID] || seenNames[strings.ToLower(group.Name)] {
+			continue
+		}
+		seenIDs[group.ID] = true
+		seenNames[strings.ToLower(group.Name)] = true
+		group.Position = len(out)
+		out = append(out, group)
+	}
+	return out
 }
 
 func (s *Store) Save(state domain.GatewayState) error {
@@ -726,6 +773,10 @@ func (s *Store) Save(state domain.GatewayState) error {
 				accountLabel = provider.Trae.AccountLabel
 				authJSON = marshalProviderCredential(provider.Trae)
 			}
+		case domain.AuthTypePeer:
+			// 对端 bearer 在 api_key_source；续签凭据走通用 oauth_refresh_token
+			// 列，既不改表结构，也不会进入任何前端可见的 Provider 字段。
+			refreshToken = provider.PeerRefreshToken
 		}
 		disabled := 0
 		if provider.Disabled {
@@ -877,6 +928,26 @@ func (s *Store) Save(state domain.GatewayState) error {
 	if err := setSetting(tx, "peerUpstreamGrants", string(grantsRaw)); err != nil {
 		return err
 	}
+	groupsRaw, err := json.Marshal(state.ProviderGroups)
+	if err != nil {
+		return err
+	}
+	if err := setSetting(tx, "providerGroups", string(groupsRaw)); err != nil {
+		return err
+	}
+	assignments := make(map[string]string, len(state.Providers))
+	for _, provider := range state.Providers {
+		if groupID := strings.TrimSpace(provider.GroupID); groupID != "" {
+			assignments[provider.ID] = groupID
+		}
+	}
+	assignmentsRaw, err := json.Marshal(assignments)
+	if err != nil {
+		return err
+	}
+	if err := setSetting(tx, "providerGroupAssignments", string(assignmentsRaw)); err != nil {
+		return err
+	}
 	if err := pruneCheckins(tx); err != nil {
 		return err
 	}
@@ -1013,6 +1084,8 @@ func (s *Store) loadProviders() ([]domain.Provider, error) {
 			if unmarshalProviderCredential(authJSON, &credential) {
 				p.Trae = &credential
 			}
+		case domain.AuthTypePeer:
+			p.PeerRefreshToken = refreshToken
 		default:
 			if accessToken != "" || refreshToken != "" {
 				p.ClaudeOAuth = &domain.ClaudeOAuthCredential{

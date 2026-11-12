@@ -6,12 +6,18 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/luca/llm-protocol-gateway/internal/domain"
 )
+
+// peerAllProvidersGrant 是「全部 Provider（动态）」在资源授权表里的内部标记。
+// 它不是真实 provider ID，只在 peer principal 展开授权时生效；普通用户即使
+// 意外带上同一字符串也不会获得任何额外 Provider。
+const peerAllProvidersGrant = "peer:all-providers"
 
 // 下游注册到上游。
 //
@@ -42,6 +48,9 @@ type peerRegisterRequest struct {
 type peerRegisterResponse struct {
 	// Token 是上游给这把对端凭据的明文，只在此刻返回一次。
 	Token string `json:"token"`
+	// RefreshToken 只用于 /__peer/renew。它和流量 bearer 分开保存、分开校验：
+	// bearer 失效时下游可以静默续签，但续签凭据本身不能拿来跑模型请求。
+	RefreshToken string `json:"refreshToken"`
 	// GatewayID 回显上游记录的网关身份，方便下游核对注册到了谁身上。
 	GatewayID string `json:"gatewayId"`
 	// ParentGatewayID 是上游自己的网关身份。上面那个 GatewayID 回显的是下游
@@ -58,6 +67,12 @@ type peerRegisterResponse struct {
 	// RequestedProviderIDs 少——被拒的请求要能看见，不然下游会一直重试一个
 	// 永远不会成功的东西。
 	GrantedProviderIDs []string `json:"grantedProviderIds"`
+}
+
+// peerRenewRequest 只用于确认续签凭据属于它声明的那个网关。凭据本身已经
+// 绑定 owner，多带一个 gatewayId 是为了让"拿错机器凭据"尽早失败。
+type peerRenewRequest struct {
+	GatewayID string `json:"gatewayId"`
 }
 
 // handlePeerRegister 处理下游的注册/重新注册。
@@ -152,12 +167,21 @@ func (s *Server) handlePeerRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 换发凭据：旧的立刻失效。同一次调用里完成，避免中途失败留下两把有效凭据。
+	// 与 renew/refresh-token 共用一把锁：并发注册和续签不能交叉轮换，否则
+	// 后一个响应会把前一个刚交给下游的凭据再次作废。
+	s.peerCredentialRenewMu.Lock()
+	defer s.peerCredentialRenewMu.Unlock()
 	token, err := generatePeerToken()
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "failed to generate peer token: "+err.Error())
 		return
 	}
-	key, err := s.rotatePeerToken(account, token)
+	refreshToken, err := generatePeerRefreshToken()
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to generate peer refresh token: "+err.Error())
+		return
+	}
+	key, err := s.rotatePeerCredentials(account, token, refreshToken)
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -184,10 +208,121 @@ func (s *Server) handlePeerRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	s.logs.AddApp("info", "peer gateway "+verb, fmt.Sprintf("%s (%s) from %s", account.User.Username, gatewayID, requestClientIP(r)))
 	writeJSON(w, http.StatusOK, peerRegisterResponse{
-		Token:     token,
-		GatewayID: gatewayID,
+		Token:        token,
+		RefreshToken: refreshToken,
+		GatewayID:    gatewayID,
 		// 上游自己的身份。老版本下游不认这个字段，忽略即可；新版本据此在
 		// 「已连接的上游」里显示对面是哪台机器。
+		ParentGatewayID:    s.GatewayID(),
+		UserID:             account.User.ID,
+		Username:           account.User.Username,
+		GrantedProviderIDs: granted,
+	})
+}
+
+// handlePeerRenew 用独立的续签凭据换发新的 bearer + refresh 凭据。
+//
+// 这是重启/长时间运行后保持网关互联不断线的关键路径：下游不需要保存用户
+// 密码，也不需要弹回注册表单；父端账号仍启用且续签凭据未吊销即可恢复。
+func (s *Server) handlePeerRenew(w http.ResponseWriter, r *http.Request) {
+	s.peerCredentialRenewMu.Lock()
+	defer s.peerCredentialRenewMu.Unlock()
+	account, err := s.authenticatePeerRefresh(r)
+	if err != nil {
+		s.writePeerAuthError(w, r, "renew credential is not valid", err)
+		return
+	}
+	var payload peerRenewRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<14)).Decode(&payload); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(payload.GatewayID) == "" || strings.TrimSpace(payload.GatewayID) != strings.TrimSpace(account.User.GatewayID) {
+		s.writePeerAuthError(w, r, "renew credential gateway mismatch", errPeerTokenInvalid)
+		return
+	}
+
+	token, err := generatePeerToken()
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to generate peer token: "+err.Error())
+		return
+	}
+	refreshToken, err := generatePeerRefreshToken()
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to generate peer refresh token: "+err.Error())
+		return
+	}
+	key, err := s.rotatePeerCredentials(account, token, refreshToken)
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	account.Key = key
+	_, granted := s.peerGrantState(account.User.ID)
+	if granted == nil {
+		granted = []string{}
+	}
+	s.logs.AddApp("info", "peer gateway auto renewed", fmt.Sprintf("%s (%s)", account.User.Username, account.User.GatewayID))
+	writeJSON(w, http.StatusOK, peerRegisterResponse{
+		Token:              token,
+		RefreshToken:       refreshToken,
+		GatewayID:          account.User.GatewayID,
+		ParentGatewayID:    s.GatewayID(),
+		UserID:             account.User.ID,
+		Username:           account.User.Username,
+		GrantedProviderIDs: granted,
+	})
+}
+
+// handlePeerIssueRefreshToken 是旧版单凭据链路的一次性升级入口：当前 bearer
+// 仍有效时，换取一组带续签凭据的新组合。账号已经有续签凭据后该入口拒绝，
+// 防止普通流量凭据泄漏后反复轮换把真正的下游踢下线。
+func (s *Server) handlePeerIssueRefreshToken(w http.ResponseWriter, r *http.Request) {
+	s.peerCredentialRenewMu.Lock()
+	defer s.peerCredentialRenewMu.Unlock()
+	account, err := s.authenticatePeer(r)
+	if err != nil {
+		s.writePeerAuthError(w, r, "traffic credential is not valid", err)
+		return
+	}
+	var payload peerRenewRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<14)).Decode(&payload); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(payload.GatewayID) == "" || strings.TrimSpace(payload.GatewayID) != strings.TrimSpace(account.User.GatewayID) {
+		s.writePeerAuthError(w, r, "traffic credential gateway mismatch", errPeerTokenInvalid)
+		return
+	}
+	for _, key := range s.router.State().APIKeys {
+		if strings.TrimSpace(key.OwnerUserID) == account.User.ID && strings.HasPrefix(key.Key, peerRefreshTokenPrefix) {
+			writeOpenAIError(w, http.StatusConflict, "refresh credential already exists")
+			return
+		}
+	}
+
+	token, err := generatePeerToken()
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	refreshToken, err := generatePeerRefreshToken()
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	key, err := s.rotatePeerCredentials(account, token, refreshToken)
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	account.Key = key
+	_, granted := s.peerGrantState(account.User.ID)
+	s.logs.AddApp("info", "peer gateway refresh credential issued", fmt.Sprintf("%s (%s)", account.User.Username, account.User.GatewayID))
+	writeJSON(w, http.StatusOK, peerRegisterResponse{
+		Token:              token,
+		RefreshToken:       refreshToken,
+		GatewayID:          account.User.GatewayID,
 		ParentGatewayID:    s.GatewayID(),
 		UserID:             account.User.ID,
 		Username:           account.User.Username,
@@ -248,7 +383,9 @@ func (s *Server) createPeerAccount(gatewayID, username, password, displayName st
 	return peerAccount{User: user}, nil
 }
 
-// rotatePeerToken 为对端换发凭据：删掉它名下已有的对端密钥，再插一把新的。
+// rotatePeerCredentials 为对端同时换发流量 bearer 与续签凭据：删掉它名下
+// 已有的两类旧凭据，再插入新的两把。流量凭据失效时，续签凭据仍可让下游
+// 静默恢复，不需要用户重新填写用户名密码。
 //
 // 先删后插而不是就地改写，是因为「吊销后重建」和「换发」在语义上是同一件
 // 事，共用一条已验证的路径比维护两条更安全。整个过程在路由状态锁内完成，
@@ -262,7 +399,7 @@ func (s *Server) createPeerAccount(gatewayID, username, password, displayName st
 // models / routes，从来不碰 api_keys（密钥页那些行是逐条 CRUD 的）。只靠
 // saveState 的话这把凭据活在内存里、进程一重启就没了——下游看到的是"上游账号
 // 还在、但凭据没了"，只能重新注册，而它自己并不知道为什么被踢下线。
-func (s *Server) rotatePeerToken(account peerAccount, token string) (domain.APIKey, error) {
+func (s *Server) rotatePeerCredentials(account peerAccount, token, refreshToken string) (domain.APIKey, error) {
 	name := peerKeyName(account.User)
 	key := domain.APIKey{
 		ID:          peerKeyID(account.User.ID),
@@ -272,17 +409,28 @@ func (s *Server) rotatePeerToken(account peerAccount, token string) (domain.APIK
 		CreatedAt:   nowRFC3339(),
 		OwnerUserID: account.User.ID,
 	}
-	if err := s.router.ReplacePeerKey(key); err != nil {
+	keys := []domain.APIKey{key}
+	if strings.TrimSpace(refreshToken) != "" {
+		keys = append(keys, domain.APIKey{
+			ID:          peerRefreshKeyID(account.User.ID),
+			Name:        peerRefreshKeyName(account.User),
+			Key:         strings.TrimSpace(refreshToken),
+			Enabled:     true,
+			CreatedAt:   nowRFC3339(),
+			OwnerUserID: account.User.ID,
+		})
+	}
+	if err := s.router.ReplacePeerKeys(keys...); err != nil {
 		return domain.APIKey{}, err
 	}
-	if err := s.persistPeerKey(account.User.ID, key); err != nil {
+	if err := s.persistPeerKeys(account.User.ID, keys...); err != nil {
 		return domain.APIKey{}, err
 	}
 	return key, nil
 }
 
-// persistPeerKey 把刚刚换发的那把对端凭据写进库，并删掉这个 owner 名下其余
-// 的对端密钥行。
+// persistPeerKeys 把刚刚换发的一整组对端凭据写进库，并删掉这个 owner 名下
+// 其余密钥行。
 //
 // 删旧行和写内存是同一步的两半：只删不写会让下游立刻被拒，只写不删会留下
 // 上一条（已经不该再有效的）凭据。这里按 owner 先清后插，所以重复注册、吊销
@@ -290,7 +438,7 @@ func (s *Server) rotatePeerToken(account peerAccount, token string) (domain.APIK
 //
 // 没有任何 APIKeyStore（测试里的最小 Server）时退化成只写内存：那是调用方
 // 自己决定不落库，不是这条路径的失败。
-func (s *Server) persistPeerKey(ownerUserID string, key domain.APIKey) error {
+func (s *Server) persistPeerKeys(ownerUserID string, keys ...domain.APIKey) error {
 	if s.apiKeyStore == nil {
 		return nil
 	}
@@ -309,8 +457,10 @@ func (s *Server) persistPeerKey(ownerUserID string, key domain.APIKey) error {
 			return fmt.Errorf("failed to drop stale peer credential: %w", err)
 		}
 	}
-	if err := s.apiKeyStore.CreateAPIKey(key); err != nil {
-		return fmt.Errorf("failed to persist peer credential: %w", err)
+	for _, key := range keys {
+		if err := s.apiKeyStore.CreateAPIKey(key); err != nil {
+			return fmt.Errorf("failed to persist peer credential: %w", err)
+		}
 	}
 	return nil
 }
@@ -335,6 +485,9 @@ func (s *Server) apiKeyStoreKeys() []domain.APIKey {
 // peerKeyID 由账号 ID 派生，保证一个对端只有一把凭据。
 func peerKeyID(userID string) string { return "peerkey-" + strings.TrimSpace(userID) }
 
+// peerRefreshKeyID 与流量凭据分开，但都以账号 ID 为唯一键，重复注册时收敛。
+func peerRefreshKeyID(userID string) string { return "peerrefresh-" + strings.TrimSpace(userID) }
+
 // peerKeyName 是密钥在控制台里的显示名。
 func peerKeyName(user domain.User) string {
 	label := strings.TrimSpace(user.DisplayName)
@@ -345,6 +498,11 @@ func peerKeyName(user domain.User) string {
 		label = user.Username
 	}
 	return "网关 " + label
+}
+
+// peerRefreshKeyName 让管理员在密钥页能区分续签凭据和流量凭据。
+func peerRefreshKeyName(user domain.User) string {
+	return peerKeyName(user) + "（自动续签）"
 }
 
 // validatedPeerGrants 把请求的 provider 列表过滤成真实存在、未删除的那部分。
@@ -361,11 +519,46 @@ func (s *Server) validatedPeerGrants(requested []string) []string {
 	grants := make([]string, 0, len(requested))
 	for _, id := range requested {
 		id = strings.TrimSpace(id)
-		if id != "" && valid[id] {
+		if id != "" && id != peerAllProvidersGrant && valid[id] {
 			grants = append(grants, id)
 		}
 	}
 	return grants
+}
+
+// peerGrantsIncludeAll 判断一份原始授权里是否带着动态全量标记。
+func peerGrantsIncludeAll(grants []string) bool {
+	for _, id := range grants {
+		if strings.TrimSpace(id) == peerAllProvidersGrant {
+			return true
+		}
+	}
+	return false
+}
+
+// peerGrantState 把数据库里的原始授权展开成界面和透传都容易使用的两态：
+// allProviders=true 时 granted 是当前全部可见 Provider（未来新增会自动进入）；
+// false 时 granted 是管理员明确勾选的那一组。
+func (s *Server) peerGrantState(userID string) (allProviders bool, granted []string) {
+	raw := s.resourceGrants()[userID]
+	if !peerGrantsIncludeAll(raw) {
+		out := make([]string, 0, len(raw))
+		for _, id := range raw {
+			id = strings.TrimSpace(id)
+			if id != "" && id != peerAllProvidersGrant {
+				out = append(out, id)
+			}
+		}
+		return false, out
+	}
+	for _, provider := range s.router.State().Providers {
+		if provider.Disabled || provider.Deleted {
+			continue
+		}
+		granted = append(granted, provider.ID)
+	}
+	sort.Strings(granted)
+	return true, granted
 }
 
 // applyPeerRequestedGrants 首次注册时按请求预置授权，只接受真实存在的、
@@ -391,6 +584,16 @@ func (s *Server) setPeerGrants(userID string, requested []string) error {
 		return fmt.Errorf("role store is not configured")
 	}
 	return roleStore.SetResourceGrants(userID, s.validatedPeerGrants(requested))
+}
+
+// setPeerAllProviders 写入动态全量授权。单行标记跟随 peer 账号存在，新增
+// Provider 不需要再回写授权表；读取时按当前 Provider 集合实时展开。
+func (s *Server) setPeerAllProviders(userID string) error {
+	roleStore, ok := s.roleStoreRef()
+	if !ok {
+		return fmt.Errorf("role store is not configured")
+	}
+	return roleStore.SetResourceGrants(userID, []string{peerAllProvidersGrant})
 }
 
 // peerRegistrationAllowed 判断这个来源是否允许注册。

@@ -80,3 +80,67 @@ func TestAPIKeyPromoteKeepsEveryChainNode(t *testing.T) {
 			len(stale.FallbackProviderIDs), stale.FallbackProviderIDs)
 	}
 }
+
+// 交换首选时，主模型与备选固定模型必须一起跟随 Provider 搬运；后端归一化
+// 不能把新主模型清空，也不能把旧主模型进入备选后对应的条目丢掉。
+func TestAPIKeyPromoteKeepsPrimaryAndFallbackModelOverrides(t *testing.T) {
+	t.Parallel()
+	router := NewRouter(domain.GatewayState{
+		Providers: []domain.Provider{
+			{ID: "a", Name: "a", Protocol: domain.ProtocolOpenAIChat},
+			{ID: "b", Name: "b", Protocol: domain.ProtocolOpenAIChat},
+		},
+		Routes: []domain.Route{
+			{ID: "r-a", Name: "r-a", ProviderID: "a", OutputProtocol: domain.ProtocolOpenAIChat, Mode: domain.RouteModeAuto, Enabled: true},
+			{ID: "r-b", Name: "r-b", ProviderID: "b", OutputProtocol: domain.ProtocolOpenAIChat, Mode: domain.RouteModeAuto, Enabled: true},
+		},
+	})
+	key, err := router.AddAPIKey(domain.APIKey{
+		Name: "models", RouteID: "r-a", ModelOverride: "m-a",
+		FallbackProviderIDs: []string{"b"}, FallbackModelOverrides: map[string]string{"b": "m-b"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := router.UpdateAPIKey(key.ID, domain.APIKey{
+		Name: "models", RouteID: "r-b", ModelOverride: "m-b",
+		FallbackProviderIDs: []string{"a"}, FallbackModelOverrides: map[string]string{"a": "m-a"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.ModelOverride != "m-b" || updated.FallbackModelOverrides["a"] != "m-a" {
+		t.Fatalf("model overrides lost on promote: model=%q fallbacks=%v", updated.ModelOverride, updated.FallbackModelOverrides)
+	}
+}
+
+// 旧首选变成了备选时，Key 级 activeProviderId 也必须清空，否则调度会继续把
+// 旧节点当 sticky 首选，用户看到的就是“改了首选但请求还在旧 Provider”。
+func TestAPIKeyPromoteClearsStickyActiveProvider(t *testing.T) {
+	t.Parallel()
+	router := NewRouter(domain.GatewayState{
+		Providers: []domain.Provider{
+			{ID: "a", Name: "a", Protocol: domain.ProtocolOpenAIChat},
+			{ID: "b", Name: "b", Protocol: domain.ProtocolOpenAIChat},
+		},
+		Routes: []domain.Route{
+			{ID: "r-a", Name: "r-a", ProviderID: "a", OutputProtocol: domain.ProtocolOpenAIChat, Enabled: true},
+			{ID: "r-b", Name: "r-b", ProviderID: "b", OutputProtocol: domain.ProtocolOpenAIChat, Enabled: true},
+		},
+	})
+	key, err := router.AddAPIKey(domain.APIKey{
+		Name: "sticky", RouteID: "r-a", ActiveProviderID: "b", FallbackProviderIDs: []string{"b"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := router.UpdateAPIKey(key.ID, domain.APIKey{
+		Name: "sticky", RouteID: "r-b", FallbackProviderIDs: []string{"a"}, FallbackModelOverrides: map[string]string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.ActiveProviderID != "" {
+		t.Fatalf("promote kept stale active provider %q", updated.ActiveProviderID)
+	}
+}

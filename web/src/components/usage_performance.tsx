@@ -1,6 +1,6 @@
 import {useMemo, useState} from 'react';
 import type {LogEntry, Provider} from '../types';
-import {formatCompactCount, formatTokenCount, providerUsageLabel} from '../lib';
+import {formatCompactCount, formatTokenCount, isTrafficLogCanceled, providerUsageLabel} from '../lib';
 import {resolveProviderIcon} from '../provider_presets';
 import {UsageDonutChart} from './charts';
 import {BrandIcon} from './ui';
@@ -14,6 +14,7 @@ type PerfEntity = {
   id: string;
   requests: number;
   successes: number;
+  canceled: number;
   errors4: number;
   errors5: number;
   input: number;
@@ -55,7 +56,7 @@ function aggregate(rows: LogEntry[], keyOf: (row: LogEntry) => string) {
     const id = keyOf(row) || '未知';
     let entity = entities.get(id);
     if (!entity) {
-      entity = {id, requests: 0, successes: 0, errors4: 0, errors5: 0, input: 0, output: 0, cache: 0, latencies: [], ttfts: [], speeds: [], providers: new Map()};
+      entity = {id, requests: 0, successes: 0, canceled: 0, errors4: 0, errors5: 0, input: 0, output: 0, cache: 0, latencies: [], ttfts: [], speeds: [], providers: new Map()};
       entities.set(id, entity);
     }
     entity.requests++;
@@ -71,6 +72,9 @@ function aggregate(rows: LogEntry[], keyOf: (row: LogEntry) => string) {
         const tail = row.latencyMs - row.ttftMs!;
         if (row.outputTokens > 0 && tail > 0) entity.speeds.push(Math.round(row.outputTokens * 1000 / tail));
       }
+    } else if (isTrafficLogCanceled(row)) {
+      // 客户端主动取消不计入失败率：请求已经正常建立，只是调用端先结束了连接。
+      entity.canceled++;
     } else if (row.status >= 500) {
       entity.errors5++;
     } else if (row.status >= 400) {
@@ -200,7 +204,9 @@ export function PerformanceAnalysisPanel({rows, providers, onNavigateLogs}: {row
             {rankedModels.map((entity, index) => {
               const provider = providerByID.get(topProvider(entity));
               const total = entity.input + entity.output;
-              const rate = entity.requests ? entity.successes / entity.requests * 100 : 0;
+              const measured = Math.max(0, entity.requests - entity.canceled);
+              const rate = measured ? entity.successes / measured * 100 : 0;
+              const rateTone = measured ? tone(rate) : 'neutral';
               return <tr key={entity.id}>
                 <td><div className="usage-rank-identity">
                   <span className={`usage-rank-number rank-${index < 3 ? index + 1 : 'rest'}`}>{String(index + 1).padStart(2, '0')}</span>
@@ -208,7 +214,7 @@ export function PerformanceAnalysisPanel({rows, providers, onNavigateLogs}: {row
                   <div><span className="usage-entity-name" title={entity.id}>{entity.id}</span><small className="usage-entity-subtitle">{provider ? provider.name : '未知来源'}{entity.providers.size > 1 ? ` 等 ${entity.providers.size} 个来源` : ''}</small></div>
                 </div></td>
                 <td><b className="usage-ranking-value">{entity.requests.toLocaleString()}</b><small className="usage-cell-caption">{percent(entity.requests, rows.length)} 占比</small></td>
-                <td><span className={`perf-rate is-${tone(rate)}`}>{rate.toFixed(1)}%</span><small className="usage-cell-caption">{entity.requests - entity.successes} 次失败</small></td>
+                <td><span className={`perf-rate is-${rateTone}`}>{measured ? `${rate.toFixed(1)}%` : '—'}</span><small className="usage-cell-caption">{Math.max(0, measured - entity.successes)} 次失败{entity.canceled ? ` · ${entity.canceled} 次取消` : ''}</small></td>
                 <td>{duration(percentile(entity.latencies, .5))}<small className="usage-cell-caption">P90 {duration(percentile(entity.latencies, .9))}</small></td>
                 <td>{duration(percentile(entity.ttfts, .5))}<small className="usage-cell-caption">{entity.ttfts.length} 个流式样本</small></td>
                 <td>{entity.speeds.length ? `${percentile(entity.speeds, .5)} tok/s` : '—'}<small className="usage-cell-caption">{entity.speeds.length} 个样本</small></td>
@@ -232,7 +238,9 @@ export function PerformanceAnalysisPanel({rows, providers, onNavigateLogs}: {row
             <tbody>
               {rankedProviders.map((entity, index) => {
                 const provider = providerByID.get(entity.id);
-                const rate = entity.requests ? entity.successes / entity.requests * 100 : 0;
+                const measured = Math.max(0, entity.requests - entity.canceled);
+                const rate = measured ? entity.successes / measured * 100 : 0;
+                const rateTone = measured ? tone(rate) : 'neutral';
                 return <tr key={entity.id}>
                   <td><div className="usage-rank-identity">
                     <span className={`usage-rank-number rank-${index < 3 ? index + 1 : 'rest'}`}>{String(index + 1).padStart(2, '0')}</span>
@@ -240,7 +248,7 @@ export function PerformanceAnalysisPanel({rows, providers, onNavigateLogs}: {row
                     <div><span className="usage-entity-name" title={entity.id}>{providerUsageLabel(entity.id, providers)}</span><small className="usage-entity-subtitle">{entity.id}</small></div>
                   </div></td>
                   <td><b className="usage-ranking-value">{entity.requests.toLocaleString()}</b><small className="usage-cell-caption">{percent(entity.requests, rows.length)} 占比</small></td>
-                  <td><span className={`perf-rate is-${tone(rate)}`}>{rate.toFixed(1)}%</span><small className="usage-cell-caption">{entity.requests - entity.successes} 次失败</small></td>
+                  <td><span className={`perf-rate is-${rateTone}`}>{measured ? `${rate.toFixed(1)}%` : '—'}</span><small className="usage-cell-caption">{Math.max(0, measured - entity.successes)} 次失败{entity.canceled ? ` · ${entity.canceled} 次取消` : ''}</small></td>
                   <td>{duration(percentile(entity.latencies, .5))}<small className="usage-cell-caption">P90 {duration(percentile(entity.latencies, .9))}</small></td>
                   <td>{duration(percentile(entity.ttfts, .5))}<small className="usage-cell-caption">{entity.ttfts.length} 样本</small></td>
                   <td>{percent(entity.cache, entity.input)}<small className="usage-cell-caption">{formatTokenCount(entity.cache)} Token</small></td>
@@ -268,10 +276,10 @@ export function PerformanceAnalysisPanel({rows, providers, onNavigateLogs}: {row
         <table className="usage-data-table usage-request-table perf-table">
           <thead><tr>{['时间 / 模型', 'Provider', '状态', '耗时 / 首字', '输入 / 输出', '推理'].map(head => <th key={head}>{head}</th>)}</tr></thead>
           <tbody>
-            {slowest.map((row, index) => <tr key={row.id || index} className={row.status >= 400 ? 'is-error' : ''}>
+            {slowest.map((row, index) => <tr key={row.id || index} className={row.status >= 400 && !isTrafficLogCanceled(row) ? 'is-error' : ''}>
               <td><span className="usage-request-model">{row.model}</span><small className="usage-cell-caption">{new Date(row.time).toLocaleString()}</small></td>
               <td>{providerUsageLabel(row.providerId, providers)}</td>
-              <td><span className={`usage-status${row.status >= 400 ? ' is-error' : ''}`}>{row.status >= 400 ? '×' : '✓'} {row.status}</span></td>
+              <td><span className={`usage-status${row.status >= 400 && !isTrafficLogCanceled(row) ? ' is-error' : isTrafficLogCanceled(row) ? ' is-canceled' : ''}`}>{isTrafficLogCanceled(row) ? '—' : row.status >= 400 ? '×' : '✓'} {row.status}</span></td>
               <td>{duration(row.latencyMs)}<small className="usage-cell-caption">{isStreamSample(row) ? duration(row.ttftMs!) : '—'}</small></td>
               <td>{formatTokenCount(row.inputTokens)} / {formatTokenCount(row.outputTokens)}</td>
               <td>{row.reasoningEffort || '—'}</td>
