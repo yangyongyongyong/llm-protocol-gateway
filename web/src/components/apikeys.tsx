@@ -796,36 +796,34 @@ export function ApiKeyFallbackProvidersModal({
                 <div className="api-key-fallback-models-list">
                   {selectedProviders.length > 1 ? (
                     <div className="api-key-fallback-models-batch">
-                      <span className="api-key-fallback-models-batch-label">批量设置</span>
-                      <div className="field-inline">
-                        <SearchableModelSelect
-                          value={batchModel}
-                          models={batchModels}
-                          disabled={busy || saving}
-                          emptyLabel="选一个模型，应用到下面全部备选"
-                          onChange={(value) => { setBatchModel(value); setBatchNotice(''); }}
-                        />
-                        <button
-                          className="mini-btn"
-                          type="button"
-                          disabled={busy || saving || !batchModel.trim()}
-                          onClick={applyBatchModel}
-                          title="把选中的模型写给下面每一个有此模型的备选"
-                        >
-                          应用到全部
-                        </button>
-                        <button
-                          className="mini-btn"
-                          type="button"
-                          disabled={busy || saving}
-                          onClick={clearAllOverrides}
-                          title="清掉所有固定模型，全部改为自动"
-                        >
-                          全部留空
-                        </button>
-                      </div>
-                      <span className="api-key-fallback-models-batch-hint">
-                        {batchNotice || `共 ${selectedProviders.length} 个备选；只写给模型清单里有它的 Provider`}
+                      <span className="api-key-fallback-models-batch-label">批量</span>
+                      <SearchableModelSelect
+                        value={batchModel}
+                        models={batchModels}
+                        disabled={busy || saving}
+                        emptyLabel="选一个模型…"
+                        onChange={(value) => { setBatchModel(value); setBatchNotice(''); }}
+                      />
+                      <button
+                        className="mini-btn"
+                        type="button"
+                        disabled={busy || saving || !batchModel.trim()}
+                        onClick={applyBatchModel}
+                        title="把选中的模型写给下面每一个有此模型的备选"
+                      >
+                        应用到全部
+                      </button>
+                      <button
+                        className="mini-btn"
+                        type="button"
+                        disabled={busy || saving}
+                        onClick={clearAllOverrides}
+                        title="清掉所有固定模型，全部改为自动"
+                      >
+                        全部留空
+                      </button>
+                      <span className="api-key-fallback-models-batch-hint" title={batchNotice || undefined}>
+                        {batchNotice || `${selectedProviders.length} 个备选 · 只写给有此模型的`}
                       </span>
                     </div>
                   ) : null}
@@ -833,30 +831,34 @@ export function ApiKeyFallbackProvidersModal({
                     const providerModels = models.filter((model) => model.providerId === provider.id);
                     const crossProtocol = !sameProtocol(provider);
                     const chosen = (overrides[provider.id] || '').trim();
+                    // 单行三列：Provider 名 / 模型下拉 / 刷新。
+                    // 原先每行是「名字一行 + 下拉一行 + 刷新按钮飘在右边」，一行占两行高，
+                    // 220px 的滚动区只看得见两条半；跨协议说明还再占第三行。现在收成一行，
+                    // 列宽固定后下拉彼此对齐，同屏能看全大半张清单。
+                    // 跨协议那句话进 title：它只在「未固定模型」时才有意义，不该常驻占行。
+                    const rowHint = crossProtocol
+                      ? (chosen ? '跨协议备选：网关会自动转换协议' : '跨协议备选：不固定模型时使用请求模型或该 Provider 默认模型（网关自动转换协议）')
+                      : (chosen ? `固定使用 ${chosen}` : '留空时沿用请求模型或该 Provider 默认模型');
                     return (
-                      <div className="api-key-fallback-models-row" key={provider.id}>
+                      <div className="api-key-fallback-models-row" key={provider.id} title={rowHint}>
                         <ProviderLabel provider={provider} size={16} />
-                        <div className="field-inline">
-                          <SearchableModelSelect
-                            value={overrides[provider.id] || ''}
-                            models={providerModels}
-                            disabled={busy || saving}
-                            emptyLabel="留空 = 自动选择模型"
-                            onChange={(value) => setProviderModel(provider.id, value)}
-                          />
-                          <button
-                            className="mini-btn"
-                            type="button"
-                            disabled={busy || saving || testingProviderID === provider.id}
-                            onClick={() => void onRefreshModels(provider.id, provider.name)}
-                            title="刷新该 Provider 模型列表"
-                          >
-                            {testingProviderID === provider.id ? '刷新中…' : '刷新模型'}
-                          </button>
-                        </div>
-                        {!chosen && crossProtocol ? (
-                          <div className="hint-text">跨协议由网关自动转换；不固定模型时会使用请求模型或该 Provider 的默认模型。</div>
-                        ) : null}
+                        <SearchableModelSelect
+                          value={overrides[provider.id] || ''}
+                          models={providerModels}
+                          disabled={busy || saving}
+                          emptyLabel="自动（沿用请求模型）"
+                          onChange={(value) => setProviderModel(provider.id, value)}
+                        />
+                        <button
+                          className="icon-btn"
+                          type="button"
+                          disabled={busy || saving || testingProviderID === provider.id}
+                          onClick={() => void onRefreshModels(provider.id, provider.name)}
+                          title="刷新该 Provider 的模型列表"
+                          aria-label="刷新该 Provider 的模型列表"
+                        >
+                          {testingProviderID === provider.id ? '…' : '↻'}
+                        </button>
                       </div>
                     );
                   })}

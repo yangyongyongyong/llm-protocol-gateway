@@ -2148,26 +2148,46 @@ body.fpp-dragging, body.fpp-dragging * { cursor: grabbing !important; user-selec
   border-radius: 999px; background: var(--red-soft); color: var(--red-text);
   font-size: var(--fs-xs); font-weight: 700;
 }
-.api-key-fallback-models-list { display: grid; gap: 8px; padding: 8px 10px; max-height: 220px; overflow: auto; }
-/* 批量设置条：备选一多（同一家 N 个账号 = N 行下拉），逐个点相当于把同一件事做 N 遍。
-   这条栏黏在清单顶部，滚动时不跟着走 —— 否则滚到第 8 行想批量，还得先滚回顶部。 */
+/* 固定模型替换：一行一个备选的三列表格。
+   原先每行是「Provider 名一行 + 模型下拉一行 + 刷新按钮飘在右下」，一行占两行高，
+   220px 的滚动区只看得见两条半；跨协议说明还会再占第三行。现在按列对齐：
+   名字（可截断） / 下拉（吃掉剩余宽度） / 刷新图标，一行 ~34px，同屏能看八条。
+   滚动区同步加高，让「备选多」这件事靠滚动解决，而不是靠一屏只显示两条。 */
+.api-key-fallback-models-list { display: grid; gap: 4px; padding: 8px 10px; max-height: 320px; overflow: auto; }
+.api-key-fallback-models-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.9fr) minmax(0, 1.6fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 3px 0;
+}
+.api-key-fallback-models-row > .provider-label,
+.api-key-fallback-models-row > *:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.api-key-fallback-models-row .icon-btn { width: 26px; height: 26px; flex: none; }
+/* 批量条：单行。备选一多（同一家 N 个账号 = N 行下拉），逐个点等于把同一件事做 N 遍；
+   但它自己不能再占两三行，所以只留「批量 / 下拉 / 应用 / 清空」一行，说明进 title。 */
 .api-key-fallback-models-batch {
   position: sticky; top: -8px; z-index: 1;
-  display: grid; gap: 6px; min-width: 0;
-  margin: -8px -10px 0;
-  padding: 8px 10px;
+  display: flex; align-items: center; gap: 8px; min-width: 0;
+  margin: -8px -10px 4px;
+  padding: 7px 10px;
   background: var(--surface-soft);
   border-bottom: 1px solid var(--border);
 }
 .api-key-fallback-models-batch-label {
+  flex: none;
   font-size: var(--fs-sm); font-weight: 700; color: var(--muted);
   letter-spacing: 0.02em;
 }
+.api-key-fallback-models-batch > .searchable-select,
+.api-key-fallback-models-batch > *:nth-child(2) { flex: 1 1 auto; min-width: 0; max-width: 320px; }
+.api-key-fallback-models-batch .mini-btn { flex: none; }
 .api-key-fallback-models-batch-hint {
+  flex: 1 1 auto; min-width: 0;
   font-size: var(--fs-sm); color: var(--subtle);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.api-key-fallback-models-row { display: grid; gap: 4px; min-width: 0; }
 .api-key-fallback-summary-text { margin-right: auto; color: var(--subtle); font-size: var(--fs-sm); }
 
 .api-key-fallback-list { display: grid; gap: 8px; max-height: 360px; overflow: auto; padding-right: 4px; }
