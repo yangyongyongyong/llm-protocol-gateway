@@ -12960,6 +12960,15 @@ html[data-theme="dark"] .wb-task-badge[data-tone="ok"] { color: #6ee7b7; border-
 .peer-upstream-models { min-width: 0; color: var(--text); overflow-wrap: anywhere; }
 .peer-upstream-actions { display: flex; align-items: center; gap: 6px; justify-content: flex-end; }
 .peer-upstream-actions .mini-btn.danger { color: var(--danger, #dc2626); }
+/* 「测试连接」的结果单独占一行：塞在按钮旁边会被挤成两三行竖排。 */
+.peer-upstream-test-result {
+  grid-column: 1 / -1;
+  margin-top: -2px;
+  font-size: 11.5px; line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.peer-upstream-test-result.ok { color: var(--muted); }
+.peer-upstream-test-result.bad { color: var(--danger, #dc2626); }
 
 .peer-cidr-editor {
   display: flex; flex-direction: column; gap: 8px;

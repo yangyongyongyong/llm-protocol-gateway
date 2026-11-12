@@ -114,6 +114,76 @@ func TestPeerModelsForProtocolDropsMismatchedProviders(t *testing.T) {
 
 // 刷新（界面上的「测试连接」）必须更新模型清单，同时绝不能把已存的凭据
 // 清空——Router.UpdateProvider 会拿 patch 里的空 apiKeySource 覆盖旧值。
+// 「测试连接」用的是 refresh：它既要把上游最新的授权清单拉回来，也要能告诉运维
+// 这次同步到底改了什么。上游那边一条授权都没改时不能报错，改了要能看出来。
+// 这条测试盯住"改授权后点测试连接"的真实场景（控制台按钮就是这条路径）。
+func TestPeerUpstreamRefreshPicksUpChangedGrants(t *testing.T) {
+	parent := newPeerTestServer(t,
+		domain.Provider{
+			ID: "p-a", Name: "p-a", Protocol: domain.ProtocolOpenAIChat, BaseURL: "https://parent.example.com",
+			Models: []domain.Model{{ID: "m-a", ProviderID: "p-a", InMenu: true}},
+		},
+	)
+	parent.SetGatewayID(otherID)
+	parentHTTP := httptest.NewServer(parent.Handler())
+	defer parentHTTP.Close()
+
+	child := newPeerTestServer(t)
+	child.SetGatewayID(gwID)
+	registration, granted, err := child.registerWithParent(
+		httptest.NewRequest(http.MethodGet, "/__probe", nil),
+		parentHTTP.URL, "vps1", "sub-gw", "a-strong-password", []string{"p-a"},
+	)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	rows, err := child.createPeerUpstreamProviders(httptest.NewRequest(http.MethodPost, "/__peer-upstreams", nil), registration.ParentURL, domain.ProtocolOpenAIChat, registration, granted)
+	if err != nil {
+		t.Fatalf("create providers: %v", err)
+	}
+	if len(rows) == 0 {
+		t.Fatal("注册之后本机应当多出一条 peer provider")
+	}
+
+	refresh := func() *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/__peer-upstreams/"+rows[0].ID+"/refresh", nil)
+		request.SetPathValue("id", rows[0].ID)
+		request.Host = "127.0.0.1"
+		request.RemoteAddr = "127.0.0.1:40000"
+		recorder := httptest.NewRecorder()
+		child.Handler().ServeHTTP(recorder, request)
+		return recorder
+	}
+
+	// 第一次：清单没变，也必须成功（这是运维点得最多的一次）。
+	if recorder := refresh(); recorder.Code != http.StatusOK {
+		t.Fatalf("unchanged grants: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	// 上游新增一条授权：点测试连接后本机应当多出一条成员行。
+	parent.router.AddProvider(domain.Provider{
+		ID: "p-b", Name: "p-b", Protocol: domain.ProtocolOpenAIChat, BaseURL: "https://parent.example.com",
+		Models: []domain.Model{{ID: "m-b", ProviderID: "p-b", InMenu: true}},
+	})
+	users, _ := parent.userStore.ListUsers()
+	for _, user := range users {
+		if user.IsPeer() {
+			// 授权是按「对端账号 → provider id」存的，直接改这条授权表，
+			// 等价于上游管理员在用户页勾上新增的那一项。
+			if err := parent.roles.SetResourceGrants(user.ID, []string{"p-a", "p-b"}); err != nil {
+				t.Fatalf("set grants: %v", err)
+			}
+		}
+	}
+	if recorder := refresh(); recorder.Code != http.StatusOK {
+		t.Fatalf("added grant: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	members := child.peerUpstreamMembers(peerGroupKeyForProvider(rows[0]))
+	if len(members) != 2 {
+		t.Fatalf("新授权的 provider 应当落成一条新成员行，members = %+v", members)
+	}
+}
+
 func TestPeerUpstreamRefreshKeepsCredential(t *testing.T) {
 	parent := newPeerTestServer(t, domain.Provider{
 		ID: "parent-model", Name: "parent-model", Protocol: domain.ProtocolOpenAIChat,
@@ -837,5 +907,70 @@ func TestPeerUpstreamRefreshKeepsAnchorWhenGrantsEmptied(t *testing.T) {
 	if grants := members[0].PeerGrants; grants == nil || grants.SyncedAt == "" {
 		// 授权快照仍要刷新：界面上「上游授权 0 个」是个可信的结论，不是没同步。
 		t.Fatalf("快照仍应更新：%+v", grants)
+	}
+}
+
+// 对话测试（/__providers/{id}/chat-test）以前把裸请求体直接 POST 到上游的
+// /__peer/chat/completions，换来一句 400 "payload is required"：真实转发走
+// sendPeerDoor 才会套信封。这条测试把「注册 → 对话测试」串起来，保证按钮
+// 点下去和真实调用走的是同一套信封。
+func TestPeerProviderChatTestWrapsUpstreamEnvelope(t *testing.T) {
+	realUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"from parent"}}],"usage":{"prompt_tokens":3,"completion_tokens":2}}`)
+	}))
+	defer realUpstream.Close()
+
+	parent := newPeerTestServer(t, domain.Provider{
+		ID: "parent-model", Name: "parent-model", Protocol: domain.ProtocolOpenAIChat,
+		AuthType: domain.AuthTypeAPIKey, APIKeySource: "literal:sk-parent",
+		BaseURL: realUpstream.URL,
+		Models:  []domain.Model{{ID: "claude-sonnet-4-5", ProviderID: "parent-model", Protocol: domain.ProtocolOpenAIChat, InMenu: true}},
+	})
+	parent.SetGatewayID(otherID)
+	parentHTTP := httptest.NewServer(parent.Handler())
+	defer parentHTTP.Close()
+
+	child := newPeerTestServer(t)
+	child.SetGatewayID(gwID)
+	registration, granted, err := child.registerWithParent(
+		httptest.NewRequest(http.MethodGet, "/__probe", nil),
+		parentHTTP.URL, "vps1", "sub-gw", "a-strong-password", []string{"parent-model"},
+	)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	rows, err := child.createPeerUpstreamProviders(httptest.NewRequest(http.MethodPost, "/__peer-upstreams", nil), registration.ParentURL, domain.ProtocolOpenAIChat, registration, granted)
+	if err != nil {
+		t.Fatalf("create providers: %v", err)
+	}
+	if len(rows) == 0 {
+		t.Fatal("注册之后本机应当多出一条 peer provider")
+	}
+
+	body, _ := json.Marshal(providerChatTestRequest{Model: "claude-sonnet-4-5", UserPrompt: "x+5等于几"})
+	request := httptest.NewRequest(http.MethodPost, "/__providers/"+rows[0].ID+"/chat-test", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Host = "127.0.0.1"
+	request.RemoteAddr = "127.0.0.1:40000"
+	recorder := httptest.NewRecorder()
+	child.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var result struct {
+		Success      bool   `json:"success"`
+		Error        string `json:"error"`
+		ResponseBody string `json:"responseBody"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.Success {
+		t.Fatalf("对话测试应当成功（信封没套上时上游会回 payload is required）：%+v", result)
+	}
+	if !strings.Contains(result.ResponseBody, "from parent") {
+		t.Fatalf("上游的回答必须回来：%s", result.ResponseBody)
 	}
 }

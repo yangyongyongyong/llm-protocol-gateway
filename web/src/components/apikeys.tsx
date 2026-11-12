@@ -52,6 +52,7 @@ import {FallbackProviderPicker} from './fallback_picker';
  */
 export type ApiKeyEditableField =
   | 'name' | 'routeId' | 'modelOverride' | 'thinkingDepthOverride' | 'maxOutputTokens'
+  | 'firstPacketTimeoutSec' | 'sameProviderRetries'
   | 'streamEnabled' | 'codexKeepOfficialLogin' | 'codexForceFast' | 'scheduleMode' | 'enabled'
   | 'quotaWindow' | 'quotaTokens' | 'quotaCostMicros';
 
@@ -177,6 +178,11 @@ export function ApiKeyDetailPanel({
   const activeProviderId = keyItem.activeProviderId || binding.providerId;
   const activeProvider = providers.find((item) => item.id === activeProviderId);
   const usingFallback = Boolean(keyItem.activeProviderId && keyItem.activeProviderId !== binding.providerId);
+  // 「在服务」的多节点口径（见后端 ServingProviderIDs）：最近 10 分钟答过请求的
+  // 每一台都在服务。老后端只给单个 id 时退回那一个，再退回粘滞位。
+  const servingIds = keyItem.servingProviderIds?.length
+    ? keyItem.servingProviderIds
+    : [keyItem.servingProviderId || activeProviderId].filter(Boolean);
   const activeFallbackModel = usingFallback ? (fallbackModelOverrides[keyItem.activeProviderId || ''] || '') : '';
   // 同协议备选不需要锁定模型：请求里的模型名对两边都成立，直接沿用。
   const activeFallbackProvider = providers.find((item) => item.id === activeProviderId);
@@ -434,18 +440,20 @@ export function ApiKeyDetailPanel({
               </button>
             </div>
             {/* 故障转移是一条链，就按链排：一行一个候选，谁在服务一眼看到底。
-                原来把整条链拼成一句「1. A → m ； 2. B → m」的纯文本，三个备选就换行成糊。 */}
+                原来把整条链拼成一句「1. A → m ； 2. B → m」的纯文本，三个备选就换行成糊。
+                会话分散下多台同时服务是正常的，所以「在服务」按后端给的窗口内节点集合判，
+                而不是只看粘滞位。 */}
             <div className="fallback-chain">
               <FallbackChainRow
                 rank="首选"
                 provider={primaryProvider}
                 missingLabel="未绑定"
                 modelLabel={keyItem.modelOverride || '按客户端模型'}
-                serving={!usingFallback}
-                stateLabel={usingFallback ? '已切走' : '在服务'}
+                serving={servingIds.includes(binding.providerId)}
+                stateLabel={servingIds.includes(binding.providerId) ? '在服务' : (usingFallback ? '已切走' : undefined)}
               />
               {fallbackIds.map((id, index) => {
-                const serving = usingFallback && activeProviderId === id;
+                const serving = servingIds.includes(id);
                 const fallbackProvider = providers.find((item) => item.id === id);
                 const modelOverride = fallbackModelOverrides[id];
                 const inheritsModel = !modelOverride && sameProtocolAsPrimary(fallbackProvider);

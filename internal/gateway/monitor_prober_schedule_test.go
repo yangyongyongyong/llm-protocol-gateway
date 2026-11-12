@@ -186,7 +186,13 @@ func TestRunProbeTickWithoutTrafficSendsNothing(t *testing.T) {
 	server, _ := newQuotaTestServer(t, upstream.URL)
 	server.monitoringStore = db
 
-	server.runProbeTick(context.Background(), time.Now().UTC())
+	// 固定到一个**不在**默认每日窗口（本地 04:00–06:00）里的时刻。
+	// 以前这里传 time.Now()，于是这条测试在每天 04:00–06:00 之间必红：
+	// 那时每日轮是开着的，而 allowDaily 只看当日用量、不看有没有真实流量，
+	// 于是一个"从没跑过"的账号会被补一发。那是每日轮本来的语义，不是这条
+	// 测试要断言的东西——它要断言的是「没流量就没事件驱动探测」。
+	at := time.Date(2026, 1, 15, 13, 0, 0, 0, time.UTC)
+	server.runProbeTick(context.Background(), at)
 	if calls != 0 {
 		t.Fatalf("default config must not probe from the gateway: %d calls", calls)
 	}

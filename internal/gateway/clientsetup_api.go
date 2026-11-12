@@ -31,6 +31,18 @@ func (s *Server) handleSetupClients(w http.ResponseWriter, r *http.Request) {
 		GatewayURL string `json:"gatewayUrl"`
 		Token      string `json:"token"`
 		Model      string `json:"model"`
+		// Client 决定写哪一家：空 / "claude" 是原有的 Claude CLI + Desktop；
+		// "codex" 走 Codex CLI 的 ~/.codex/config.toml。
+		Client string `json:"client"`
+		// 以下是 Codex 专用字段：BaseURL 之外它还要 provider id、模型名与模型目录。
+		CodexProviderID   string `json:"codexProviderId"`
+		CodexProviderName string `json:"codexProviderName"`
+		CodexModel        string `json:"codexModel"`
+		CodexEffort       string `json:"codexEffort"`
+		CodexCatalogPath  string `json:"codexCatalogPath"`
+		CodexCatalog      string `json:"codexCatalog"`
+		// CodexKeepOfficialLogin=true 时不动 auth.json，保住本机原有的 ChatGPT 登录。
+		CodexKeepOfficialLogin bool `json:"codexKeepOfficialLogin"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid JSON body")
@@ -38,6 +50,25 @@ func (s *Server) handleSetupClients(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.TrimSpace(input.BaseURL) == "" || strings.TrimSpace(input.Token) == "" {
 		writeOpenAIError(w, http.StatusBadRequest, "baseUrl and token are required")
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(input.Client), "codex") {
+		res, err := clidesktop.ApplyCodex(clidesktop.CodexEndpoint{
+			ProviderID:        strings.TrimSpace(input.CodexProviderID),
+			ProviderName:      strings.TrimSpace(input.CodexProviderName),
+			BaseURL:           strings.TrimSpace(input.BaseURL),
+			Token:             strings.TrimSpace(input.Token),
+			Model:             strings.TrimSpace(input.CodexModel),
+			ReasoningEffort:   strings.TrimSpace(input.CodexEffort),
+			ModelCatalogPath:  strings.TrimSpace(input.CodexCatalogPath),
+			ModelCatalog:      input.CodexCatalog,
+			KeepOfficialLogin: input.CodexKeepOfficialLogin,
+		})
+		payload := map[string]any{"ok": err == nil, "result": res}
+		if err != nil {
+			payload["error"] = err.Error()
+		}
+		writeJSON(w, http.StatusOK, payload)
 		return
 	}
 	res, err := clidesktop.Apply(clidesktop.Endpoint{

@@ -25,8 +25,8 @@ func TestUpdateAPIKeyToleratesItsOwnDanglingRoute(t *testing.T) {
 		// The console echoes the current routeId back on every save.
 		RouteID:             "route-that-was-deleted",
 		FallbackProviderIDs: []string{"p-new"},
-		// With no resolvable primary the console requires a fixed model for the
-		// backup (see fallbackModelRequiredLocked), and offers a picker for it.
+		// 没锁模型也该存得下：备选自己的目录会给出默认模型，缺一个锁定值
+		// 不该让整次保存被拒。
 		FallbackModelOverrides: map[string]string{"p-new": "glm-5.2"},
 	})
 	if err != nil {
@@ -43,19 +43,23 @@ func TestUpdateAPIKeyToleratesItsOwnDanglingRoute(t *testing.T) {
 	}
 }
 
-// The runtime rule stays: a backup whose protocol cannot be compared with the
-// primary must pin a model. Saving one without it is still refused.
-func TestUpdateAPIKeyStillRequiresAModelForADanglingPrimary(t *testing.T) {
+// 首选失效时，备选没有锁定模型也该存得下：链路的可用性不该取决于有没有填
+// 一个覆盖值——备选自己的模型目录会兜底（applyProviderModelFallback）。
+func TestUpdateAPIKeyAcceptsAModelLessBackupForADanglingPrimary(t *testing.T) {
 	router := NewRouter(domain.GatewayState{
 		Providers: []domain.Provider{{ID: "p-new", Name: "new", AuthType: domain.AuthTypeAPIKey}},
 		APIKeys:   []domain.APIKey{{ID: "k1", Name: "k", RouteID: "route-that-was-deleted"}},
 	})
 
-	if _, err := router.UpdateAPIKey("k1", domain.APIKey{
+	updated, err := router.UpdateAPIKey("k1", domain.APIKey{
 		RouteID:             "route-that-was-deleted",
 		FallbackProviderIDs: []string{"p-new"},
-	}); err == nil {
-		t.Fatal("want an error: a backup with no comparable primary must pin a model")
+	})
+	if err != nil {
+		t.Fatalf("UpdateAPIKey: %v", err)
+	}
+	if len(updated.FallbackProviderIDs) != 1 {
+		t.Fatalf("fallbacks = %v, want p-new kept", updated.FallbackProviderIDs)
 	}
 }
 

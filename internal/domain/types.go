@@ -334,6 +334,18 @@ type Provider struct {
 	// and a provider that thinks for two minutes before answering is not
 	// mistaken for a hung one.
 	FirstPacketTimeoutSec int `json:"firstPacketTimeoutSec,omitempty"`
+	// ProtocolSupport 是这台上游「实测支持哪些线协议」的结论，由创建/变更
+	// baseUrl 之后的后台探测写下（见 gateway.detectProviderProtocols）。
+	//
+	// 为什么要存下来：一个上游（OpenCode Go 是典型）可能同时在 /v1 和
+	// /anthropic/v1 提供两套协议。知道这件事之后，网关才能在链路里优先挑与
+	// 下游协议相同的那个 provider —— 直通只是搬字节，转换才是容易出问题的那层。
+	// 探测是网络动作，不能每次渲染控制台都跑一遍，所以结论落库。
+	//
+	// 空 = 还没探过（老记录、或探测失败）。绝不把「没探过」当成「什么都不支持」。
+	ProtocolSupport []string `json:"protocolSupport,omitempty"`
+	// ProtocolProbedAt 是上次探测的时间（RFC3339），空 = 从未探过。
+	ProtocolProbedAt string `json:"protocolProbedAt,omitempty"`
 	// MaxConcurrentRequests caps how many upstream requests this provider serves
 	// at the same time; 0 (the default) means no cap. It is admission control,
 	// not a fairness promise: a burst is refused by the gateway with 429 before
@@ -833,6 +845,21 @@ type APIKey struct {
 	// MaxOutputTokens 可选覆盖上游 max_tokens / max_output_tokens。
 	// 0 表示按实际上游模型自动解析；>0 时优先使用该值（用于新模型或临时调高/压低）。
 	MaxOutputTokens int `json:"maxOutputTokens,omitempty"`
+	// FirstPacketTimeoutSec 是这个 Key 的「等上游响应头」上限，覆盖它名下所有
+	// Provider。0 = 不单独设，按各 Provider 自己的 FirstPacketTimeoutSec（再没有
+	// 就落到网关默认的 120s 空闲窗口）。
+	//
+	// 为什么要在 Key 上再放一个：同一个 Provider 可能同时服务「秒回的聊天」和
+	// 「先想两分钟再开口」的重模型，Provider 级的一个数答不了两种用法；而调用方
+	// 最清楚自己这一把 Key 是干什么的。
+	FirstPacketTimeoutSec int `json:"firstPacketTimeoutSec,omitempty"`
+	// SameProviderRetries 是「同一个 Provider 上最多再试几次」。
+	//
+	// 默认 0 = 一失败就换下一个节点（历史行为）。设成 1 或 2 之后，网络抖动、
+	// 上游一瞬间的 5xx 这类瞬时故障会先在原地重试，不把整条链路往前推——这才是
+	// 「第一个明明还能用，偶尔出错就切走」那类抱怨的正解。只对可重试的失败生效
+	// （传输错误、5xx、429 这类），4xx 参数错误重试多少次都一样。
+	SameProviderRetries int `json:"sameProviderRetries,omitempty"`
 	// QuotaWindow 是额度口径："day"（按网关本机时区的 0 点重置）或 "month"
 	// （1 号 0 点）。空表示不设额度，也是升级前所有密钥的行为。
 	// 按本机日历而不是 UTC：这套网关是一个运维给自己的客户端用的，「每天 0 点重新开始」
@@ -893,6 +920,12 @@ type APIKey struct {
 	// 控制台的「在服务」看它：会话粘性命中的请求不会改写 ActiveProviderID，
 	// 只看粘滞位会把正在服务的备选显示成首选。空 = 进程启动后还没有请求。
 	ServingProviderID string `json:"servingProviderId,omitempty"`
+	// ServingProviderIDs 是最近 10 分钟内真正返回过响应的全部 Provider。
+	//
+	// 会话分散（spread）下多条会话各落一个账号是常态，那时它们都真的在服务，
+	// 控制台要同时把它们标绿才对得上「分散」二字。只给一个的话，另外两条会被
+	// 显示成「待命」，看起来像分散没生效。
+	ServingProviderIDs []string `json:"servingProviderIds,omitempty"`
 	// OwnerUserID binds this key to a console user. Empty means the key belongs
 	// to the administrator (legacy keys default to admin ownership).
 	OwnerUserID string `json:"ownerUserId,omitempty"`

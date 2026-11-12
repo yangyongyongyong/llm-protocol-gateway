@@ -1309,6 +1309,14 @@ func (s *Server) executeProtocolFlowWithFailover(
 		}
 		defer admission.release()
 	}
+	// 这个 Key 自己设的等待窗口，沿 context 传到真正发请求的地方（见
+	// effectiveFirstPacketTimeout）。挂在 r 上而不是当参数层层传：发送点在每种
+	// 协议各自的 send 闭包深处，加一个参数要改一长串签名。
+	if gatewayKeyMatched {
+		if seconds := clampFirstPacketTimeoutSec(matchedKey.FirstPacketTimeoutSec); seconds > 0 {
+			r = r.WithContext(withAPIKeyFirstPacketTimeout(r.Context(), time.Duration(seconds)*time.Second))
+		}
+	}
 
 	if !gatewayKeyMatched {
 		timer := startAttempt()
@@ -1377,6 +1385,8 @@ func (s *Server) executeProtocolFlowWithFailover(
 		advance: true,
 	})
 	attempts, pinnedProviderID := s.applySessionPin(sessionKey, attempts)
+	// 能直通就别转换：同一个上游同时支持多种协议时，让下游的协议决定走哪一条。
+	attempts = s.preferNativeProtocol(attempts, clientProtocol, pinnedProviderID)
 	// spread mode decides a conversation's account here, before the request is
 	// sent: two conversations that start at the same moment would both read an
 	// empty table and pick the same account. A turn that settles nothing (every
@@ -1402,7 +1412,14 @@ func (s *Server) executeProtocolFlowWithFailover(
 	var lastDecision domain.RouteDecision = decision
 	lastModel := model
 	requestModel, _ := req["model"].(string)
-	for i, providerID := range attempts {
+	// 索引循环而不是 range：原地重试要把 i 退回去重打同一个节点。
+	sameNodeRetries := 0
+	for i := 0; i < len(attempts); i++ {
+		providerID := attempts[i]
+		// 换到下一个节点，重试配额重新算。
+		if i > 0 && attempts[i-1] != providerID {
+			sameNodeRetries = 0
+		}
 		// 被管理员停用的 Provider 对所有 Key 都不可用，管理员自己的 Key 也一样：
 		// 停用是“这个账号先别发了”，不是按用户授权。
 		if provider, err := s.router.ProviderByID(providerID); err == nil && provider.Disabled {
@@ -1411,7 +1428,9 @@ func (s *Server) executeProtocolFlowWithFailover(
 			noteScheduleAttempt(r.Context(), monitor.RequestAttempt{ProviderID: providerID, Reason: attemptReasonDisabled, Skipped: true})
 			continue
 		}
-		attemptDecision, err := s.router.DecideForProvider(route.ID, providerID)
+		// 按这次请求的协议判定这一跳该直通还是转换。用不带协议的老调用会把
+		// route 的 OutputProtocol 捡回来——同一把 Key 换条端点就变成"转换未实现"。
+		attemptDecision, err := s.router.DecideForProviderProtocol(route.ID, providerID, clientProtocol)
 		if err != nil {
 			lastErr = err
 			noteScheduleAttempt(r.Context(), monitor.RequestAttempt{ProviderID: providerID, Reason: attemptReasonUndecidable, Error: truncateReason(err.Error()), Skipped: true})
@@ -1426,15 +1445,17 @@ func (s *Server) executeProtocolFlowWithFailover(
 			if matchedKey.FallbackModelOverrides != nil {
 				override = strings.TrimSpace(matchedKey.FallbackModelOverrides[providerID])
 			}
-			// 同协议备选沿用请求模型；跨协议备选必须锁定自己的模型，否则把
-			// 上游 A 的模型名发给协议不同的上游 B 只会换来一个 400。
-			if override == "" && s.router.fallbackModelRequired(route.ProviderID, providerID) {
-				s.logs.AddApp("warn", "provider failover skipped missing model override", fmt.Sprintf("key=%s provider=%s", matchedKey.ID, providerID))
-				noteScheduleAttempt(r.Context(), monitor.RequestAttempt{ProviderID: providerID, Reason: attemptReasonMissingModel, Skipped: true})
-				continue
-			}
+			// 跨协议备选不再强制要求锁定模型：模型解析会按备选自己的目录兜底
+			// （见 applyProviderModelFallback）。但转换器本身仍然要看两端：这条
+			// 链路真的要走转换、而对应的转换器没实现时，发出去只会换来一句 400，
+			// 跳过比白打一次好（与 executeProtocolFlow 的 switch 表同一份事实）。
 			if override != "" {
 				attemptKey.ModelOverride = override
+			}
+			if !attemptServesClientProtocol(attemptDecision, clientProtocol) {
+				s.logs.AddApp("warn", "provider failover skipped unsupported conversion", fmt.Sprintf("key=%s provider=%s %s->%s", matchedKey.ID, providerID, clientProtocol, attemptDecision.InputProtocol))
+				noteScheduleAttempt(r.Context(), monitor.RequestAttempt{ProviderID: providerID, Reason: attemptReasonUnsupportedConversion, Skipped: true})
+				continue
 			}
 		}
 		attemptProvider, _ := s.router.ProviderByID(providerID)
@@ -1539,6 +1560,16 @@ func (s *Server) executeProtocolFlowWithFailover(
 				if t := requestTimingFrom(r.Context()); t != nil {
 					t.resetUpstreamMarks()
 				}
+				// 原地重试：传输错误多半是瞬时抖动（连接被重置、上游一瞬间
+				// 打嗝），换账号解决不了问题，反而把整条链路白推一格。次数由
+				// Key 的 SameProviderRetries 决定，0 = 旧行为（直接换下一个）。
+				// 模型繁忙不重试：那是上游在排队，再打一次只会排得更后面。
+				if !busy && sameNodeRetries < matchedKey.SameProviderRetries {
+					sameNodeRetries++
+					s.logs.AddApp("info", "provider retried on the same node", fmt.Sprintf("key=%s provider=%s try=%d/%d err=%s", matchedKey.ID, providerID, sameNodeRetries, matchedKey.SameProviderRetries, execErr.Error()))
+					i--
+					continue
+				}
 				s.logs.AddApp("warn", "provider failover after transport error", fmt.Sprintf("key=%s from=%s err=%s", matchedKey.ID, providerID, execErr.Error()))
 				s.noteProviderUsage(providerID, usage)
 				s.releaseSessionPin(sessionKey, pinnedProviderID, providerID)
@@ -1583,6 +1614,16 @@ func (s *Server) executeProtocolFlowWithFailover(
 			markTimingFlag(r.Context(), timingFlagFailoverRetry)
 			if t := requestTimingFrom(r.Context()); t != nil {
 				t.resetUpstreamMarks()
+			}
+			// 同一节点先重试：5xx 和「模型繁忙」在这一层就是可重试的瞬时故障。
+			// 4xx（参数错误、认证失败）不走这条路——重试多少次结果都一样，那是
+			// 该换节点或该直接报错的场景。
+			retryable := status >= 500 || status == http.StatusTooManyRequests
+			if retryable && sameNodeRetries < matchedKey.SameProviderRetries {
+				sameNodeRetries++
+				s.logs.AddApp("info", "provider retried on the same node", fmt.Sprintf("key=%s provider=%s try=%d/%d status=%d", matchedKey.ID, providerID, sameNodeRetries, matchedKey.SameProviderRetries, status))
+				i--
+				continue
 			}
 			s.logs.AddApp("warn", "provider failover after upstream error", fmt.Sprintf("key=%s from=%s status=%d", matchedKey.ID, providerID, status))
 			s.releaseSessionPin(sessionKey, pinnedProviderID, providerID)
@@ -1827,6 +1868,15 @@ func (s *Server) probeProviderAvailable(ctx context.Context, provider domain.Pro
 // sent: the conversation's pinned account when there is one, otherwise the
 // first provider the failover loop would try.
 func (s *Server) decisionForAPIKey(route domain.Route, key domain.APIKey, fallback domain.RouteDecision, sessionKey string) domain.RouteDecision {
+	return s.decisionForAPIKeyProtocol(route, key, fallback, sessionKey, "")
+}
+
+// decisionForAPIKeyProtocol 是 decisionForAPIKey 的「按这次请求的协议」版本。
+//
+// 协议必须一路传到底：这里重算的那份 decision 决定了日志归属，也决定了
+// pass_through 还是 convert。用不带协议的老调用会把 route 上的 OutputProtocol
+// 又捡回来，等于把「一把 Key 多种协议」在临门一脚处废掉。
+func (s *Server) decisionForAPIKeyProtocol(route domain.Route, key domain.APIKey, fallback domain.RouteDecision, sessionKey string, clientProtocol domain.Protocol) domain.RouteDecision {
 	chain := apiKeyProviderChain(route.ProviderID, key.FallbackProviderIDs)
 	// Mirror the request-time authorization filter in
 	// executeProtocolFlowWithFailover so the pre-flight decision (used for
@@ -1846,7 +1896,9 @@ func (s *Server) decisionForAPIKey(route domain.Route, key domain.APIKey, fallba
 		keyID:  key.ID,
 	})
 	attempts, _ = s.applySessionPin(sessionKey, attempts)
-	decision, err := s.router.DecideForProvider(route.ID, attempts[0])
+	// 与执行循环保持同一口径，否则日志里记的节点会和真正服务的那个不一样。
+	attempts = s.preferNativeProtocol(attempts, clientProtocol, "")
+	decision, err := s.router.DecideForProviderProtocol(route.ID, attempts[0], clientProtocol)
 	if err != nil {
 		return fallback
 	}

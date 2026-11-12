@@ -23,12 +23,17 @@ import {
   apiKeyClientBaseURL,
   apiKeyGatewayRoot,
   applyClaudeClientSetup,
+  applyCodexClientSetup,
+  buildApiKeyCodexModelCatalogJSON,
   buildClaudeCodeSwitcherScript,
   clientConfigsForProtocol,
+  codexCatalogPathForHome,
   copyToClipboard,
   localAgentGatewayRoot,
   protocolLabel,
   protocolFromLabel,
+  resolveCodexReasoningEffort,
+  sanitizeClientConfigID,
   ScheduleModeOptions,
   thinkingDepthSelectOptions,
 } from '../lib';
@@ -711,6 +716,9 @@ export function ApiKeyDetailWorkspace(props: ApiKeyWorkspaceProps) {
   }
 
   const clientURL = route ? apiKeyClientBaseURL(route, endpoints, effectivePublicBase) : '';
+  // 三条端点共用一个网关根地址，路径各不相同（见下面 url 菜单）。
+  const gatewayURL = apiKeyGatewayRoot(endpoints, effectivePublicBase).replace(/\/$/, '');
+  const [urlMenuOpen, setUrlMenuOpen] = React.useState(false);
 
   const tabs: Array<{id: ApiKeyDetailTab; label: string; icon: React.ReactNode}> = [
     {id: 'routing', label: '转发方案与容灾链路', icon: ICONS.shuffle},
@@ -752,16 +760,48 @@ export function ApiKeyDetailWorkspace(props: ApiKeyWorkspaceProps) {
           ) : null}
         </div>
         <div className="akc-detail-actions">
-          <button
-            type="button"
-            className={`akc-action${copied === 'url' ? ' copied' : ''}`}
-            disabled={!clientURL}
-            onClick={() => copy(clientURL, `已复制客户端 Base URL：${clientURL}`, 'url')}
-            title={clientURL || '请先为密钥绑定路由'}
-          >
-            <Icon path={copied === 'url' ? ICONS.check : ICONS.copy} size={13} />
-            <span>{copied === 'url' ? '已复制' : '复制 URL'}</span>
-          </button>
+          {/* 一把 Key 三条端点都能用，所以「复制 URL」要给三条，而不是按输出
+              协议只给一条。用哪条由客户端自己决定——这也正是删掉「输出协议」
+              下拉之后用户该看的东西。 */}
+          <div className="akc-url-picker">
+            <button
+              type="button"
+              className={`akc-action${copied.startsWith('url-') ? ' copied' : ''}`}
+              disabled={!gatewayURL}
+              title={gatewayURL ? '选择要复制的端点地址' : '请先为密钥绑定路由'}
+              onClick={() => setUrlMenuOpen((open) => !open)}
+            >
+              <Icon path={copied.startsWith('url-') ? ICONS.check : ICONS.copy} size={13} />
+              <span>{copied.startsWith('url-') ? '已复制' : '复制 URL'}</span>
+            </button>
+            {urlMenuOpen ? (
+              <div className="akc-url-menu" role="menu">
+                {([
+                  {id: 'claude', label: 'Claude（Messages）', path: '/anthropic'},
+                  {id: 'chat', label: 'OpenAI Chat', path: '/v1'},
+                  {id: 'responses', label: 'OpenAI Responses（Codex）', path: '/openai/v1'},
+                ] as const).map((item) => {
+                  const full = `${gatewayURL}${item.path}`;
+                  return (
+                    <button
+                      key={item.id}
+                      type="button"
+                      role="menuitem"
+                      className="akc-url-menu-item"
+                      title={full}
+                      onClick={() => {
+                        setUrlMenuOpen(false);
+                        copy(full, `已复制 ${item.label} 地址：${full}`, `url-${item.id}`);
+                      }}
+                    >
+                      <span className="akc-url-menu-label">{item.label}</span>
+                      <code className="akc-url-menu-path">{item.path}</code>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : null}
+          </div>
           <button
             type="button"
             className={`akc-action${copied === 'key' ? ' copied' : ''}`}
@@ -936,9 +976,13 @@ function RoutingTab({
   const staleFallbackCount = fallbackRefs.length - fallbackIds.length;
   const overrides = keyItem.fallbackModelOverrides || {};
   const primary = providers.find((item) => item.id === primaryProviderId);
-  // 「在服务」= 后端记录的真实服务节点（含会话粘性命中的备选）；老后端没有这个
-  // 字段时退回粘滞位，再退回首选。
-  const servingProviderId = keyItem.servingProviderId || keyItem.activeProviderId || primaryProviderId;
+  // 「在服务」= 后端记录的真实服务节点。会话分散下多台同时服务是正常的：最近
+  // 10 分钟内答过请求的每一台都算，只标一台会把其余几台显示成「待命」，看起来
+  // 像分散没生效。老后端没有这个字段时退回粘滞位，再退回首选。
+  const servingProviderIds = keyItem.servingProviderIds?.length
+    ? keyItem.servingProviderIds
+    : [keyItem.servingProviderId || keyItem.activeProviderId || primaryProviderId];
+  const isServing = (id: string) => Boolean(id) && servingProviderIds.includes(id);
   const [dragState, setDragState] = React.useState<RowDragState>({draggingId: '', overId: '', after: false});
   const drag: RowDragBinding = {
     state: dragState,
@@ -1093,7 +1137,11 @@ function RoutingTab({
             provider={primary}
             fallbackProviderId={primaryProviderId}
             model={keyItem.modelOverride || primary?.defaultModel || ''}
-            serving={servingProviderId === primaryProviderId || !servingProviderId}
+            modelMuted={!keyItem.modelOverride}
+            models={primary ? models.filter((model) => model.providerId === primary.id) : []}
+            onPickModel={(model) => void panel.onUpdateField(keyItem, 'modelOverride', model)}
+            onClearModel={() => void panel.onUpdateField(keyItem, 'modelOverride', '')}
+            serving={isServing(primaryProviderId) || servingProviderIds.length === 0}
             providerModelCount={primary ? models.filter((model) => model.providerId === primary.id).length : 0}
             saving={saving}
             testingProviderID={testingProviderID}
@@ -1113,7 +1161,14 @@ function RoutingTab({
                 fallbackProviderId={id}
                 model={override || (inherits ? '请求模型' : '')}
                 modelMuted={!override}
-                serving={servingProviderId === id}
+                models={provider ? models.filter((model) => model.providerId === provider.id) : []}
+                onPickModel={(model) => void panel.onUpdateFallbacks(
+                  keyItem, fallbackIds, {...overrides, [id]: model},
+                )}
+                onClearModel={() => void panel.onUpdateFallbacks(
+                  keyItem, fallbackIds, removeKey(overrides, id),
+                )}
+                serving={isServing(id)}
                 saving={saving}
                 testingProviderID={testingProviderID}
                 drag={drag}
@@ -1190,6 +1245,9 @@ function PipelineRow({
   fallbackProviderId,
   model,
   modelMuted,
+  models,
+  onPickModel,
+  onClearModel,
   serving,
   saving,
   testingProviderID,
@@ -1205,6 +1263,10 @@ function PipelineRow({
   fallbackProviderId: string;
   model: string;
   modelMuted?: boolean;
+  /** 该节点自己的模型目录：备选行的模型下拉就从这里取，不用跑去弹窗里配。 */
+  models?: Model[];
+  onPickModel?: (model: string) => void;
+  onClearModel?: () => void;
   serving: boolean;
   saving: boolean;
   testingProviderID: string;
@@ -1231,7 +1293,8 @@ function PipelineRow({
   const dragProps = drag ? {
     onPointerDown: (event: React.PointerEvent<HTMLDivElement>) => {
       if (saving || event.button !== 0) return;
-      if ((event.target as HTMLElement).closest('button')) return;
+      // 点模型下拉是在配置这一行，不是在排序；交给下拉自己处理。
+      if ((event.target as HTMLElement).closest('button, input, .searchable-select')) return;
       drag.onPointerDown(event, fallbackProviderId);
     },
   } : {};
@@ -1253,7 +1316,18 @@ function PipelineRow({
         )}
       </div>
       <div className="akc-chain-middle">
-        {provider ? (
+        {/* 备选行的模型以前只能去「配置备选 Provider」弹窗里改，可它本来就摆在
+            这一行上——能看见就该能改，所以直接做成下拉。首选行的模型仍在上面
+            「模型替换与推理深度」里改（那是同一条链路的首选位）。 */}
+        {provider && onPickModel ? (
+          <SearchableModelSelect
+            value={modelMuted ? '' : model}
+            models={models || []}
+            disabled={saving}
+            emptyLabel="沿用请求模型"
+            onChange={(next) => (next ? onPickModel(next) : onClearModel?.())}
+          />
+        ) : provider ? (
           <span className={`akc-model-chip${modelMuted || !model ? ' muted' : ''}`} title={modelMuted ? '沿用请求里的模型名' : '该节点锁定的模型'}>
             {model || '未锁定模型'}
           </span>
@@ -1483,22 +1557,11 @@ function ParamsTab({
               </select>
             </div>
           ) : null}
-          <div className="akc-form-row">
-            <div className="akc-field">
-              <label>输出协议</label>
-              <select
-                value={protocolLabel(bindingOutputProtocol)}
-                disabled={saving || !primaryProviderId}
-                onChange={(event) => void panel.onUpdateBinding(keyItem, primaryProviderId, protocolFromLabel(event.target.value))}
-              >
-                {fixedOutputLabels.map((label) => <option key={label} value={label}>{label}</option>)}
-              </select>
-            </div>
-            <div className="akc-field">
-              <label>上游母语协议</label>
-              <div className="akc-readonly">{primaryProvider ? protocolLabel(primaryProvider.protocol) : '—'}</div>
-            </div>
-          </div>
+          {/* 「输出协议」已经删掉：一把 Key 本来就能同时服务 Claude Code、Codex
+              和任意 OpenAI SDK，每条端点自带协议，网关按本次请求实际走的那条
+              端点决定直通还是转换。留一个下拉只会让人以为选它就限制了 —— 以前
+              确实限制（另一条端点会被拒），现在不会了。
+              下面的「协议接入一览」列出三条可用地址，用哪条由客户端自己决定。 */}
           <div className="akc-field">
             <div className="akc-label-row">
               <label>公网 Base URL 预览</label>
@@ -1522,19 +1585,18 @@ function ParamsTab({
           </span>
         </div>
         <div className="akc-form">
+          {/* 「固定模型替换」已经挪到「转发方案与容灾链路」——首选和备选各有自己
+              的模型覆盖，放在那边才能一眼看见整条链路用的是哪个模型。这里只留
+              刷新按钮：模型清单是链路配模型的前提，放在哪一页都要够得着。 */}
           <div className="akc-field">
             <div className="akc-label-row">
-              <label>固定模型替换</label>
-              <InfoTip text="设置后将忽略请求体中的 model，统一替换为所选模型；留空表示按客户端请求的模型走。" />
+              <label>模型清单</label>
+              <InfoTip text="模型替换在「转发方案与容灾链路」里按节点配置：首选和每个备选各有自己的模型。这里只负责把这个 Provider 的模型列表拉新。" />
             </div>
             <div className="akc-field-inline">
-              <SearchableModelSelect
-                value={keyItem.modelOverride || ''}
-                models={providerModels}
-                disabled={saving || !primaryProvider}
-                emptyLabel={primaryProvider?.defaultModel ? `（不替换 · 默认 ${primaryProvider.defaultModel}）` : '（不替换，使用请求体 model）'}
-                onChange={(value) => void panel.onUpdateField(keyItem, 'modelOverride', value)}
-              />
+              <span className="akc-muted-inline">
+                {providerModels.length > 0 ? `${providerModels.length} 个模型` : '还没有模型清单'}
+              </span>
               <button
                 type="button"
                 className="akc-soft-btn"
@@ -1549,7 +1611,13 @@ function ParamsTab({
 
           <div className="akc-form-row">
             <div className="akc-field">
-              <label>思考深度</label>
+              <div className="akc-label-row">
+                <label>思考深度</label>
+                {/* 这是 Key 级设置：不论这一轮落到首选还是哪个备选、走哪个模型
+                    都按它发。放在「基本绑定」里最容易被误读成只对首选生效，
+                    所以把范围写在问号里。 */}
+                <InfoTip text="这个 Key 的全局思考深度：无论请求最终落在首选、哪个备选，还是哪个模型，都按这里发。留空表示尊重客户端自己带的值（例如 reasoning_effort / thinking）。" />
+              </div>
               <select
                 value={keyItem.thinkingDepthOverride || ''}
                 disabled={saving}
@@ -1562,6 +1630,19 @@ function ParamsTab({
               value={keyItem.maxOutputTokens && keyItem.maxOutputTokens > 0 ? keyItem.maxOutputTokens : 0}
               disabled={saving}
               onSave={(value) => panel.onUpdateField(keyItem, 'maxOutputTokens', value)}
+            />
+          </div>
+
+          <div className="akc-form-row">
+            <FirstPacketTimeoutField
+              value={keyItem.firstPacketTimeoutSec && keyItem.firstPacketTimeoutSec > 0 ? keyItem.firstPacketTimeoutSec : 0}
+              disabled={saving}
+              onSave={(value) => panel.onUpdateField(keyItem, 'firstPacketTimeoutSec', value)}
+            />
+            <SameProviderRetriesField
+              value={keyItem.sameProviderRetries && keyItem.sameProviderRetries > 0 ? keyItem.sameProviderRetries : 0}
+              disabled={saving}
+              onSave={(value) => panel.onUpdateField(keyItem, 'sameProviderRetries', value)}
             />
           </div>
 
@@ -1653,8 +1734,86 @@ function MaxOutputTokensField({value, disabled, onSave}: {value: number; disable
   );
 }
 
-function ApiKeyNameField({name, disabled, onSave}: {name: string; disabled: boolean; onSave: (name: string) => Promise<void>}) {
-  const [draft, setDraft] = React.useState(name);
+/**
+ * 这个 Key 等上游「响应头」的上限。
+ *
+ * 只覆盖「请求已发出、上游还没开口」这一段：一旦响应头到了，长回答、慢 stream
+ * 都不受影响。默认 0 表示按各 Provider 自己的设置走（再没有就是网关的 120s
+ * 空闲窗口）——同一个 Provider 可能既跑秒回的聊天又跑先想两分钟的模型，所以这
+ * 个值放在 Key 上才答得了「我这把钥匙要等多久」。
+ */
+function FirstPacketTimeoutField({value, disabled, onSave}: {value: number; disabled: boolean; onSave: (value: number) => Promise<void>}) {
+  const [draft, setDraft] = React.useState(value > 0 ? String(value) : '');
+  React.useEffect(() => { setDraft(value > 0 ? String(value) : ''); }, [value]);
+  const commit = () => {
+    const raw = draft.trim();
+    const parsed = raw === '' ? 0 : Number.parseInt(raw, 10);
+    const next = Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 600) : 0;
+    setDraft(next > 0 ? String(next) : '');
+    if (next === value) return;
+    void onSave(next);
+  };
+  return (
+    <div className="akc-field">
+      <div className="akc-label-row">
+        <label>等待响应头（秒）</label>
+        <InfoTip text="从请求发出到上游返回响应头的上限。只影响「还没开口」这一段，一旦开始返回就不会被打断。留空或 0 = 按 Provider 的设置走（默认 120 秒）。" />
+      </div>
+      <input
+        type="number"
+        min={0}
+        max={600}
+        placeholder="0 = 按 Provider 设置"
+        disabled={disabled}
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={commit}
+        onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }}
+      />
+    </div>
+  );
+}
+
+/**
+ * 同一个 Provider 上最多再试几次。
+ *
+ * 传输错误和 5xx/429 多半是瞬时抖动，换账号解决不了问题，反而把整条链路白推
+ * 一格——「第一个明明还能用，偶尔出错就切走」就是这么来的。设成 1~3 之后先在
+ * 原地重试，真不行才换节点。0 = 一失败就换（历史行为）。
+ */
+function SameProviderRetriesField({value, disabled, onSave}: {value: number; disabled: boolean; onSave: (value: number) => Promise<void>}) {
+  const [draft, setDraft] = React.useState(value > 0 ? String(value) : '');
+  React.useEffect(() => { setDraft(value > 0 ? String(value) : ''); }, [value]);
+  const commit = () => {
+    const raw = draft.trim();
+    const parsed = raw === '' ? 0 : Number.parseInt(raw, 10);
+    const next = Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 3) : 0;
+    setDraft(next > 0 ? String(next) : '');
+    if (next === value) return;
+    void onSave(next);
+  };
+  return (
+    <div className="akc-field">
+      <div className="akc-label-row">
+        <label>同节点重试次数</label>
+        <InfoTip text="同一个 Provider 失败后先原地重试几次再换下一个节点。只对可重试的失败生效（连接中断、5xx、429）；参数错误、认证失败不重试——重试多少次结果都一样。0 = 一失败就切走（默认）。" />
+      </div>
+      <input
+        type="number"
+        min={0}
+        max={3}
+        placeholder="0 = 失败即切"
+        disabled={disabled}
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={commit}
+        onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }}
+      />
+    </div>
+  );
+}
+
+function ApiKeyNameField({name, disabled, onSave}: {name: string; disabled: boolean; onSave: (name: string) => Promise<void>}) {  const [draft, setDraft] = React.useState(name);
   React.useEffect(() => { setDraft(name); }, [name]);
   return (
     <div className="akc-field">
@@ -1744,6 +1903,46 @@ function ClientTab({
     }
   };
 
+  // Codex 的一键写入：CLI 与 Codex Desktop 读的是同一份 ~/.codex/config.toml，
+  // 所以写一次两端都生效。config.toml 里只替换本工具管理的那一段，其余配置不动；
+  // 模型目录（model_catalog_json）也一起写，否则 Codex 会报 "Model metadata
+  // not found"，见 buildApiKeyCodexConfig 的注释。
+  //
+  // auth.json：Codex 判定"已登录"看的是它，不是 config.toml。不写就会在启动时
+  // 弹登录页——哪怕 provider 已经指向自带凭据的网关。默认写；用户本机已有
+  // ChatGPT 登录时可以用下面的开关保住它。
+  const applyCodexLocally = async () => {
+    if (!route) return;
+    setApplyingClients(true);
+    try {
+      // Codex 的 base_url 是网关的 /openai/v1；本机地址与公网地址的取舍和
+      // Claude 那条一样：本机走回环，选了公网域名才用公网。
+      const outcome = await applyCodexClientSetup({
+        baseURL: `${localAgentURL}/openai/v1`,
+        token: keyItem.key,
+        providerID: sanitizeClientConfigID(keyItem.name),
+        providerName: keyItem.name || 'LLM Gateway',
+        model: keyItem.modelOverride || primary?.defaultModel || 'gpt-5.6-terra',
+        reasoningEffort: resolveCodexReasoningEffort(keyItem),
+        catalogPath: codexCatalogPathForHome(),
+        catalog: buildApiKeyCodexModelCatalogJSON(keyItem, primary),
+        keepOfficialLogin: keyItem.codexKeepOfficialLogin === true,
+      });
+      if (!outcome.ok) {
+        void alertDialog(outcome.error || '写入失败');
+        return;
+      }
+      onCopy('', '已写入本机 Codex CLI 与 Desktop 配置', 'codex-local');
+      const notes = (outcome.result?.notes || []).join('\n');
+      const authLine = outcome.result?.authPath ? `\n${outcome.result.authPath}` : '';
+      void alertDialog(`已写入本机 Codex 配置（CLI 与 Desktop 共用）：\n${outcome.result?.configPath || ''}${authLine}${outcome.result?.catalogPath ? `\n${outcome.result.catalogPath}` : ''}${notes ? `\n\n${notes}` : ''}`);
+    } catch (error) {
+      void alertDialog(String(error));
+    } finally {
+      setApplyingClients(false);
+    }
+  };
+
   const snippets = {
     claude: {
       label: 'Claude Code',
@@ -1822,10 +2021,8 @@ function ClientTab({
             <button
               type="button"
               className={`akc-client-btn${copied === 'claude-switcher' ? ' copied' : ''}`}
-              disabled={!route || route.outputProtocol !== 'claude'}
-              title={route && route.outputProtocol !== 'claude'
-                ? '需要输出协议为 Claude（Messages）：这条链走 /anthropic/v1/messages'
-                : '把内置模型名固定为 default，模型与 Provider 之后全在平台上切'}
+              disabled={!route}
+              title="把内置模型名固定为 default，模型与 Provider 之后全在平台上切"
               onClick={() => onCopy(
                 buildClaudeCodeSwitcherScript(keyItem, endpoints, publicBase),
                 '已复制 Claude Code 一键接入脚本（模型固定为 default，粘贴到终端执行）',
@@ -1841,14 +2038,24 @@ function ClientTab({
             <button
               type="button"
               className={`akc-client-btn${copied === 'claude-local' ? ' copied' : ''}`}
-              disabled={!route || route.outputProtocol !== 'claude' || applyingClients}
-              title={route && route.outputProtocol !== 'claude'
-                ? '需要输出协议为 Claude（Messages）'
-                : '在本机直接写入 Claude Code CLI 与桌面端的配置（都固定为 default）'}
+              disabled={!route || applyingClients}
+              title="在本机直接写入 Claude Code CLI 与桌面端的配置（模型固定为 default）；走 /anthropic 端点，与 Codex 的配置互不影响"
               onClick={() => void applyLocally()}
             >
               <BrandIcon icon="claude-color" name="claude" size={15} />
               <span>{copied === 'claude-local' ? '已写入本机' : applyingClients ? '写入中…' : '一键写入本机（CLI + 桌面端）'}</span>
+            </button>
+            {/* Codex：CLI 与 Codex Desktop 读的是同一份 ~/.codex 目录（config.toml
+                + auth.json），所以写一次两端都配好。需要输出协议为 Responses。 */}
+            <button
+              type="button"
+              className={`akc-client-btn${copied === 'codex-local' ? ' copied' : ''}`}
+              disabled={!route || applyingClients}
+              title="在本机写入 ~/.codex（config.toml + auth.json + 模型目录），Codex CLI 与 Desktop 同时生效；走 /openai/v1 端点，与 Claude 的配置互不影响"
+              onClick={() => void applyCodexLocally()}
+            >
+              <BrandIcon icon="codex-color" name="codex" size={15} />
+              <span>{copied === 'codex-local' ? '已写入本机' : applyingClients ? '写入中…' : '一键写入本机（Codex CLI + Desktop）'}</span>
             </button>
           </div>
           <div className="akc-hint">

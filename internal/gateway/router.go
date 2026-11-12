@@ -743,6 +743,8 @@ func (r *Router) AddAPIKey(key domain.APIKey) (domain.APIKey, error) {
 	key.ModelAliases = normalizeModelAliases(key.ModelAliases)
 	key.ThinkingDepthOverride = strings.TrimSpace(key.ThinkingDepthOverride)
 	key.MaxOutputTokens = normalizeMaxOutputTokens(key.MaxOutputTokens)
+	key.FirstPacketTimeoutSec = clampFirstPacketTimeoutSec(key.FirstPacketTimeoutSec)
+	key.SameProviderRetries = clampSameProviderRetries(key.SameProviderRetries)
 	preferredProviderID := ""
 	if route, ok := r.routeLocked(key.RouteID); ok {
 		preferredProviderID = route.ProviderID
@@ -881,6 +883,8 @@ func (r *Router) UpdateAPIKey(keyID string, patch domain.APIKey) (domain.APIKey,
 		}
 		updated.ThinkingDepthOverride = strings.TrimSpace(patch.ThinkingDepthOverride)
 		updated.MaxOutputTokens = normalizeMaxOutputTokens(patch.MaxOutputTokens)
+		updated.FirstPacketTimeoutSec = clampFirstPacketTimeoutSec(patch.FirstPacketTimeoutSec)
+		updated.SameProviderRetries = clampSameProviderRetries(patch.SameProviderRetries)
 		updated.Enabled = patch.Enabled
 		updated.StreamEnabled = patch.StreamEnabled
 		updated.CodexKeepOfficialLogin = patch.CodexKeepOfficialLogin
@@ -1254,43 +1258,16 @@ func normalizeFallbackModelOverrides(fallbackIDs []string, overrides map[string]
 	return out
 }
 
-// validateFallbackModelOverridesLocked requires a fixed model only for backups
-// that speak a different protocol than the primary: those cannot reuse the
-// request's model id and need one from their own catalog. Same-protocol
-// backups inherit the request model, so an empty override is valid.
+// validateFallbackModelOverridesLocked used to reject a cross-protocol backup
+// that pinned no model. It no longer does: the backup has a model catalog of
+// its own, and resolveConsumerModelOnProvider falls back to the backup's own
+// default when the request names a model it does not serve (see
+// applyProviderModelFallback). Refusing the save made "设为首选" fail the moment
+// the two sides spoke different protocols, which is exactly the case the chain
+// exists for. A pinned model is therefore an optimization, not a requirement.
 // Caller must hold r.mu.
 func (r *Router) validateFallbackModelOverridesLocked(preferredProviderID string, fallbackIDs []string, overrides map[string]string) error {
-	for _, id := range fallbackIDs {
-		if overrides != nil && strings.TrimSpace(overrides[id]) != "" {
-			continue
-		}
-		if r.fallbackModelRequiredLocked(preferredProviderID, id) {
-			return fmt.Errorf("fallback provider %q requires a fixed model override (different protocol from the primary provider)", id)
-		}
-	}
 	return nil
-}
-
-// fallbackModelRequiredLocked reports whether a backup must pin its own model.
-// Unknown or deleted providers fall back to "required" so a broken chain never
-// silently forwards a model the backup may not recognize. Caller must hold r.mu.
-func (r *Router) fallbackModelRequiredLocked(preferredProviderID, fallbackProviderID string) bool {
-	preferred, ok := r.providerLocked(strings.TrimSpace(preferredProviderID))
-	if !ok {
-		return true
-	}
-	fallback, ok := r.providerLocked(strings.TrimSpace(fallbackProviderID))
-	if !ok {
-		return true
-	}
-	return fallback.Protocol != preferred.Protocol
-}
-
-// fallbackModelRequired is the runtime (lock-taking) form used by failover.
-func (r *Router) fallbackModelRequired(preferredProviderID, fallbackProviderID string) bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.fallbackModelRequiredLocked(preferredProviderID, fallbackProviderID)
 }
 
 func sanitizeActiveProviderID(activeID, preferredProviderID string, fallbacks []string) string {
@@ -2037,6 +2014,34 @@ func (r *Router) SetProviderCheckin(providerID string, enabled bool) (domain.Pro
 // check-in switches it has its own setter so a partial provider patch cannot
 // reset it — and so that patch semantics stay unusable here: an int cannot tell
 // "not sent" from "cleared".
+// SetProviderProtocolSupport 记下这台上游实测支持哪些协议（见
+// domain.Provider.ProtocolSupport）。探测是后台跑的，所以这条路径要能单独写：
+// 走 UpdateProvider 会顺带覆盖凭据等字段，而这里只想改这一个结论。
+func (r *Router) SetProviderProtocolSupport(providerID string, protocols []string) (domain.Provider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID != providerID {
+			continue
+		}
+		cleaned := make([]string, 0, len(protocols))
+		seen := map[string]bool{}
+		for _, item := range protocols {
+			item = strings.TrimSpace(item)
+			if item == "" || seen[item] {
+				continue
+			}
+			seen[item] = true
+			cleaned = append(cleaned, item)
+		}
+		r.state.Providers[index].ProtocolSupport = cleaned
+		r.state.Providers[index].ProtocolProbedAt = nowRFC3339()
+		return r.state.Providers[index], nil
+	}
+	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+}
+
+// SetProviderFirstPacketTimeout 已知的 per-provider 超时设置函数。
 func (r *Router) SetProviderFirstPacketTimeout(providerID string, seconds int) (domain.Provider, error) {
 	if seconds < 0 {
 		seconds = 0
@@ -2226,6 +2231,12 @@ func (r *Router) UpdateProviderModels(providerID string, models []domain.Model, 
 			fillModelTokenBudgets(&models[modelIndex])
 		}
 		r.state.Providers[index].Models = models
+		// 目录刷新后顺手补齐默认模型：没有它，所有「不指定模型」的路径（对话测试、
+		// 模型探测、路由没给模型的兜底）都会拿到 "request-model-not-set" 这个占位
+		// 符再发给上游，换回一句莫名其妙的 400。只补空值，运维自己选的绝不覆盖。
+		if strings.TrimSpace(r.state.Providers[index].DefaultModel) == "" && len(models) > 0 {
+			r.state.Providers[index].DefaultModel = strings.TrimSpace(models[0].ID)
+		}
 		if strings.TrimSpace(healthStatus) != "" {
 			r.state.Providers[index].HealthStatus = strings.TrimSpace(healthStatus)
 		}
@@ -2301,6 +2312,12 @@ func (r *Router) ProviderAccessible(providerID, userID string, granted []string)
 }
 
 func (r *Router) Decide(routeID string) (domain.RouteDecision, error) {
+	return r.DecideForProtocol(routeID, "")
+}
+
+// DecideForProtocol 是 Decide 的「按这次请求的协议」版本：auto 模式下用它判定
+// 直通还是转换。clientProtocol 为空时行为与 Decide 完全一致。
+func (r *Router) DecideForProtocol(routeID string, clientProtocol domain.Protocol) (domain.RouteDecision, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -2314,12 +2331,18 @@ func (r *Router) Decide(routeID string) (domain.RouteDecision, error) {
 	if route == nil {
 		return domain.RouteDecision{}, fmt.Errorf("route %q not found", routeID)
 	}
-	return r.decideLocked(*route, route.ProviderID)
+	return r.decideLockedForProtocol(*route, route.ProviderID, clientProtocol)
 }
 
 // DecideForProvider builds a route decision using an overridden input provider
 // (API key failover / sticky active provider).
 func (r *Router) DecideForProvider(routeID, providerID string) (domain.RouteDecision, error) {
+	return r.DecideForProviderProtocol(routeID, providerID, "")
+}
+
+// DecideForProviderProtocol 是 DecideForProvider 的「按这次请求的协议」版本。
+// clientProtocol 为空时行为与 DecideForProvider 完全一致。
+func (r *Router) DecideForProviderProtocol(routeID, providerID string, clientProtocol domain.Protocol) (domain.RouteDecision, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -2333,10 +2356,24 @@ func (r *Router) DecideForProvider(routeID, providerID string) (domain.RouteDeci
 	if route == nil {
 		return domain.RouteDecision{}, fmt.Errorf("route %q not found", routeID)
 	}
-	return r.decideLocked(*route, providerID)
+	return r.decideLockedForProtocol(*route, providerID, clientProtocol)
 }
 
 func (r *Router) decideLocked(route domain.Route, providerID string) (domain.RouteDecision, error) {
+	return r.decideLockedForProtocol(route, providerID, "")
+}
+
+// decideLocked 用 auto 模式判定「直通还是转换」。
+//
+// clientProtocol 是调用方这一次请求真正走的那条端点的协议（/v1/chat/completions
+// 是 openai_chat，/anthropic/v1/messages 是 claude，以此类推）。空值表示调用方
+// 不知道（老调用点、内部探测），这时只能退回 route.OutputProtocol 那个口径。
+//
+// 为什么要按请求而不是按 route：一把 Key 本来就该能同时被 Claude Code 和 Codex
+// 用——它们是两条不同的端点，客户端自己就分好了协议。以前 auto 模式拿 route 上
+// 那个「输出协议」当客户端协议，于是把 route 钉死成一种协议，另一条端点的请求
+// 会被直接拒掉（endpoint mismatch）。那不是安全边界，只是一个问错了人的判断。
+func (r *Router) decideLockedForProtocol(route domain.Route, providerID string, clientProtocol domain.Protocol) (domain.RouteDecision, error) {
 	providerID = strings.TrimSpace(providerID)
 	if providerID == "" {
 		providerID = route.ProviderID
@@ -2346,22 +2383,34 @@ func (r *Router) decideLocked(route domain.Route, providerID string) (domain.Rou
 		return domain.RouteDecision{}, fmt.Errorf("provider %q not found", providerID)
 	}
 
+	// 客户端协议：调用方给了就用它，否则退回 route 声明的那个。
+	protocol := clientProtocol
+	if protocol == "" {
+		protocol = route.OutputProtocol
+	}
+	// 空 Mode 与 auto 同义：AddRoute 会给新路由填 auto，但老数据（以及测试里
+	// 手搓的 Route）可能是空串。不把这两者当成一回事，就会把一条本该直通的
+	// 请求硬塞进转换器表，然后回一句「转换未实现」。
+	mode := route.Mode
+	if mode == "" {
+		mode = domain.RouteModeAuto
+	}
 	action := "convert"
-	if route.Mode == domain.RouteModePassThrough || (route.Mode == domain.RouteModeAuto && route.OutputProtocol == provider.Protocol) {
+	if mode == domain.RouteModePassThrough || (mode == domain.RouteModeAuto && protocol == provider.Protocol) {
 		action = "pass_through"
 	}
-	if route.Mode == domain.RouteModeConvert {
+	if mode == domain.RouteModeConvert {
 		action = "convert"
 	}
 
 	return domain.RouteDecision{
 		RouteID:         route.ID,
 		ProviderID:      provider.ID,
-		OutputProtocol:  route.OutputProtocol,
+		OutputProtocol:  protocol,
 		InputProtocol:   provider.Protocol,
-		Mode:            route.Mode,
+		Mode:            mode,
 		Action:          action,
-		ConversionLabel: fmt.Sprintf("%s -> %s", provider.Protocol.DisplayName(), route.OutputProtocol.DisplayName()),
+		ConversionLabel: fmt.Sprintf("%s -> %s", provider.Protocol.DisplayName(), protocol.DisplayName()),
 	}, nil
 }
 

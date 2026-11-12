@@ -493,6 +493,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /__providers/export", s.handleExportProviders)
 	mux.HandleFunc("POST /__providers/import", s.handleImportProviders)
 	mux.HandleFunc("POST /__providers/{id}/test", s.handleTestProvider)
+	mux.HandleFunc("POST /__providers/{id}/detect-protocols", s.handleDetectProviderProtocols)
 	mux.HandleFunc("POST /__providers/{id}/enabled", s.handleSetProviderEnabled)
 	mux.HandleFunc("POST /__providers/{id}/rtk", s.handleSetProviderRTK)
 	mux.HandleFunc("POST /__providers/{id}/first-packet-timeout", s.handleSetProviderFirstPacketTimeout)
@@ -734,6 +735,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	// 控制台以前只看粘滞位，于是日志显示备选在服务、界面却仍标首选）。
 	for index := range state.APIKeys {
 		state.APIKeys[index].ServingProviderID = s.servingProviderFor(state.APIKeys[index])
+		state.APIKeys[index].ServingProviderIDs = s.servingProvidersFor(state.APIKeys[index])
 	}
 	state.Providers = redactProvidersForClient(state.Providers)
 	for index := range state.Providers {
@@ -2523,6 +2525,9 @@ func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.logs.AddApp("info", "provider created", created.ID)
+	// 新建之后立刻在后台探一遍它支持哪些协议。人不用点按钮——建完就有了结论，
+	// 控制台上直接看到"这台上游支持 Claude / OpenAI 两套"。
+	s.autoDetectProviderProtocols(created)
 	writeJSON(w, http.StatusCreated, redactProviderForClient(created))
 }
 
@@ -2610,6 +2615,8 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.logs.AddApp("info", "provider updated", updated.ID)
+	// baseUrl 或协议变了，之前那份探测结论就不再成立：后台重探一遍。
+	s.autoDetectProviderProtocols(updated)
 	writeJSON(w, http.StatusOK, redactProviderForClient(updated))
 }
 
@@ -3444,6 +3451,12 @@ func resolveProviderChatURL(provider domain.Provider, model string) string {
 	if provider.Protocol == domain.ProtocolOpenAIResponses && !strings.Contains(lowerURL, "/responses") && !strings.Contains(provider.BaseURL, "{model}") {
 		upstreamURL = strings.TrimRight(upstreamURL, "/") + "/responses"
 	}
+	// Claude 也要补，理由与上面两条一样：真实转发路径（sendClaudeMessagesUpstream /
+	// executeClaudeMessagesHTTP）都补 /messages，只有这里漏了，于是「对话测试」
+	// 打到一个裸 base URL 上换回 404 —— 测出来的是路径不存在，不是 provider 有病。
+	if provider.Protocol == domain.ProtocolClaude && !strings.Contains(lowerURL, "/messages") && !strings.Contains(provider.BaseURL, "{model}") {
+		upstreamURL = strings.TrimRight(upstreamURL, "/") + "/messages"
+	}
 	return upstreamURL
 }
 
@@ -3558,6 +3571,12 @@ func (s *Server) executeProviderChatHTTP(r *http.Request, provider domain.Provid
 		body = shaped
 	}
 	send := func(requestBody []byte) (*http.Response, error) {
+		// 对端 provider 是「上游网关的一扇门」，那条端点只认信封（providerId /
+		// protocol / payload）。这条路径以前直发裸请求体，于是对话测试永远换来
+		// 上级一句 400 "payload is required"——真实转发走 sendPeerDoor 才有信封。
+		if provider.AuthType == domain.AuthTypePeer {
+			return s.sendPeerDoor(r.Context(), r, provider, resolvedModel, requestBody, "application/json")
+		}
 		request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(requestBody))
 		if err != nil {
 			return nil, err
@@ -3665,6 +3684,23 @@ func (s *Server) executeClaudeMessagesHTTP(r *http.Request, provider domain.Prov
 	if err != nil {
 		return claudeOAuthHTTPResult{Error: err.Error(), LatencyMs: time.Since(started).Milliseconds()}
 	}
+	// 对端 provider 的 Claude 协议同样有这个问题：上游的 /__peer/chat/completions
+	// 只认信封，裸 Messages 请求体换来的是一句 400 "payload is required"。
+	if provider.AuthType == domain.AuthTypePeer {
+		response, err := s.sendPeerDoor(r.Context(), r, provider, stringValue(claudeBodyField(body, "model")), body, "application/json")
+		if err != nil {
+			return claudeOAuthHTTPResult{Error: err.Error(), TargetURL: resolveProviderChatURL(provider, ""), RequestBody: string(body), LatencyMs: time.Since(started).Milliseconds()}
+		}
+		defer response.Body.Close()
+		responseBody, _ := io.ReadAll(io.LimitReader(response.Body, 16384))
+		return claudeOAuthHTTPResult{
+			Status:       response.StatusCode,
+			LatencyMs:    time.Since(started).Milliseconds(),
+			ResponseBody: string(responseBody),
+			RequestBody:  string(body),
+			TargetURL:    resolveProviderChatURL(provider, ""),
+		}
+	}
 	upstreamURL := strings.TrimSpace(provider.BaseURL)
 	lowerURL := strings.ToLower(upstreamURL)
 	if upstreamURL == "" || strings.Contains(lowerURL, "anthropic.com") {
@@ -3681,6 +3717,8 @@ func (s *Server) executeClaudeMessagesHTTP(r *http.Request, provider domain.Prov
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("anthropic-version", "2023-06-01")
 	applyProviderAuth(request, provider, r.Header.Get("Authorization"))
+	// 「对话测试」必须和真实请求发一样的东西，否则测出来的是另一条路径的行为。
+	applyRequestAdapterHeaders(request, provider, stringValue(claudeBodyField(body, "model")))
 
 	client := &http.Client{Timeout: 120 * time.Second}
 	response, err := client.Do(request)
@@ -4417,20 +4455,15 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	internalTest := internalTestRequest(r)
-	if gatewayKeyMatched && !internalTest && route.OutputProtocol != domain.ProtocolOpenAIChat {
-		mismatchBody := routeProtocolMismatchBody(route, domain.ProtocolOpenAIChat)
-		writeRouteProtocolMismatch(w, route, domain.ProtocolOpenAIChat)
-		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, "", "rejected", route.OutputProtocol.DisplayName()+" endpoint mismatch", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, mismatchBody)
-		return
-	}
-	decision, err := s.router.Decide(route.ID)
+	// 一把 Key 本来就该同时被多种客户端用：每条端点自带协议，auto 模式按本次
+	// 请求的协议判定直通还是转换，不再用 route 上那个「输出协议」把端点钉死。
+	decision, err := s.router.DecideForProtocol(route.ID, domain.ProtocolOpenAIChat)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	if gatewayKeyMatched {
-		decision = s.decisionForAPIKey(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID))
+		decision = s.decisionForAPIKeyProtocol(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID), domain.ProtocolOpenAIChat)
 	}
 
 	requestModel, _ := req["model"].(string)
@@ -4548,20 +4581,13 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": map[string]any{"message": err.Error(), "type": "authentication_error"}})
 		return
 	}
-	internalTest := internalTestRequest(r)
-	if gatewayKeyMatched && !internalTest && route.OutputProtocol != domain.ProtocolOpenAIResponses {
-		mismatchBody := routeProtocolMismatchBody(route, domain.ProtocolOpenAIResponses)
-		writeRouteProtocolMismatch(w, route, domain.ProtocolOpenAIResponses)
-		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, "", "rejected", route.OutputProtocol.DisplayName()+" endpoint mismatch", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, mismatchBody)
-		return
-	}
-	decision, err := s.router.Decide(route.ID)
+	decision, err := s.router.DecideForProtocol(route.ID, domain.ProtocolOpenAIResponses)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": err.Error(), "type": "gateway_error"}})
 		return
 	}
 	if gatewayKeyMatched {
-		decision = s.decisionForAPIKey(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID))
+		decision = s.decisionForAPIKeyProtocol(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID), domain.ProtocolOpenAIResponses)
 	}
 
 	requestModel, _ := req["model"].(string)
@@ -4845,14 +4871,16 @@ func (s *Server) serveOpenAIPassThrough(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	internalTest := internalTestRequest(r)
-	if gatewayKeyMatched && !internalTest && route.OutputProtocol != domain.ProtocolOpenAIChat {
+	// 嵌入和音频不是「协议」，是独立的端点能力：它们没有 Claude / Responses
+	// 版本可转换，所以这条链路的输出协议必须真的是 OpenAI Chat。这和聊天入口
+	// 的多协议放宽是两回事——那边每条端点都自带协议，这边只有一种形状。
+	if gatewayKeyMatched && !internalTestRequest(r) && route.OutputProtocol != domain.ProtocolOpenAIChat {
 		writeRouteProtocolMismatch(w, route, domain.ProtocolOpenAIChat)
 		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, "", "rejected", route.OutputProtocol.DisplayName()+" endpoint mismatch", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, routeProtocolMismatchBody(route, domain.ProtocolOpenAIChat))
 		return
 	}
 
-	decision, err := s.router.Decide(route.ID)
+	decision, err := s.router.DecideForProtocol(route.ID, domain.ProtocolOpenAIChat)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, err.Error())
 		return
@@ -5051,20 +5079,13 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-	internalTest := internalTestRequest(r)
-	if gatewayKeyMatched && !internalTest && route.OutputProtocol != domain.ProtocolClaude {
-		mismatchBody := routeProtocolMismatchBody(route, domain.ProtocolClaude)
-		writeRouteProtocolMismatch(w, route, domain.ProtocolClaude)
-		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, "", "rejected", route.OutputProtocol.DisplayName()+" endpoint mismatch", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, mismatchBody)
-		return
-	}
-	decision, err := s.router.Decide(route.ID)
+	decision, err := s.router.DecideForProtocol(route.ID, domain.ProtocolClaude)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	if gatewayKeyMatched {
-		decision = s.decisionForAPIKey(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID))
+		decision = s.decisionForAPIKeyProtocol(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID), domain.ProtocolClaude)
 	}
 
 	requestModel, _ := req["model"].(string)
@@ -5148,13 +5169,7 @@ func (s *Server) handleClaudeCountTokens(w http.ResponseWriter, r *http.Request)
 		writeClaudeError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
-	internalTest := internalTestRequest(r)
-	if gatewayKeyMatched && !internalTest && route.OutputProtocol != domain.ProtocolClaude {
-		writeRouteProtocolMismatch(w, route, domain.ProtocolClaude)
-		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, "", "rejected", route.OutputProtocol.DisplayName()+" endpoint mismatch", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, routeProtocolMismatchBody(route, domain.ProtocolClaude))
-		return
-	}
-	decision, err := s.router.Decide(route.ID)
+	decision, err := s.router.DecideForProtocol(route.ID, domain.ProtocolClaude)
 	if err != nil {
 		writeClaudeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -5164,7 +5179,7 @@ func (s *Server) handleClaudeCountTokens(w http.ResponseWriter, r *http.Request)
 	// 旧 Key 仍然能拿 token 计数（以及上游账号的额度）。这里补上同一条判定，
 	// 并把 decision 收窄到仍被授权的 Provider。
 	if gatewayKeyMatched {
-		decision = s.decisionForAPIKey(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID))
+		decision = s.decisionForAPIKeyProtocol(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID), domain.ProtocolClaude)
 		if decision.ProviderID == route.ProviderID && !s.providerAllowedForKeyOwner(matchedKey, decision.ProviderID) {
 			if strings.TrimSpace(matchedKey.OwnerUserID) == "" {
 				writeClaudeError(w, http.StatusServiceUnavailable, "no enabled provider on the key's provider chain")
@@ -5484,6 +5499,9 @@ func (s *Server) fetchProviderModels(r *http.Request, provider domain.Provider, 
 		return providerTestResult{Success: false, Provider: provider.ID, ModelsURL: modelsURL, LatencyMs: time.Since(started).Milliseconds(), Error: err.Error(), Models: []domain.Model{}}
 	}
 	request.Header.Set("Accept", "application/json")
+	// per-provider 自定义头也要带上：要求路由头才能列模型的上游（OpenCode Go
+	// 的 x-opencode-session）在配置里写好了却发不出去，模型清单永远是空的。
+	applyRequestAdapterHeaders(request, provider, "")
 	if provider.AuthType == domain.AuthTypeClaudeOAuth {
 		refreshed, refreshErr := s.ensureFreshClaudeToken(provider)
 		if refreshErr != nil {
@@ -6474,6 +6492,10 @@ func (s *Server) sendClaudeMessagesUpstream(r *http.Request, provider domain.Pro
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("Accept", r.Header.Get("Accept"))
 		request.Header.Set("anthropic-version", "2023-06-01")
+		// per-provider 的自定义请求头（requestAdapter.headers）。Claude 这条直通
+		// 路径以前漏了这一步：OpenCode Go 这类上游要求额外的路由头
+		// （x-opencode-session），配了也发不出去，只会换来一句 400 MissingSessionID。
+		applyRequestAdapterHeaders(request, provider, stringValue(claudeBodyField(body, "model")))
 		// Pass the client's anthropic-beta through (some relays require specific
 		// flags), and auto-enable the 1M-context beta for 1M-capable models:
 		// new-api style relays otherwise reject with 400
@@ -6597,6 +6619,9 @@ func (s *Server) doClaudeProviderRequest(ctx context.Context, r *http.Request, p
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("anthropic-version", "2023-06-01")
 		applyProviderAuth(request, provider, r.Header.Get("Authorization"))
+		// 转换路径同样要带上 per-provider 自定义头，否则「同一台上游，直通能通、
+		// 从别的协议转进来就 400」——排查起来最难的一类差异。
+		applyRequestAdapterHeaders(request, provider, stringValue(claudeBodyField(body, "model")))
 	}
 	if accept != "" {
 		request.Header.Set("Accept", accept)

@@ -353,6 +353,7 @@ func providerRoutePermission(method, path string) *domain.Permission {
 		{"/purge", domain.PermProvidersDelete},
 		{"/auth-preview", domain.PermProvidersSecret},
 		{"/chat-test", domain.PermProvidersTest},
+		{"/detect-protocols", domain.PermProvidersTest},
 		{"/cache-test", domain.PermProvidersTest},
 		{"/thinking-test", domain.PermProvidersTest},
 		{"/conformance", domain.PermProvidersTest},

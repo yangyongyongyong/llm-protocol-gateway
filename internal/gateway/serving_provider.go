@@ -28,21 +28,35 @@ import (
 // marker must never outlive the process.
 const servingProviderSettleDelay = 3 * time.Second
 
+// servingWindow 是一个节点被判为「在服务」的活跃窗口。
+//
+// 会话分散（spread）下三条会话分别落在三个账号上是常态，这时三个节点都真的在
+// 服务。只留"最近一个"会把另外两个显示成「待命」，等于把分散效果藏起来。所以
+// 记的不是最后一个，而是窗口内所有答过请求的节点。
+const servingWindow = 10 * time.Minute
+
 type servingMark struct {
-	// providerID 是最近一笔响应的节点（可能还在等 settle）。
+	// providerID 是最近一笔响应的节点（保留给旧字段 ServingProviderID）。
 	providerID string
-	// effective 是控制台当前展示的节点，只有它决定绿点。
-	effective string
-	timer     *time.Timer
+	// lastAnswerAt 是每个答过请求的节点最近一次答话的时刻，按它判活跃。
+	lastAnswerAt map[string]time.Time
 }
 
 type servingProviderTracker struct {
 	mu    sync.Mutex
 	marks map[string]*servingMark
+	now   func() time.Time
 }
 
 func newServingProviderTracker() *servingProviderTracker {
 	return &servingProviderTracker{marks: map[string]*servingMark{}}
+}
+
+func (tracker *servingProviderTracker) nowTime() time.Time {
+	if tracker != nil && tracker.now != nil {
+		return tracker.now()
+	}
+	return time.Now()
 }
 
 // note records that providerID answered keyID. The first answer for a key is
@@ -57,38 +71,23 @@ func (tracker *servingProviderTracker) note(keyID, providerID string, delay time
 	}
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
+	now := tracker.nowTime()
 	mark, ok := tracker.marks[keyID]
 	if !ok {
-		tracker.marks[keyID] = &servingMark{providerID: providerID, effective: providerID}
-		return
+		mark = &servingMark{lastAnswerAt: map[string]time.Time{}}
+		tracker.marks[keyID] = mark
 	}
-	if mark.providerID != providerID {
-		mark.providerID = providerID
-		if mark.timer != nil {
-			mark.timer.Stop()
-			mark.timer = nil
+	if mark.lastAnswerAt == nil {
+		mark.lastAnswerAt = map[string]time.Time{}
+	}
+	mark.providerID = providerID
+	mark.lastAnswerAt[providerID] = now
+	// 过期条目顺手清掉：这张表按 Key 常驻，不清理会随历史节点一直长。
+	for id, at := range mark.lastAnswerAt {
+		if now.Sub(at) > servingWindow {
+			delete(mark.lastAnswerAt, id)
 		}
 	}
-	if mark.effective == providerID {
-		return
-	}
-	if delay <= 0 {
-		mark.effective = providerID
-		return
-	}
-	// 每次响应都把 settle 计时推到 delay 之后：只有这个节点连续 keep 住这么久
-	// （中间没被别的节点顶替）才真正成为展示值。
-	target := providerID
-	mark.timer = time.AfterFunc(delay, func() {
-		tracker.mu.Lock()
-		defer tracker.mu.Unlock()
-		current, ok := tracker.marks[keyID]
-		if !ok || current.providerID != target || current.effective == target {
-			return
-		}
-		current.effective = target
-		current.timer = nil
-	})
 }
 
 // serving returns the provider the console should crown for keyID, "" when
@@ -100,9 +99,30 @@ func (tracker *servingProviderTracker) serving(keyID string) string {
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
 	if mark, ok := tracker.marks[keyID]; ok {
-		return mark.effective
+		return mark.providerID
 	}
 	return ""
+}
+
+// servingIDs 返回窗口内答过请求的全部节点，供控制台把它们都标成「在服务」。
+func (tracker *servingProviderTracker) servingIDs(keyID string) []string {
+	if tracker == nil {
+		return nil
+	}
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	mark, ok := tracker.marks[keyID]
+	if !ok || len(mark.lastAnswerAt) == 0 {
+		return nil
+	}
+	now := tracker.nowTime()
+	out := make([]string, 0, len(mark.lastAnswerAt))
+	for id, at := range mark.lastAnswerAt {
+		if now.Sub(at) <= servingWindow {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 func (s *Server) noteKeyServingProvider(keyID, providerID string) {
@@ -123,4 +143,18 @@ func (s *Server) servingProviderFor(key domain.APIKey) string {
 		}
 	}
 	return strings.TrimSpace(key.ActiveProviderID)
+}
+
+// servingProvidersFor 是「在服务」的多节点形态：窗口内所有答过请求的节点。
+// 没有任何记录时退回单节点口径（粘滞位），保持重启后的界面不空。
+func (s *Server) servingProvidersFor(key domain.APIKey) []string {
+	if s != nil && s.servingProviders != nil {
+		if ids := s.servingProviders.servingIDs(key.ID); len(ids) > 0 {
+			return ids
+		}
+	}
+	if active := strings.TrimSpace(key.ActiveProviderID); active != "" {
+		return []string{active}
+	}
+	return nil
 }

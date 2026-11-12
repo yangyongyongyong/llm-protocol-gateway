@@ -237,6 +237,11 @@ func (s *Store) migrate() error {
 		// lane_group: the account several Provider rows of one subscription share
 		// their lane with (see domain.Provider.LaneGroup). '' = own account.
 		{"lane_group", "TEXT NOT NULL DEFAULT ''"},
+		// protocol_support / protocol_probed_at: 这台上游实测支持哪些线协议
+		// （见 domain.Provider.ProtocolSupport）。由创建/改 baseUrl 之后的后台
+		// 探测写下；'' 表示还没探过。
+		{"protocol_support", "TEXT NOT NULL DEFAULT ''"},
+		{"protocol_probed_at", "TEXT NOT NULL DEFAULT ''"},
 	}
 	for _, column := range oauthColumns {
 		if err := addColumnIfMissing(tx, "providers", column.name, column.definition); err != nil {
@@ -303,6 +308,16 @@ func (s *Store) migrate() error {
 		return fmt.Errorf("migrate: %w", err)
 	}
 	if err := addColumnIfMissing(tx, "api_keys", "max_output_tokens", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	// first_packet_timeout_sec: 这个 Key 等上游响应头的上限（0 = 按 Provider 的
+	// 设置走）。默认 0，所以升级前建的 Key 行为完全不变。
+	if err := addColumnIfMissing(tx, "api_keys", "first_packet_timeout_sec", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	// same_provider_retries: 同一个 Provider 上最多再试几次（0 = 一失败就换下
+	// 一个节点，升级前的行为）。
+	if err := addColumnIfMissing(tx, "api_keys", "same_provider_retries", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
 	// Per-key quota (see domain.APIKey.Quota*): a reset window plus two budgets.
@@ -739,15 +754,16 @@ func (s *Store) Save(state domain.GatewayState) error {
 			(id, name, protocol, base_url, api_key_source, default_model, default_thinking_depth, health_status, auth_header, extra_endpoint, position,
 			 auth_type, oauth_access_token, oauth_refresh_token, oauth_expires_at, oauth_scope, oauth_account_label, owner_user_id, disabled, rtk_compress,
 			 checkin_enabled, first_packet_timeout_sec, max_concurrent_requests, queue_wait_seconds, requests_per_minute, lane_group,
+			 protocol_support, protocol_probed_at,
 			 self_reg_token_hash, self_reg_token_preview, self_reg_created_at, self_reg_last_seen_at, deleted, deleted_at,
 			 coding_plan_provider, team_organization_id, team_project_id, oauth_user_id, oauth_domain, oauth_json)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			provider.ID, provider.Name, string(provider.Protocol), provider.BaseURL, provider.APIKeySource,
 			provider.DefaultModel, provider.DefaultThinkingDepth, provider.HealthStatus, provider.AuthHeader,
 			provider.ExtraEndpoint, pIndex,
 			provider.AuthType, accessToken, refreshToken, expiresAt, scope, accountLabel, provider.OwnerUserID, disabled, rtkCompress,
 			checkinEnabled, provider.FirstPacketTimeoutSec, provider.MaxConcurrentRequests, provider.QueueWaitSeconds, provider.RequestsPerMinute,
-			provider.LaneGroup,
+			provider.LaneGroup, encodeProviderIDList(provider.ProtocolSupport), strings.TrimSpace(provider.ProtocolProbedAt),
 			selfRegTokenHash, selfRegTokenPreview, selfRegCreatedAt, selfRegLastSeenAt, deleted, provider.DeletedAt,
 			provider.CodingPlanProvider, provider.TeamOrganizationID, provider.TeamProjectID, userID, authDomain, authJSON); err != nil {
 			return err
@@ -877,6 +893,7 @@ func (s *Store) loadProviders() ([]domain.Provider, error) {
 	rows, err := s.reader().Query(`SELECT id, name, protocol, base_url, api_key_source, default_model, default_thinking_depth, health_status, auth_header, extra_endpoint,
 		auth_type, oauth_access_token, oauth_refresh_token, oauth_expires_at, oauth_scope, oauth_account_label, owner_user_id, disabled, rtk_compress,
 		checkin_enabled, first_packet_timeout_sec, max_concurrent_requests, queue_wait_seconds, requests_per_minute, lane_group,
+		protocol_support, protocol_probed_at,
 		self_reg_token_hash, self_reg_token_preview, self_reg_created_at, self_reg_last_seen_at, deleted, deleted_at,
 		coding_plan_provider, team_organization_id, team_project_id, oauth_user_id, oauth_domain, oauth_json
 		FROM providers ORDER BY position, id`)
@@ -895,15 +912,19 @@ func (s *Store) loadProviders() ([]domain.Provider, error) {
 		var deletedAt string
 		var codingPlanProvider, teamOrganizationID, teamProjectID string
 		var authJSON string
+		var protocolSupport, protocolProbedAt string
 		if err := rows.Scan(&p.ID, &p.Name, &protocol, &p.BaseURL, &p.APIKeySource, &p.DefaultModel, &p.DefaultThinkingDepth, &p.HealthStatus, &p.AuthHeader, &p.ExtraEndpoint,
 			&p.AuthType, &accessToken, &refreshToken, &expiresAt, &scope, &accountLabel, &p.OwnerUserID, &disabled, &rtkCompress,
 			&checkinEnabled, &p.FirstPacketTimeoutSec, &p.MaxConcurrentRequests, &p.QueueWaitSeconds, &p.RequestsPerMinute, &p.LaneGroup,
+			&protocolSupport, &protocolProbedAt,
 			&selfRegTokenHash, &selfRegTokenPreview, &selfRegCreatedAt, &selfRegLastSeenAt, &deleted, &deletedAt,
 			&codingPlanProvider, &teamOrganizationID, &teamProjectID, &userID, &authDomain, &authJSON); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}
 		p.Protocol = domain.Protocol(protocol)
+		p.ProtocolSupport = decodeProviderIDList(protocolSupport)
+		p.ProtocolProbedAt = strings.TrimSpace(protocolProbedAt)
 		p.Disabled = disabled != 0
 		p.RTKCompress = rtkCompress != 0
 		p.CheckinEnabled = checkinEnabled != 0
@@ -1197,7 +1218,7 @@ func decodeKeyProfiles(raw string) []domain.KeyProfile {
 }
 
 func (s *Store) loadAPIKeys() ([]domain.APIKey, error) {
-	rows, err := s.reader().Query(`SELECT id, name, key, route_id, model_override, model_aliases, thinking_depth_override, max_output_tokens, quota_window, quota_tokens, quota_cost_micros, stream_enabled, codex_keep_official_login, fallback_provider_ids, fallback_model_overrides, active_provider_id, owner_user_id, profiles, active_profile_id, schedule_mode, enabled, created_at, last_used_at
+	rows, err := s.reader().Query(`SELECT id, name, key, route_id, model_override, model_aliases, thinking_depth_override, max_output_tokens, first_packet_timeout_sec, same_provider_retries, quota_window, quota_tokens, quota_cost_micros, stream_enabled, codex_keep_official_login, fallback_provider_ids, fallback_model_overrides, active_provider_id, owner_user_id, profiles, active_profile_id, schedule_mode, enabled, created_at, last_used_at
 		FROM api_keys ORDER BY position, id`)
 	if err != nil {
 		return nil, err
@@ -1213,7 +1234,7 @@ func (s *Store) loadAPIKeys() ([]domain.APIKey, error) {
 		var fallbackProviderIDs string
 		var fallbackModelOverrides string
 		var profiles string
-		if err := rows.Scan(&k.ID, &k.Name, &k.Key, &k.RouteID, &k.ModelOverride, &modelAliases, &k.ThinkingDepthOverride, &k.MaxOutputTokens, &k.QuotaWindow, &k.QuotaTokens, &k.QuotaCostMicros, &streamEnabled, &codexKeepOfficialLogin, &fallbackProviderIDs, &fallbackModelOverrides, &k.ActiveProviderID, &k.OwnerUserID, &profiles, &k.ActiveProfileID, &k.ScheduleMode, &enabled, &k.CreatedAt, &k.LastUsedAt); err != nil {
+		if err := rows.Scan(&k.ID, &k.Name, &k.Key, &k.RouteID, &k.ModelOverride, &modelAliases, &k.ThinkingDepthOverride, &k.MaxOutputTokens, &k.FirstPacketTimeoutSec, &k.SameProviderRetries, &k.QuotaWindow, &k.QuotaTokens, &k.QuotaCostMicros, &streamEnabled, &codexKeepOfficialLogin, &fallbackProviderIDs, &fallbackModelOverrides, &k.ActiveProviderID, &k.OwnerUserID, &profiles, &k.ActiveProfileID, &k.ScheduleMode, &enabled, &k.CreatedAt, &k.LastUsedAt); err != nil {
 			return nil, err
 		}
 		k.Enabled = enabled != 0
@@ -1260,9 +1281,9 @@ func (s *Store) CreateAPIKey(key domain.APIKey) error {
 		codexKeepOfficialLogin = 1
 	}
 	_, err := s.db.Exec(`INSERT INTO api_keys
-		(id, name, key, route_id, model_override, model_aliases, thinking_depth_override, max_output_tokens, quota_window, quota_tokens, quota_cost_micros, stream_enabled, codex_keep_official_login, fallback_provider_ids, fallback_model_overrides, active_provider_id, owner_user_id, profiles, active_profile_id, schedule_mode, enabled, created_at, last_used_at, position)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		key.ID, key.Name, key.Key, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, key.MaxOutputTokens, strings.TrimSpace(key.QuotaWindow), key.QuotaTokens, key.QuotaCostMicros, streamEnabled, codexKeepOfficialLogin, encodeProviderIDList(key.FallbackProviderIDs), encodeFallbackModelOverrides(key.FallbackModelOverrides), strings.TrimSpace(key.ActiveProviderID), strings.TrimSpace(key.OwnerUserID), encodeKeyProfiles(key.Profiles), strings.TrimSpace(key.ActiveProfileID), strings.TrimSpace(key.ScheduleMode), enabled, key.CreatedAt, key.LastUsedAt, position)
+		(id, name, key, route_id, model_override, model_aliases, thinking_depth_override, max_output_tokens, first_packet_timeout_sec, same_provider_retries, quota_window, quota_tokens, quota_cost_micros, stream_enabled, codex_keep_official_login, fallback_provider_ids, fallback_model_overrides, active_provider_id, owner_user_id, profiles, active_profile_id, schedule_mode, enabled, created_at, last_used_at, position)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		key.ID, key.Name, key.Key, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, key.MaxOutputTokens, key.FirstPacketTimeoutSec, key.SameProviderRetries, strings.TrimSpace(key.QuotaWindow), key.QuotaTokens, key.QuotaCostMicros, streamEnabled, codexKeepOfficialLogin, encodeProviderIDList(key.FallbackProviderIDs), encodeFallbackModelOverrides(key.FallbackModelOverrides), strings.TrimSpace(key.ActiveProviderID), strings.TrimSpace(key.OwnerUserID), encodeKeyProfiles(key.Profiles), strings.TrimSpace(key.ActiveProfileID), strings.TrimSpace(key.ScheduleMode), enabled, key.CreatedAt, key.LastUsedAt, position)
 	return err
 }
 
@@ -1280,9 +1301,9 @@ func (s *Store) UpdateAPIKey(key domain.APIKey) error {
 		codexKeepOfficialLogin = 1
 	}
 	_, err := s.db.Exec(`UPDATE api_keys
-		SET name = ?, route_id = ?, model_override = ?, model_aliases = ?, thinking_depth_override = ?, max_output_tokens = ?, quota_window = ?, quota_tokens = ?, quota_cost_micros = ?, stream_enabled = ?, codex_keep_official_login = ?, fallback_provider_ids = ?, fallback_model_overrides = ?, active_provider_id = ?, owner_user_id = ?, profiles = ?, active_profile_id = ?, schedule_mode = ?, enabled = ?
+		SET name = ?, route_id = ?, model_override = ?, model_aliases = ?, thinking_depth_override = ?, max_output_tokens = ?, first_packet_timeout_sec = ?, same_provider_retries = ?, quota_window = ?, quota_tokens = ?, quota_cost_micros = ?, stream_enabled = ?, codex_keep_official_login = ?, fallback_provider_ids = ?, fallback_model_overrides = ?, active_provider_id = ?, owner_user_id = ?, profiles = ?, active_profile_id = ?, schedule_mode = ?, enabled = ?
 		WHERE id = ?`,
-		key.Name, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, key.MaxOutputTokens, strings.TrimSpace(key.QuotaWindow), key.QuotaTokens, key.QuotaCostMicros, streamEnabled, codexKeepOfficialLogin, encodeProviderIDList(key.FallbackProviderIDs), encodeFallbackModelOverrides(key.FallbackModelOverrides), strings.TrimSpace(key.ActiveProviderID), strings.TrimSpace(key.OwnerUserID), encodeKeyProfiles(key.Profiles), strings.TrimSpace(key.ActiveProfileID), strings.TrimSpace(key.ScheduleMode), enabled, key.ID)
+		key.Name, key.RouteID, key.ModelOverride, encodeModelAliases(key.ModelAliases), key.ThinkingDepthOverride, key.MaxOutputTokens, key.FirstPacketTimeoutSec, key.SameProviderRetries, strings.TrimSpace(key.QuotaWindow), key.QuotaTokens, key.QuotaCostMicros, streamEnabled, codexKeepOfficialLogin, encodeProviderIDList(key.FallbackProviderIDs), encodeFallbackModelOverrides(key.FallbackModelOverrides), strings.TrimSpace(key.ActiveProviderID), strings.TrimSpace(key.OwnerUserID), encodeKeyProfiles(key.Profiles), strings.TrimSpace(key.ActiveProfileID), strings.TrimSpace(key.ScheduleMode), enabled, key.ID)
 	return err
 }
 

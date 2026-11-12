@@ -24,7 +24,11 @@ const maxFirstPacketTimeoutSec = 600
 // The window is generous on purpose: a Claude turn can think for a while
 // between frames, and the heartbeat the gateway itself sends every 15s does
 // not count — this is the upstream's silence, not ours.
-const upstreamIdleTimeout = 120 * time.Second
+//
+// 300s rather than the old 120s: reasoning models routinely think for minutes
+// before the first frame, and cutting them at two minutes turned a slow-but-fine
+// answer into a provider fault. Per-provider and per-key overrides still win.
+const upstreamIdleTimeout = 300 * time.Second
 
 // errUpstreamIdleTimeout is what a silent upstream is reported as. Like
 // errUpstreamFirstPacketTimeout it is not a context error, so the failover loop
@@ -170,6 +174,63 @@ func firstPacketTimeoutFrom(ctx context.Context) time.Duration {
 	}
 	timeout, _ := ctx.Value(firstPacketTimeoutKey{}).(time.Duration)
 	return timeout
+}
+
+// apiKeyFirstPacketTimeoutKey 携带「这个 Key 自己设的」窗口。
+//
+// 单独一个 context 键而不是直接折进 firstPacketTimeoutKey：Key 级是覆盖，
+// Provider 级是缺省，两者的优先级要在真正发请求的那一刻才合并（见
+// effectiveFirstPacketTimeout）。塞进同一个值里就分不出「没设」和「设成 0」。
+type apiKeyFirstPacketTimeoutKey struct{}
+
+func withAPIKeyFirstPacketTimeout(ctx context.Context, timeout time.Duration) context.Context {
+	if timeout <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, apiKeyFirstPacketTimeoutKey{}, timeout)
+}
+
+func apiKeyFirstPacketTimeoutFrom(ctx context.Context) time.Duration {
+	if ctx == nil {
+		return 0
+	}
+	timeout, _ := ctx.Value(apiKeyFirstPacketTimeoutKey{}).(time.Duration)
+	return timeout
+}
+
+// effectiveFirstPacketTimeout 合并 Key 级与 Provider 级的等待窗口：Key 设了就
+// 用 Key 的（调用方最清楚自己这把钥匙要等多久），否则用 Provider 的。
+func effectiveFirstPacketTimeout(ctx context.Context, provider domain.Provider) time.Duration {
+	if timeout := apiKeyFirstPacketTimeoutFrom(ctx); timeout > 0 {
+		return timeout
+	}
+	return providerFirstPacketTimeout(provider)
+}
+
+// clampFirstPacketTimeoutSec 把任意输入夹到允许区间，0 表示「不设」。
+func clampFirstPacketTimeoutSec(seconds int) int {
+	if seconds <= 0 {
+		return 0
+	}
+	if seconds > maxFirstPacketTimeoutSec {
+		return maxFirstPacketTimeoutSec
+	}
+	return seconds
+}
+
+// maxSameProviderRetries 是同一个节点最多再试几次。3 已经足够扛过瞬时抖动，
+// 再多只是想用一个坏掉的账号把请求拖到超时。
+const maxSameProviderRetries = 3
+
+// clampSameProviderRetries 把重试次数夹到 0..3；0 = 一失败就换下一个节点。
+func clampSameProviderRetries(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	if n > maxSameProviderRetries {
+		return maxSameProviderRetries
+	}
+	return n
 }
 
 func providerFirstPacketTimeout(provider domain.Provider) time.Duration {

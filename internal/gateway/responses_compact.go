@@ -240,12 +240,12 @@ func (s *Server) handleOpenAIResponsesCompact(w http.ResponseWriter, r *http.Req
 		writeOpenAIError(w, http.StatusBadRequest, "this api key's route is not configured for OpenAI Responses")
 		return
 	}
-	decision, err := s.router.Decide(route.ID)
+	decision, err := s.router.DecideForProtocol(route.ID, domain.ProtocolOpenAIResponses)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	decision = s.decisionForAPIKey(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID))
+	decision = s.decisionForAPIKeyProtocol(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID), domain.ProtocolOpenAIResponses)
 
 	requestModel, _ := req["model"].(string)
 	model, logModel := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)

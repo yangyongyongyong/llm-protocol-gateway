@@ -909,6 +909,14 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
   // Qoder 有两个门：浏览器授权（OAuth 设备码）与粘贴个人访问令牌。徽章跟着
   // 实际走过的那个门走，标成 OAuth 会让用令牌连的人找不到自己的 PT 在哪。
   const oauthBadgeLabel = isQoderPAT ? (provider?.qoderPat?.signInMode === 'pat' ? 'PAT' : 'OAuth') : 'OAuth';
+  // 探测到的、除当前协议之外还支持的那些协议。空清单 = 还没探过（老记录），
+  // 那时什么都不显示，而不是显示"都不支持"。
+  const extraProtocols = (provider?.protocolSupport || [])
+    .filter((item) => item && item !== protocol && item !== provider?.protocol)
+    .map((item) => ({
+      value: item,
+      label: item === 'claude' ? 'Claude' : item === 'openai_responses' ? 'Responses' : 'OpenAI Chat',
+    }));
   const isUnavailable = healthStatus === 'unavailable';
   const now = useNowTick(isUnavailable && !!nextRetryAt);
   const retryLabel = isUnavailable ? retrySecondsLabel(nextRetryAt, now) : null;
@@ -977,6 +985,15 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
               </span>
             ) : null}
             <Badge tone="slate">{protocol}</Badge>
+            {/* 这台上游实测还支持的其他协议。
+                新建 provider 之后后台会自动探一次（不需要人点按钮），结论存在
+                provider 上。显示出来的用处：一眼看出「这里其实也能走 OpenAI，
+                再建一条同样 baseUrl 的 provider 就能让下游直通、不经过转换」。 */}
+            {extraProtocols.map((item) => (
+              <span key={item.value} title={`这条上游也支持 ${item.label}：再建一条同 baseUrl、协议为 ${item.label} 的 Provider，就能让该协议的请求直通而不必转换`}>
+                <Badge tone="cyan">+{item.label}</Badge>
+              </span>
+            ))}
             {showOAuthBadge ? (
               <Badge tone={oauthConnected ? 'green' : 'amber'}>{oauthBadgeLabel}{oauthConnected ? ' 已连接' : ' 未连接'}</Badge>
             ) : (

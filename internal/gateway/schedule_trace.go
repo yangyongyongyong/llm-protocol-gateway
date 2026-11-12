@@ -30,6 +30,7 @@ const (
 	attemptReasonFirstPacketTimeout = "first_packet_timeout"
 	attemptReasonSaturated          = "saturated"
 	attemptReasonMissingModel       = "missing_model_override"
+	attemptReasonUnsupportedConversion = "unsupported_conversion"
 	attemptReasonDisabled           = "disabled"
 	attemptReasonNotAssigned        = "not_assigned"
 	attemptReasonUndecidable        = "decision_failed"

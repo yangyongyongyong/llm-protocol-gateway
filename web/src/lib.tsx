@@ -143,6 +143,17 @@ export const CODEX_MODEL_CATALOG_REL = '.codex/lpg-model-catalog.json';
 
 export const CODEX_MODEL_CATALOG_DISPLAY = `~/${CODEX_MODEL_CATALOG_REL}`;
 
+/**
+ * 「一键写入本机」时模型目录的位置，相对主目录。
+ *
+ * 后端在跑网关那台机器上写文件，只有它知道 Home() 在哪，所以这里给相对路径，
+ * 由后端拼绝对路径再写进 config.toml 的 model_catalog_json——那个键必须是
+ * 绝对路径，Codex 不认 `~`。
+ */
+export function codexCatalogPathForHome(): string {
+  return CODEX_MODEL_CATALOG_REL;
+}
+
 export const defaultProviderChatTestOptions: ProviderChatTestOptions = {
   systemPrompt: 'x=10',
   userPrompt: 'x+5等于几',
@@ -2117,6 +2128,8 @@ export function buildApiKeyPatchBody(key: APIKey, patch: Partial<APIKey> = {}) {
     modelAliases: patch.modelAliases ?? key.modelAliases ?? {},
     thinkingDepthOverride: patch.thinkingDepthOverride ?? key.thinkingDepthOverride ?? '',
     maxOutputTokens: patch.maxOutputTokens ?? key.maxOutputTokens ?? 0,
+    firstPacketTimeoutSec: patch.firstPacketTimeoutSec ?? key.firstPacketTimeoutSec ?? 0,
+    sameProviderRetries: patch.sameProviderRetries ?? key.sameProviderRetries ?? 0,
     streamEnabled: patch.streamEnabled ?? key.streamEnabled ?? true,
     codexKeepOfficialLogin: patch.codexKeepOfficialLogin ?? key.codexKeepOfficialLogin ?? false,
     codexForceFast: patch.codexForceFast ?? key.codexForceFast ?? false,
@@ -2492,9 +2505,12 @@ export function buildApiKeyOpenCodeConfig(key: APIKey, route: Route | undefined,
 export function openCodeModelLimit(modelID: string, provider?: Provider, aliases?: Record<string, string>) {
   const target = ((aliases?.[modelID] || aliases?.[modelID.trim()] || modelID) || '').trim() || modelID;
   const listed = provider?.models?.find((item) => item.id === target || item.id === modelID);
-  // 目录未显式给出上下文长度时，默认按 1M 处理（与 Claude [1m] 保持一致，
-  // 避免 Codex/OpenCode 回落到 128k 触发过早压缩）。目录若有真实值则以真实值为准。
-  const context = listed?.contextLength && listed.contextLength > 0 ? listed.contextLength : 1_000_000;
+  // 窗口按「对外宣称的那个数」算：declaredModelWindow 已经是全站共识——运维
+  // 手填的 contextOverride 优先，其次上游自己报的 contextLength。以前这里只读
+  // contextLength，于是「给一个其实有 1M 的中转模型手填窗口」对 Codex/OpenCode
+  // 完全不起作用：后端 /v1/models 已经按 override 报数，客户端拿到的还是旧值。
+  // 两者都没有时按 1M 兜底（与 Claude 的 [1m] 一致，避免回落到 128k 过早压缩）。
+  const context = (listed ? declaredModelWindow(listed) : 0) || 1_000_000;
   const output = context >= 1_000_000
     ? 128000
     : context >= 200000
@@ -2537,39 +2553,90 @@ export function buildApiKeyCodexModelCatalogJSON(key: APIKey, provider?: Provide
   }));
   const defaultEffort = resolveCodexReasoningEffort(key);
 
-  const models = [...slugs].map((slug, index) => {
-    const limit = openCodeModelLimit(slug, provider, aliases);
-    return {
-      slug,
-      display_name: slug,
-      description: `${slug} (via LLM Protocol Gateway)`,
-      default_reasoning_level: defaultEffort,
-      supported_reasoning_levels: reasoningLevels,
-      context_window: limit.context,
-      max_context_window: limit.context,
-      shell_type: 'shell_command',
-      visibility: 'list',
-      supported_in_api: true,
-      priority: index,
-      availability_nux: null,
-      upgrade: null,
-      base_instructions: 'You are Codex, a coding agent.',
-      supports_reasoning_summaries: true,
-      support_verbosity: false,
-      default_verbosity: null,
-      apply_patch_tool_type: null,
-      truncation_policy: { mode: 'tokens', limit: 10000 },
-      supports_parallel_tool_calls: true,
-      experimental_supported_tools: [],
-      input_modalities: ['text', 'image'],
-    };
-  });
-  return `${JSON.stringify({ models }, null, 2)}\n`;
+  const models = [...slugs].map((slug, index) => codexCatalogEntry({
+    slug,
+    displayName: slug,
+    description: `${slug} (via LLM Protocol Gateway)`,
+    context: openCodeModelLimit(slug, provider, aliases).context,
+    effort: defaultEffort,
+    reasoningLevels,
+    priority: CODEX_RESERVED_ALIASES.length + index,
+  }));
+  // 两个固定别名，和 Claude 侧同一套做法：客户端只认 default / default[1m]，
+  // 真正用哪个模型由网关按这把 Key 的配置解析（ModelOverride → 默认模型）。
+  // 于是换模型、换 provider 全在平台上改，Codex 的配置一个字都不用动，也就不
+  // 再需要频繁重写 config.toml。
+  //
+  // 两者的差别只在窗口：default 报普通窗口，default[1m] 报 1M。Codex 按
+  // context_window 决定什么时候压缩上下文，所以「要 1M 就用 default[1m]」在
+  // 客户端侧就是一次模型切换。优先级排在最前，客户端菜单里一眼就能选到。
+  const reserved = CODEX_RESERVED_ALIASES.map((entry, index) => codexCatalogEntry({
+    slug: entry.slug,
+    displayName: entry.label,
+    description: `${entry.label} — 模型与 provider 在网关上切换`,
+    context: entry.window,
+    effort: defaultEffort,
+    reasoningLevels,
+    priority: index,
+  }));
+  return `${JSON.stringify({ models: [...reserved, ...models] }, null, 2)}\n`;
+}
+
+/**
+ * Codex 侧的两个固定模型别名。
+ *
+ * 与 Claude 的 default / default[1m] 同构：客户端只认这两个名字，网关按 Key 的
+ * 配置解析成真实模型。窗口写死在目录里，因为 Codex 是按 context_window 决定
+ * 何时压缩上下文的——「1M」这件事必须由客户端自己看见。
+ */
+export const CODEX_RESERVED_ALIASES: ReadonlyArray<{slug: string; window: number; label: string}> = [
+  {slug: 'default', window: 128_000, label: 'Platform default'},
+  {slug: 'default[1m]', window: 1_000_000, label: 'Platform default (1M context)'},
+];
+
+/** codexCatalogEntry 拼一条 Codex 模型目录项，两个来源（固定别名、真实模型）共用。 */
+function codexCatalogEntry(input: {
+  slug: string;
+  displayName: string;
+  description: string;
+  context: number;
+  effort: string;
+  reasoningLevels: Array<{ effort: string; description: string }>;
+  priority: number;
+}) {
+  return {
+    slug: input.slug,
+    display_name: input.displayName,
+    description: input.description,
+    default_reasoning_level: input.effort,
+    supported_reasoning_levels: input.reasoningLevels,
+    context_window: input.context,
+    max_context_window: input.context,
+    shell_type: 'shell_command',
+    visibility: 'list',
+    supported_in_api: true,
+    priority: input.priority,
+    availability_nux: null,
+    upgrade: null,
+    base_instructions: 'You are Codex, a coding agent.',
+    supports_reasoning_summaries: true,
+    support_verbosity: false,
+    default_verbosity: null,
+    apply_patch_tool_type: null,
+    truncation_policy: { mode: 'tokens', limit: 10000 },
+    supports_parallel_tool_calls: true,
+    experimental_supported_tools: [],
+    input_modalities: ['text', 'image'],
+  };
 }
 
 export function buildApiKeyCodexConfig(key: APIKey, route: Route | undefined, endpoints: OutputEndpoint[], publicBase: string, provider?: Provider, keepOfficialLogin?: boolean) {
   const providerID = sanitizeClientConfigID(key.name);
-  const model = resolveApiKeyModel(key, provider);
+  // 模型名固定写 "default"：真正用哪个模型由网关按这把 Key 的配置解析（别名 →
+  // 固定模型 → provider 默认模型），和 Claude 侧同一个思路。这样换模型、换
+  // provider 都在平台上完成，Codex 的 config.toml 不用反复重写，也不会因为
+  // 客户端记着一个早就换掉的真名而发请求出去。
+  const model = 'default';
   const effort = resolveCodexReasoningEffort(key);
   const baseURL = `${apiKeyGatewayRoot(endpoints, publicBase)}/openai/v1`;
   const warning = !route || route.outputProtocol !== 'openai_responses'
@@ -2603,7 +2670,11 @@ sandbox_mode = "danger-full-access"
 name = "${providerName}"
 base_url = "${baseURL}"
 wire_api = "responses"
-requires_openai_auth = true
+# requires_openai_auth 管的是「登录界面」，不是「请求带什么凭据」：为 true 而
+# auth.json 里没有能用的登录时，Codex 会卡在登录选择页不放。我们的凭据走
+# experimental_bearer_token，所以默认 false；开了「保持账号登录」才写 true
+# （那时盘上有一份真登录，Codex 认它）。
+requires_openai_auth = ${keepOfficialLogin ? 'true' : 'false'}
 # Codex 0.118+ 默认会先尝试 WebSocket 连 /v1/responses，这是 OpenAI 内部专用、
 # 没有公开文档的传输协议，第三方网关根本接不住，只会 405 之后重试几轮才退回
 # HTTPS（社区已知问题，如 github.com/openai/codex/issues/13103、#28503）。
@@ -2755,6 +2826,13 @@ export type ClientSetupOutcome = {
     desktopChange?: boolean;
     backups?: string[];
     notes?: string[];
+    /** Codex 那一侧：写入的 config.toml、auth.json 与模型目录。 */
+    configPath?: string;
+    changed?: boolean;
+    unchanged?: boolean;
+    authPath?: string;
+    authChanged?: boolean;
+    catalogPath?: string;
   };
 };
 
@@ -2764,16 +2842,52 @@ export async function applyClaudeClientSetup(options: {
   token: string;
   model: string;
 }): Promise<ClientSetupOutcome> {
+  return postClientSetup({
+    baseUrl: options.baseURL,
+    gatewayUrl: options.gatewayURL,
+    token: options.token,
+    model: options.model,
+  });
+}
+
+/**
+ * 在「运行网关的这台机器」上把 Codex CLI 指向本网关。
+ *
+ * 和 Claude 那条完全同样的道理（本机写文件、后端只收回环请求），只是 Codex
+ * 读的是 ~/.codex/config.toml：TOML，没有"命名块"，所以后端按一对注释分界线
+ * 整段替换，文件里其余配置一字不动。
+ */
+export async function applyCodexClientSetup(options: {
+  baseURL: string;
+  token: string;
+  providerID: string;
+  providerName: string;
+  model: string;
+  reasoningEffort?: string;
+  catalogPath?: string;
+  catalog?: string;
+  keepOfficialLogin?: boolean;
+}): Promise<ClientSetupOutcome> {
+  return postClientSetup({
+    client: 'codex',
+    baseUrl: options.baseURL,
+    token: options.token,
+    codexProviderId: options.providerID,
+    codexProviderName: options.providerName,
+    codexModel: options.model,
+    codexEffort: options.reasoningEffort || '',
+    codexCatalogPath: options.catalogPath || '',
+    codexCatalog: options.catalog || '',
+    codexKeepOfficialLogin: options.keepOfficialLogin === true,
+  });
+}
+
+async function postClientSetup(body: Record<string, unknown>): Promise<ClientSetupOutcome> {
   const response = await fetch(`${API_BASE}/__clients/setup`, {
     method: 'POST',
     credentials: 'same-origin',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      baseUrl: options.baseURL,
-      gatewayUrl: options.gatewayURL,
-      token: options.token,
-      model: options.model,
-    }),
+    body: JSON.stringify(body),
   });
   if (response.status === 403) {
     return {ok: false, error: '只能在运行网关的这台机器上操作（浏览器需通过本机地址打开管理页）。'};

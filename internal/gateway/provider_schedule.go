@@ -263,6 +263,55 @@ func (s *Server) healthyFirst(chain []string) []string {
 	return append(healthy, unavailable...)
 }
 
+// preferNativeProtocol moves the first provider that speaks clientProtocol
+// (pass-through) to the front, when the chain currently starts with one that
+// would need a conversion.
+//
+// 为什么值得为它改顺序：转换是本网关里最容易出错的一层——报文重写、流重打包、
+// 字段兼容，每一处都可能吃掉一次本该成功的请求；直通则只是把字节搬过去。所以
+// 同一个上游既支持 Claude 又支持 OpenAI 时（OpenCode Go 就是），让下游的协议
+// 决定走哪一条，出问题的概率明显更低。
+//
+// 这是一条 preference，不是硬规则：
+//   - 链上没有任何同协议的 provider 时，原样返回；
+//   - 已经是同协议开头时，原样返回；
+//   - 会话粘性已经钉住某个 provider 时不动（那是有意的选择，见 applySessionPin）；
+//   - 同协议的节点如果全被标记不可用，healthyFirst 会把它排到最后，这里也不会
+//     凭空造出一个健康节点——真正的可用性仍由那一层决定。
+func (s *Server) preferNativeProtocol(chain []string, clientProtocol domain.Protocol, pinned string) []string {
+	if clientProtocol == "" || len(chain) < 2 || pinned != "" || s.router == nil {
+		return chain
+	}
+	first := s.providerProtocol(chain[0])
+	if first == "" || first == clientProtocol {
+		return chain
+	}
+	for index := 1; index < len(chain); index++ {
+		if s.providerProtocol(chain[index]) != clientProtocol {
+			continue
+		}
+		promoted := make([]string, 0, len(chain))
+		promoted = append(promoted, chain[index])
+		promoted = append(promoted, chain[:index]...)
+		promoted = append(promoted, chain[index+1:]...)
+		if s.logs != nil {
+			s.logs.AddApp("info", "provider chosen for native protocol", fmt.Sprintf(
+				"client=%s promoted=%s over=%s (直通代替转换)", clientProtocol, chain[index], chain[0]))
+		}
+		return promoted
+	}
+	return chain
+}
+
+// providerProtocol 返回这个 provider 的母语协议，查不到时返回空串。
+func (s *Server) providerProtocol(providerID string) domain.Protocol {
+	provider, err := s.router.ProviderByID(providerID)
+	if err != nil {
+		return ""
+	}
+	return provider.Protocol
+}
+
 // handleSetProviderFirstPacketTimeout is the admin-only per-provider knob for
 // how long one attempt may wait for the upstream's response headers before the
 // chain moves on. It is a dedicated endpoint like /rtk and /checkin/auto

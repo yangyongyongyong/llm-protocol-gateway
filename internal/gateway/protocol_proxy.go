@@ -951,7 +951,7 @@ func (s *Server) executeProtocolFlow(
 	// adapters that build their own request — enforces it without knowing about
 	// scheduling. Providers that answer headers and then think for minutes are
 	// unaffected: the timer only covers the wait for headers.
-	if timeout := providerFirstPacketTimeout(provider); timeout > 0 {
+	if timeout := effectiveFirstPacketTimeout(r.Context(), provider); timeout > 0 {
 		r = r.WithContext(withFirstPacketTimeout(r.Context(), timeout))
 	}
 

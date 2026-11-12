@@ -541,6 +541,15 @@ func (s *Server) stateForUser(identity sessionIdentity, state domain.GatewayStat
 		if serving != "" && !allowed[serving] {
 			state.APIKeys[index].ServingProviderID = ""
 		}
+		if len(state.APIKeys[index].ServingProviderIDs) > 0 {
+			kept := make([]string, 0, len(state.APIKeys[index].ServingProviderIDs))
+			for _, id := range state.APIKeys[index].ServingProviderIDs {
+				if allowed[id] {
+					kept = append(kept, id)
+				}
+			}
+			state.APIKeys[index].ServingProviderIDs = kept
+		}
 	}
 	if state.Endpoints == nil {
 		state.Endpoints = []domain.OutputEndpoint{}

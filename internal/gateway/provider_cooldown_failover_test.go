@@ -30,7 +30,10 @@ func TestFailoverHonoursUpstreamRetryAfter(t *testing.T) {
 			ID: "cooldown-probe", Name: "cooldown-probe", Protocol: domain.ProtocolOpenAIChat,
 			BaseURL: upstream.URL, AuthType: "api_key", APIKeySource: "static",
 		}, {
-			ID: "cooldown-backup", Name: "cooldown-backup", Protocol: domain.ProtocolClaude,
+			// 备选刻意与首选同协议：这条测试要钉的是「Retry-After 有没有进冷缩」，
+			// 不是协议选择。一旦两边协议不同，preferNativeProtocol 会把同协议的那
+			// 个提到前面，冷缩算术跟着换节点，测的就不是原来那件事了。
+			ID: "cooldown-backup", Name: "cooldown-backup", Protocol: domain.ProtocolOpenAIChat,
 			BaseURL: upstream.URL, AuthType: "api_key", APIKeySource: "static",
 		}},
 		Routes: []domain.Route{
@@ -65,8 +68,12 @@ func TestFailoverHonoursUpstreamRetryAfter(t *testing.T) {
 			t.Fatalf("attempt %d status = %d err=%v, want 429", i+1, status, execErr)
 		}
 	}
-	if atomic.LoadInt32(&hits) != providerSoftFailureThreshold {
-		t.Fatalf("upstream hits = %d, want %d", hits, providerSoftFailureThreshold)
+	// 每次请求会打两次上游：首选 429 之后切到备选，备选也回 429（同一个
+	// httptest 服务器）。以前备选会因为「跨协议缺锁定模型」被跳过，所以只有三次；
+	// 那条跳过规则已经拆掉——模型会按备选自己的目录兜底，链路该真的走完。
+	wantHits := int32(providerSoftFailureThreshold) * 2
+	if atomic.LoadInt32(&hits) != wantHits {
+		t.Fatalf("upstream hits = %d, want %d (each request tries both nodes)", hits, wantHits)
 	}
 	st, ok := server.providerUnavailableSnapshot("cooldown-probe")
 	if !ok {

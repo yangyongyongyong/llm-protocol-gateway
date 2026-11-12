@@ -136,6 +136,9 @@ export function PeersPage({
   const [draftError, setDraftError] = useState('');
   const [draftSaving, setDraftSaving] = useState(false);
   const [busyId, setBusyId] = useState('');
+  // 「测试连接」的结果：按上游 providerId 记，成功也留一条——运维点完按钮要的
+  // 是「连上了、同步到了什么」，只有失败才冒出来会让人反复点。
+  const [testResults, setTestResults] = useState<Record<string, { ok: boolean; text: string }>>({});
 
   const loadUpstreams = useCallback(async () => {
     setUpstreamsLoading(true);
@@ -231,15 +234,32 @@ export function PeersPage({
     }
   };
 
+  // 「测试连接」走 refresh：连得上就把上游最新的授权清单同步回来，连不上要说清
+  // 是解析不到、被拒、还是凭据失效——只留一行红字等于让运维去翻服务端日志。
   const refreshUpstream = async (upstream: PeerUpstream) => {
-    setBusyId(upstream.providerId);
+    const id = upstream.providerId;
+    setBusyId(id);
+    setTestResults((current) => {
+      const next = {...current};
+      delete next[id];
+      return next;
+    });
     try {
-      await jsonRequest(`${API_BASE}/__peer-upstreams/${encodeURIComponent(upstream.providerId)}/refresh`, {
-        method: 'POST',
-      });
+      const payload = await jsonRequest<{ upstream?: PeerUpstream }>(
+        `${API_BASE}/__peer-upstreams/${encodeURIComponent(id)}/refresh`,
+        { method: 'POST' },
+      );
+      const synced = payload.upstream;
+      const parts: string[] = ['连接正常'];
+      if (synced?.parentGatewayId) parts.push(`上游身份 ${synced.parentGatewayId}`);
+      if (synced?.grantsSynced) parts.push(`已同步 ${synced.grantCount} 个授权 Provider`);
+      if (synced && synced.models.length > 0) parts.push(`${synced.models.length} 个可用模型`);
+      setTestResults((current) => ({...current, [id]: {ok: true, text: `已同步来源授权清单；${parts.join('；')}`}}));
       await refreshAll();
     } catch (error) {
-      setUpstreamsError((error as Error).message);
+      // 上游拒绝时 jsonRequest 抛的是它那句错误正文，直接显示——比自己再翻译一遍准。
+      setTestResults((current) => ({...current, [id]: {ok: false, text: `测试连接失败：${(error as Error).message}`}}));
+      setUpstreamsError('');
       await loadUpstreams();
     } finally {
       setBusyId('');
@@ -423,6 +443,11 @@ export function PeersPage({
                     </>
                   ) : null}
                 </div>
+                {testResults[upstream.providerId] ? (
+                  <div className={`peer-upstream-test-result ${testResults[upstream.providerId].ok ? 'ok' : 'bad'}`}>
+                    {testResults[upstream.providerId].text}
+                  </div>
+                ) : null}
               </div>
             ))}
           </div>

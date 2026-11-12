@@ -658,3 +658,53 @@ test('mergeModelsAcrossAccounts: 同名模型按宣称窗口取大的那个', ()
   assert.equal(swapped[0].contextLength, 900000);
   assert.equal(swapped[0].contextOverride, 0, '换过来的账号没有手动值，不能留着上一个的');
 });
+
+test('Codex 模型目录：固定列出 default 与 default[1m]，窗口一普通一 1M', () => {
+  const key = {
+    name: 'k', key: 'sk-gw-x',
+    modelOverride: 'deepseek-v4.1-flash',
+    thinkingDepthOverride: 'high',
+  };
+  const provider = {
+    id: 'p1', name: 'P1',
+    models: [{id: 'deepseek-v4.1-flash', providerId: 'p1', protocol: 'openai_responses', contextLength: 128000, inMenu: true}],
+  };
+  const catalog = JSON.parse(lib.buildApiKeyCodexModelCatalogJSON(key, provider));
+  const bySlug = Object.fromEntries(catalog.models.map((m) => [m.slug, m]));
+
+  // 两个固定别名必须排在最前（priority 最小），客户端菜单才好认。
+  assert.ok(bySlug['default'], '缺少 default 别名');
+  assert.ok(bySlug['default[1m]'], '缺少 default[1m] 别名');
+  assert.equal(bySlug['default'].priority, 0);
+  assert.equal(bySlug['default[1m]'].priority, 1);
+
+  // 窗口：default 普通，default[1m] 必须真的是 1M，否则 Codex 会按普通窗口
+  // 提前压缩上下文，「用 1M」就成了一句空话。
+  assert.equal(bySlug['default'].context_window, 128000);
+  assert.equal(bySlug['default'].max_context_window, 128000);
+  assert.equal(bySlug['default[1m]'].context_window, 1000000);
+  assert.equal(bySlug['default[1m]'].max_context_window, 1000000);
+
+  // 真实模型仍在目录里，且窗口跟着声明值走。
+  assert.equal(bySlug['deepseek-v4.1-flash'].context_window, 128000);
+});
+
+test('Codex 模型目录：手填的 contextOverride 压过上游报的窗口', () => {
+  const key = {name: 'k', key: 'sk-gw-x', modelOverride: 'm1'};
+  const provider = {
+    id: 'p1', name: 'P1',
+    models: [{id: 'm1', providerId: 'p1', protocol: 'openai_responses', contextLength: 128000, contextOverride: 1000000, inMenu: true}],
+  };
+  const catalog = JSON.parse(lib.buildApiKeyCodexModelCatalogJSON(key, provider));
+  const entry = catalog.models.find((m) => m.slug === 'm1');
+  assert.equal(entry.context_window, 1000000, '运维手填的 1M 必须生效');
+});
+
+test('Codex 配置：model 固定写 default，换模型不用重写 config.toml', () => {
+  const key = {name: 'k', key: 'sk-gw-x', modelOverride: 'some-real-model'};
+  const route = {id: 'r1', providerId: 'p1', outputProtocol: 'openai_responses'};
+  const text = lib.buildApiKeyCodexConfig(key, route, [], 'https://gw.example.com');
+  assert.match(text, /^model = "default"$/m, 'model 必须固定为 default');
+  assert.doesNotMatch(text, /some-real-model/, '不该把真实模型名写进客户端配置');
+  assert.match(text, /requires_openai_auth = false/, '凭据走 bearer 时必须写 false');
+});

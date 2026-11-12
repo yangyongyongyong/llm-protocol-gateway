@@ -125,6 +125,15 @@ func applyRequestAdapterBody(provider domain.Provider, model string, body []byte
 }
 
 func generateRequestAdapterCurl(adapter *domain.RequestAdapter, baseURL, model, sampleBody string) string {
+	return generateRequestAdapterCurlFor(adapter, baseURL, model, sampleBody, "")
+}
+
+// generateRequestAdapterCurlFor 拼一段能直接粘去跑的 curl 示例。
+//
+// protocol 决定两件事：拼接哪条端点路径、示例体长什么样。以前两样都写死成
+// OpenAI Chat，于是 Claude 协议的 provider 会看到「/anthropic/v1/chat/completions」
+// 这种把两种协议拼在一起的地址，照着跑必然 404。
+func generateRequestAdapterCurlFor(adapter *domain.RequestAdapter, baseURL, model, sampleBody string, protocol domain.Protocol) string {
 	if adapter == nil {
 		return ""
 	}
@@ -140,7 +149,7 @@ func generateRequestAdapterCurl(adapter *domain.RequestAdapter, baseURL, model, 
 		if strings.Contains(baseURL, "{model}") {
 			url = baseURL
 		} else {
-			url = strings.TrimRight(baseURL, "/") + "/chat/completions"
+			url = strings.TrimRight(baseURL, "/") + adapterEndpointPath(protocol, baseURL)
 		}
 	}
 	url = applyRequestAdapterPlaceholders(url, baseURL, mappedModel)
@@ -174,6 +183,43 @@ func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
 }
 
+// adapterEndpointPath 是示例里该拼的端点路径。基地址已经带着它就返回空串，
+// 免得拼出 /messages/messages。
+func adapterEndpointPath(protocol domain.Protocol, baseURL string) string {
+	lower := strings.ToLower(baseURL)
+	switch protocol {
+	case domain.ProtocolClaude:
+		if strings.Contains(lower, "/messages") {
+			return ""
+		}
+		return "/messages"
+	case domain.ProtocolOpenAIResponses:
+		if strings.Contains(lower, "/responses") {
+			return ""
+		}
+		return "/responses"
+	default:
+		if strings.Contains(lower, "/chat/completions") {
+			return ""
+		}
+		return "/chat/completions"
+	}
+}
+
+// adapterSampleBody 是示例请求体。Claude 与 OpenAI 两套形状不能混用：把
+// messages+max_completion_tokens 发给 Claude 端点，或者把 max_tokens 发给
+// Responses 端点，都会得到一句参数错误，而不是一次成功的示例。
+func adapterSampleBody(protocol domain.Protocol, model string) string {
+	switch protocol {
+	case domain.ProtocolClaude:
+		return `{"model":"` + model + `","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`
+	case domain.ProtocolOpenAIResponses:
+		return `{"model":"` + model + `","input":"hi","max_output_tokens":64}`
+	default:
+		return `{"model":"` + model + `","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":64}`
+	}
+}
+
 func enrichProviderAdapterCurl(provider *domain.Provider) {
 	if provider == nil || provider.RequestAdapter == nil {
 		return
@@ -189,10 +235,11 @@ func enrichProviderAdapterCurl(provider *domain.Provider) {
 		sort.Strings(aliases)
 		clientModel = aliases[0]
 	}
-	provider.RequestAdapter.CurlExample = generateRequestAdapterCurl(
+	provider.RequestAdapter.CurlExample = generateRequestAdapterCurlFor(
 		provider.RequestAdapter,
 		firstNonEmpty(provider.BaseURL, "https://example.invalid"),
 		clientModel,
-		`{"model":"`+clientModel+`","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":64}`,
+		adapterSampleBody(provider.Protocol, clientModel),
+		provider.Protocol,
 	)
 }

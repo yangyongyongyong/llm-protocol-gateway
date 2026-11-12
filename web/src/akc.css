@@ -431,6 +431,24 @@ body.akc-dragging, body.akc-dragging * { cursor: grabbing !important; user-selec
 }
 
 .akc-detail-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+/* 「复制 URL」的下拉：一把 Key 三条端点都能用，让用户自己选要哪一条。 */
+.akc-url-picker { position: relative; }
+.akc-url-menu {
+  position: absolute; top: calc(100% + 4px); right: 0; z-index: 40;
+  min-width: 250px; padding: 4px;
+  background: var(--surface); border: 1px solid var(--border-strong);
+  border-radius: var(--r-md); box-shadow: var(--shadow-pop, 0 8px 24px rgba(0,0,0,.18));
+  display: flex; flex-direction: column; gap: 2px;
+}
+.akc-url-menu-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  width: 100%; padding: 7px 9px; border: 0; border-radius: var(--r-xs);
+  background: transparent; color: var(--text); cursor: pointer;
+  font-size: 12px; text-align: left;
+}
+.akc-url-menu-item:hover { background: var(--surface-sunken); }
+.akc-url-menu-label { white-space: nowrap; }
+.akc-url-menu-path { color: var(--muted); font-family: var(--mono); font-size: 11px; }
 .akc-action {
   display: inline-flex; align-items: center; gap: 5px;
   height: 28px; padding: 0 10px;
@@ -621,6 +639,13 @@ body.akc-dragging, body.akc-dragging * { cursor: grabbing !important; user-selec
 .akc-chain-identity .provider-label { min-width: 0; }
 .akc-chain-missing { color: var(--red); font-size: 12px; font-weight: 600; }
 .akc-chain-middle { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+/* 链路行里的模型下拉：固定宽度，免得长模型名把它撑成两行；高度对齐原来的
+   .akc-model-chip，一行里看起来是同一个控件。 */
+.akc-chain-middle .searchable-select { width: 190px; flex-shrink: 0; }
+.akc-chain-middle .searchable-select-input {
+  height: 24px; padding: 0 26px 0 7px; border-radius: var(--r-xs);
+  font-family: var(--mono); font-size: 11px; background: var(--surface-sunken);
+}
 .akc-model-chip {
   display: inline-flex; align-items: center;
   max-width: 200px; height: 21px; padding: 0 7px;

@@ -38,8 +38,10 @@ func TestFallbackModelOverrideOnlyRequiredAcrossProtocols(t *testing.T) {
 	if _, err := router.AddAPIKey(domain.APIKey{
 		Name: "cross-protocol-missing", RouteID: "r1",
 		FallbackProviderIDs: []string{"p-claude"},
-	}); err == nil {
-		t.Fatal("cross-protocol fallback without a model override must be rejected")
+	}); err != nil {
+		// 跨协议备选没锁模型不再是错误：它自己的模型目录会给出默认模型
+		// （见 resolveConsumerModelOnProvider / applyProviderModelFallback）。
+		t.Fatalf("cross-protocol fallback without a model override should be accepted: %v", err)
 	}
 
 	if _, err := router.AddAPIKey(domain.APIKey{
@@ -50,13 +52,13 @@ func TestFallbackModelOverrideOnlyRequiredAcrossProtocols(t *testing.T) {
 		t.Fatalf("cross-protocol fallback with a model override should be accepted: %v", err)
 	}
 
-	// Switching the fallback to a different protocol without a model must be
-	// rejected by the update path too.
+	// Switching the fallback to a different protocol without a pinned model is
+	// accepted too: the chain must not be blocked by "设为首选" across protocols.
 	if _, err := router.UpdateAPIKey(key.ID, domain.APIKey{
 		Name:                "same-protocol",
 		FallbackProviderIDs: []string{"p-claude"},
-	}); err == nil {
-		t.Fatal("update to a cross-protocol fallback without a model override must be rejected")
+	}); err != nil {
+		t.Fatalf("update to a cross-protocol fallback without a model override should be accepted: %v", err)
 	}
 }
 

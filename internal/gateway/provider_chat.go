@@ -413,13 +413,7 @@ func (s *Server) testProviderChat(r *http.Request, providerID string, req provid
 		provider = refreshed
 	}
 
-	model := strings.TrimSpace(req.Model)
-	if model == "" {
-		model = strings.TrimSpace(provider.DefaultModel)
-	}
-	if model == "" {
-		model = "request-model-not-set"
-	}
+	model := providerTestModel(provider, req.Model)
 
 	// Payload shape follows the provider's own protocol (api_key providers of
 	// any of the three supported protocols, not just OpenAI Chat): the
@@ -445,7 +439,17 @@ func (s *Server) testProviderChat(r *http.Request, providerID string, req provid
 			payload["max_tokens"] = req.MaxTokens
 		}
 	}
-	round := s.executeProviderChatHTTP(r, provider, model, payload, started)
+	// Claude 协议走它自己那条真实路径：sendClaudeMessagesUpstream 会做
+	// stop_sequences 剪裁、thinking 关闭写法、anthropic-beta、以及 per-provider 的
+	// requestAdapter 头（OpenCode Go 的 x-opencode-session 就在这里）。以前这里统一
+	// 走 OpenAI 那条通用发送，测出来的是「另一条路径」的行为——上游要求专有头时
+	// 对话测试永远失败，而真实请求其实是好的。
+	var round providerChatHTTPResult
+	if provider.Protocol == domain.ProtocolClaude {
+		round = claudeRoundToProviderResult(s.executeClaudeMessagesHTTP(r, provider, payload, started))
+	} else {
+		round = s.executeProviderChatHTTP(r, provider, model, payload, started)
+	}
 	if round.Error != "" {
 		s.logs.AddApp("error", "provider chat test failed", round.Error)
 		return map[string]any{
@@ -595,13 +599,7 @@ func (s *Server) testProviderCacheChat(r *http.Request, providerID string, req p
 		return map[string]any{"success": false, "providerId": provider.ID, "error": "Cache test supports OpenAI Chat and Claude providers only"}, http.StatusOK
 	}
 
-	model := strings.TrimSpace(req.Model)
-	if model == "" {
-		model = strings.TrimSpace(provider.DefaultModel)
-	}
-	if model == "" {
-		model = "request-model-not-set"
-	}
+	model := providerTestModel(provider, req.Model)
 
 	userPrompt := buildProviderCacheRound1UserPrompt(req)
 	round1Started := time.Now()
@@ -616,13 +614,7 @@ func (s *Server) testProviderCacheChat(r *http.Request, providerID string, req p
 }
 
 func (s *Server) testClaudeProviderCacheChat(r *http.Request, provider domain.Provider, req providerChatTestRequest, started time.Time) (map[string]any, int) {
-	model := strings.TrimSpace(req.Model)
-	if model == "" {
-		model = strings.TrimSpace(provider.DefaultModel)
-	}
-	if model == "" {
-		model = "request-model-not-set"
-	}
+	model := providerTestModel(provider, req.Model)
 
 	userPrompt := buildProviderCacheRound1UserPrompt(req)
 	round1Started := time.Now()
@@ -719,13 +711,7 @@ func (s *Server) testProviderThinkingChat(r *http.Request, providerID string, re
 		provider = refreshed
 	}
 
-	model := strings.TrimSpace(req.Model)
-	if model == "" {
-		model = strings.TrimSpace(provider.DefaultModel)
-	}
-	if model == "" {
-		model = "request-model-not-set"
-	}
+	model := providerTestModel(provider, req.Model)
 
 	thinkingOptions := thinkingOptionsForProvider(provider)
 	field := strings.TrimSpace(req.ThinkingField)
@@ -807,4 +793,26 @@ func (s *Server) testProviderThinkingChat(r *http.Request, providerID string, re
 		"targetUrl":       round.TargetURL,
 		"error":           round.Error,
 	}, http.StatusOK
+}
+
+// providerTestModel 决定一次「测试/探测」用哪个模型。
+//
+// 顺序：调用方指定的 → Provider 的默认模型 → **目录里的第一个** → 占位符。
+// 第三个才是这里的关键：默认模型为空是很常见的状态（刚建好、还没手动选），
+// 而目录恰好就是「这台上游能服务什么」的权威答案。跳过它直接发占位符
+// "request-model-not-set"，换回来的是上游一句莫名其妙的 400/404——看起来像
+// provider 坏了，其实是网关自己编了一个不存在的模型名。
+func providerTestModel(provider domain.Provider, requested string) string {
+	if model := strings.TrimSpace(requested); model != "" {
+		return model
+	}
+	if model := strings.TrimSpace(provider.DefaultModel); model != "" {
+		return model
+	}
+	for _, model := range provider.Models {
+		if id := strings.TrimSpace(model.ID); id != "" {
+			return id
+		}
+	}
+	return "request-model-not-set"
 }

@@ -648,6 +648,11 @@ export type Provider = {
   // 网关等这台上游返回响应头的最长时间，超时即换下一个 Provider。0/缺省 = 不限制，
   // 且只约束开流前的等待，不会切断已经在输出的回答。
   firstPacketTimeoutSec?: number;
+  // 实测这台上游支持哪些线协议（新建/改 baseUrl 后由后台自动探测写下）。
+  // 空数组 = 还没探过，不代表"什么都不支持"。
+  protocolSupport?: string[];
+  /** 上次探测时间（RFC3339）；从未探过时为空。 */
+  protocolProbedAt?: string;
   // 并发上限与排队等待（管理员，通过 POST /__providers/{id}/concurrency 单独保存）：
   // 这台上游同时在飞的最大请求数，0/缺省 = 不限制；排队秒数只在设了上限时有意义。
   maxConcurrentRequests?: number;
@@ -728,6 +733,10 @@ export type APIKey = {
   modelAliases?: Record<string, string>;
   thinkingDepthOverride?: string;
   maxOutputTokens?: number;
+  /** 这个 Key 等上游响应头的上限（秒）。0/缺省 = 按 Provider 的设置走。 */
+  firstPacketTimeoutSec?: number;
+  /** 同一个 Provider 上最多再试几次。0/缺省 = 一失败就换下一个节点。 */
+  sameProviderRetries?: number;
   streamEnabled?: boolean;
   // Codex「复制配置」弹窗内“保持账号登录”开关，绑定到具体 key，跨次打开弹窗保留。
   codexKeepOfficialLogin?: boolean;
@@ -738,7 +747,8 @@ export type APIKey = {
   activeProviderId?: string;
   /** 运行期：最近一次真正返回响应的 Provider（「在服务」看它，而不是 activeProviderId）。 */
   servingProviderId?: string;
-  /** 运行期：最近一次真正返回响应的 Provider（「在服务」看它，而不是 activeProviderId）。 */
+  /** 运行期：最近 10 分钟内真正返回过响应的全部 Provider（会话分散下它们同时「在服务」）。 */
+  servingProviderIds?: string[];
   /** 调度模式：'' / order 按链路顺序，rotate 轮流，least_used 挑近几分钟干活最少的，quota 挑额度剩得最多的，spread 把不同会话分到不同账号（每会话独占一个账号两小时）。会话粘性始终优先。 */
   scheduleMode?: string;
   /** 额度窗口：'' 不限 / 'day' 每天（网关本机时区 0 点重置）/ 'month' 每月 1 号 0 点。 */

@@ -91,11 +91,14 @@ func TestAnAPIKeyIsAccepted(t *testing.T) {
 	request.Header.Set("x-api-key", "sk-console-key-1")
 	recorder := httptest.NewRecorder()
 	server.Handler().ServeHTTP(recorder, request)
-	// The fixture's provider speaks Claude, so Claude→Claude has no conversion
-	// to run: 502 here is that gap, not a refused credential. What matters is
-	// that the key got through and the turn was built.
-	if recorder.Code != http.StatusBadGateway || !strings.Contains(recorder.Body.String(), "protocol conversion is not implemented") {
-		t.Fatalf("status = %d, want the conversion-gap 502 the keyed path reaches (body %s)", recorder.Code, recorder.Body.String())
+	// 带 key 的请求必须走通。这个 fixture 的 provider 讲 Claude，请求也走 Claude
+	// 端点——auto 模式按「这次请求的协议」判定，两端一致就是直通。
+	//
+	// 这里曾经断言的是 502「protocol conversion is not implemented」：那时判定看的是
+	// route 上的 OutputProtocol（fixture 里是 openai_chat），Claude→Claude 被当成需要
+	// 转换、又找不到转换器。那是 bug，不是契约。
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for a keyed Claude request (body %s)", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -131,19 +134,23 @@ func TestInternalTestRouteIDRequiresTheServerSideMark(t *testing.T) {
 	}
 }
 
-// X-Gateway-Internal-Test 早先还兼着一个「跳过协议不符检查」的开关：带上它，
-// 发给 Claude 端点的 chat 路由就不会被拒。客户端本该拿不到这个能力 —— 一个带合法
-// key、但 key 绑的路由输出的是 chat 协议的请求，原来能靠这个头绕过 400。
-func TestClientCannotForgeTheInternalTestFlagToSkipProtocolChecks(t *testing.T) {
+// X-Gateway-Internal-Test 曾经兼着一个「跳过协议不符检查」的开关。那个检查本身
+// 已经拆掉了：一把 Key 本来就该同时被 Claude Code 和 Codex 用，每条端点自带协议，
+// auto 模式按「这次请求走的是哪条端点」判定直通还是转换，而不是拿 route 上那个
+// 输出协议去拒绝另一条端点。
+//
+// 这条测试盯的是新口径：同一个 Key 绑在 chat 输出的路由上，发 Claude 端点的请求
+// 也必须被正常服务，而不需要任何特殊请求头。
+func TestOneKeyServesEveryProtocolEndpoint(t *testing.T) {
 	upstream, _ := routeGateUpstream(t)
 	state := routeGateState(upstream.URL)
-	// 让 k1 绑到 chat 输出的 r2：这时把请求发给 Claude 端点就是协议不符。
+	// k1 绑到 chat 输出的 r2：按旧口径，往 Claude 端点发就是「协议不符」。
 	state.APIKeys[0].RouteID = "r2"
 	server := NewServer(NewRouter(state), monitor.NewStore())
 	server.SetAdminAuthStore(newMemoryAdminAuthStore())
 	body := `{"model":"claude-x","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
 
-	// 对照：不带这个头，Claude 端点 + chat 路由 = 400 协议不符。
+	// 不带任何特殊头：Claude 端点也必须能用。
 	plain := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(body))
 	plain.Host = "gateway.example.com"
 	plain.RemoteAddr = "203.0.113.70:443"
@@ -151,11 +158,11 @@ func TestClientCannotForgeTheInternalTestFlagToSkipProtocolChecks(t *testing.T) 
 	plain.Header.Set("x-api-key", "sk-console-key-1")
 	plainRecorder := httptest.NewRecorder()
 	server.Handler().ServeHTTP(plainRecorder, plain)
-	if plainRecorder.Code != http.StatusBadRequest {
-		t.Fatalf("baseline: status = %d, want 400 protocol mismatch (body %s)", plainRecorder.Code, plainRecorder.Body.String())
+	if plainRecorder.Code != http.StatusOK {
+		t.Fatalf("同一把 Key 应当能走 Claude 端点，status = %d (body %s)", plainRecorder.Code, plainRecorder.Body.String())
 	}
 
-	// 带上伪造的头：结果必须一样，不能因此走到上游。
+	// 伪造的内部测试头不能改变任何东西（它早已不参与协议判定）。
 	forged := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", strings.NewReader(body))
 	forged.Host = "gateway.example.com"
 	forged.RemoteAddr = "203.0.113.70:443"
@@ -164,8 +171,8 @@ func TestClientCannotForgeTheInternalTestFlagToSkipProtocolChecks(t *testing.T) 
 	forged.Header.Set(headerGatewayInternalTest, "1")
 	forgedRecorder := httptest.NewRecorder()
 	server.Handler().ServeHTTP(forgedRecorder, forged)
-	if forgedRecorder.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want the same 400 the header must not change (body %s)", forgedRecorder.Code, forgedRecorder.Body.String())
+	if forgedRecorder.Code != http.StatusOK {
+		t.Fatalf("带上内部测试头结果应当一样，status = %d (body %s)", forgedRecorder.Code, forgedRecorder.Body.String())
 	}
 }
 
