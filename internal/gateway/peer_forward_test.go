@@ -404,3 +404,77 @@ func adminCall(t *testing.T, handler http.HandlerFunc, method, target string, bo
 	handler(recorder, request)
 	return recorder
 }
+
+// 授权集里的 Provider 声明 openai_chat、实测支持 claude 时，父网关应当接受
+// Claude payload，并在本次尝试里按 Claude 直通。
+func TestSelectPeerProviderUsesProtocolSupport(t *testing.T) {
+	server := NewServer(NewRouter(domain.GatewayState{
+		Providers: []domain.Provider{{
+			ID: "pod", Name: "pod", Protocol: domain.ProtocolOpenAIChat,
+			ProtocolSupport: []string{"openai_chat", "openai_responses", "claude"},
+			Models:          []domain.Model{{ID: "m", ProviderID: "pod", Protocol: domain.ProtocolOpenAIChat}},
+		}},
+	}), monitor.NewStore())
+	decision, ok := server.selectPeerProvider(map[string]bool{"pod": true}, "pod", domain.ProtocolClaude, "m")
+	if !ok {
+		t.Fatal("应当选中声明 openai_chat、实测支持 claude 的 Provider")
+	}
+	if decision.InputProtocol != domain.ProtocolClaude || decision.OutputProtocol != domain.ProtocolClaude {
+		t.Fatalf("decision protocols = %s/%s, want claude/claude", decision.InputProtocol, decision.OutputProtocol)
+	}
+}
+
+// 父网关收到 Claude payload：Provider 声明 openai_chat 但实测支持 claude 时，
+// 必须打它的 /messages，而不是按声明协议转成 /chat/completions。
+func TestPeerChatForwardsWithSupportedNativeProtocol(t *testing.T) {
+	var paths []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/messages" {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"error":{"message":"not found"}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"msg_1","type":"message","role":"assistant","model":"m","content":[{"type":"text","text":"native ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	defer upstream.Close()
+
+	server := newPeerTestServer(t,
+		domain.Provider{
+			ID: "multi", Name: "multi", Protocol: domain.ProtocolOpenAIChat,
+			ProtocolSupport: []string{"openai_chat", "claude"},
+			AuthType:        domain.AuthTypeAPIKey, APIKeySource: "literal:sk-upstream",
+			BaseURL: upstream.URL,
+			Models:  []domain.Model{{ID: "m", ProviderID: "multi", Protocol: domain.ProtocolOpenAIChat, InMenu: true}},
+		},
+	)
+	server.router.SetPeerRegistrationAllowCIDRs("127.0.0.1/32")
+	_, response := peerRegister(t, server, peerRegisterPayload(map[string]any{
+		"requestedProviderIds": []string{"multi"},
+	}))
+
+	body, _ := json.Marshal(map[string]any{
+		"providerId": "multi",
+		"protocol":   "claude",
+		"payload": map[string]any{
+			"model": "m", "max_tokens": 16,
+			"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		},
+	})
+	request := httptest.NewRequest(http.MethodPost, peerEndpointPrefix+"chat/completions", bytes.NewReader(body))
+	request.Header.Set("Authorization", "Bearer "+response.Token)
+	request.Header.Set("Content-Type", "application/json")
+	request.RemoteAddr = "127.0.0.1:40000"
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(paths) != 1 || paths[0] != "/messages" {
+		t.Fatalf("upstream paths = %v, want [/messages]", paths)
+	}
+	if !strings.Contains(recorder.Body.String(), "native ok") {
+		t.Fatalf("body = %s", recorder.Body.String())
+	}
+}

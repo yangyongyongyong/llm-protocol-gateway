@@ -234,6 +234,13 @@ func applyCLI(home string, e Endpoint) (cliResult, error) {
 			changed = true
 		}
 	}
+	// 两个变量同时存在时 Claude Code 会优先用 ANTHROPIC_API_KEY，并提示冲突。
+	// 上一次写入或其它工具留下的旧 Key 会盖住这次写入的 AUTH_TOKEN，表现为
+	// 401 invalid api key。这里统一以 AUTH_TOKEN 为准，把冲突项删掉。
+	if _, exists := env["ANTHROPIC_API_KEY"]; exists {
+		delete(env, "ANTHROPIC_API_KEY")
+		changed = true
+	}
 	if !changed {
 		res.unchanged = true
 		return res, nil

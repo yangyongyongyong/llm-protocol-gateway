@@ -100,12 +100,19 @@ func protocolProbeCandidates(baseURL string, current domain.Protocol) []protocol
 		sibling := strings.TrimSuffix(base, "/anthropic")
 		add(domain.ProtocolOpenAIChat, sibling, "")
 		add(domain.ProtocolOpenAIResponses, sibling, "")
+		// Anthropic 风格的根多数是 …/anthropic/v1（DeepSeek 等），端点还要再带
+		// 一层 /v1；同根 /messages 作为兜底保留。
+		add(domain.ProtocolClaude, base+"/v1", "")
 		add(domain.ProtocolClaude, base, "")
 		return roots
 	}
-	// 普通 OpenAI 风格的根：兄弟是它自己加上 /anthropic。
+	// 普通 OpenAI 风格的根：有的上游把 Claude 放在 /anthropic 兄弟路径下，也有
+	// 的（OpenCode Go）就在同一个根上开 /messages。两种都探：同根优先，404 时
+	// 再退到 /anthropic 兄弟路径。少探这一条会让 OpenCode Go 的 Claude 能力永远
+	// 显示不出来。
 	add(domain.ProtocolOpenAIChat, base, "")
 	add(domain.ProtocolOpenAIResponses, base, "")
+	add(domain.ProtocolClaude, base, "")
 	add(domain.ProtocolClaude, base+"/anthropic", "")
 	return roots
 }
@@ -148,18 +155,53 @@ func classifyProtocolProbe(status int) bool {
 // detectProviderProtocols 探一遍这条上游支持的协议。
 func (s *Server) detectProviderProtocols(ctx context.Context, provider domain.Provider) []protocolDetection {
 	candidates := protocolProbeCandidates(provider.BaseURL, provider.Protocol)
-	out := make([]protocolDetection, 0, len(candidates))
+	// 同一个协议可能有多条候选路径（例如 Claude 同根 /messages 与 /anthropic
+	// 兄弟路径）。按协议分组后只要任意一条成立就算支持，避免后一条 404 把前一条
+	// 已经探到的结论覆盖掉。
+	order := make([]domain.Protocol, 0, len(candidates))
+	grouped := make(map[domain.Protocol][]protocolProbe, len(candidates))
 	for _, candidate := range candidates {
-		result := protocolDetection{
-			Protocol: candidate.Protocol,
-			URL:      candidate.URL,
-			Current:  candidate.Protocol == provider.Protocol,
+		if _, ok := grouped[candidate.Protocol]; !ok {
+			order = append(order, candidate.Protocol)
 		}
-		status, detail := s.probeOneProtocol(ctx, provider, candidate)
-		result.Status = status
-		result.Detail = detail
-		result.Supported = classifyProtocolProbe(status)
-		result.Unknown = status == 0
+		grouped[candidate.Protocol] = append(grouped[candidate.Protocol], candidate)
+	}
+	out := make([]protocolDetection, 0, len(order))
+	for _, protocol := range order {
+		result := protocolDetection{Protocol: protocol, Current: protocol == provider.Protocol}
+		unknownDetail := ""
+		for _, candidate := range grouped[protocol] {
+			status, detail := s.probeOneProtocol(ctx, provider, candidate)
+			if result.URL == "" {
+				result.URL = candidate.URL
+			}
+			if classifyProtocolProbe(status) {
+				result.URL = candidate.URL
+				result.Status = status
+				result.Detail = detail
+				result.Supported = true
+				result.Unknown = false
+				break
+			}
+			if status == 0 {
+				if unknownDetail == "" {
+					unknownDetail = detail
+				}
+				continue
+			}
+			// 记下第一条明确的否定证据，供全部候选都失败时展示。
+			if result.Status == 0 && unknownDetail == "" {
+				result.Status = status
+				result.Detail = detail
+			}
+		}
+		// 有条候选没探出结论（超时/连不上）时，这条协议整体记「未知」：不能拿
+		// 另一条候选的 404 去否定它，否则一次网络抖动就会把已支持的协议删掉。
+		if !result.Supported && unknownDetail != "" {
+			result.Unknown = true
+			result.Status = 0
+			result.Detail = unknownDetail
+		}
 		out = append(out, result)
 	}
 	return out
@@ -198,6 +240,9 @@ func (s *Server) probeOneProtocol(ctx context.Context, provider domain.Provider,
 	}
 	applyRequestAdapterHeaders(request, provider, provider.DefaultModel)
 	applyProviderAuth(request, provider, "")
+	if candidate.Protocol == domain.ProtocolClaude {
+		applyOpenCodeGoClaudeHeaders(request, provider, body)
+	}
 
 	response, err := (&http.Client{Timeout: protocolProbeTimeout}).Do(request)
 	if err != nil {
@@ -226,9 +271,9 @@ func (s *Server) handleDetectProviderProtocols(w http.ResponseWriter, r *http.Re
 	s.persistProtocolSupport(provider.ID, results)
 	provider, _ = s.router.ProviderByID(r.PathValue("id"))
 	writeJSON(w, http.StatusOK, map[string]any{
-		"providerId":    provider.ID,
-		"baseUrl":       provider.BaseURL,
-		"protocols":     results,
+		"providerId":      provider.ID,
+		"baseUrl":         provider.BaseURL,
+		"protocols":       results,
 		"protocolSupport": provider.ProtocolSupport,
 	})
 }
@@ -387,4 +432,3 @@ func (s *Server) autoFetchProviderModels(ctx context.Context, provider domain.Pr
 	s.logs.AddApp("info", "provider models fetched automatically", fmt.Sprintf(
 		"provider=%s models=%d", provider.ID, len(result.Models)))
 }
-

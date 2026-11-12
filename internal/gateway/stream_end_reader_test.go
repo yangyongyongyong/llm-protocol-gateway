@@ -54,6 +54,11 @@ func closingCases() []closeCase {
 		{name: "chat [DONE] terminated by EOF", want: true, body: chatChunkOK + "data: [DONE]"},
 		{name: "responses completed", want: true,
 			body: responsesCreated + newlines + "event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"id\":\"resp_1\"}}\n\n"},
+		// OpenAI Responses 的结束帧把完整 response 放在前面，顶层 type 可能
+		// 落在扫描窗口之后（OpenCode Go 的 response.completed 实测就是这样）。
+		{name: "responses completed with type past the scan window", want: true,
+			body: responsesCreated + newlines + `event: response.completed` + newlines +
+				`data: {"response":{"id":"resp_1","output_text":"` + strings.Repeat("a", 2000) + `"},"type":"response.completed","sequence_number":2}` + newlines},
 		{name: "responses incomplete", want: true,
 			body: responsesCreated + newlines + "data: {\"type\":\"response.incomplete\",\"sequence_number\":2}\n\n"},
 		{name: "responses failed", want: true,

@@ -84,6 +84,36 @@ func TestApplyCLIPinsEveryTierAndSubagentModel(t *testing.T) {
 	}
 }
 
+// 旧版本/其它工具可能留下 ANTHROPIC_API_KEY。两个变量同时存在时 Claude Code
+// 会优先用 API_KEY 并提示冲突，旧 Key 失效时表现为 401。写入 AUTH_TOKEN 时
+// 必须把冲突项清掉，同时保留用户自己的其它配置。
+func TestApplyCLIClearsConflictingAPIKey(t *testing.T) {
+	home := withHome(t)
+	path := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	existing := `{"env":{"ANTHROPIC_API_KEY":"sk-gw-stale"},"permissions":{"allow":["Bash(ls)"]}}`
+	if err := os.WriteFile(path, []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Apply(endpoint()); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	root := readJSON(t, path)
+	env, _ := root["env"].(map[string]any)
+	if _, ok := env["ANTHROPIC_API_KEY"]; ok {
+		t.Fatalf("冲突的 ANTHROPIC_API_KEY 应当被清掉：%v", env["ANTHROPIC_API_KEY"])
+	}
+	if got, _ := env["ANTHROPIC_AUTH_TOKEN"].(string); got != "sk-gw-test" {
+		t.Fatalf("AUTH_TOKEN = %q", got)
+	}
+	permissions, _ := root["permissions"].(map[string]any)
+	if allow, _ := permissions["allow"].([]any); len(allow) != 1 {
+		t.Fatalf("用户自己的 permissions 被改动了：%v", root["permissions"])
+	}
+}
+
 // 子 agent 必须跟着走：不给 CLAUDE_CODE_SUBAGENT_MODEL，内置的
 // claude-code-guide（haiku）和 statusline-setup（sonnet）会按真实模型名发请求，
 // 绕开平台的模型切换。

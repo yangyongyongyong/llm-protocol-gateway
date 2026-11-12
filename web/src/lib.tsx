@@ -765,7 +765,10 @@ export function trafficLogProviderLabel(log: LogEntry, providers: Provider[]) {
 }
 
 export function isTrafficLogError(log: LogEntry) {
-  return log.status >= 400 || Boolean(log.errorDescription?.trim());
+  // 历史数据里可能有成功响应被写成字符串 "<nil>"（Responses 的 error:null），
+  // 那不是错误；保留这个判断，避免旧日志一直显示成红色。
+  const description = log.errorDescription?.trim() || '';
+  return log.status >= 400 || (description !== '' && description !== '<nil>');
 }
 
 /**
@@ -1345,6 +1348,27 @@ export function protocolLabel(protocol: Protocol) {
     case 'claude': return 'Claude';
     case 'gemini': return 'Gemini';
   }
+}
+
+/**
+ * API 日志里的协议缩写。
+ *
+ * 取首字母会让 OpenAI Chat 与 OpenAI Responses 都变成 "O"，同一列里无法区分。
+ * 两字母编码既短又唯一：oc / or / cl。
+ */
+export function protocolShortCode(label: string) {
+  const value = label.trim().toLowerCase();
+  if (!value) return '?';
+  if (value.startsWith('claude')) return 'cl';
+  if (value.startsWith('openai responses')) return 'or';
+  if (value.startsWith('openai chat')) return 'oc';
+  return label.trim()[0].toUpperCase();
+}
+
+export function compactProtocolFlow(label: string) {
+  if (!label) return '—';
+  const [from, to] = label.split('->').map((part) => part.trim());
+  return to ? `${protocolShortCode(from)}→${protocolShortCode(to)}` : protocolShortCode(from);
 }
 
 export function protocolFromLabel(label: string): Protocol {
@@ -2702,7 +2726,6 @@ export function buildApiKeyClaudeConfig(key: APIKey, route: Route | undefined, e
     env: {
       ANTHROPIC_BASE_URL: baseURL,
       ANTHROPIC_AUTH_TOKEN: key.key,
-      ANTHROPIC_API_KEY: key.key,
       ANTHROPIC_MODEL: model,
     },
     model,
@@ -2792,6 +2815,8 @@ export function buildClaudeCodeSwitcherScript(
     'env = data.get("env")',
     'if not isinstance(env, dict):',
     '    env = {}',
+    '# 两个都设置时 Claude Code 会优先用 API_KEY 并提示冲突；以 AUTH_TOKEN 为准。',
+    'env.pop("ANTHROPIC_API_KEY", None)',
     'env.update(NEW["env"])',
     'data["env"] = env',
     '# 顶层 model 只在本工具写过时才覆盖：用户自己在 /config 里选的模型更该保留。',

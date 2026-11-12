@@ -23,6 +23,29 @@ import (
 //     ChatToResponsesStreamOptions (Cursor vs Standard). Never hardcode
 //     Cursor-only behavior into the default path used by Claude→Responses.
 
+// upstreamProtocolOverrideKey 让调度层为「这一次尝试」指定上游协议。
+//
+// 一个 provider 只声明一种母语协议（Protocol），但实测可能同时支持多种
+// （ProtocolSupport）。当调度决定先用客户端协议直通时，需要把这次尝试的
+// 上游协议临时改成客户端协议——URL 拼接、请求体形状、响应解析都按它走；
+// 直通失败退回转换时，只要不再注入这个值，就回到 provider 声明的协议。
+type upstreamProtocolOverrideKey struct{}
+
+func withUpstreamProtocolOverride(ctx context.Context, protocol domain.Protocol) context.Context {
+	if protocol == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, upstreamProtocolOverrideKey{}, protocol)
+}
+
+func upstreamProtocolOverrideFrom(ctx context.Context) domain.Protocol {
+	if ctx == nil {
+		return ""
+	}
+	protocol, _ := ctx.Value(upstreamProtocolOverrideKey{}).(domain.Protocol)
+	return protocol
+}
+
 func resolveProviderResponsesURL(provider domain.Provider, model string) string {
 	resolvedModel := strings.TrimSpace(model)
 	if resolvedModel == "" {
@@ -915,6 +938,11 @@ func (s *Server) executeProtocolFlow(
 	provider, err := s.router.ProviderByID(providerID)
 	if err != nil {
 		return 0, TokenUsage{}, nil, err
+	}
+	// 调度层决定「这次先用哪个协议直通」时，会把这个值挂在 context 上。
+	// 只影响本次尝试的 URL 构造与响应解析，不改 provider 的持久化配置。
+	if override := upstreamProtocolOverrideFrom(r.Context()); override != "" {
+		provider.Protocol = override
 	}
 	// Single chokepoint for the Qoder job-token refresh: every pass-through path
 	// and every protocol conversion below flows through here.

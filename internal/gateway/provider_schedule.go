@@ -282,12 +282,11 @@ func (s *Server) preferNativeProtocol(chain []string, clientProtocol domain.Prot
 	if clientProtocol == "" || len(chain) < 2 || pinned != "" || s.router == nil {
 		return chain
 	}
-	first := s.providerProtocol(chain[0])
-	if first == "" || first == clientProtocol {
+	if s.providerServesNative(chain[0], clientProtocol) {
 		return chain
 	}
 	for index := 1; index < len(chain); index++ {
-		if s.providerProtocol(chain[index]) != clientProtocol {
+		if !s.providerServesNative(chain[index], clientProtocol) {
 			continue
 		}
 		promoted := make([]string, 0, len(chain))
@@ -303,6 +302,21 @@ func (s *Server) preferNativeProtocol(chain []string, clientProtocol domain.Prot
 	return chain
 }
 
+// providerServesNative 报告这台上游能不能按客户端协议直通：声明协议一致，
+// 或者实测支持清单里有它。后者是同一台 baseUrl 上多开一条协议路径的上游
+// （OpenCode Go 这类），调度时同样应该优先直通。
+func (s *Server) providerServesNative(providerID string, clientProtocol domain.Protocol) bool {
+	provider, err := s.router.ProviderByID(providerID)
+	if err != nil {
+		return false
+	}
+	if provider.Protocol == clientProtocol {
+		return true
+	}
+	_, ok := nativeProtocolForProvider(provider, clientProtocol)
+	return ok
+}
+
 // providerProtocol 返回这个 provider 的母语协议，查不到时返回空串。
 func (s *Server) providerProtocol(providerID string) domain.Protocol {
 	provider, err := s.router.ProviderByID(providerID)
@@ -310,6 +324,41 @@ func (s *Server) providerProtocol(providerID string) domain.Protocol {
 		return ""
 	}
 	return provider.Protocol
+}
+
+// nativeProtocolForProvider 返回这台上游可以直通客户端协议时该用的协议。
+//
+// 只认实测结论（ProtocolSupport），不靠猜：某条路径探到过（非 404）才会进
+// 这个清单。声明协议已经一致时返回 false——那种情况本来就该直通，不需要
+// 覆盖。当前只对 api_key 型上游启用：订阅 OAuth、对端网关、专有客户端的
+// “多协议”不是同一条 baseUrl 派生多条路径的形态。
+func nativeProtocolForProvider(provider domain.Provider, clientProtocol domain.Protocol) (domain.Protocol, bool) {
+	if clientProtocol == "" || provider.Protocol == clientProtocol {
+		return "", false
+	}
+	// 对端网关同样适用：上游把多协议能力透传下来后，下游也应该优先按客户端
+	// 协议把请求送进父网关，由父网关挑它自己那台同协议的真实上游。
+	if provider.AuthType != domain.AuthTypeAPIKey && provider.AuthType != domain.AuthTypePeer {
+		return "", false
+	}
+	if providerSupportsProtocol(provider, clientProtocol) {
+		return clientProtocol, true
+	}
+	return "", false
+}
+
+// providerSupportsProtocol 报告这台上游能否按 protocol 直通：声明协议一致，
+// 或者实测支持清单里包含它。
+func providerSupportsProtocol(provider domain.Provider, protocol domain.Protocol) bool {
+	if protocol == "" || provider.Protocol == protocol {
+		return true
+	}
+	for _, supported := range provider.ProtocolSupport {
+		if domain.Protocol(strings.TrimSpace(supported)) == protocol {
+			return true
+		}
+	}
+	return false
 }
 
 // handleSetProviderFirstPacketTimeout is the admin-only per-provider knob for

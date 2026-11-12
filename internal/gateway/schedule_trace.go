@@ -22,19 +22,20 @@ import (
 // strings because the console labels them, and a log reader needs to tell
 // "moved on because the account was busy" from "moved on because it was out".
 const (
-	attemptReasonServed             = "served"
-	attemptReasonUpstreamError      = "upstream_error"
-	attemptReasonModelBusy          = "model_busy"
-	attemptReasonStreamInterrupted  = "stream_interrupted"
-	attemptReasonTransportError     = "transport_error"
-	attemptReasonFirstPacketTimeout = "first_packet_timeout"
-	attemptReasonSaturated          = "saturated"
-	attemptReasonMissingModel       = "missing_model_override"
+	attemptReasonServed                = "served"
+	attemptReasonUpstreamError         = "upstream_error"
+	attemptReasonModelBusy             = "model_busy"
+	attemptReasonStreamInterrupted     = "stream_interrupted"
+	attemptReasonTransportError        = "transport_error"
+	attemptReasonFirstPacketTimeout    = "first_packet_timeout"
+	attemptReasonSaturated             = "saturated"
+	attemptReasonMissingModel          = "missing_model_override"
 	attemptReasonUnsupportedConversion = "unsupported_conversion"
-	attemptReasonDisabled           = "disabled"
-	attemptReasonNotAssigned        = "not_assigned"
-	attemptReasonUndecidable        = "decision_failed"
-	attemptReasonClientGone         = "client_gone"
+	attemptReasonDisabled              = "disabled"
+	attemptReasonNotAssigned           = "not_assigned"
+	attemptReasonUndecidable           = "decision_failed"
+	attemptReasonClientGone            = "client_gone"
+	attemptReasonNativePassthroughFail = "native_passthrough_failed"
 )
 
 type scheduleTrace struct {

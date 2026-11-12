@@ -34,8 +34,8 @@ func TestSameProviderRetriesStayOnTheNode(t *testing.T) {
 	key := domain.APIKey{
 		ID: "k-retry", Name: "k-retry", Key: "sk-gw-retry", RouteID: route.ID,
 		Enabled: true, StreamEnabled: true,
-		FallbackProviderIDs:  []string{"p-healthy"},
-		SameProviderRetries:  2,
+		FallbackProviderIDs: []string{"p-healthy"},
+		SameProviderRetries: 2,
 	}
 	server := NewServer(NewRouter(domain.GatewayState{
 		Providers: []domain.Provider{

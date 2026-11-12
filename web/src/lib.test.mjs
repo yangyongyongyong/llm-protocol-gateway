@@ -69,6 +69,13 @@ test('cloudflareAuthPollOutcome: 授权成功就收尾，不再等待', () => {
   assert.equal(lib.cloudflareAuthPollOutcome({authorized: true, elapsedMs: 700000, timeoutMs: 600000}), 'authorized');
 });
 
+test('isTrafficLogError: 成功响应里的 <nil> 不算错误', () => {
+  assert.equal(lib.isTrafficLogError({status: 200, errorDescription: '<nil>'}), false);
+  assert.equal(lib.isTrafficLogError({status: 200, errorDescription: ''}), false);
+  assert.equal(lib.isTrafficLogError({status: 200, errorDescription: 'boom'}), true);
+  assert.equal(lib.isTrafficLogError({status: 500}), true);
+});
+
 test('cloudflareAuthPollOutcome: 没授权且未超时继续等，超过时限收尾', () => {
   assert.equal(lib.cloudflareAuthPollOutcome({authorized: false, elapsedMs: 0, timeoutMs: 600000}), 'wait');
   assert.equal(lib.cloudflareAuthPollOutcome({authorized: false, elapsedMs: 600000, timeoutMs: 600000}), 'wait');
@@ -707,4 +714,16 @@ test('Codex 配置：model 固定写 default，换模型不用重写 config.toml
   assert.match(text, /^model = "default"$/m, 'model 必须固定为 default');
   assert.doesNotMatch(text, /some-real-model/, '不该把真实模型名写进客户端配置');
   assert.match(text, /requires_openai_auth = false/, '凭据走 bearer 时必须写 false');
+});
+
+test('API 日志协议缩写：oc / or / cl，不再共用首字母 O', () => {
+  assert.equal(lib.protocolShortCode('OpenAI Chat'), 'oc');
+  assert.equal(lib.protocolShortCode('OpenAI Responses'), 'or');
+  assert.equal(lib.protocolShortCode('Claude'), 'cl');
+  // 完整流向：上游 -> 客户端，两侧各用自己的缩写。
+  assert.equal(lib.compactProtocolFlow('OpenAI Chat -> Claude'), 'oc→cl');
+  assert.equal(lib.compactProtocolFlow('OpenAI Chat -> OpenAI Responses'), 'oc→or');
+  // 未知协议保留首字母大写，空值不伪装成某种协议。
+  assert.equal(lib.protocolShortCode('Gemini'), 'G');
+  assert.equal(lib.compactProtocolFlow(''), '—');
 });

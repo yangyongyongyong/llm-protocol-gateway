@@ -24,6 +24,12 @@ func (s *Server) servePeerProtocol(w http.ResponseWriter, r *http.Request, accou
 		writeOpenAIError(w, http.StatusBadGateway, "granted provider is no longer available: "+err.Error())
 		return
 	}
+	// 下游送来的 payload 协议可能不是这台 Provider 声明的那一种：上游实测
+	// 支持它（selectPeerProvider 已确认）时，本次就按 payload 的协议直通。
+	// 只改这一次尝试的副本，不落库、不影响其它请求。
+	if decision.InputProtocol != "" {
+		provider.Protocol = decision.InputProtocol
+	}
 	started := time.Now()
 	// 下游的凭据不能以任何形式继续往上游走。Claude 直通在没有配置自己的 key
 	// 时会回退到客户端的 Authorization，而这里那个头正是对端凭据——先摘掉，

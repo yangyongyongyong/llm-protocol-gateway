@@ -1465,6 +1465,76 @@ func (s *Server) executeProtocolFlowWithFailover(
 		attemptReq := cloneRequestMap(req)
 		attemptReq["model"] = attemptModel
 
+		// 这台上游实测支持客户端协议时，先按客户端协议直通一次：直通只搬字节，
+		// 不经过转换器，长尾字段与流式事件最不容易被改写。失败且尚未向客户端
+		// 提交任何字节时，再退回它声明的协议做转换重试——转换是保底，不是首选。
+		if nativeProtocol, ok := nativeProtocolForProvider(attemptProvider, clientProtocol); ok {
+			nativeDecision := attemptDecision
+			nativeDecision.Action = "pass_through"
+			nativeDecision.InputProtocol = nativeProtocol
+			nativeDecision.ConversionLabel = fmt.Sprintf("%s -> %s", nativeProtocol.DisplayName(), nativeProtocol.DisplayName())
+			nativeReq := cloneRequestMap(attemptReq)
+			nativeReq["model"] = attemptModel
+			nativeWriter := newFailoverResponseWriter(w, true)
+			nativeTimer := startAttempt()
+			nativeR := r.WithContext(withUpstreamProtocolOverride(r.Context(), nativeProtocol))
+			status, usage, body, nativeErr := s.executeProtocolFlow(nativeWriter, nativeR, route, nativeDecision, attemptModel, nativeReq, clientProtocol, skipIncomingAuth)
+			elapsed := nativeTimer.millis()
+			if nativeErr == nil && status >= 200 && status < 300 {
+				if !nativeWriter.passthrough {
+					nativeWriter.FlushError()
+				}
+				respBody := body
+				if len(respBody) == 0 {
+					respBody = nativeWriter.BufferedBody()
+				}
+				s.noteKeyServingProvider(matchedKey.ID, providerID)
+				s.setSessionPinFor(sessionKey, providerID, s.sessionPinTTL(matchedKey.ScheduleMode))
+				served = true
+				qoderBlameBucketFrom(r.Context()).flush(s)
+				s.noteProviderUsage(providerID, usage)
+				noteScheduleAttempt(r.Context(), monitor.RequestAttempt{ProviderID: providerID, Model: attemptModel, Status: status, Ms: elapsed, Reason: attemptReasonServed})
+				return status, usage, respBody, nativeDecision, attemptModel, nil
+			}
+			if nativeWriter.deferring() {
+				nativeWriter.Discard()
+				detail := fmt.Sprintf("status=%d", status)
+				if nativeErr != nil {
+					detail += " err=" + truncateReason(nativeErr.Error())
+				} else if len(body) > 0 {
+					detail += " body=" + truncateReason(string(body))
+				}
+				s.logs.AddApp("warn", "native protocol pass-through failed, retrying conversion", fmt.Sprintf(
+					"key=%s provider=%s client=%s %s", matchedKey.ID, providerID, clientProtocol, detail))
+				errText := ""
+				if nativeErr != nil {
+					errText = nativeErr.Error()
+				}
+				noteScheduleAttempt(r.Context(), monitor.RequestAttempt{
+					ProviderID: providerID, Model: attemptModel, Status: status, Ms: elapsed,
+					Reason:   attemptReasonNativePassthroughFail,
+					Error:    truncateReason(firstNonEmpty(errText, string(body))),
+					Deferred: true,
+				})
+				markTimingFlag(r.Context(), timingFlagFailoverRetry)
+				if t := requestTimingFrom(r.Context()); t != nil {
+					t.resetUpstreamMarks()
+				}
+				// 落到下面的转换尝试：同一个 provider，按它声明的协议再发一次。
+			} else {
+				// 已经开始向客户端写（流已提交），不能再换请求形状重放。
+				nativeWriter.FlushError()
+				if nativeErr == nil {
+					nativeErr = fmt.Errorf("native pass-through ended with HTTP %d", status)
+				}
+				noteScheduleAttempt(r.Context(), monitor.RequestAttempt{
+					ProviderID: providerID, Model: attemptModel, Status: status, Ms: elapsed,
+					Reason: attemptReasonNativePassthroughFail, Error: truncateReason(nativeErr.Error()),
+				})
+				return status, usage, body, nativeDecision, attemptModel, nativeErr
+			}
+		}
+
 		canDefer := i < len(attempts)-1
 		writer := newFailoverResponseWriter(w, canDefer)
 		timer := startAttempt()

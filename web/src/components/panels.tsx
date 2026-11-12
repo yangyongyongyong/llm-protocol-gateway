@@ -922,6 +922,12 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
       value: item,
       label: item === 'claude' ? 'Claude' : item === 'openai_responses' ? 'Responses' : 'OpenAI Chat',
     }));
+  // 卡片与列表共用同一组徽章：只在一处渲染会让默认视图看不到这些能力。
+  const extraProtocolBadges = extraProtocols.map((item) => (
+    <span key={item.value} title={`这条上游也支持 ${item.label}：再建一条同 baseUrl、协议为 ${item.label} 的 Provider，就能让该协议的请求直通而不必转换`}>
+      <Badge tone="cyan">+{item.label}</Badge>
+    </span>
+  ));
   const isUnavailable = healthStatus === 'unavailable';
   const now = useNowTick(isUnavailable && !!nextRetryAt);
   const retryLabel = isUnavailable ? retrySecondsLabel(nextRetryAt, now) : null;
@@ -994,11 +1000,7 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
                 新建 provider 之后后台会自动探一次（不需要人点按钮），结论存在
                 provider 上。显示出来的用处：一眼看出「这里其实也能走 OpenAI，
                 再建一条同样 baseUrl 的 provider 就能让下游直通、不经过转换」。 */}
-            {extraProtocols.map((item) => (
-              <span key={item.value} title={`这条上游也支持 ${item.label}：再建一条同 baseUrl、协议为 ${item.label} 的 Provider，就能让该协议的请求直通而不必转换`}>
-                <Badge tone="cyan">+{item.label}</Badge>
-              </span>
-            ))}
+            {extraProtocolBadges}
             {showOAuthBadge ? (
               <Badge tone={oauthConnected ? 'green' : 'amber'}>{oauthBadgeLabel}{oauthConnected ? ' 已连接' : ' 未连接'}</Badge>
             ) : (
@@ -1048,6 +1050,7 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
           </span>
         ) : null}
         <Badge tone="slate">{protocol}</Badge>
+        {extraProtocolBadges}
         {showOAuthBadge ? (
           <Badge tone={oauthConnected ? 'green' : 'amber'}>{oauthBadgeLabel}{oauthConnected ? ' 已连接' : ' 未连接'}</Badge>
         ) : (

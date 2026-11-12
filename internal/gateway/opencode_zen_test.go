@@ -270,3 +270,31 @@ func normalizeProviderForTest(provider domain.Provider) domain.Provider {
 	normalizeProvider(&provider)
 	return provider
 }
+
+// OpenCode Go 的 Claude 端点不认 Authorization: Bearer，只认 x-api-key，而且
+// 必须带 x-opencode-session；少任何一个都会 401 / MissingSessionID。
+func TestApplyOpenCodeGoClaudeHeaders(t *testing.T) {
+	provider := domain.Provider{
+		ID:           "opencode-go",
+		AuthType:     domain.AuthTypeAPIKey,
+		BaseURL:      "https://opencode.ai/zen/go/v1",
+		APIKeySource: "literal:oc_sk_test",
+	}
+	request, err := http.NewRequest(http.MethodPost, "https://opencode.ai/zen/go/v1/messages", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyOpenCodeGoClaudeHeaders(request, provider, []byte(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if got := request.Header.Get("x-api-key"); got != "oc_sk_test" {
+		t.Fatalf("x-api-key = %q", got)
+	}
+	if got := request.Header.Get("x-opencode-session"); got == "" {
+		t.Fatal("x-opencode-session 不能为空")
+	}
+	// 同一段对话每次都得到同一个 session，否则上游会把每一轮当冷启动。
+	again, _ := http.NewRequest(http.MethodPost, "https://opencode.ai/zen/go/v1/messages", nil)
+	applyOpenCodeGoClaudeHeaders(again, provider, []byte(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if got, want := again.Header.Get("x-opencode-session"), request.Header.Get("x-opencode-session"); got != want {
+		t.Fatalf("session 不稳定：%q != %q", got, want)
+	}
+}

@@ -5,6 +5,7 @@ import {
     API_BASE,
     actionLabel,
     buildReplayHeaders,
+    compactProtocolFlow,
     formatBytes,
     formatCostMicros,
     isTrafficLogError,
@@ -79,13 +80,6 @@ function splitModel(value: string) {
  * `Claude -> OpenAI Chat` 写全要 170px，每行都放一遍既撑爆表格又是噪声：
  * 压成 C→O，完整流向留在 title 里。
  */
-function compactFlow(label: string) {
-  if (!label) return '—';
-  const [from, to] = label.split('->').map((part) => part.trim());
-  const initial = (value: string) => (value ? value[0].toUpperCase() : '?');
-  return to ? `${initial(from)}→${initial(to)}` : initial(from);
-}
-
 /**
  * 调度轨迹：这次请求按什么顺序、因为什么碰过哪些 Provider。
  *
@@ -105,6 +99,7 @@ const SCHEDULE_REASONS: Record<string, { text: string; tone: 'green' | 'amber' |
   not_assigned: { text: '未授权', tone: 'slate' },
   decision_failed: { text: 'Provider 不存在', tone: 'slate' },
   client_gone: { text: '客户端已断开', tone: 'slate' },
+  native_passthrough_failed: { text: '直通失败·转转换', tone: 'amber' },
 };
 
 export function ScheduleTracePanel({ log, providers }: { log: LogEntry; providers: Provider[] }) {
@@ -319,8 +314,8 @@ export function TrafficLogTable({ logs, providers, routes, apiKeys, onOpen, fres
               <span className={`tlog-peer${peerChain.peered ? ' peered' : ''}`} title={peerChain.title}>
                 {peerChain.text}
               </span>
-              <span className="tlog-proto" title={`${actionLabel(log.action)} · ${log.protocolFlow || '未知流向'} · ${log.path}`}>
-                {compactFlow(log.protocolFlow)}
+              <span className="tlog-proto" title={`${actionLabel(log.action)} · ${log.protocolFlow || '未知流向'}（oc=OpenAI Chat，or=OpenAI Responses，cl=Claude）· ${log.path}`}>
+                {compactProtocolFlow(log.protocolFlow)}
               </span>              <span className="num">{fmtNum(log.inputTokens)}</span>
               <span className="num">{fmtNum(log.outputTokens)}</span>
               <span className="num" title="写入提示缓存的 token（已计入输入）">{fmtNum(log.cacheWriteTokens)}</span>

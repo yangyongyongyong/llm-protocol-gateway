@@ -160,6 +160,53 @@ func applyOpenCodeZenHeaders(request *http.Request, provider domain.Provider, bo
 	request.Header.Del("X-Session-Id")
 }
 
+// isOpenCodeGoProvider reports whether this provider points at OpenCode Go's
+// paid deployment (…/zen/go/…).
+//
+// Go serves Claude on the same root as OpenAI (`/v1/messages`), unlike the
+// `/anthropic` sibling layout most relays use. That endpoint also authenticates
+// with `x-api-key` instead of the bearer the OpenAI routes accept, and refuses a
+// request that carries no routing session header.
+func isOpenCodeGoProvider(provider domain.Provider) bool {
+	if provider.AuthType != domain.AuthTypeAPIKey {
+		return false
+	}
+	parsed, err := url.Parse(strings.TrimSpace(provider.BaseURL))
+	if err != nil || parsed.Scheme == "" {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host != "opencode.ai" && !strings.HasSuffix(host, ".opencode.ai") {
+		return false
+	}
+	path := strings.TrimRight(strings.ToLower(parsed.Path), "/")
+	return path == "/zen/go" || strings.HasPrefix(path, "/zen/go/")
+}
+
+// applyOpenCodeGoClaudeHeaders dresses a Claude-protocol request for OpenCode Go:
+// the endpoint wants the key in `x-api-key` and a stable `x-opencode-session`,
+// otherwise it answers 401 or "MissingSessionID" even though the route exists.
+func applyOpenCodeGoClaudeHeaders(request *http.Request, provider domain.Provider, body []byte) {
+	if request == nil || !isOpenCodeGoProvider(provider) {
+		return
+	}
+	token := strings.TrimSpace(resolveProviderAuth(provider))
+	if strings.HasPrefix(strings.ToLower(token), "bearer ") {
+		token = strings.TrimSpace(token[len("bearer "):])
+	}
+	if token != "" {
+		request.Header.Set("x-api-key", token)
+	}
+	seed := strings.TrimSpace(request.Header.Get("x-opencode-session"))
+	if !openCodeZenRealSession(seed) {
+		seed = provider.ID + "|" + openCodeZenFirstUserText(body)
+	}
+	session := openCodeZenSessionID(seed)
+	request.Header.Set("x-opencode-session", session)
+	request.Header.Set("x-opencode-session-id", session)
+	request.Header.Set("User-Agent", openCodeZenUserAgent)
+}
+
 // resolveOpenCodeZenURL points a free-model request at the inference API. It is
 // called from the chat URL resolver, so every path that asks Zen gets it.
 func resolveOpenCodeZenURL(provider domain.Provider, model, upstreamURL string) string {

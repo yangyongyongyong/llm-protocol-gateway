@@ -974,3 +974,20 @@ func TestPeerProviderChatTestWrapsUpstreamEnvelope(t *testing.T) {
 		t.Fatalf("上游的回答必须回来：%s", result.ResponseBody)
 	}
 }
+
+// 上游的 protocolSupport 必须抄进下游的成员计划，否则跨网关仍然只会按
+// 一种协议转发，多协议能力在第二跳就丢了。
+func TestPeerProviderPlansCarryProtocolSupport(t *testing.T) {
+	plans := peerProviderPlans("up", domain.ProtocolOpenAIChat, []peerProviderView{{
+		ID: "p1", Name: "p1", Protocol: "openai_chat",
+		ProtocolSupport: []string{"openai_chat", "openai_responses", "claude"},
+		Models:          []string{"m1"},
+	}})
+	if len(plans) != 1 {
+		t.Fatalf("plans = %d, want 1", len(plans))
+	}
+	got := strings.Join(plans[0].ProtocolSupport, ",")
+	if got != "openai_chat,openai_responses,claude" {
+		t.Fatalf("protocolSupport = %q", got)
+	}
+}

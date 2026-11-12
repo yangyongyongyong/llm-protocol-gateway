@@ -3,6 +3,8 @@ package gateway
 import (
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -44,6 +46,42 @@ func TestPwaInstallPathsStayFetchable(t *testing.T) {
 		}
 		if !isAdminAuthPublicPath(path) {
 			t.Errorf("isAdminAuthPublicPath(%q) = false, want true", path)
+		}
+	}
+}
+
+// 控制台的每个页面都要能在服务器上刷新出来。
+//
+// 前端是单页应用：侧边栏切换只改 history，不发请求，所以后端白名单漏一条
+// 页面照样能点进去；但在那一页按 F5（或把链接发给别人）就是一个裸 404。
+// 这条测试直接读 web/src/lib.tsx 的 navItems，把它和 uiNavPaths 对齐，
+// 以后新增页面忘了同步后端就会红。
+func TestUINavPathsCoverFrontendNav(t *testing.T) {
+	source, err := os.ReadFile(filepath.Join("..", "..", "web", "src", "lib.tsx"))
+	if err != nil {
+		t.Fatalf("read frontend nav definitions: %v", err)
+	}
+	start := strings.Index(string(source), "export const navItems")
+	if start < 0 {
+		t.Fatal("web/src/lib.tsx 里找不到 navItems")
+	}
+	// navItems 是一个以 "] as const;" 结尾的数组字面量。
+	block := string(source)[start:]
+	if end := strings.Index(block, "] as const;"); end >= 0 {
+		block = block[:end]
+	}
+	ids := regexp.MustCompile(`\{ id: '([a-z0-9-]+)', label:`).FindAllStringSubmatch(block, -1)
+	if len(ids) == 0 {
+		t.Fatal("没能从 navItems 里解析出任何页面 id")
+	}
+	for _, match := range ids {
+		// input-providers 就是首屏 "/"，navPathForID 也这么映射。
+		path := "/" + match[1]
+		if match[1] == "input-providers" {
+			path = "/"
+		}
+		if !shouldServeUIFallback(path) {
+			t.Errorf("前端有页面 %s，后端 uiNavPaths 里没有它：侧边栏点得进去，刷新就 404", path)
 		}
 	}
 }

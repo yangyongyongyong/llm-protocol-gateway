@@ -743,18 +743,9 @@ export function ApiKeyDetailWorkspace(props: ApiKeyWorkspaceProps) {
             <span className="akc-status-dot" />
             {keyItem.enabled ? '启用中' : '已停用'}
           </button>
-          {outputProtocol ? (
-            <span className="akc-proto-chip" title="客户端协议 → 上游协议">
-              {protocolLabel(outputProtocol)}
-              {primary && primary.protocol !== outputProtocol ? (
-                <><span aria-hidden="true" className="akc-proto-arrow">→</span>{protocolLabel(primary.protocol)}</>
-              ) : (
-                <em className="akc-proto-chip-tag">透传</em>
-              )}
-            </span>
-          ) : (
-            <Badge tone="red">路由失效</Badge>
-          )}
+          {/* 不再显示「输出协议 → 上游协议」：同一把 Key 的三条端点都能用，
+              上游还可能多协议按请求切换，这个箭头会把“默认值”读成“绑定值”。 */}
+          {outputProtocol ? null : <Badge tone="red">路由失效</Badge>}
           {keyItem.activeProviderId && keyItem.activeProviderId !== (route?.providerId || '') ? (
             <Badge tone="amber">已切备选</Badge>
           ) : null}
@@ -2059,7 +2050,7 @@ function ClientTab({
             </button>
           </div>
           <div className="akc-hint">
-            {route ? `当前输出协议：${protocolLabel(route.outputProtocol)}` : '请先在「基本绑定」里为该密钥选择 Provider 与输出协议。'}
+            {route ? '三条端点（OpenAI Chat / OpenAI Responses / Claude）均可调用；网关按请求进来的端点自动直通或转换，不再由输出协议钉死。' : '请先在「基本绑定」里为该密钥选择 Provider。'}
           </div>
           <ol className="akc-steps">
             <li><b>先选网关地址</b>：本机或同一局域网用「内网」，外部网络用「公网域名」。</li>
@@ -2114,7 +2105,7 @@ function ClientTab({
           <ul className="akc-notes">
             <li>密钥通过 <code>{active.auth}</code> 发送，内网、公网同一把。</li>
             <li>请求里的模型名默认按原样转发；要固定模型请到「基本绑定与模型覆写」设置。</li>
-            <li>输出协议决定网关替你转换到哪种方言，客户端只认 {route ? protocolLabel(route.outputProtocol) : '当前协议'}。</li>
+            <li>客户端用哪条端点由客户端自己决定；网关只按实际入口做直通或转换，三条端点共用同一把 Key。</li>
           </ul>
         </div>
       </div>

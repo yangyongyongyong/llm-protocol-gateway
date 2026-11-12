@@ -76,14 +76,13 @@ var (
 // the id and model are established there and are what a closing frame repeats.
 var responseDrainedMarker = []byte("response.created")
 
-// closingFrameScanMax bounds how much of a frame is read for its type.
-const closingFrameScanMax = 1024
-
 // closingBodyMax bounds how much of a body the closing verdict keeps.
 const closingBodyMax = 1 << 20
 
-// jsonTypeKey is the member a frame's type is read from.
-var jsonTypeKey = []byte(`"type":`)
+// closingFrameScanMax bounds how much of an unterminated trailing line the
+// line reader holds while looking for a closing marker. A complete final
+// frame is judged by the whole-body scan, not by this bound.
+const closingFrameScanMax = 1024
 
 // sseDataPrefixMark is the beginning of any SSE data line.
 var sseDataPrefixMark = []byte("data:")
@@ -697,22 +696,72 @@ func endingFrameOf(line []byte) *closingMarker {
 // A member written after the answer's text has begun is not the frame's own:
 // the type of a real event is in the frame's opening bytes, so the search
 // stops at the first string value's end.
+// streamEventType reads the frame's top-level JSON "type".
+//
+// It has to be the top-level one: Responses events carry nested objects that
+// also have a "type" ("reasoning", "message", "output_text"), and the terminal
+// frame is often large enough that its own type is the last member — a prefix
+// scan finds the nested one first and a suffix scan can find the wrong one.
+// This walks the JSON structure and only reads the member at depth 1.
 func streamEventType(payload []byte) string {
-	scan := payload[:min(len(payload), closingFrameScanMax)]
-	index := bytes.Index(scan, jsonTypeKey)
-	if index < 0 {
-		return ""
+	depth := 0
+	for i := 0; i < len(payload); i++ {
+		switch payload[i] {
+		case '{', '[':
+			depth++
+		case '}', ']':
+			depth--
+		case '"':
+			start := i + 1
+			j := start
+			for j < len(payload) {
+				if payload[j] == '\\' {
+					j += 2
+					continue
+				}
+				if payload[j] == '"' {
+					break
+				}
+				j++
+			}
+			if j >= len(payload) {
+				return ""
+			}
+			key := payload[start:j]
+			i = j
+			k := j + 1
+			for k < len(payload) && (payload[k] == ' ' || payload[k] == '\t' || payload[k] == '\n' || payload[k] == '\r') {
+				k++
+			}
+			if k >= len(payload) || payload[k] != ':' {
+				continue
+			}
+			if depth != 1 || !bytes.Equal(key, []byte("type")) {
+				continue
+			}
+			k++
+			for k < len(payload) && (payload[k] == ' ' || payload[k] == '\t' || payload[k] == '\n' || payload[k] == '\r') {
+				k++
+			}
+			if k >= len(payload) || payload[k] != '"' {
+				return ""
+			}
+			valueStart := k + 1
+			m := valueStart
+			for m < len(payload) {
+				if payload[m] == '\\' {
+					m += 2
+					continue
+				}
+				if payload[m] == '"' {
+					return string(payload[valueStart:m])
+				}
+				m++
+			}
+			return ""
+		}
 	}
-	rest := scan[index+len(jsonTypeKey):]
-	rest = bytes.TrimLeft(rest, " \t")
-	if len(rest) == 0 || rest[0] != '"' {
-		return ""
-	}
-	end := bytes.IndexByte(rest[1:], '"')
-	if end < 0 {
-		return ""
-	}
-	return string(rest[1 : 1+end])
+	return ""
 }
 
 // sameBytes compares two byte slices byte by byte.

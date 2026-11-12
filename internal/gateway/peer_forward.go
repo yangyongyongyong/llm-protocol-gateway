@@ -69,10 +69,13 @@ func (s *Server) handlePeerMe(w http.ResponseWriter, r *http.Request) {
 // 只给下游决策需要的东西：id、协议、有哪些可用模型。上游的 base_url 和凭据
 // 一概不下发——下游只需要知道"用哪个模型能被接受"，不需要知道上游怎么连。
 type peerProviderView struct {
-	ID       string   `json:"id"`
-	Name     string   `json:"name"`
-	Protocol string   `json:"protocol"`
-	Models   []string `json:"models"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Protocol string `json:"protocol"`
+	// ProtocolSupport 是上游实测支持的全部协议。只给声明协议会让下游把
+	// 「同一台上游的多协议能力」丢掉，跨网关也就无法优先同协议直通。
+	ProtocolSupport []string `json:"protocolSupport,omitempty"`
+	Models          []string `json:"models"`
 }
 
 // handlePeerProviders 列出这个对端当前能用的 provider。
@@ -95,6 +98,9 @@ func (s *Server) handlePeerProviders(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		view := peerProviderView{ID: provider.ID, Name: provider.Name, Protocol: string(provider.Protocol), Models: []string{}}
+		if len(provider.ProtocolSupport) > 0 {
+			view.ProtocolSupport = append([]string(nil), provider.ProtocolSupport...)
+		}
 		for _, model := range state.Models {
 			if model.ProviderID == provider.ID && strings.TrimSpace(model.ID) != "" {
 				view.Models = append(view.Models, model.ID)
@@ -213,7 +219,7 @@ func (s *Server) selectPeerProvider(allowed map[string]bool, requestedProviderID
 		if !allowed[provider.ID] || provider.Disabled || provider.Deleted {
 			return false
 		}
-		if protocol != "" && provider.Protocol != protocol {
+		if protocol != "" && !providerSupportsProtocol(provider, protocol) {
 			return false
 		}
 		return s.providerServesModel(provider, model)
@@ -221,7 +227,7 @@ func (s *Server) selectPeerProvider(allowed map[string]bool, requestedProviderID
 	if requestedProviderID != "" {
 		for _, provider := range state.Providers {
 			if provider.ID == requestedProviderID && servable(provider) {
-				return peerDecisionFor(provider), true
+				return peerDecisionFor(provider, protocol), true
 			}
 		}
 	}
@@ -229,7 +235,7 @@ func (s *Server) selectPeerProvider(allowed map[string]bool, requestedProviderID
 	// 决定，比随机挑更可预测。
 	for _, provider := range state.Providers {
 		if servable(provider) {
-			return peerDecisionFor(provider), true
+			return peerDecisionFor(provider, protocol), true
 		}
 	}
 	return domain.RouteDecision{}, false
@@ -241,12 +247,16 @@ func (s *Server) selectPeerProvider(allowed map[string]bool, requestedProviderID
 // servePeerProtocol 直接交给 provider 的端点，不做协议转换（转换需要
 // 目的协议的转换器与回包整形，而"父网关看到的就是子网关看到的那份报文"正是
 // 这条链路最容易解释的性质）。
-func peerDecisionFor(provider domain.Provider) domain.RouteDecision {
+func peerDecisionFor(provider domain.Provider, protocol domain.Protocol) domain.RouteDecision {
+	effective := provider.Protocol
+	if protocol != "" && providerSupportsProtocol(provider, protocol) {
+		effective = protocol
+	}
 	return domain.RouteDecision{
 		RouteID:        "",
 		ProviderID:     provider.ID,
-		OutputProtocol: provider.Protocol,
-		InputProtocol:  provider.Protocol,
+		OutputProtocol: effective,
+		InputProtocol:  effective,
 		Mode:           domain.RouteModePassThrough,
 		Action:         "peer",
 	}

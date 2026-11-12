@@ -154,7 +154,9 @@ func TestApplyCodexWritesModelCatalog(t *testing.T) {
 		t.Fatalf("模型目录内容不对：%s", raw)
 	}
 	config, _ := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
-	if !strings.Contains(string(config), `model_catalog_json = "`+e.ModelCatalogPath+`"`) {
+	// TOML 字符串里的反斜杠会被 tomlString 转义；Windows 的绝对路径带反斜杠，
+	// 直接拼原文会误判成"没写进去"。按写入侧的同一口径比较。
+	if !strings.Contains(string(config), `model_catalog_json = `+tomlString(e.ModelCatalogPath)) {
 		t.Fatalf("config.toml 里没引用模型目录：\n%s", config)
 	}
 }

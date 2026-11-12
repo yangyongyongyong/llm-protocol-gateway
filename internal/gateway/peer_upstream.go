@@ -398,14 +398,15 @@ func (s *Server) createPeerUpstreamProviders(r *http.Request, name string, proto
 	created := make([]domain.Provider, 0, len(plans))
 	for _, plan := range plans {
 		provider := domain.Provider{
-			Name:         plan.Name,
-			Protocol:     plan.Protocol,
-			BaseURL:      registration.ParentURL,
-			APIKeySource: "literal:" + registration.Token,
-			AuthType:     domain.AuthTypePeer,
-			Models:       plan.Models,
-			HealthStatus: "healthy",
-			OwnerUserID:  ownerID,
+			Name:            plan.Name,
+			Protocol:        plan.Protocol,
+			ProtocolSupport: plan.ProtocolSupport,
+			BaseURL:         registration.ParentURL,
+			APIKeySource:    "literal:" + registration.Token,
+			AuthType:        domain.AuthTypePeer,
+			Models:          plan.Models,
+			HealthStatus:    "healthy",
+			OwnerUserID:     ownerID,
 		}
 		// 每一条都带上同一份授权快照（同一把凭据、同一个上游），只改"我对应
 		// 上游的哪一个"。列表接口靠这份快照显示「上游授权了几个」，透传靠
@@ -435,8 +436,11 @@ func (s *Server) createPeerUpstreamProviders(r *http.Request, name string, proto
 
 // peerProviderPlan 是"上游的一个授权 provider"在本机要落成的 provider 行的样子。
 type peerProviderPlan struct {
-	Name              string
-	Protocol          domain.Protocol
+	Name     string
+	Protocol domain.Protocol
+	// ProtocolSupport 是这条上游 Provider 实测支持的全部协议，注册/刷新时
+	// 原样抄到下游的 peer provider 上，供调度判断能否同协议直通。
+	ProtocolSupport   []string
 	Models            []domain.Model
 	GrantedProviderID string
 }
@@ -471,6 +475,7 @@ func peerProviderPlans(name string, protocol domain.Protocol, granted []peerProv
 			// 两行看起来像重复；「vps1 · 名字」一眼就知道它属于哪条链路。
 			Name:              peerMemberProviderName(name, label),
 			Protocol:          memberProtocol,
+			ProtocolSupport:   peerProtocolSupport(view.ProtocolSupport, memberProtocol),
 			Models:            models,
 			GrantedProviderID: id,
 		})
@@ -480,10 +485,31 @@ func peerProviderPlans(name string, protocol domain.Protocol, granted []peerProv
 	}
 	// 没授权（或上游没给清单）：沿用注册时选的协议落一条占位行。
 	return []peerProviderPlan{{
-		Name:     name,
-		Protocol: protocol,
-		Models:   peerModelsForProtocol(protocol, granted),
+		Name:            name,
+		Protocol:        protocol,
+		ProtocolSupport: peerProtocolSupport(nil, protocol),
+		Models:          peerModelsForProtocol(protocol, granted),
 	}}
+}
+
+// peerProtocolSupport 归一化上游的多协议清单：去空、去重，并保证声明协议
+// 一定在清单里（老版本上游不带这个字段时，至少还能按声明协议直通）。
+func peerProtocolSupport(raw []string, declared domain.Protocol) []string {
+	seen := make(map[string]bool, len(raw)+1)
+	out := make([]string, 0, len(raw)+1)
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			return
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	add(string(declared))
+	for _, value := range raw {
+		add(value)
+	}
+	return out
 }
 
 // peerMemberProviderName 是一条成员 provider 在子网关里的名字。
@@ -669,6 +695,10 @@ func (s *Server) reconcilePeerUpstreamMembers(anchor domain.Provider, registrati
 			if err != nil {
 				return updated, err
 			}
+			saved, err = s.router.SetProviderProtocolSupport(member.ID, plan.ProtocolSupport)
+			if err != nil {
+				return updated, err
+			}
 			snapshot := grants.Clone()
 			snapshot.GrantedProviderID = plan.GrantedProviderID
 			if _, err := s.router.SetPeerGrants(member.ID, snapshot); err != nil {
@@ -679,14 +709,15 @@ func (s *Server) reconcilePeerUpstreamMembers(anchor domain.Provider, registrati
 		}
 		// 新授权：落一条新的成员行。
 		provider := domain.Provider{
-			Name:         plan.Name,
-			Protocol:     plan.Protocol,
-			BaseURL:      registration.ParentURL,
-			APIKeySource: "literal:" + registration.Token,
-			AuthType:     domain.AuthTypePeer,
-			Models:       plan.Models,
-			HealthStatus: "healthy",
-			OwnerUserID:  anchor.OwnerUserID,
+			Name:            plan.Name,
+			Protocol:        plan.Protocol,
+			ProtocolSupport: plan.ProtocolSupport,
+			BaseURL:         registration.ParentURL,
+			APIKeySource:    "literal:" + registration.Token,
+			AuthType:        domain.AuthTypePeer,
+			Models:          plan.Models,
+			HealthStatus:    "healthy",
+			OwnerUserID:     anchor.OwnerUserID,
 		}
 		if len(plan.Models) > 0 {
 			provider.DefaultModel = plan.Models[0].ID

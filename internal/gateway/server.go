@@ -5651,11 +5651,15 @@ func extractResponseErrorMessage(responseBody []byte) string {
 		}
 		return text
 	}
-	if errorValue, ok := payload["error"]; ok {
+	// OpenAI Responses 的成功响应带 "error": null。键存在但值是 nil 不是错误，
+	// 以前 fmt.Sprint(nil) 会得到字符串 "<nil>"，让一条 200 在日志里显示成红色。
+	if errorValue, ok := payload["error"]; ok && errorValue != nil {
 		if item, ok := errorValue.(map[string]any); ok {
 			return formatAPIErrorMessage(item)
 		}
-		return strings.TrimSpace(fmt.Sprint(errorValue))
+		if message := strings.TrimSpace(fmt.Sprint(errorValue)); message != "" && message != "<nil>" {
+			return message
+		}
 	}
 	if detail := strings.TrimSpace(stringValue(payload["detail"])); detail != "" {
 		return detail
@@ -6512,6 +6516,7 @@ func (s *Server) sendClaudeMessagesUpstream(r *http.Request, provider domain.Pro
 			request.Header.Set("anthropic-beta", beta)
 		}
 		applyProviderAuth(request, provider, r.Header.Get("Authorization"))
+		applyOpenCodeGoClaudeHeaders(request, provider, body)
 	}
 
 	return doHTTPWithTiming(r.Context(), &http.Client{Timeout: 0}, request)
@@ -6626,6 +6631,7 @@ func (s *Server) doClaudeProviderRequest(ctx context.Context, r *http.Request, p
 		// 转换路径同样要带上 per-provider 自定义头，否则「同一台上游，直通能通、
 		// 从别的协议转进来就 400」——排查起来最难的一类差异。
 		applyRequestAdapterHeaders(request, provider, stringValue(claudeBodyField(body, "model")))
+		applyOpenCodeGoClaudeHeaders(request, provider, body)
 	}
 	if accept != "" {
 		request.Header.Set("Accept", accept)
