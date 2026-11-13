@@ -96,7 +96,7 @@ func TestClientGoneReleasesTheProviderSlotQuickly(t *testing.T) {
 			BaseURL: upstream.URL, APIKeySource: "sk-upstream-secret", MaxConcurrentRequests: 1, QueueWaitSeconds: 0,
 		}},
 		Models:  []domain.Model{{ID: "claude-x", ProviderID: "p1", InMenu: true}},
-		Routes:  []domain.Route{{ID: "r1", Name: "R1", ProviderID: "p1", OutputProtocol: domain.ProtocolClaude, Enabled: true, Mode: domain.RouteModePassThrough}},
+		Routes:  []domain.Route{{ID: "r1", Name: "R1", ProviderID: "p1", OutputProtocol: domain.ProtocolClaude, Enabled: true}},
 		APIKeys: []domain.APIKey{{ID: "k1", Name: "K1", Key: "gw-test-key-1", RouteID: "r1", Enabled: true, StreamEnabled: true}},
 	}
 	server := NewServer(NewRouter(state), monitor.NewStore())

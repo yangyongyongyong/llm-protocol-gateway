@@ -16,7 +16,7 @@ import (
 func pricedServer(t *testing.T) (*Server, *Router, *store.Store) {
 	t.Helper()
 	provider := domain.Provider{ID: "p1", Name: "p1", Protocol: domain.ProtocolOpenAIChat, BaseURL: "https://a.example/v1"}
-	route := domain.Route{ID: "r1", Name: "r1", ProviderID: provider.ID, OutputProtocol: domain.ProtocolOpenAIChat, Mode: domain.RouteModeAuto, Enabled: true}
+	route := domain.Route{ID: "r1", Name: "r1", ProviderID: provider.ID, OutputProtocol: domain.ProtocolOpenAIChat, Enabled: true}
 	key := domain.APIKey{ID: "k1", Name: "k1", Key: "sk-gw-pricing", RouteID: route.ID, Enabled: true, StreamEnabled: true}
 	db, err := store.Open(filepath.Join(t.TempDir(), "gateway.db"))
 	if err != nil {

@@ -107,7 +107,7 @@ func newTimeoutFixture(t *testing.T, timeoutSec int, stall time.Duration, stallA
 		ID: "p-fast", Name: "p-fast", Protocol: domain.ProtocolOpenAIChat,
 		AuthType: domain.AuthTypeAPIKey, BaseURL: fast.URL + "/v1", APIKeySource: "sk-b", HealthStatus: "healthy",
 	}
-	route := domain.Route{ID: "r-to", Name: "r-to", ProviderID: preferred.ID, OutputProtocol: domain.ProtocolOpenAIChat, Mode: domain.RouteModeAuto, Enabled: true}
+	route := domain.Route{ID: "r-to", Name: "r-to", ProviderID: preferred.ID, OutputProtocol: domain.ProtocolOpenAIChat, Enabled: true}
 	apiKey := domain.APIKey{
 		ID: "k-to", Name: "k-to", Key: "sk-gw-test-timeout", RouteID: route.ID,
 		Enabled: true, StreamEnabled: true, FallbackProviderIDs: []string{backup.ID},

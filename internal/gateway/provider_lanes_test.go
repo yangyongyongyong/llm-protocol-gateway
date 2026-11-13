@@ -259,7 +259,7 @@ func newAdmissionFixture(t *testing.T, maxConcurrent int, queueWaitSeconds int, 
 		ID: "p-fast", Name: "p-fast", Protocol: domain.ProtocolOpenAIChat,
 		AuthType: domain.AuthTypeAPIKey, BaseURL: fast.URL + "/v1", APIKeySource: "sk-b",
 	}
-	route := domain.Route{ID: "r-adm", Name: "r-adm", ProviderID: primary.ID, OutputProtocol: domain.ProtocolOpenAIChat, Mode: domain.RouteModeAuto, Enabled: true}
+	route := domain.Route{ID: "r-adm", Name: "r-adm", ProviderID: primary.ID, OutputProtocol: domain.ProtocolOpenAIChat, Enabled: true}
 	apiKey := domain.APIKey{
 		ID: "k-adm", Name: "k-adm", Key: "sk-gw-admission", RouteID: route.ID,
 		Enabled: true, StreamEnabled: true,

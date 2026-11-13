@@ -226,7 +226,7 @@ func newFailoverFixture(t *testing.T, preferredStatus, backupStatus int, activeP
 		ID: "p-back", Name: "p-back", Protocol: domain.ProtocolOpenAIChat,
 		AuthType: domain.AuthTypeAPIKey, BaseURL: backupServer.URL + "/v1", APIKeySource: "sk-b", HealthStatus: "healthy",
 	}
-	route := domain.Route{ID: "r-sched", Name: "r-sched", ProviderID: preferred.ID, OutputProtocol: domain.ProtocolOpenAIChat, Mode: domain.RouteModeAuto, Enabled: true}
+	route := domain.Route{ID: "r-sched", Name: "r-sched", ProviderID: preferred.ID, OutputProtocol: domain.ProtocolOpenAIChat, Enabled: true}
 	apiKey := domain.APIKey{
 		ID: "k-sched", Name: "k-sched", Key: "sk-gw-test-schedule", RouteID: route.ID,
 		Enabled: true, StreamEnabled: true,

@@ -47,7 +47,6 @@ func claudeToChatServer(t *testing.T, key domain.APIKey, providerDefaultDepth st
 			ProviderID:       "wb",
 			OutputProtocol:   domain.ProtocolClaude,
 			OutputEndpointID: "claude-output",
-			Mode:             domain.RouteModeAuto,
 			Enabled:          true,
 		}},
 		APIKeys: []domain.APIKey{key},

@@ -140,9 +140,12 @@ IP 被 GFW 识别，和请求频率无关。如需降频，可调大 `providerFa
 
 - **与主 Provider 同协议**：请求里的模型名优先原样带给备选；若备选的模型目录里没有该模型
   且配置了 `defaultModel`，会用备选自己的默认模型兜底。
-- **与主 Provider 跨协议**：网关按本次客户端协议与备选 Provider 协议自动转换，不要求用户
-  锁定模型。`fallbackModelOverrides` 是可选项，仅在希望该备选始终使用某个模型时配置；
-  未配置时仍按“请求模型 → 备选目录 → 备选默认模型”的顺序自动解析。
+- **当前 Provider 支持客户端协议**：优先按客户端协议直通；`ProtocolSupport` 已实测支持的
+  多协议上游会在当前 Provider 内先尝试同协议直通。直通失败且尚未向客户端提交内容时，才回退
+  到该 Provider 的声明协议做转换。
+- **当前 Provider 不支持客户端协议**：网关自动做协议转换，不要求用户锁定模型。
+  `fallbackModelOverrides` 是可选项，仅在希望该备选始终使用某个模型时配置；未配置时仍按
+  “请求模型 → 备选目录 → 备选默认模型”的顺序自动解析。
 
 ### 6.1 尝试顺序：整条链都可以回头试
 一次请求先把链路过滤成**候选集**（`failoverAttemptOrder`，`internal/gateway/provider_schedule.go`）：
@@ -154,9 +157,9 @@ Key 的 `activeProviderId`（粘滞）只决定起点：链被旋转成"粘滞�
 既不会每次都回去骚扰首选，又能在粘滞备选也失败时**在同一请求内回头试前序 Provider**。
 旧实现是从粘滞下标一直往后走，停在链尾，前序 Provider 要等 5.3 的回切探测（最长 2 分钟）才用得上。
 
-调度完成后，`preferNativeProtocol` 只允许优化 **`chain[1:]` 的备选顺序**：首选需要协议转换、
-后面的备选能直通时，仍先尝试首选，首选失败后才把同协议备选提前。显式首选、会话 pin、
-`rotate` / `least_used` / `spread` 选出的第一节点都不会被协议优化越过。
+Provider 的使用顺序完全由 Key 的调度规则决定：首选、备选、会话 pin、`rotate` /
+`least_used` / `spread` 等选出的顺序不会因为协议是否可直通而改变。协议直通/转换只在
+**当前被选中的 Provider 内部**判断，不参与 Provider 之间的排序。
 
 ### 6.2 会话粘性（prompt cache 优先于均衡）
 `ActiveProviderId` 是 Key 级的，一把 Key 同时跑几个 Agent 时会互相顶掉，

@@ -263,69 +263,6 @@ func (s *Server) healthyFirst(chain []string) []string {
 	return append(healthy, unavailable...)
 }
 
-// preferNativeProtocol 在不越过主候选的前提下，把备选链中第一个能按
-// clientProtocol 直通的 Provider 提到备选的第一位。
-//
-// 为什么仍要优化：转换是网关里最容易出错的一层——报文重写、流重打包、字段兼容，
-// 每一处都可能吃掉一次本该成功的请求；直通则只是把字节搬过去。首选失败之后，
-// 若后面的节点支持客户端协议，先试它可以少一次转换。
-//
-// 但协议直通只是成本优化，不能覆盖管理员显式配置的流量归属。首选 Provider、
-// 会话 pin、rotate/least_used/spread 等调度模式选出的 chain[0] 必须先被尝试；
-// 这里只调整 chain[1:] 的顺序。其它边界：
-//   - 链上没有任何同协议的备选时，原样返回；
-//   - 备选里的第一个已经是同协议时，原样返回；
-//   - 会话粘性已经钉住某个 provider 时不动（见 applySessionPin）；
-//   - 不可用节点会先被 healthyFirst 排到后面，这里不会凭空造出健康节点。
-func (s *Server) preferNativeProtocol(chain []string, clientProtocol domain.Protocol, pinned string) []string {
-	if clientProtocol == "" || len(chain) < 3 || pinned != "" || s.router == nil {
-		return chain
-	}
-	// chain[1] 已经是直通节点时无需调整；只从备选的第二个位置开始找。
-	if s.providerServesNative(chain[1], clientProtocol) {
-		return chain
-	}
-	for index := 2; index < len(chain); index++ {
-		if !s.providerServesNative(chain[index], clientProtocol) {
-			continue
-		}
-		promoted := make([]string, 0, len(chain))
-		promoted = append(promoted, chain[0], chain[index])
-		promoted = append(promoted, chain[1:index]...)
-		promoted = append(promoted, chain[index+1:]...)
-		if s.logs != nil {
-			s.logs.AddApp("info", "fallback ordered for native protocol", fmt.Sprintf(
-				"client=%s primary=%s promoted=%s (仅优化备选顺序，直通代替转换)", clientProtocol, chain[0], chain[index]))
-		}
-		return promoted
-	}
-	return chain
-}
-
-// providerServesNative 报告这台上游能不能按客户端协议直通：声明协议一致，
-// 或者实测支持清单里有它。后者是同一台 baseUrl 上多开一条协议路径的上游
-// （OpenCode Go 这类），调度时同样应该优先直通。
-func (s *Server) providerServesNative(providerID string, clientProtocol domain.Protocol) bool {
-	provider, err := s.router.ProviderByID(providerID)
-	if err != nil {
-		return false
-	}
-	if provider.Protocol == clientProtocol {
-		return true
-	}
-	_, ok := nativeProtocolForProvider(provider, clientProtocol)
-	return ok
-}
-
-// providerProtocol 返回这个 provider 的母语协议，查不到时返回空串。
-func (s *Server) providerProtocol(providerID string) domain.Protocol {
-	provider, err := s.router.ProviderByID(providerID)
-	if err != nil {
-		return ""
-	}
-	return provider.Protocol
-}
-
 // nativeProtocolForProvider 返回这台上游可以直通客户端协议时该用的协议。
 //
 // 只认实测结论（ProtocolSupport），不靠猜：某条路径探到过（非 404）才会进

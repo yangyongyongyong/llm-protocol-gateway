@@ -20,7 +20,7 @@ func TestFallbackModelOverrideOptionalAcrossProtocols(t *testing.T) {
 			{ID: "p-claude", Name: "p-claude", Protocol: domain.ProtocolClaude},
 		},
 		Routes: []domain.Route{
-			{ID: "r1", Name: "r1", ProviderID: "p-openai", OutputProtocol: domain.ProtocolOpenAIChat, Mode: domain.RouteModeAuto, Enabled: true},
+			{ID: "r1", Name: "r1", ProviderID: "p-openai", OutputProtocol: domain.ProtocolOpenAIChat, Enabled: true},
 		},
 	})
 
@@ -100,7 +100,7 @@ func TestFailoverCrossProtocolWithoutModelOverrideUsesFallbackDefault(t *testing
 		DefaultModel: "claude-backup",
 		Models:       []domain.Model{{ID: "claude-backup", ProviderID: "p-claude", Protocol: domain.ProtocolClaude}},
 	}
-	route := domain.Route{ID: "r-cross", Name: "r-cross", ProviderID: preferred.ID, OutputProtocol: domain.ProtocolOpenAIChat, Mode: domain.RouteModeAuto, Enabled: true}
+	route := domain.Route{ID: "r-cross", Name: "r-cross", ProviderID: preferred.ID, OutputProtocol: domain.ProtocolOpenAIChat, Enabled: true}
 	apiKey := domain.APIKey{
 		ID: "k-cross", Name: "k-cross", Key: "sk-gw-test-cross-protocol", RouteID: route.ID,
 		Enabled: true, StreamEnabled: true,
@@ -183,7 +183,7 @@ func TestFailoverSameProtocolReusesRequestModel(t *testing.T) {
 		ID: "p-back", Name: "p-back", Protocol: domain.ProtocolOpenAIChat,
 		AuthType: domain.AuthTypeAPIKey, BaseURL: live.URL + "/v1", APIKeySource: "sk-b", HealthStatus: "healthy",
 	}
-	route := domain.Route{ID: "r-fb", Name: "r-fb", ProviderID: preferred.ID, OutputProtocol: domain.ProtocolOpenAIChat, Mode: domain.RouteModeAuto, Enabled: true}
+	route := domain.Route{ID: "r-fb", Name: "r-fb", ProviderID: preferred.ID, OutputProtocol: domain.ProtocolOpenAIChat, Enabled: true}
 	apiKey := domain.APIKey{
 		ID: "k-fb", Name: "k-fb", Key: "sk-gw-test-fallback-model", RouteID: route.ID,
 		Enabled: true, StreamEnabled: true,

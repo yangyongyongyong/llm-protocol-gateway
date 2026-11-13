@@ -279,7 +279,7 @@ func TestFailoverRetryAfterReadsTheAccountLane(t *testing.T) {
 		}},
 		Routes: []domain.Route{{
 			ID: "acct-route", Name: "acct-route", ProviderID: "acct-a",
-			OutputProtocol: domain.ProtocolClaude, Mode: domain.RouteModePassThrough, Enabled: true,
+			OutputProtocol: domain.ProtocolClaude, Enabled: true,
 		}},
 	}
 	server := NewServer(NewRouter(state), monitor.NewStore())

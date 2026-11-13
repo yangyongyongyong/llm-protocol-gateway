@@ -30,7 +30,7 @@ func TestSameProviderRetriesStayOnTheNode(t *testing.T) {
 	}))
 	defer healthy.Close()
 
-	route := domain.Route{ID: "r-retry", Name: "r-retry", ProviderID: "p-flaky", OutputProtocol: domain.ProtocolOpenAIChat, Mode: domain.RouteModeAuto, Enabled: true}
+	route := domain.Route{ID: "r-retry", Name: "r-retry", ProviderID: "p-flaky", OutputProtocol: domain.ProtocolOpenAIChat, Enabled: true}
 	key := domain.APIKey{
 		ID: "k-retry", Name: "k-retry", Key: "sk-gw-retry", RouteID: route.ID,
 		Enabled: true, StreamEnabled: true,
@@ -84,7 +84,7 @@ func TestSameProviderRetriesZeroFailsOverImmediately(t *testing.T) {
 	}))
 	defer healthy.Close()
 
-	route := domain.Route{ID: "r-norety", Name: "r-norety", ProviderID: "p-a", OutputProtocol: domain.ProtocolOpenAIChat, Mode: domain.RouteModeAuto, Enabled: true}
+	route := domain.Route{ID: "r-norety", Name: "r-norety", ProviderID: "p-a", OutputProtocol: domain.ProtocolOpenAIChat, Enabled: true}
 	key := domain.APIKey{ID: "k-norety", Name: "k", Key: "sk-gw-norety", RouteID: route.ID, Enabled: true, StreamEnabled: true, FallbackProviderIDs: []string{"p-b"}}
 	server := NewServer(NewRouter(domain.GatewayState{
 		Providers: []domain.Provider{

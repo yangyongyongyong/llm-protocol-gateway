@@ -1385,8 +1385,7 @@ func (s *Server) executeProtocolFlowWithFailover(
 		advance: true,
 	})
 	attempts, pinnedProviderID := s.applySessionPin(sessionKey, attempts)
-	// 能直通就别转换：同一个上游同时支持多种协议时，让下游的协议决定走哪一条。
-	attempts = s.preferNativeProtocol(attempts, clientProtocol, pinnedProviderID)
+	// Provider 顺序完全由 Key 的调度规则决定；不为了协议直通重排候选。
 	// spread mode decides a conversation's account here, before the request is
 	// sent: two conversations that start at the same moment would both read an
 	// empty table and pick the same account. A turn that settles nothing (every
@@ -1440,6 +1439,7 @@ func (s *Server) executeProtocolFlowWithFailover(
 
 		attemptModel := model
 		attemptKey := matchedKey
+		attemptProvider, _ := s.router.ProviderByID(providerID)
 		if providerID != strings.TrimSpace(route.ProviderID) {
 			override := ""
 			if matchedKey.FallbackModelOverrides != nil {
@@ -1452,13 +1452,12 @@ func (s *Server) executeProtocolFlowWithFailover(
 			if override != "" {
 				attemptKey.ModelOverride = override
 			}
-			if !attemptServesClientProtocol(attemptDecision, clientProtocol) {
+			if !attemptServesClientProtocol(attemptDecision, clientProtocol, attemptProvider) {
 				s.logs.AddApp("warn", "provider failover skipped unsupported conversion", fmt.Sprintf("key=%s provider=%s %s->%s", matchedKey.ID, providerID, clientProtocol, attemptDecision.InputProtocol))
 				noteScheduleAttempt(r.Context(), monitor.RequestAttempt{ProviderID: providerID, Reason: attemptReasonUnsupportedConversion, Skipped: true})
 				continue
 			}
 		}
-		attemptProvider, _ := s.router.ProviderByID(providerID)
 		if resolved, _ := resolveConsumerModelOnProvider(attemptProvider, attemptKey, true, requestModel); strings.TrimSpace(resolved) != "" {
 			attemptModel = resolved
 		}
@@ -1966,8 +1965,6 @@ func (s *Server) decisionForAPIKeyProtocol(route domain.Route, key domain.APIKey
 		keyID:  key.ID,
 	})
 	attempts, _ = s.applySessionPin(sessionKey, attempts)
-	// 与执行循环保持同一口径，否则日志里记的节点会和真正服务的那个不一样。
-	attempts = s.preferNativeProtocol(attempts, clientProtocol, "")
 	decision, err := s.router.DecideForProviderProtocol(route.ID, attempts[0], clientProtocol)
 	if err != nil {
 		return fallback

@@ -36,24 +36,24 @@ func TestConversionLabelDirection(t *testing.T) {
 			upstream: domain.ProtocolClaude,
 			want:     "OpenAI Chat -> Claude",
 		},
-		// 两端相同时只写一个名字，不写 "X -> X"。
+		// 同协议也保留两侧：日志列显示 oc->oc，而不是只剩一个 oc。
 		{
-			name:     "same protocol has no arrow",
+			name:     "same chat keeps both sides",
 			client:   domain.ProtocolOpenAIChat,
 			upstream: domain.ProtocolOpenAIChat,
-			want:     "OpenAI Chat",
+			want:     "OpenAI Chat -> OpenAI Chat",
 		},
 		{
-			name:     "same responses has no arrow",
+			name:     "same responses keeps both sides",
 			client:   domain.ProtocolOpenAIResponses,
 			upstream: domain.ProtocolOpenAIResponses,
-			want:     "OpenAI Responses",
+			want:     "OpenAI Responses -> OpenAI Responses",
 		},
 		{
-			name:     "same claude has no arrow",
+			name:     "same claude keeps both sides",
 			client:   domain.ProtocolClaude,
 			upstream: domain.ProtocolClaude,
-			want:     "Claude",
+			want:     "Claude -> Claude",
 		},
 	}
 	for _, tc := range cases {
@@ -66,19 +66,15 @@ func TestConversionLabelDirection(t *testing.T) {
 	}
 }
 
-// 回归测试：标签只看两端协议，与 action 无关。
+// 回归测试：协议流标签必须同时写出客户端协议和上游协议。
 //
-// 这条盯的是一个真实踩过的坑：曾经的实现在 action=="pass_through" 时只写客户端
-// 协议，理由是"直通即两端相同"。那是错的——pass_through 表示「不许转换」，完全
-// 可能收到与上游不同协议的请求（上游只认 Chat，客户端偏发 Responses）。那时日志
-// 只剩一个 "OpenAI Responses"，把「上游其实是 Chat」这个排查 400 最关键的事实
-// 吞掉了。
-func TestConversionLabelIgnoresActionAndKeepsUpstreamVisible(t *testing.T) {
-	// pass_through 且两端不同：必须完整写出两段。
+// 现在直通/转换完全由本次请求协议和 provider 声明协议决定，不存在可配置
+// mode。Chat provider 收到 Responses 客户端请求时必须走转换，日志仍要完整
+// 写出 "OpenAI Responses -> OpenAI Chat"，不能只剩客户端一侧。
+func TestConversionLabelKeepsUpstreamVisible(t *testing.T) {
 	if got := conversionLabel(domain.ProtocolOpenAIResponses, domain.ProtocolOpenAIChat); got != "OpenAI Responses -> OpenAI Chat" {
-		t.Fatalf("pass_through 下两端不同也必须写全，得到 %q", got)
+		t.Fatalf("两端不同时必须写全，得到 %q", got)
 	}
-	// 路由决策里 pass_through + 协议不同，标签同样不能被简化成一个名字。
 	router := NewRouter(domain.GatewayState{
 		Providers: []domain.Provider{{
 			ID:       "p1",
@@ -90,7 +86,6 @@ func TestConversionLabelIgnoresActionAndKeepsUpstreamVisible(t *testing.T) {
 			Name:           "r1",
 			ProviderID:     "p1",
 			OutputProtocol: domain.ProtocolOpenAIChat,
-			Mode:           domain.RouteModePassThrough,
 			Enabled:        true,
 		}},
 	})
@@ -98,11 +93,22 @@ func TestConversionLabelIgnoresActionAndKeepsUpstreamVisible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecideForProtocol: %v", err)
 	}
-	if decision.Action != "pass_through" {
-		t.Fatalf("这条路由应当判成 pass_through，实际 %q", decision.Action)
+	if decision.Action != "convert" {
+		t.Fatalf("Chat provider 收到 Responses 请求必须转换，实际 %q", decision.Action)
 	}
 	if decision.ConversionLabel != "OpenAI Responses -> OpenAI Chat" {
 		t.Fatalf("协议流 = %q，want OpenAI Responses -> OpenAI Chat", decision.ConversionLabel)
+	}
+
+	same, err := router.DecideForProtocol("r1", domain.ProtocolOpenAIChat)
+	if err != nil {
+		t.Fatalf("DecideForProtocol same protocol: %v", err)
+	}
+	if same.Action != "pass_through" {
+		t.Fatalf("同协议必须直通，实际 %q", same.Action)
+	}
+	if same.ConversionLabel != "OpenAI Chat -> OpenAI Chat" {
+		t.Fatalf("同协议标签 = %q，want OpenAI Chat -> OpenAI Chat", same.ConversionLabel)
 	}
 }
 

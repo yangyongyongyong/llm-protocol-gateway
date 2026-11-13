@@ -22,7 +22,7 @@ func TestOpenCodeGoCountTokensReturnsLocalStub(t *testing.T) {
 		}},
 		Routes: []domain.Route{{
 			ID: "opencode-go-claude", Name: "OpenCode Go · Claude", ProviderID: "opencode-go",
-			OutputProtocol: domain.ProtocolClaude, Mode: domain.RouteModeAuto, Enabled: true,
+			OutputProtocol: domain.ProtocolClaude, Enabled: true,
 		}},
 		APIKeys: []domain.APIKey{{
 			ID: "key1", Name: "key1", Key: "sk-gw-test", RouteID: "opencode-go-claude", Enabled: true,

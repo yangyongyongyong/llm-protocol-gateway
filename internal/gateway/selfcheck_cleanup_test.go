@@ -19,7 +19,7 @@ func TestSweepSelfcheckLeftoversRemovesOnlySelfcheckKeys(t *testing.T) {
 		}},
 	})
 	route, err := server.router.AddRoute(domain.Route{
-		Name: "r", ProviderID: "p1", OutputProtocol: domain.ProtocolClaude, Mode: domain.RouteModeAuto, Enabled: true,
+		Name: "r", ProviderID: "p1", OutputProtocol: domain.ProtocolClaude, Enabled: true,
 	})
 	if err != nil {
 		t.Fatal(err)

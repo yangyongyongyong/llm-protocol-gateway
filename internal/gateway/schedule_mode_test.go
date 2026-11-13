@@ -11,7 +11,7 @@ func scheduleModeRouter(t *testing.T) *Router {
 	t.Helper()
 	provider := domain.Provider{ID: "p1", Name: "p1", Protocol: domain.ProtocolOpenAIChat, BaseURL: "https://a.example/v1"}
 	backup := domain.Provider{ID: "p2", Name: "p2", Protocol: domain.ProtocolOpenAIChat, BaseURL: "https://b.example/v1"}
-	route := domain.Route{ID: "r1", Name: "r1", ProviderID: provider.ID, OutputProtocol: domain.ProtocolOpenAIChat, Mode: domain.RouteModeAuto, Enabled: true}
+	route := domain.Route{ID: "r1", Name: "r1", ProviderID: provider.ID, OutputProtocol: domain.ProtocolOpenAIChat, Enabled: true}
 	key := domain.APIKey{ID: "k1", Name: "k1", Key: "sk-gw-schedule", RouteID: route.ID, Enabled: true, StreamEnabled: true}
 	return NewRouter(domain.GatewayState{
 		Providers: []domain.Provider{provider, backup},

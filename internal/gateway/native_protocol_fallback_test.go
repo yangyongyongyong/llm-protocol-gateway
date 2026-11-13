@@ -40,7 +40,7 @@ func TestNativeProtocolPassThroughFallsBackToConversion(t *testing.T) {
 		}},
 		Routes: []domain.Route{{
 			ID: "multi-route", Name: "multi-route", ProviderID: "multi",
-			OutputProtocol: domain.ProtocolClaude, Mode: domain.RouteModeAuto, Enabled: true,
+			OutputProtocol: domain.ProtocolClaude, Enabled: true,
 		}},
 	}
 	server := NewServer(NewRouter(state), monitor.NewStore())
@@ -103,7 +103,7 @@ func TestNativeProtocolPassThroughSucceedsWithoutConversion(t *testing.T) {
 		}},
 		Routes: []domain.Route{{
 			ID: "multi-route", Name: "multi-route", ProviderID: "multi",
-			OutputProtocol: domain.ProtocolClaude, Mode: domain.RouteModeAuto, Enabled: true,
+			OutputProtocol: domain.ProtocolClaude, Enabled: true,
 		}},
 	}
 	server := NewServer(NewRouter(state), monitor.NewStore())

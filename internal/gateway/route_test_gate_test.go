@@ -92,7 +92,7 @@ func TestAnAPIKeyIsAccepted(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	server.Handler().ServeHTTP(recorder, request)
 	// 带 key 的请求必须走通。这个 fixture 的 provider 讲 Claude，请求也走 Claude
-	// 端点——auto 模式按「这次请求的协议」判定，两端一致就是直通。
+	// 端点——按「这次请求的协议」判定，两端一致就是直通。
 	//
 	// 这里曾经断言的是 502「protocol conversion is not implemented」：那时判定看的是
 	// route 上的 OutputProtocol（fixture 里是 openai_chat），Claude→Claude 被当成需要
@@ -136,7 +136,7 @@ func TestInternalTestRouteIDRequiresTheServerSideMark(t *testing.T) {
 
 // X-Gateway-Internal-Test 曾经兼着一个「跳过协议不符检查」的开关。那个检查本身
 // 已经拆掉了：一把 Key 本来就该同时被 Claude Code 和 Codex 用，每条端点自带协议，
-// auto 模式按「这次请求走的是哪条端点」判定直通还是转换，而不是拿 route 上那个
+// 按「这次请求走的是哪条端点」判定直通还是转换，而不是拿 route 上那个
 // 输出协议去拒绝另一条端点。
 //
 // 这条测试盯的是新口径：同一个 Key 绑在 chat 输出的路由上，发 Claude 端点的请求

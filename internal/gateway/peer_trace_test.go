@@ -145,3 +145,51 @@ func TestPeerTraceHelpersTolerateNil(t *testing.T) {
 		t.Fatal("a nil timing must report no egress peer")
 	}
 }
+
+// 已尝试 egress 但还没拿到父网关身份（客户端取消、超时、连接失败）时，
+// PeerDirection 必须是 egress。若这里退化成空，前端会把它误画成“直连”。
+func TestPeerTraceKeepsEgressAttemptWhenIdentityUnknown(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	timing := newRequestTiming(time.Now())
+	timing.notePeerEgressAttempt()
+
+	entry := monitor.RequestLog{}
+	applyPeerTrace(&entry, peerTraceFor(request, timing))
+	if entry.Egress != "" {
+		t.Fatalf("Egress must stay empty until the parent id is known, got %q", entry.Egress)
+	}
+	if entry.PeerDirection != "egress" {
+		t.Fatalf("PeerDirection = %q, want egress for an attempted hop", entry.PeerDirection)
+	}
+}
+
+// 注册快照里的父网关 ID 可以作为取消请求的兜底：响应头没回来时，日志仍应
+// 指向上游网关，而不是一条没有来源的空链路。
+func TestPeerTraceUsesRememberedParentWhenEgressIdentityMissing(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	timing := newRequestTiming(time.Now())
+	timing.notePeerEgressAttempt()
+	timing.notePeerEgress(otherID)
+
+	entry := monitor.RequestLog{}
+	applyPeerTrace(&entry, peerTraceFor(request, timing))
+	if entry.Egress != otherID || entry.PeerDirection != "egress" {
+		t.Fatalf("Egress/Direction = %q/%q, want %q/egress", entry.Egress, entry.PeerDirection, otherID)
+	}
+}
+
+// The fallback must not replace the authoritative parent identity learned from
+// a live response header.
+func TestPeerTraceLiveEgressHeaderBeatsRegistrationFallback(t *testing.T) {
+	timing := newRequestTiming(time.Now())
+	timing.notePeerEgressAttempt()
+	timing.notePeerEgressFallback("gw_aaaaaaaaaaaaaaaa")
+	timing.notePeerEgress("gw_bbbbbbbbbbbbbbbb")
+
+	entry := monitor.RequestLog{}
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	applyPeerTrace(&entry, peerTraceFor(request, timing))
+	if entry.Egress != "gw_bbbbbbbbbbbbbbbb" {
+		t.Fatalf("Egress = %q, want the live header value", entry.Egress)
+	}
+}

@@ -204,7 +204,7 @@ func TestClaudePassThroughResolvesReservedDefaultModel(t *testing.T) {
 		}},
 		Routes: []domain.Route{{
 			ID: "r1", Name: "R1", ProviderID: "p1",
-			OutputProtocol: domain.ProtocolClaude, Mode: domain.RouteModeAuto, Enabled: true,
+			OutputProtocol: domain.ProtocolClaude, Enabled: true,
 		}},
 		APIKeys: []domain.APIKey{{ID: "k1", Name: "K1", Key: "sk-gw", RouteID: "r1", Enabled: true}},
 	})
@@ -253,7 +253,7 @@ func TestClaudePassThroughKeepsDefaultWithoutProviderDefault(t *testing.T) {
 		}},
 		Routes: []domain.Route{{
 			ID: "r1", Name: "R1", ProviderID: "p1",
-			OutputProtocol: domain.ProtocolClaude, Mode: domain.RouteModeAuto, Enabled: true,
+			OutputProtocol: domain.ProtocolClaude, Enabled: true,
 		}},
 		APIKeys: []domain.APIKey{{ID: "k1", Name: "K1", Key: "sk-gw", RouteID: "r1", Enabled: true}},
 	})
@@ -282,7 +282,7 @@ func TestClaudeModelsListsReservedDefaultAlias(t *testing.T) {
 		}},
 		Routes: []domain.Route{{
 			ID: "r1", Name: "R1", ProviderID: "p1",
-			OutputProtocol: domain.ProtocolClaude, Mode: domain.RouteModeAuto, Enabled: true,
+			OutputProtocol: domain.ProtocolClaude, Enabled: true,
 		}},
 		APIKeys: []domain.APIKey{{ID: "k1", Name: "K1", Key: "sk-gw", RouteID: "r1", Enabled: true}},
 	})
@@ -332,7 +332,7 @@ func TestClaudeModelsOmitsUnservedTierAliases(t *testing.T) {
 		}},
 		Routes: []domain.Route{{
 			ID: "r1", Name: "R1", ProviderID: "p1",
-			OutputProtocol: domain.ProtocolClaude, Mode: domain.RouteModeAuto, Enabled: true,
+			OutputProtocol: domain.ProtocolClaude, Enabled: true,
 		}},
 		APIKeys: []domain.APIKey{{ID: "k1", Name: "K1", Key: "sk-gw", RouteID: "r1", Enabled: true}},
 	})
@@ -389,7 +389,7 @@ func TestClaudeModelsKeepsServedTierAliases(t *testing.T) {
 		}},
 		Routes: []domain.Route{{
 			ID: "r1", Name: "R1", ProviderID: "p1",
-			OutputProtocol: domain.ProtocolClaude, Mode: domain.RouteModeAuto, Enabled: true,
+			OutputProtocol: domain.ProtocolClaude, Enabled: true,
 		}},
 		APIKeys: []domain.APIKey{{ID: "k1", Name: "K1", Key: "sk-gw", RouteID: "r1", Enabled: true}},
 	})

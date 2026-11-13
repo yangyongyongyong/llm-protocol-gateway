@@ -31,14 +31,6 @@ func (p Protocol) DisplayName() string {
 	}
 }
 
-type RouteMode string
-
-const (
-	RouteModeAuto        RouteMode = "auto"
-	RouteModePassThrough RouteMode = "pass_through"
-	RouteModeConvert     RouteMode = "convert"
-)
-
 type PublicAccessMode string
 
 const (
@@ -901,14 +893,16 @@ type OutputEndpoint struct {
 	StreamEnabled bool `json:"streamEnabled"`
 }
 
+// Route 只描述“这条 Key 绑定哪个 Provider”及其默认输出端点，不承载
+// 直通/转换策略。每次请求由实际客户端协议、Provider.Protocol 和
+// ProtocolSupport 现场判定。
 type Route struct {
-	ID               string    `json:"id"`
-	Name             string    `json:"name"`
-	OutputEndpointID string    `json:"outputEndpointId"`
-	ProviderID       string    `json:"providerId"`
-	OutputProtocol   Protocol  `json:"outputProtocol"`
-	Mode             RouteMode `json:"mode"`
-	Enabled          bool      `json:"enabled"`
+	ID               string   `json:"id"`
+	Name             string   `json:"name"`
+	OutputEndpointID string   `json:"outputEndpointId"`
+	ProviderID       string   `json:"providerId"`
+	OutputProtocol   Protocol `json:"outputProtocol"`
+	Enabled          bool     `json:"enabled"`
 }
 
 type APIKey struct {
@@ -1128,14 +1122,14 @@ const (
 // IsPeer 报告这是否是一个下游网关账号。
 func (u User) IsPeer() bool { return u.Kind == UserKindPeer }
 
+// RouteDecision 是一次请求的运行时决策。Action 是结果，不是可配置输入。
 type RouteDecision struct {
-	RouteID         string    `json:"routeId"`
-	ProviderID      string    `json:"providerId"`
-	OutputProtocol  Protocol  `json:"outputProtocol"`
-	InputProtocol   Protocol  `json:"inputProtocol"`
-	Mode            RouteMode `json:"mode"`
-	Action          string    `json:"action"`
-	ConversionLabel string    `json:"conversionLabel"`
+	RouteID         string   `json:"routeId"`
+	ProviderID      string   `json:"providerId"`
+	OutputProtocol  Protocol `json:"outputProtocol"`
+	InputProtocol   Protocol `json:"inputProtocol"`
+	Action          string   `json:"action"`
+	ConversionLabel string   `json:"conversionLabel"`
 }
 
 // DataPaths lists absolute filesystem locations for user-level gateway data.

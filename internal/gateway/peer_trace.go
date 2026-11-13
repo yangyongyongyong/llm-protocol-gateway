@@ -24,6 +24,10 @@ type peerTrace struct {
 	Ingress string
 	// Egress 是本机把请求转发出去的对端网关 ID。
 	Egress string
+	// EgressAttempted 表示本机确实尝试过走对端网关，但可能因为取消/超时/
+	// 连接失败而还没拿到对方的身份。它让日志区分“从未经过对端”和“走对端
+	// 但身份未落地”，前者才是直连。
+	EgressAttempted bool
 	// Origin 是发起方网关 ID（X-Gateway-Origin 的值）。
 	Origin string
 	// Path 是这次请求已经过的网关 ID 链（X-Gateway-Path，从发起方开始，不含
@@ -53,14 +57,14 @@ func (t peerTrace) peerDirection() string {
 	if strings.TrimSpace(t.Ingress) != "" {
 		return "ingress"
 	}
-	if strings.TrimSpace(t.Egress) != "" {
+	if strings.TrimSpace(t.Egress) != "" || t.EgressAttempted {
 		return "egress"
 	}
 	return ""
 }
 
 func (t peerTrace) isEmpty() bool {
-	return strings.TrimSpace(t.Ingress) == "" && strings.TrimSpace(t.Egress) == "" &&
+	return strings.TrimSpace(t.Ingress) == "" && strings.TrimSpace(t.Egress) == "" && !t.EgressAttempted &&
 		strings.TrimSpace(t.Origin) == "" && len(t.Path) == 0
 }
 
@@ -124,7 +128,10 @@ func peerTraceFor(r *http.Request, timing *requestTiming) peerTrace {
 			trace.Origin = strings.TrimSpace(r.Header.Get(headerGatewayOrigin))
 		}
 	}
-	if r != nil && (trace.Ingress != "" || trace.Egress != "") && len(trace.Path) == 0 {
+	if timing.peerEgressAttempted() {
+		trace.EgressAttempted = true
+	}
+	if r != nil && (trace.Ingress != "" || trace.Egress != "" || trace.EgressAttempted) && len(trace.Path) == 0 {
 		trace.Path = parseGatewayHop(r).Path
 	}
 	return trace

@@ -268,7 +268,6 @@ func peerDecisionFor(provider domain.Provider, protocol domain.Protocol) domain.
 		ProviderID:     provider.ID,
 		OutputProtocol: effective,
 		InputProtocol:  effective,
-		Mode:           domain.RouteModePassThrough,
 		Action:         "peer",
 	}
 }

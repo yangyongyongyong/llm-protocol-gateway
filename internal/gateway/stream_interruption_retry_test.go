@@ -376,7 +376,7 @@ func newStreamDropState(t *testing.T, primaryURL, backupURL string) domain.Gatew
 		}},
 		Routes: []domain.Route{{
 			ID: "stream-drop-route", Name: "stream-drop-route", ProviderID: "stream-drop-primary",
-			OutputProtocol: domain.ProtocolClaude, Mode: domain.RouteModePassThrough, Enabled: true,
+			OutputProtocol: domain.ProtocolClaude, Enabled: true,
 		}},
 	}
 	if backupURL != "" {
@@ -386,7 +386,7 @@ func newStreamDropState(t *testing.T, primaryURL, backupURL string) domain.Gatew
 		})
 		state.Routes = append(state.Routes, domain.Route{
 			ID: "stream-drop-backup-route", Name: "stream-drop-backup-route", ProviderID: "stream-drop-backup",
-			OutputProtocol: domain.ProtocolClaude, Mode: domain.RouteModePassThrough, Enabled: true,
+			OutputProtocol: domain.ProtocolClaude, Enabled: true,
 		})
 	}
 	return state

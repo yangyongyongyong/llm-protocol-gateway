@@ -152,7 +152,6 @@ func TestHandleOpenAIResponsesCompactEndToEnd(t *testing.T) {
 		Name:           "r1",
 		ProviderID:     provider.ID,
 		OutputProtocol: domain.ProtocolOpenAIResponses,
-		Mode:           domain.RouteModeAuto,
 		Enabled:        true,
 	}
 	apiKey := domain.APIKey{
@@ -299,7 +298,7 @@ func TestHandleOpenAIResponsesCompactAttributesLogToServingProvider(t *testing.T
 		ID: "p-back", Name: "p-back", Protocol: domain.ProtocolOpenAIResponses,
 		AuthType: domain.AuthTypeAPIKey, BaseURL: live.URL + "/v1/responses", APIKeySource: "sk-b", HealthStatus: "healthy",
 	}
-	route := domain.Route{ID: "r-cf", Name: "r-cf", ProviderID: preferred.ID, OutputProtocol: domain.ProtocolOpenAIResponses, Mode: domain.RouteModeAuto, Enabled: true}
+	route := domain.Route{ID: "r-cf", Name: "r-cf", ProviderID: preferred.ID, OutputProtocol: domain.ProtocolOpenAIResponses, Enabled: true}
 	apiKey := domain.APIKey{
 		ID: "k-cf", Name: "k-cf", Key: "sk-gw-test-compact-failover", RouteID: route.ID,
 		Enabled: true, StreamEnabled: true,
@@ -406,7 +405,7 @@ func TestHandleOpenAIResponsesCompactFlattensToolCallsWithoutToolsSchema(t *test
 		ID: "p2", Name: "p2", Protocol: domain.ProtocolOpenAIResponses, AuthType: domain.AuthTypeAPIKey,
 		BaseURL: upstream.URL + "/v1/responses", APIKeySource: "sk-upstream-test", HealthStatus: "healthy",
 	}
-	route := domain.Route{ID: "r2", Name: "r2", ProviderID: provider.ID, OutputProtocol: domain.ProtocolOpenAIResponses, Mode: domain.RouteModeAuto, Enabled: true}
+	route := domain.Route{ID: "r2", Name: "r2", ProviderID: provider.ID, OutputProtocol: domain.ProtocolOpenAIResponses, Enabled: true}
 	apiKey := domain.APIKey{ID: "k2", Name: "k2", Key: "sk-gw-test-compact-toolcalls", RouteID: route.ID, Enabled: true, StreamEnabled: true}
 	router := NewRouter(domain.GatewayState{Providers: []domain.Provider{provider}, Routes: []domain.Route{route}, APIKeys: []domain.APIKey{apiKey}})
 	server := NewServer(router, monitor.NewStore())

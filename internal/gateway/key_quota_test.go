@@ -52,7 +52,7 @@ func newQuotaFixture(t *testing.T, quota func(*domain.APIKey), gated bool) *quot
 	provider := domain.Provider{ID: "p-quota", Name: "p-quota", Protocol: domain.ProtocolOpenAIChat,
 		AuthType: domain.AuthTypeAPIKey, BaseURL: upstream.URL + "/v1", APIKeySource: "sk-a"}
 	route := domain.Route{ID: "r-quota", Name: "r-quota", ProviderID: provider.ID,
-		OutputProtocol: domain.ProtocolOpenAIChat, Mode: domain.RouteModeAuto, Enabled: true}
+		OutputProtocol: domain.ProtocolOpenAIChat, Enabled: true}
 	apiKey := domain.APIKey{ID: "k-quota", Name: "k-quota", Key: "sk-gw-quota", RouteID: route.ID,
 		Enabled: true, StreamEnabled: true}
 	quota(&apiKey)

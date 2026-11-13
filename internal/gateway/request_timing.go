@@ -58,22 +58,63 @@ type requestTiming struct {
 	scheduleMu sync.Mutex
 	schedule   *scheduleTrace
 
-	// peerEgress is the parent gateway this request was forwarded to, learned
-	// from its response header at send time (see peer_egress.go). Read once when
-	// the request log is assembled; the lock only guards the several retries that
-	// may each report it.
-	peerEgressMu sync.Mutex
-	peerEgress   string
+	// peerEgress is the parent gateway this request was forwarded to. The
+	// authoritative value comes from the parent's response header; before that
+	// header arrives (client cancellation, timeout, transport error) we keep the
+	// peer identity known from the provider registration so an interrupted
+	// egress attempt cannot turn into an empty "direct" chain in the log.
+	//
+	// peerEgressKnown distinguishes "no peer attempt" from "egress attempted but
+	// identity unavailable": both have an empty Egress string, but only the
+	// latter should render as an unknown chain rather than as a direct one.
+	peerEgressMu    sync.Mutex
+	peerEgress      string
+	peerEgressKnown bool
+	// peerEgressFallback is the registered parent identity. It is used only
+	// when the response header never arrives (cancellation/timeout), and never
+	// overrides an identity learned from the live response.
+	peerEgressFallback string
 }
 
 // notePeerEgress records the parent gateway a forwarded request reached.
 func (t *requestTiming) notePeerEgress(gatewayID string) {
 	gatewayID = strings.TrimSpace(gatewayID)
+	if t == nil {
+		return
+	}
+	t.peerEgressMu.Lock()
+	t.peerEgressKnown = true
+	if gatewayID != "" {
+		t.peerEgress = gatewayID
+	}
+	t.peerEgressMu.Unlock()
+}
+
+// notePeerEgressFallback records the parent identity from the registration
+// snapshot. It is deliberately weaker than the live response header: a
+// cancelled or timed-out request can still name the peer it was addressed to,
+// while a successful response keeps the authoritative header value.
+func (t *requestTiming) notePeerEgressFallback(gatewayID string) {
+	gatewayID = strings.TrimSpace(gatewayID)
 	if t == nil || gatewayID == "" {
 		return
 	}
 	t.peerEgressMu.Lock()
-	t.peerEgress = gatewayID
+	if t.peerEgressFallback == "" {
+		t.peerEgressFallback = gatewayID
+	}
+	t.peerEgressMu.Unlock()
+}
+
+// notePeerEgressAttempt marks that this request is leaving through a peer
+// gateway even when its identity is not known yet. It is called before the
+// upstream round trip; the response header refines the value later.
+func (t *requestTiming) notePeerEgressAttempt() {
+	if t == nil {
+		return
+	}
+	t.peerEgressMu.Lock()
+	t.peerEgressKnown = true
 	t.peerEgressMu.Unlock()
 }
 
@@ -84,7 +125,21 @@ func (t *requestTiming) peerEgressFrom() string {
 	}
 	t.peerEgressMu.Lock()
 	defer t.peerEgressMu.Unlock()
-	return t.peerEgress
+	if t.peerEgress != "" {
+		return t.peerEgress
+	}
+	return t.peerEgressFallback
+}
+
+// peerEgressAttempted reports whether this request tried to leave through a
+// peer gateway, regardless of whether its identity was learned.
+func (t *requestTiming) peerEgressAttempted() bool {
+	if t == nil {
+		return false
+	}
+	t.peerEgressMu.Lock()
+	defer t.peerEgressMu.Unlock()
+	return t.peerEgressKnown
 }
 
 func newRequestTiming(started time.Time) *requestTiming {

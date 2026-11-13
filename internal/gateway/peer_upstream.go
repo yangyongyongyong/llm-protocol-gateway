@@ -851,7 +851,13 @@ func peerModelsForProtocol(protocol domain.Protocol, granted []peerProviderView)
 	return out
 }
 
-// ensurePeerUpstreamRoute 确保这条 provider 有一条可用的同协议路由。
+// ensurePeerUpstreamRoute 确保这条 provider 有一条自动创建的路由。
+//
+// 路由只保存 provider 绑定，不保存“直通/转换”模式。每次请求由实际客户端
+// 协议和 provider 声明协议决定：相同就直通，不同就转换；如果实测
+// ProtocolSupport 说明当前 provider 也支持客户端协议，则先在当前 provider
+// 内尝试同协议直通，失败后再走转换。Provider 的先后顺序完全由 Key 的调度
+// 规则决定，这里不参与协议偏好排序。
 func (s *Server) ensurePeerUpstreamRoute(provider domain.Provider) error {
 	for _, route := range s.router.State().Routes {
 		if route.ProviderID == provider.ID && route.OutputProtocol == provider.Protocol {
@@ -862,7 +868,6 @@ func (s *Server) ensurePeerUpstreamRoute(provider domain.Provider) error {
 		Name:           provider.Name + " · " + string(provider.Protocol),
 		ProviderID:     provider.ID,
 		OutputProtocol: provider.Protocol,
-		Mode:           domain.RouteModePassThrough,
 	})
 	return err
 }

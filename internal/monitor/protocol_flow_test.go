@@ -3,8 +3,9 @@ package monitor
 import "testing"
 
 // protocol_flow 的方向在 2026-11-13 改过：以前写 "<上游> -> <客户端>"，现在写
-// "<客户端> -> <上游>"，直通则只写一个协议名。协议用量统计按这个字符串取
-// 「输出协议」（客户端那一侧），所以要盯住左侧取值。
+// "<客户端> -> <上游>"。同协议也保留两侧（OpenAI Chat -> OpenAI Chat），前端
+// 会显示成 oc->oc。协议用量统计按这个字符串取「输出协议」（客户端那一侧），
+// 所以要盯住左侧取值。
 //
 // 旧方向没法在解析时兼容——"Claude -> OpenAI Chat" 在两种格式下都是合法表达，
 // 含义却相反。旧行靠一次数据订正（protocol_flow_direction 迁移）翻正，不是靠
@@ -21,10 +22,11 @@ func TestOutputProtocolFromFlow(t *testing.T) {
 		{"convert chat to claude", "OpenAI Chat -> Claude", "OpenAI Chat"},
 		{"convert responses to claude", "OpenAI Responses -> Claude", "OpenAI Responses"},
 
-		// 直通：只写一个协议名。
-		{"passthrough chat", "OpenAI Chat", "OpenAI Chat"},
-		{"passthrough responses", "OpenAI Responses", "OpenAI Responses"},
-		{"passthrough claude", "Claude", "Claude"},
+		// 同协议：两侧都写；兼容旧日志里只有一个协议名的行。
+		{"passthrough chat", "OpenAI Chat -> OpenAI Chat", "OpenAI Chat"},
+		{"passthrough responses", "OpenAI Responses -> OpenAI Responses", "OpenAI Responses"},
+		{"passthrough claude", "Claude -> Claude", "Claude"},
+		{"legacy single chat", "OpenAI Chat", "OpenAI Chat"},
 
 		// 认不出来的不该硬编一个协议出来。
 		{"empty", "", ""},

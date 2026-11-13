@@ -146,7 +146,6 @@ func (s *Store) migrate() error {
 			output_endpoint_id TEXT NOT NULL DEFAULT '',
 			provider_id TEXT NOT NULL,
 			output_protocol TEXT NOT NULL,
-			mode TEXT NOT NULL DEFAULT 'auto',
 			enabled INTEGER NOT NULL DEFAULT 1,
 			position INTEGER NOT NULL DEFAULT 0
 		)`,
@@ -865,10 +864,10 @@ func (s *Store) Save(state domain.GatewayState) error {
 			enabled = 1
 		}
 		if _, err := tx.Exec(`INSERT INTO routes
-			(id, name, output_endpoint_id, provider_id, output_protocol, mode, enabled, position)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			(id, name, output_endpoint_id, provider_id, output_protocol, enabled, position)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`,
 			route.ID, route.Name, route.OutputEndpointID, route.ProviderID, string(route.OutputProtocol),
-			string(route.Mode), enabled, index); err != nil {
+			enabled, index); err != nil {
 			return err
 		}
 	}
@@ -1162,7 +1161,8 @@ func (s *Store) loadModels(providerID string) ([]domain.Model, error) {
 }
 
 func (s *Store) loadRoutes() ([]domain.Route, error) {
-	rows, err := s.reader().Query(`SELECT id, name, output_endpoint_id, provider_id, output_protocol, mode, enabled FROM routes ORDER BY position, id`)
+	// 旧数据库里可能还留着 routes.mode 列；新代码不再读取它。
+	rows, err := s.reader().Query(`SELECT id, name, output_endpoint_id, provider_id, output_protocol, enabled FROM routes ORDER BY position, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -1170,13 +1170,12 @@ func (s *Store) loadRoutes() ([]domain.Route, error) {
 	routes := []domain.Route{}
 	for rows.Next() {
 		var route domain.Route
-		var protocol, mode string
+		var protocol string
 		var enabled int
-		if err := rows.Scan(&route.ID, &route.Name, &route.OutputEndpointID, &route.ProviderID, &protocol, &mode, &enabled); err != nil {
+		if err := rows.Scan(&route.ID, &route.Name, &route.OutputEndpointID, &route.ProviderID, &protocol, &enabled); err != nil {
 			return nil, err
 		}
 		route.OutputProtocol = domain.Protocol(protocol)
-		route.Mode = domain.RouteMode(mode)
 		route.Enabled = enabled != 0
 		routes = append(routes, route)
 	}

@@ -4655,8 +4655,8 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	// 一把 Key 本来就该同时被多种客户端用：每条端点自带协议，auto 模式按本次
-	// 请求的协议判定直通还是转换，不再用 route 上那个「输出协议」把端点钉死。
+	// 一把 Key 本来就该同时被多种客户端用：每条端点自带协议，按本次请求的
+	// 协议判定直通还是转换，不再用 route 上那个「输出协议」把端点钉死。
 	decision, err := s.router.DecideForProtocol(route.ID, domain.ProtocolOpenAIChat)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, err.Error())
@@ -5985,7 +5985,6 @@ func buildRouteTestDiagnostics(route domain.Route, provider domain.Provider, dec
 		"gatewayUrl":       gatewayURL,
 		"action":           decision.Action,
 		"protocolFlow":     decision.ConversionLabel,
-		"mode":             route.Mode,
 		"model":            model,
 		"status":           status,
 		"requestBody":      requestBody,

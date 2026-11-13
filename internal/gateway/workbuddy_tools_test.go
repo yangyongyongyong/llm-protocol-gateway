@@ -471,7 +471,7 @@ func TestClaudeToolsAreFittedAndNamedBack(t *testing.T) {
 		Providers: []domain.Provider{provider},
 		Routes: []domain.Route{{
 			ID: "r1", Name: "R1", ProviderID: provider.ID,
-			OutputProtocol: domain.ProtocolClaude, Mode: domain.RouteModeAuto, Enabled: true,
+			OutputProtocol: domain.ProtocolClaude, Enabled: true,
 		}},
 		APIKeys: []domain.APIKey{{ID: "k1", Name: "K1", Key: "sk-gw", RouteID: "r1", Enabled: true, StreamEnabled: true}},
 	})

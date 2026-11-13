@@ -57,6 +57,24 @@ func protocolConversionImplemented(clientProtocol domain.Protocol, decision doma
 	return false
 }
 
+// 当前 provider 实测支持客户端协议时，即使“声明协议 -> 客户端协议”这条
+// 转换器不存在，也不能提前跳过它：同协议直通本身就能成功。这个判断只影响
+// 当前 provider 是否可尝试，不改变 Key 的 provider 调度顺序。
+func TestAttemptServesClientProtocolHonorsNativeSupport(t *testing.T) {
+	provider := domain.Provider{
+		Protocol:        domain.ProtocolGemini,
+		AuthType:        domain.AuthTypeAPIKey,
+		ProtocolSupport: []string{"gemini", "openai_chat"},
+	}
+	decision := domain.RouteDecision{
+		Action:        "convert",
+		InputProtocol: domain.ProtocolGemini,
+	}
+	if !attemptServesClientProtocol(decision, domain.ProtocolOpenAIChat, provider) {
+		t.Fatal("native openai_chat support must keep this provider attemptable")
+	}
+}
+
 func TestOpenAIChatToResponsesRequest(t *testing.T) {
 	chatReq := map[string]any{
 		"model": "gpt-5",

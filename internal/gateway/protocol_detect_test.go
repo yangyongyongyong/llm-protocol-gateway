@@ -2,11 +2,9 @@ package gateway
 
 import (
 	"net/http"
-	"strings"
 	"testing"
 
 	"github.com/luca/llm-protocol-gateway/internal/domain"
-	"github.com/luca/llm-protocol-gateway/internal/monitor"
 )
 
 // 基地址带 /anthropic 的，兄弟根是砍掉它的那一层；其余情况兄弟是 + /anthropic。
@@ -84,70 +82,6 @@ func TestClassifyProtocolProbe(t *testing.T) {
 	for _, tc := range cases {
 		if got := classifyProtocolProbe(tc.status); got != tc.want {
 			t.Fatalf("classifyProtocolProbe(%d) = %v, want %v (%s)", tc.status, got, tc.want, tc.why)
-		}
-	}
-}
-
-// 协议直通只能优化备选顺序，不能越过显式首选。首选需要转换、备选可直通时，
-// 仍应先试首选；首选失败后才轮到同协议备选。
-func TestPreferNativeProtocolKeepsPrimaryFirst(t *testing.T) {
-	t.Parallel()
-	server := NewServer(NewRouter(domain.GatewayState{
-		Providers: []domain.Provider{
-			{ID: "p-claude", Name: "claude", Protocol: domain.ProtocolClaude},
-			{ID: "p-openai", Name: "openai", Protocol: domain.ProtocolOpenAIChat},
-		},
-	}), monitor.NewStore())
-
-	got := server.preferNativeProtocol([]string{"p-claude", "p-openai"}, domain.ProtocolOpenAIChat, "")
-	if len(got) != 2 || got[0] != "p-claude" || got[1] != "p-openai" {
-		t.Fatalf("chain = %v, want the configured primary first", got)
-	}
-}
-
-// 三节点链里只调整备选：首个备选需要转换，第二个备选可直通时，把后者提到
-// 备选首位，但 chain[0] 永远不动。
-func TestPreferNativeProtocolPromotesOnlyFallbackTail(t *testing.T) {
-	t.Parallel()
-	server := NewServer(NewRouter(domain.GatewayState{
-		Providers: []domain.Provider{
-			{ID: "p-primary", Name: "primary", Protocol: domain.ProtocolOpenAIChat},
-			{ID: "p-fallback", Name: "fallback", Protocol: domain.ProtocolOpenAIChat},
-			{ID: "p-native", Name: "native", Protocol: domain.ProtocolOpenAIChat, AuthType: domain.AuthTypeAPIKey, ProtocolSupport: []string{"openai_chat", "openai_responses"}},
-		},
-	}), monitor.NewStore())
-
-	got := server.preferNativeProtocol([]string{"p-primary", "p-fallback", "p-native"}, domain.ProtocolOpenAIResponses, "")
-	if strings.Join(got, ",") != "p-primary,p-native,p-fallback" {
-		t.Fatalf("chain = %v, want primary unchanged and native fallback next", got)
-	}
-}
-
-// 这三种情况必须原样返回，免得把管理员的意图踩掉。
-func TestPreferNativeProtocolLeavesOrderAlone(t *testing.T) {
-	t.Parallel()
-	server := NewServer(NewRouter(domain.GatewayState{
-		Providers: []domain.Provider{
-			{ID: "p-claude", Name: "claude", Protocol: domain.ProtocolClaude},
-			{ID: "p-openai", Name: "openai", Protocol: domain.ProtocolOpenAIChat},
-		},
-	}), monitor.NewStore())
-
-	cases := []struct {
-		name  string
-		chain []string
-		proto domain.Protocol
-		pin   string
-	}{
-		{"已经是同协议开头", []string{"p-openai", "p-claude"}, domain.ProtocolOpenAIChat, ""},
-		{"没有同协议节点", []string{"p-claude"}, domain.ProtocolOpenAIChat, ""},
-		{"会话粘性钉住了", []string{"p-claude", "p-openai"}, domain.ProtocolOpenAIChat, "p-claude"},
-		{"协议未知", []string{"p-claude", "p-openai"}, "", ""},
-	}
-	for _, tc := range cases {
-		got := server.preferNativeProtocol(tc.chain, tc.proto, tc.pin)
-		if len(got) != len(tc.chain) || got[0] != tc.chain[0] {
-			t.Fatalf("%s: chain = %v, want unchanged %v", tc.name, got, tc.chain)
 		}
 	}
 }

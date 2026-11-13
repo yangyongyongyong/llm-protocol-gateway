@@ -820,9 +820,6 @@ func (r *Router) AddRoute(route domain.Route) (domain.Route, error) {
 	if route.OutputEndpointID == "" {
 		route.OutputEndpointID = endpoint.ID
 	}
-	if route.Mode == "" {
-		route.Mode = domain.RouteModeAuto
-	}
 	route.Enabled = true
 
 	r.state.Routes = append(r.state.Routes, route)
@@ -854,9 +851,6 @@ func (r *Router) UpdateRoute(routeID string, patch domain.Route) (domain.Route, 
 			}
 			updated.OutputProtocol = patch.OutputProtocol
 			updated.OutputEndpointID = endpoint.ID
-		}
-		if patch.Mode != "" {
-			updated.Mode = patch.Mode
 		}
 		r.state.Routes[index] = updated
 		return updated, nil
@@ -2547,7 +2541,7 @@ func (r *Router) Decide(routeID string) (domain.RouteDecision, error) {
 	return r.DecideForProtocol(routeID, "")
 }
 
-// DecideForProtocol 是 Decide 的「按这次请求的协议」版本：auto 模式下用它判定
+// DecideForProtocol 是 Decide 的「按这次请求的协议」版本：用它判定本次
 // 直通还是转换。clientProtocol 为空时行为与 Decide 完全一致。
 func (r *Router) DecideForProtocol(routeID string, clientProtocol domain.Protocol) (domain.RouteDecision, error) {
 	r.mu.RLock()
@@ -2595,15 +2589,15 @@ func (r *Router) decideLocked(route domain.Route, providerID string) (domain.Rou
 	return r.decideLockedForProtocol(route, providerID, "")
 }
 
-// decideLocked 用 auto 模式判定「直通还是转换」。
+// decideLocked 按请求协议判定「直通还是转换」。
 //
 // clientProtocol 是调用方这一次请求真正走的那条端点的协议（/v1/chat/completions
 // 是 openai_chat，/anthropic/v1/messages 是 claude，以此类推）。空值表示调用方
 // 不知道（老调用点、内部探测），这时只能退回 route.OutputProtocol 那个口径。
 //
 // 为什么要按请求而不是按 route：一把 Key 本来就该能同时被 Claude Code 和 Codex
-// 用——它们是两条不同的端点，客户端自己就分好了协议。以前 auto 模式拿 route 上
-// 那个「输出协议」当客户端协议，于是把 route 钉死成一种协议，另一条端点的请求
+// 用——它们是两条不同的端点，客户端自己就分好了协议。以前拿 route 上那个
+// 「输出协议」当客户端协议，于是把 route 钉死成一种协议，另一条端点的请求
 // 会被直接拒掉（endpoint mismatch）。那不是安全边界，只是一个问错了人的判断。
 func (r *Router) decideLockedForProtocol(route domain.Route, providerID string, clientProtocol domain.Protocol) (domain.RouteDecision, error) {
 	providerID = strings.TrimSpace(providerID)
@@ -2620,19 +2614,13 @@ func (r *Router) decideLockedForProtocol(route domain.Route, providerID string, 
 	if protocol == "" {
 		protocol = route.OutputProtocol
 	}
-	// 空 Mode 与 auto 同义：AddRoute 会给新路由填 auto，但老数据（以及测试里
-	// 手搓的 Route）可能是空串。不把这两者当成一回事，就会把一条本该直通的
-	// 请求硬塞进转换器表，然后回一句「转换未实现」。
-	mode := route.Mode
-	if mode == "" {
-		mode = domain.RouteModeAuto
-	}
+	// 路由只有一种协议策略：本次请求的客户端协议与 provider 声明协议一致时
+	// 直通，否则转换。上游实测支持多种协议时，真正发请求前会先在当前 provider
+	// 内用客户端协议直通一次（见 nativeProtocolForProvider）；直通失败再回到
+	// 这里算出的转换路径。路由不再有可配置 mode，直通/转换只能由请求现场决定。
 	action := "convert"
-	if mode == domain.RouteModePassThrough || (mode == domain.RouteModeAuto && protocol == provider.Protocol) {
+	if protocol == provider.Protocol {
 		action = "pass_through"
-	}
-	if mode == domain.RouteModeConvert {
-		action = "convert"
 	}
 
 	return domain.RouteDecision{
@@ -2640,7 +2628,6 @@ func (r *Router) decideLockedForProtocol(route domain.Route, providerID string, 
 		ProviderID:      provider.ID,
 		OutputProtocol:  protocol,
 		InputProtocol:   provider.Protocol,
-		Mode:            mode,
 		Action:          action,
 		ConversionLabel: conversionLabel(protocol, provider.Protocol),
 	}, nil
@@ -2649,23 +2636,11 @@ func (r *Router) decideLockedForProtocol(route domain.Route, providerID string, 
 // conversionLabel 拼出日志里那一列「协议流」，方向按数据实际流动的顺序：
 // 客户端协议 -> 上游协议。
 //
-// 只按两端协议是否相同来决定显示什么，不再看 action：
-//
-//	两端相同  → 只写一个名字（直通，不存在转换）
-//	两端不同  → "<客户端> -> <上游>"
-//
-// 曾经在这里按 action == "pass_through" 就只写客户端协议，那是错的：pass_through
-// 是「不许转换」，不是「两端协议相同」。一条 pass_through 路由完全可能收到与上游
-// 不同协议的请求（上游只认 Chat，客户端偏发 Responses），这时日志只剩一个
-// "OpenAI Responses"，把上游实际是 Chat 这个关键事实吞掉了——而那恰恰是排查
-// 400 最需要看的信息。
+// 两端协议无论是否相同都写成 "<客户端> -> <上游>"。同协议也保留箭头，
+// 例如直通的 OpenAI Chat 请求显示为 "oc->oc"，这样日志列始终能看出请求
+// 是从哪条协议进、往哪条协议出；不再把两端相同的流量折叠成一个协议名。
 func conversionLabel(clientProtocol, upstreamProtocol domain.Protocol) string {
-	client := clientProtocol.DisplayName()
-	upstream := upstreamProtocol.DisplayName()
-	if clientProtocol == upstreamProtocol {
-		return client
-	}
-	return client + " -> " + upstream
+	return clientProtocol.DisplayName() + " -> " + upstreamProtocol.DisplayName()
 }
 
 func (r *Router) ActiveOpenAIChatRoute() (domain.Route, error) {

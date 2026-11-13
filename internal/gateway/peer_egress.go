@@ -28,6 +28,18 @@ import (
 // provider"，所以这里要把它的 id 带上去；留空（升级前注册的老记录）时上游仍按
 // 授权集自己挑，行为和以前完全一样。
 func (s *Server) sendPeerDoor(ctx context.Context, r *http.Request, provider domain.Provider, model string, body []byte, accept string) (*http.Response, error) {
+	// Mark the hop before the network round trip: a cancellation or timeout
+	// returns before the parent's X-Gateway-Id header exists, and that must
+	// still be logged as "egress attempted", not as a local direct request.
+	//
+	// The registered parent ID is the best identity available if the header never
+	// arrives. It is overwritten by the response header below when that arrives;
+	// this is only a fallback for interrupted requests, never a substitute for
+	// verifying the live peer.
+	notePeerEgressAttempt(ctx)
+	if grants := provider.PeerGrants; grants != nil && strings.TrimSpace(grants.ParentGatewayID) != "" {
+		notePeerEgressFallback(ctx, grants.ParentGatewayID)
+	}
 	wrapped, err := buildPeerForwardBody(peerGrantedProviderID(provider), provider.Protocol, body)
 	if err != nil {
 		return nil, err
@@ -96,5 +108,23 @@ func (s *Server) sendPeerDoor(ctx context.Context, r *http.Request, provider dom
 func notePeerEgress(ctx context.Context, gatewayID string) {
 	if t := requestTimingFrom(ctx); t != nil {
 		t.notePeerEgress(gatewayID)
+	}
+}
+
+// notePeerEgressAttempt 标记这次请求正在走对端网关，但还不能确定对方身份。
+// 取消/超时会让 sendPeerDoor 在响应头到达前返回；若没有这个标记，日志会把
+// 一次真实的 egress 误写成“直连”。
+func notePeerEgressAttempt(ctx context.Context) {
+	if t := requestTimingFrom(ctx); t != nil {
+		t.notePeerEgressAttempt()
+	}
+}
+
+// notePeerEgressFallback records the registered parent identity as a fallback
+// for interrupted egress attempts. It is separate from notePeerEgress so the
+// live X-Gateway-Id header always wins when it arrives.
+func notePeerEgressFallback(ctx context.Context, gatewayID string) {
+	if t := requestTimingFrom(ctx); t != nil {
+		t.notePeerEgressFallback(gatewayID)
 	}
 }

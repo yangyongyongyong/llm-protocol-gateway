@@ -70,7 +70,7 @@ func TestPeerChainEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	route, err := child.router.AddRoute(domain.Route{
-		Name: "via-parent", ProviderID: "via-parent", OutputProtocol: domain.ProtocolOpenAIChat, Mode: domain.RouteModePassThrough,
+		Name: "via-parent", ProviderID: "via-parent", OutputProtocol: domain.ProtocolOpenAIChat,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -178,7 +178,7 @@ func TestPeerChainClaudePassthrough(t *testing.T) {
 		t.Fatal(err)
 	}
 	route, err := child.router.AddRoute(domain.Route{
-		Name: "via-parent", ProviderID: "via-parent", OutputProtocol: domain.ProtocolClaude, Mode: domain.RouteModePassThrough,
+		Name: "via-parent", ProviderID: "via-parent", OutputProtocol: domain.ProtocolClaude,
 	})
 	if err != nil {
 		t.Fatal(err)

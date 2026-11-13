@@ -87,7 +87,8 @@ func TestReverseLegacyProtocolFlowFlipsLegacyOnce(t *testing.T) {
 	}
 }
 
-// 直通行只写一个协议名，翻转没有意义，必须原样保留。
+// 旧日志里同协议直通可能只写一个协议名；新格式是两侧都写。旧单名行要原样保留，
+// 不能被当成带箭头记录误翻。
 func TestReverseLegacyProtocolFlowLeavesSingleNameAlone(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gateway.db")
 	s, err := Open(path)

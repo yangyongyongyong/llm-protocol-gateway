@@ -23,7 +23,7 @@ func contextOverrideServer(t *testing.T, models ...domain.Model) *Server {
 		}},
 		Routes: []domain.Route{{
 			ID: "r1", Name: "R1", ProviderID: "p1",
-			OutputProtocol: domain.ProtocolOpenAIChat, Mode: domain.RouteModeAuto, Enabled: true,
+			OutputProtocol: domain.ProtocolOpenAIChat, Enabled: true,
 		}},
 		APIKeys: []domain.APIKey{{ID: "k1", Name: "K1", Key: "sk-gw", RouteID: "r1", Enabled: true}},
 	})

@@ -23,8 +23,8 @@ func TestAPIKeyPromoteKeepsEveryChainNode(t *testing.T) {
 				{ID: "e", Name: "e", Protocol: domain.ProtocolOpenAIChat},
 			},
 			Routes: []domain.Route{
-				{ID: "r-a", Name: "r-a", ProviderID: "a", OutputProtocol: domain.ProtocolOpenAIChat, Mode: domain.RouteModeAuto, Enabled: true},
-				{ID: "r-b", Name: "r-b", ProviderID: "b", OutputProtocol: domain.ProtocolOpenAIChat, Mode: domain.RouteModeAuto, Enabled: true},
+				{ID: "r-a", Name: "r-a", ProviderID: "a", OutputProtocol: domain.ProtocolOpenAIChat, Enabled: true},
+				{ID: "r-b", Name: "r-b", ProviderID: "b", OutputProtocol: domain.ProtocolOpenAIChat, Enabled: true},
 			},
 		})
 	}
@@ -91,8 +91,8 @@ func TestAPIKeyPromoteKeepsPrimaryAndFallbackModelOverrides(t *testing.T) {
 			{ID: "b", Name: "b", Protocol: domain.ProtocolOpenAIChat},
 		},
 		Routes: []domain.Route{
-			{ID: "r-a", Name: "r-a", ProviderID: "a", OutputProtocol: domain.ProtocolOpenAIChat, Mode: domain.RouteModeAuto, Enabled: true},
-			{ID: "r-b", Name: "r-b", ProviderID: "b", OutputProtocol: domain.ProtocolOpenAIChat, Mode: domain.RouteModeAuto, Enabled: true},
+			{ID: "r-a", Name: "r-a", ProviderID: "a", OutputProtocol: domain.ProtocolOpenAIChat, Enabled: true},
+			{ID: "r-b", Name: "r-b", ProviderID: "b", OutputProtocol: domain.ProtocolOpenAIChat, Enabled: true},
 		},
 	})
 	key, err := router.AddAPIKey(domain.APIKey{
