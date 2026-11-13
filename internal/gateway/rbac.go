@@ -246,6 +246,9 @@ func routePermission(method, path string) *domain.Permission {
 			return perm(domain.PermPeersView)
 		}
 		return perm(domain.PermPeersManage)
+	case "/__peers/owners":
+		// 归属候选只用于展示与编辑辅助；只看不改的角色也可以读取。
+		return perm(domain.PermPeersView)
 	case "/__settings/peer-registration-cidrs":
 		return perm(domain.PermPeersManage)
 	case "/__providers":

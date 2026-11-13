@@ -13,6 +13,7 @@ import (
 type memoryUserStore struct {
 	users  map[string]domain.User
 	grants map[string][]string
+	audits []domain.PeerGrantAudit
 }
 
 func newMemoryUserStore(users ...domain.User) *memoryUserStore {
@@ -242,4 +243,17 @@ func grantedUser(user domain.User, allowedProviderIDs []string) domain.User {
 	user.AllowedResourceIDs = append([]string{}, allowedProviderIDs...)
 	user.RoleID = domain.RoleIDGrantee
 	return user
+}
+
+func (m *memoryUserStore) AddPeerGrantAudit(audit domain.PeerGrantAudit) error {
+	m.audits = append(m.audits, audit)
+	return nil
+}
+
+func (m *memoryUserStore) LatestPeerGrantAudits() (map[string]domain.PeerGrantAudit, error) {
+	out := map[string]domain.PeerGrantAudit{}
+	for _, audit := range m.audits {
+		out[audit.PeerUserID] = audit
+	}
+	return out, nil
 }

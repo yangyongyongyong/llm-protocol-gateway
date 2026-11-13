@@ -4,8 +4,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/luca/llm-protocol-gateway/internal/domain"
+	"github.com/luca/llm-protocol-gateway/internal/monitor"
 )
 
 // WorkBuddy 的 credit 卡片必须沿着 /__peer/providers → 子端成员快照一路保留，
@@ -21,6 +23,13 @@ func TestPeerProviderCardCarriesWorkBuddyCredits(t *testing.T) {
 		Models: []domain.Model{{ID: "deepseek-v4.1-flash", ProviderID: "wb-main", InMenu: true}},
 	}
 	parent := newPeerTestServer(t, provider)
+	// 上游卡片的“总量”必须包含父网关所有用户，而不只是本次注册的下游。
+	for _, event := range []monitor.UsageEvent{
+		{Time: time.Now(), APIKeyID: "user-a", UserID: "user-a", ProviderID: provider.ID, Model: "deepseek-v4.1-flash", Status: 200, InputTokens: 100, OutputTokens: 20},
+		{Time: time.Now(), APIKeyID: "user-b", UserID: "user-b", ProviderID: provider.ID, Model: "deepseek-v4.1-flash", Status: 200, InputTokens: 50, OutputTokens: 5},
+	} {
+		parent.logs.ApplyUsageEventSync(event)
+	}
 	parent.oauthUsageCache.setForAccount(
 		oauthUsageCacheKey("workbuddy", provider.ID),
 		oauthUsageAccountID(provider),
@@ -48,6 +57,9 @@ func TestPeerProviderCardCarriesWorkBuddyCredits(t *testing.T) {
 	card := granted[0].Card
 	if card.AuthType != domain.AuthTypeWorkBuddy || card.Vendor != "workbuddy" || card.AccountLabel != "陌" || !card.Connected {
 		t.Fatalf("card metadata = %+v", card)
+	}
+	if card.TodayTokens == nil || *card.TodayTokens != 175 {
+		t.Fatalf("card today tokens = %v, want parent-wide 175", card.TodayTokens)
 	}
 	if card.Usage == nil || card.Usage.Plan != "Business Pro" || len(card.Usage.Buckets) != 1 {
 		t.Fatalf("card usage = %+v", card.Usage)

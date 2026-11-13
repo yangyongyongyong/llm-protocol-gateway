@@ -631,6 +631,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /__peer/chat/completions", s.handlePeerChatCompletions)
 	// 管理侧：列出/吊销已注册的下游网关。
 	mux.HandleFunc("GET /__peers", s.handleListPeers)
+	mux.HandleFunc("GET /__peers/owners", s.handlePeerOwnerOptions)
+	mux.HandleFunc("PATCH /__peers/{id}/owner", s.handleSetPeerOwner)
 	mux.HandleFunc("DELETE /__peers/{id}", s.handleRevokePeer)
 	mux.HandleFunc("PATCH /__settings/peer-registration-cidrs", s.handleSetPeerRegistrationCIDRs)
 	mux.HandleFunc("PATCH /__settings/peer-max-hops", s.handleSetPeerMaxHops)
@@ -1132,7 +1134,7 @@ func (s *Server) handleRequestStats(w http.ResponseWriter, r *http.Request) {
 	identity := s.requestIdentity(r)
 	if s.requestPrincipal(r).scopeOf() != domain.ScopeAll {
 		// Per-user stats: computed from own keys only; cached per user.
-		keyIDs := s.ownedKeyIDs(identity.UserID)
+		keyIDs := s.ownedKeyIDsForUsage(identity.UserID)
 		userCacheKey := cacheKey + "|user:" + identity.UserID
 		if cached, ok := s.requestStatsCache.get(userCacheKey); ok {
 			w.Header().Set("Cache-Control", "private, max-age=5")
@@ -1175,17 +1177,24 @@ func (s *Server) handleRequestStats(w http.ResponseWriter, r *http.Request) {
 		}
 		s.normalizeUsageModelIdentities(&snapshot)
 		s.fillUsageKeyNames(&snapshot)
+		s.fillUsageDownstreamGatewayNames(&snapshot)
+		// This branch is already scoped to the user's own keys; the second value
+		// on provider cards is therefore the same breakdown as ByProvider.
+		snapshot.Today.MyByProvider = append([]monitor.ProviderDayStats(nil), snapshot.Today.ByProvider...)
 		s.requestStatsCache.set(userCacheKey, snapshot)
 		w.Header().Set("Cache-Control", "private, max-age=5")
 		writeJSON(w, http.StatusOK, snapshot)
 		return
 	}
+	cacheKey += "|owner:" + strings.TrimSpace(identity.UserID)
 	if cached, ok := s.requestStatsCache.get(cacheKey); ok {
 		w.Header().Set("Cache-Control", "private, max-age=5")
 		writeJSON(w, http.StatusOK, cached)
 		return
 	}
 	snapshot := s.logs.UsageStatsRange(now, from, to)
+	ownKeyIDs := s.ownedKeyIDsForUsage(identity.UserID)
+	snapshot.Today.MyByProvider = s.logs.TodayProviderStatsForKeys(now, ownKeyIDs)
 	if s.requestLogStore != nil {
 		rangeTotal := int64(0)
 		if snapshot.Range != nil {
@@ -1223,6 +1232,7 @@ func (s *Server) handleRequestStats(w http.ResponseWriter, r *http.Request) {
 	s.normalizeUsageModelIdentities(&snapshot)
 	s.fillUsageKeyNames(&snapshot)
 	s.fillUsageUserNames(&snapshot)
+	s.fillUsageDownstreamGatewayNames(&snapshot)
 	s.requestStatsCache.set(cacheKey, snapshot)
 	w.Header().Set("Cache-Control", "private, max-age=5")
 	writeJSON(w, http.StatusOK, snapshot)
@@ -1305,6 +1315,46 @@ func (s *Server) fillUsageUserBreakdown(rangeStats *monitor.PeriodStatsSnapshot,
 	rangeStats.ByUser = out
 }
 
+// fillUsageDownstreamGatewayNames resolves stable peer gateway ids to the
+// downstream account's current display name. One ListUsers call serves the
+// whole snapshot; request logs themselves deliberately store only the stable id.
+func (s *Server) fillUsageDownstreamGatewayNames(snapshot *monitor.UsageStatsSnapshot) {
+	if snapshot == nil || s.userStore == nil {
+		return
+	}
+	if len(snapshot.Today.ByDownstreamGateway) == 0 && len(snapshot.Month.ByDownstreamGateway) == 0 &&
+		(snapshot.Range == nil || len(snapshot.Range.ByDownstreamGateway) == 0) {
+		return
+	}
+	users, err := s.userStore.ListUsers()
+	if err != nil {
+		return
+	}
+	names := make(map[string]string)
+	for _, user := range users {
+		if !user.IsPeer() {
+			continue
+		}
+		gatewayID := strings.TrimSpace(user.GatewayID)
+		if gatewayID == "" {
+			continue
+		}
+		names[gatewayID] = firstNonEmpty(user.DisplayName, user.Username, gatewayID)
+	}
+	fill := func(rows []monitor.DownstreamGatewayDayStats) {
+		for i := range rows {
+			if name := names[strings.TrimSpace(rows[i].GatewayID)]; name != "" {
+				rows[i].GatewayName = name
+			}
+		}
+	}
+	fill(snapshot.Today.ByDownstreamGateway)
+	fill(snapshot.Month.ByDownstreamGateway)
+	if snapshot.Range != nil {
+		fill(snapshot.Range.ByDownstreamGateway)
+	}
+}
+
 // fillUsageUserNames resolves display names for every byUser breakdown in the
 // snapshot. IDs are stable; names are resolved fresh so user renames reflect
 // immediately (subject only to the short response cache).
@@ -1385,7 +1435,7 @@ func (s *Server) loadRequestLogsForStatsForKeys(from, to time.Time, keyIDs []str
 // after upgrade, then the fast bucket-load path resumes on later startups.
 const (
 	usageBucketSchemaSettingKey = "usageDailyBucketSchema"
-	usageBucketSchemaVersion    = "3" // v3 persists per-key dimensions and timing/status
+	usageBucketSchemaVersion    = "4" // v4 adds downstream-gateway dimensions; v3 added per-key dimensions and timing/status
 )
 
 // RebuildUsageStats loads persisted daily aggregates (kept permanently), or
@@ -1508,6 +1558,8 @@ func (s *Server) rebuildUsageStatsFromLogs(since time.Time, target *monitor.Stor
 			CacheWriteTokens: log.CacheWriteTokens,
 			CostMicros:       costMicros,
 			Priced:           priced,
+			PeerGatewayID:    log.PeerGatewayID,
+			PeerDirection:    log.PeerDirection,
 		}))
 	}
 	if s.requestLogStore == nil {
@@ -1721,6 +1773,9 @@ func (s *Server) recordRequestLogEx(r *http.Request, started time.Time, matchedK
 		CacheWriteTokens: usage.CacheWriteTokens,
 		CostMicros:       costMicros,
 		Priced:           priced,
+		// 链路标记来自刚写好的请求日志：只有 ingress 才会进入下游网关统计。
+		PeerGatewayID: entry.PeerGatewayID,
+		PeerDirection: entry.PeerDirection,
 		// Forwarded payload sizes. For streaming responses the logged body is
 		// capped at passThroughLogBufferMax, so prefer the true streamed count
 		// recorded during the copy; fall back to the buffered length otherwise.

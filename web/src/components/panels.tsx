@@ -21,7 +21,8 @@ import {
     providerConnectKind,
     resetHint,
     retrySecondsLabel,
-    useNowTick
+    useNowTick,
+    formatProviderTokenValue,
 } from '../lib';
 import {shouldPollUsage, usagePollDelay, usageRequestKey, UsagePollDecision} from '../usage_poll';
 import {
@@ -988,7 +989,7 @@ function MatchText({ text, query }: { text: string; query?: string }) {
   );
 }
 
-export function ProviderCard({ active, selected, name, providerId, protocol, tone, url, defaultModel, modelCount, usedCount, healthStatus, nextRetryAt, testing, chatTesting, readOnly, selectable, providerDisabled, onToggleEnabled, onToggleRTK, subtitle, icon, provider, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, isQoderPAT, qoderPATConnected, isWorkBuddy, workBuddyConnected, cursorBridge, ownerName, groupName, highlightQuery, onToggleSelect, onClick, onTest, onChatTest, onConformance, onEdit, onClone, onDelete, layout = 'card' }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; defaultModel?: string; modelCount?: number; usedCount: number; healthStatus: string; nextRetryAt?: string; testing: boolean; chatTesting?: boolean; readOnly?: boolean; selectable?: boolean; providerDisabled?: boolean; onToggleEnabled?: () => void; onToggleRTK?: () => void; subtitle?: string; icon?: string; provider?: Provider; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; isQoderPAT?: boolean; qoderPATConnected?: boolean; isWorkBuddy?: boolean; workBuddyConnected?: boolean; cursorBridge?: CursorBridgeRuntime; ownerName?: string; groupName?: string; highlightQuery?: string; onToggleSelect: () => void; onClick: () => void; onTest?: () => void; onChatTest?: () => void; onConformance?: () => void; onEdit?: () => void; onClone?: () => void; onDelete?: () => void; layout?: 'card' | 'list' }) {
+export function ProviderCard({ active, selected, name, providerId, protocol, tone, url, defaultModel, modelCount, usedCount, todayTokens, myTodayTokens, healthStatus, nextRetryAt, testing, chatTesting, readOnly, selectable, providerDisabled, onToggleEnabled, onToggleRTK, subtitle, icon, provider, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, isQoderPAT, qoderPATConnected, isWorkBuddy, workBuddyConnected, cursorBridge, ownerName, groupName, highlightQuery, onToggleSelect, onClick, onTest, onChatTest, onConformance, onEdit, onClone, onDelete, layout = 'card' }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; defaultModel?: string; modelCount?: number; usedCount: number; todayTokens?: number; myTodayTokens?: number; healthStatus: string; nextRetryAt?: string; testing: boolean; chatTesting?: boolean; readOnly?: boolean; selectable?: boolean; providerDisabled?: boolean; onToggleEnabled?: () => void; onToggleRTK?: () => void; subtitle?: string; icon?: string; provider?: Provider; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; isQoderPAT?: boolean; qoderPATConnected?: boolean; isWorkBuddy?: boolean; workBuddyConnected?: boolean; cursorBridge?: CursorBridgeRuntime; ownerName?: string; groupName?: string; highlightQuery?: string; onToggleSelect: () => void; onClick: () => void; onTest?: () => void; onChatTest?: () => void; onConformance?: () => void; onEdit?: () => void; onClone?: () => void; onDelete?: () => void; layout?: 'card' | 'list' }) {
   // 订阅类（ZCode / Trae）由后端返回的凭证对象决定卡片显示什么：整张 Provider 传进来
   // 比再加六个布尔参数更省事，也不会漏掉以后新增的连接方式。
   const connectKind = provider ? providerConnectKind(provider) : 'api_key';
@@ -1047,6 +1048,19 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
     </>
   );
   // 回调缺省＝没有该权限：对应按钮/菜单项不渲染（由父组件按权限点传入）
+  // 上游成员卡的总量由父网关下发；旧版父网关没有时显示「— / 我的用量」。
+  // 本地 Provider 两项都由本机统计，不存在未知总量。
+  const tokenUsageTitle = todayTokens == null && myTodayTokens == null
+    ? undefined
+    : todayTokens == null
+      ? `上游今日总 Token 未知 · 我的 Key ${myTodayTokens?.toLocaleString('zh-CN') || '0'}`
+      : myTodayTokens == null
+        ? `今日 Token：全部 ${todayTokens.toLocaleString('zh-CN')}`
+        : `今日 Token：全部 ${todayTokens.toLocaleString('zh-CN')} · 我的 Key ${myTodayTokens.toLocaleString('zh-CN')}`;
+  const tokenUsageVisible = todayTokens == null && myTodayTokens == null
+    ? ''
+    : `${todayTokens == null ? '—' : formatProviderTokenValue(todayTokens)}${myTodayTokens == null ? '' : ` / ${formatProviderTokenValue(myTodayTokens)}`}`;
+
   const providerActions = (
     <div className="provider-actions">
       {onTest ? <button className="icon-btn" disabled={testing} onClick={onTest} title="从 Provider 接口获取可用模型">{testing ? '获取中' : '获取模型'}</button> : null}
@@ -1115,6 +1129,11 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
         </div>
         <div className="provider-list-metrics">
           <span title={`已获取 ${modelCount ?? 0} 个可用模型`}><b>{modelCount ?? 0}</b> 模型</span>
+          {tokenUsageVisible ? (
+            <span className="provider-token-usage" title={tokenUsageTitle}>
+              <b>{tokenUsageVisible}</b>
+            </span>
+          ) : null}
           <span title={`${usedCount} 个 API Key 引用`}><b>{usedCount}</b> Keys</span>
         </div>
         <div className="provider-list-actions" onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
@@ -1176,7 +1195,7 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
       {usagePanels}
       {/* 只留已配置的关键字段：默认模型与模型数量。地址/密钥是编辑期的配置项，
           放在卡片上既占行又没人看；未设置的字段整行省略，不再满屏「未设置」。 */}
-      {defaultModel || (modelCount != null && modelCount > 0) ? (
+      {defaultModel || (modelCount != null && modelCount > 0) || tokenUsageVisible ? (
         <div className="provider-card-meta">
           {defaultModel ? (
             <span className="provider-card-meta-item" title={`默认模型：${defaultModel}`}>
@@ -1188,6 +1207,11 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
             <span className="provider-card-meta-item" title={`已获取 ${modelCount} 个可用模型`}>
               <span className="provider-card-meta-label">模型</span>
               <span className="provider-card-meta-value">{modelCount} 个</span>
+            </span>
+          ) : null}
+          {tokenUsageVisible ? (
+            <span className="provider-token-usage" title={tokenUsageTitle}>
+              {tokenUsageVisible}
             </span>
           ) : null}
         </div>

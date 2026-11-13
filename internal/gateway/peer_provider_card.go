@@ -10,7 +10,7 @@ import (
 // peerProviderCardFor 生成可以安全传给下游的 Provider 卡片快照。
 // 这里刻意只读内存缓存，不在下游拉清单时访问 WorkBuddy/Anthropic 等厂商：
 // 卡片一致性不应该把父网关变成额度接口放大器的上游。
-func (s *Server) peerProviderCardFor(provider domain.Provider) *domain.PeerProviderCard {
+func (s *Server) peerProviderCardFor(provider domain.Provider, todayTokens *int64) *domain.PeerProviderCard {
 	authType := strings.TrimSpace(provider.AuthType)
 	if authType == "" {
 		authType = domain.AuthTypeAPIKey
@@ -21,6 +21,7 @@ func (s *Server) peerProviderCardFor(provider domain.Provider) *domain.PeerProvi
 		AccountLabel: peerProviderAccountLabel(provider),
 		Connected:    peerProviderConnected(provider),
 		Usage:        s.peerProviderUsageFor(provider),
+		TodayTokens:  todayTokens,
 	}
 }
 

@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -15,7 +16,7 @@ func scanUser(rows *sql.Rows) (domain.User, error) {
 	var enabled int
 	if err := rows.Scan(&user.ID, &user.Username, &user.PasswordHash, &role, &roleID,
 		&user.DisplayName, &user.AvatarURL, &enabled, &user.CreatedAt, &user.LastLoginAt, &user.LastActiveAt,
-		&kind, &user.GatewayID); err != nil {
+		&kind, &user.GatewayID, &user.OwnerUserID); err != nil {
 		return domain.User{}, err
 	}
 	user.Role = domain.UserRole(strings.TrimSpace(role))
@@ -35,7 +36,7 @@ func scanUser(rows *sql.Rows) (domain.User, error) {
 	return user, nil
 }
 
-const userSelectColumns = `id, username, password_hash, role, role_id, display_name, avatar_url, enabled, created_at, last_login_at, last_active_at, kind, gateway_id`
+const userSelectColumns = `id, username, password_hash, role, role_id, display_name, avatar_url, enabled, created_at, last_login_at, last_active_at, kind, gateway_id, owner_user_id`
 
 // ListUsers returns all console users ordered by creation time.
 func (s *Store) ListUsers() ([]domain.User, error) {
@@ -107,11 +108,11 @@ func (s *Store) CreateUser(user domain.User) error {
 		kind = string(domain.UserKindLocal)
 	}
 	_, err := s.db.Exec(`INSERT INTO users
-		(id, username, password_hash, role, role_id, display_name, avatar_url, enabled, created_at, last_login_at, last_active_at, kind, gateway_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		(id, username, password_hash, role, role_id, display_name, avatar_url, enabled, created_at, last_login_at, last_active_at, kind, gateway_id, owner_user_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		user.ID, strings.TrimSpace(user.Username), user.PasswordHash, string(user.Role), user.RoleID,
 		strings.TrimSpace(user.DisplayName), strings.TrimSpace(user.AvatarURL), enabled,
-		user.CreatedAt, user.LastLoginAt, user.LastActiveAt, kind, strings.TrimSpace(user.GatewayID))
+		user.CreatedAt, user.LastLoginAt, user.LastActiveAt, kind, strings.TrimSpace(user.GatewayID), strings.TrimSpace(user.OwnerUserID))
 	return err
 }
 
@@ -129,11 +130,11 @@ func (s *Store) UpdateUser(user domain.User) error {
 	}
 	_, err := s.db.Exec(`UPDATE users
 		SET username = ?, password_hash = ?, role = ?, role_id = ?, display_name = ?, avatar_url = ?,
-		    enabled = ?, last_login_at = ?, last_active_at = ?, kind = ?, gateway_id = ?
+		    enabled = ?, last_login_at = ?, last_active_at = ?, kind = ?, gateway_id = ?, owner_user_id = ?
 		WHERE id = ?`,
 		strings.TrimSpace(user.Username), user.PasswordHash, string(user.Role), user.RoleID,
 		strings.TrimSpace(user.DisplayName), strings.TrimSpace(user.AvatarURL), enabled,
-		user.LastLoginAt, user.LastActiveAt, kind, strings.TrimSpace(user.GatewayID), user.ID)
+		user.LastLoginAt, user.LastActiveAt, kind, strings.TrimSpace(user.GatewayID), strings.TrimSpace(user.OwnerUserID), user.ID)
 	return err
 }
 
@@ -145,6 +146,12 @@ func (s *Store) DeleteUser(id string) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.Exec(`DELETE FROM user_resource_grants WHERE user_id = ?`, id); err != nil {
+		return err
+	}
+	// Deleting a human owner must not leave downstream gateways pointing at a
+	// nonexistent user. They become unassigned, while their gateway account and
+	// traffic history stay intact.
+	if _, err := tx.Exec(`UPDATE users SET owner_user_id = '' WHERE owner_user_id = ?`, id); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM users WHERE id = ?`, id); err != nil {
@@ -207,4 +214,50 @@ func (s *Store) SetResourceGrants(userID string, resourceIDs []string) error {
 		}
 	}
 	return tx.Commit()
+}
+
+// AddPeerGrantAudit appends one manual downstream grant change.
+func (s *Store) AddPeerGrantAudit(audit domain.PeerGrantAudit) error {
+	before, err := json.Marshal(audit.BeforeProviderIDs)
+	if err != nil {
+		return err
+	}
+	after, err := json.Marshal(audit.AfterProviderIDs)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`INSERT INTO peer_grant_audits
+		(peer_user_id, actor_user_id, actor_username, actor_display_name, grant_mode, before_provider_ids, after_provider_ids, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		strings.TrimSpace(audit.PeerUserID), strings.TrimSpace(audit.ActorUserID),
+		strings.TrimSpace(audit.ActorUsername), strings.TrimSpace(audit.ActorDisplayName),
+		strings.TrimSpace(audit.GrantMode), string(before), string(after), audit.CreatedAt)
+	return err
+}
+
+// LatestPeerGrantAudits returns the newest manual grant change per peer.
+func (s *Store) LatestPeerGrantAudits() (map[string]domain.PeerGrantAudit, error) {
+	rows, err := s.reader().Query(`SELECT id, peer_user_id, actor_user_id, actor_username, actor_display_name,
+		grant_mode, before_provider_ids, after_provider_ids, created_at
+		FROM peer_grant_audits ORDER BY peer_user_id, created_at DESC, id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]domain.PeerGrantAudit{}
+	for rows.Next() {
+		var audit domain.PeerGrantAudit
+		var before, after string
+		if err := rows.Scan(&audit.ID, &audit.PeerUserID, &audit.ActorUserID, &audit.ActorUsername,
+			&audit.ActorDisplayName, &audit.GrantMode, &before, &after, &audit.CreatedAt); err != nil {
+			return nil, err
+		}
+		if _, seen := out[audit.PeerUserID]; seen {
+			continue
+		}
+		_ = json.Unmarshal([]byte(before), &audit.BeforeProviderIDs)
+		_ = json.Unmarshal([]byte(after), &audit.AfterProviderIDs)
+		out[audit.PeerUserID] = audit
+	}
+	return out, rows.Err()
 }

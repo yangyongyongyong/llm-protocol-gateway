@@ -10,15 +10,6 @@ import (
 	"github.com/luca/llm-protocol-gateway/internal/packaged"
 )
 
-// uiNavPaths 是控制台里能被直接打开（刷新、粘贴链接、书签）的页面路径。
-//
-// 它必须和 web/src/lib.tsx 的 navItems 一一对应：页面本身是单页应用，这些
-// 路径在服务器上并不存在文件，全靠这里回退到 index.html。漏掉一条的症状很
-// 具体——侧边栏点进去正常（那是前端路由，不发请求），但在那一页按 F5 或者
-// 把链接发给别人就变成 404。曾经就是这样漏掉了 /peers 和 /roles。
-//
-// 新增页面时两边一起加；TestUINavPathsCoverFrontendNav 会对比这份清单和前端
-// 的 navItems，漏了哪一条它直接报出来。
 var uiNavPaths = map[string]struct{}{
 	"/":                 {},
 	"/login":            {},
@@ -32,9 +23,7 @@ var uiNavPaths = map[string]struct{}{
 	"/traffic-tokens":   {},
 	"/monitoring":       {},
 	"/quota-keeper":     {},
-	"/peers":            {},
 	"/users":            {},
-	"/roles":            {},
 	"/machine":          {},
 	"/settings":         {},
 }

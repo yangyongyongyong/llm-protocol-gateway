@@ -225,6 +225,21 @@ type UserDayStats struct {
 	PricedCount      int64  `json:"pricedCount,omitempty"`
 }
 
+// DownstreamGatewayDayStats aggregates requests delivered by one downstream
+// gateway (PeerDirection == "ingress"). GatewayName is resolved at response
+// time; persisted buckets only store the stable gateway id.
+type DownstreamGatewayDayStats struct {
+	GatewayID        string `json:"gatewayId"`
+	GatewayName      string `json:"gatewayName,omitempty"`
+	RequestCount     int64  `json:"requestCount"`
+	InputTokens      int64  `json:"inputTokens"`
+	OutputTokens     int64  `json:"outputTokens"`
+	CacheTokens      int64  `json:"cacheTokens"`
+	CacheWriteTokens int64  `json:"cacheWriteTokens,omitempty"`
+	CostMicros       int64  `json:"costMicros,omitempty"`
+	PricedCount      int64  `json:"pricedCount,omitempty"`
+}
+
 // ModelDayStats aggregates request/token usage for one model id.
 type ModelDayStats struct {
 	Model            string `json:"model"`
@@ -256,19 +271,25 @@ type TodayStatsSnapshot struct {
 	LastRequest *RequestLog        `json:"lastRequest,omitempty"`
 	ByAPIKey    []APIKeyDayStats   `json:"byApiKey"`
 	ByProvider  []ProviderDayStats `json:"byProvider"`
-	ByModel     []ModelDayStats    `json:"byModel"`
-	ByUser      []UserDayStats     `json:"byUser,omitempty"`
-	ByProtocol  []ProtocolDayStats `json:"byProtocol,omitempty"`
+	// MyByProvider is the same provider breakdown restricted to API keys with
+	// an explicit owner equal to the requesting user. Peer/downstream keys with
+	// no owner are deliberately excluded from this personal view.
+	MyByProvider        []ProviderDayStats          `json:"myByProvider,omitempty"`
+	ByModel             []ModelDayStats             `json:"byModel"`
+	ByDownstreamGateway []DownstreamGatewayDayStats `json:"byDownstreamGateway,omitempty"`
+	ByUser              []UserDayStats              `json:"byUser,omitempty"`
+	ByProtocol          []ProtocolDayStats          `json:"byProtocol,omitempty"`
 }
 
 type PeriodStatsSnapshot struct {
-	Period     string             `json:"period"`
-	Total      APIKeyDayStats     `json:"total"`
-	ByAPIKey   []APIKeyDayStats   `json:"byApiKey"`
-	ByProvider []ProviderDayStats `json:"byProvider"`
-	ByModel    []ModelDayStats    `json:"byModel"`
-	ByUser     []UserDayStats     `json:"byUser,omitempty"`
-	ByProtocol []ProtocolDayStats `json:"byProtocol,omitempty"`
+	Period              string                      `json:"period"`
+	Total               APIKeyDayStats              `json:"total"`
+	ByAPIKey            []APIKeyDayStats            `json:"byApiKey"`
+	ByProvider          []ProviderDayStats          `json:"byProvider"`
+	ByModel             []ModelDayStats             `json:"byModel"`
+	ByDownstreamGateway []DownstreamGatewayDayStats `json:"byDownstreamGateway,omitempty"`
+	ByUser              []UserDayStats              `json:"byUser,omitempty"`
+	ByProtocol          []ProtocolDayStats          `json:"byProtocol,omitempty"`
 }
 
 type DailyRequestPoint struct {
@@ -395,6 +416,10 @@ func (s *Store) BootstrapUsageDays(days map[string]UsageDayBuckets, last *Reques
 		for id, stats := range buckets.ByProtocol {
 			copied := stats
 			day.byProtocol[id] = &copied
+		}
+		for id, stats := range buckets.ByDownstreamGateway {
+			copied := stats
+			day.byDownstream[id] = &copied
 		}
 		s.usageByDay[dayKey] = day
 	}
@@ -912,14 +937,15 @@ func (s *Store) UsageStatsRangeForKeys(now time.Time, from, to time.Time, keyIDs
 	s.mu.RUnlock()
 
 	today := TodayStatsSnapshot{
-		Date:        dayStart.Format("2006-01-02"),
-		Total:       todayPeriod.Total,
-		LastRequest: lastRequest,
-		ByAPIKey:    todayPeriod.ByAPIKey,
-		ByProvider:  todayPeriod.ByProvider,
-		ByModel:     todayPeriod.ByModel,
-		ByUser:      todayPeriod.ByUser,
-		ByProtocol:  todayPeriod.ByProtocol,
+		Date:                dayStart.Format("2006-01-02"),
+		Total:               todayPeriod.Total,
+		LastRequest:         lastRequest,
+		ByAPIKey:            todayPeriod.ByAPIKey,
+		ByProvider:          todayPeriod.ByProvider,
+		ByModel:             todayPeriod.ByModel,
+		ByDownstreamGateway: todayPeriod.ByDownstreamGateway,
+		ByUser:              todayPeriod.ByUser,
+		ByProtocol:          todayPeriod.ByProtocol,
 	}
 
 	return UsageStatsSnapshot{
@@ -1053,13 +1079,48 @@ func AggregateLogsInRange(logs []RequestLog, from, to time.Time, periodLabel str
 		return byAPIKey[i].RequestCount > byAPIKey[j].RequestCount
 	})
 	return PeriodStatsSnapshot{
-		Period:     periodLabel,
-		Total:      total,
-		ByAPIKey:   byAPIKey,
-		ByProvider: aggregateByProvider(filtered, time.Time{}),
-		ByModel:    aggregateByModel(filtered, time.Time{}),
-		ByProtocol: aggregateByProtocol(filtered, time.Time{}),
+		Period:              periodLabel,
+		Total:               total,
+		ByAPIKey:            byAPIKey,
+		ByProvider:          aggregateByProvider(filtered, time.Time{}),
+		ByModel:             aggregateByModel(filtered, time.Time{}),
+		ByDownstreamGateway: aggregateDownstreamGatewayStats(filtered, time.Time{}, time.Time{}),
+		ByProtocol:          aggregateByProtocol(filtered, time.Time{}),
 	}
+}
+
+// aggregateDownstreamGatewayStats 从请求明细还原下游网关用量。它只在日志回放
+// / 明细补算路径使用，长期统计走持久化的 downstream_gateway 桶；两边共用
+// 同一套 ingress 判定，避免“今天”和“本月”口径不同。
+func aggregateDownstreamGatewayStats(logs []RequestLog, from, to time.Time) []DownstreamGatewayDayStats {
+	byGateway := make(map[string]*DownstreamGatewayDayStats)
+	for _, log := range logs {
+		if (!from.IsZero() && log.Time.Before(from)) || (!to.IsZero() && !log.Time.Before(to)) {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(log.PeerDirection), "ingress") {
+			continue
+		}
+		gatewayID := strings.TrimSpace(log.PeerGatewayID)
+		if gatewayID == "" {
+			continue
+		}
+		stats := byGateway[gatewayID]
+		if stats == nil {
+			stats = &DownstreamGatewayDayStats{GatewayID: gatewayID}
+			byGateway[gatewayID] = stats
+		}
+		stats.RequestCount++
+		stats.InputTokens += log.InputTokens
+		stats.OutputTokens += log.OutputTokens
+		stats.CacheTokens += log.CacheTokens
+		stats.CacheWriteTokens += log.CacheWriteTokens
+		stats.CostMicros += log.CostMicros
+		if log.Priced {
+			stats.PricedCount++
+		}
+	}
+	return sortDownstreamGatewayStats(byGateway)
 }
 
 func AggregateDaily(logs []RequestLog, from, to time.Time) []DailyRequestPoint {
@@ -1234,11 +1295,12 @@ func (s *Store) TodayStatsFromLogs(logs []RequestLog, now time.Time) TodayStatsS
 	})
 
 	return TodayStatsSnapshot{
-		Date:        dateLabel,
-		Total:       total,
-		LastRequest: lastRequest,
-		ByAPIKey:    byAPIKey,
-		ByProvider:  aggregateByProvider(logs, dayStart),
+		Date:                dateLabel,
+		Total:               total,
+		LastRequest:         lastRequest,
+		ByAPIKey:            byAPIKey,
+		ByProvider:          aggregateByProvider(logs, dayStart),
+		ByDownstreamGateway: aggregateDownstreamGatewayStats(logs, dayStart, time.Time{}),
 	}
 }
 

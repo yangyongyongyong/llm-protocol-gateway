@@ -345,6 +345,32 @@ func TestPeerGrantsEditableAfterRegistration(t *testing.T) {
 	if ids := grants[response.UserID]; len(ids) != 2 {
 		t.Fatalf("grants = %v, want hj-claude + new-one (deleted/unknown dropped)", ids)
 	}
+	peerUser, err := server.userStore.UserByID(response.UserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if peerUser.OwnerUserID != legacyAdminUserID {
+		t.Fatalf("first grant should default owner to actor admin, got %q", peerUser.OwnerUserID)
+	}
+	auditStore := server.userStore.(*memoryUserStore)
+	if len(auditStore.audits) != 1 || auditStore.audits[0].ActorUserID != legacyAdminUserID {
+		t.Fatalf("grant audit = %+v, want actor admin", auditStore.audits)
+	}
+	if got := auditStore.audits[0].AfterProviderIDs; len(got) != 2 {
+		t.Fatalf("audit after providers = %v", got)
+	}
+
+	// Ownership can be reassigned independently; a later grant update must not
+	// silently transfer it back to whichever admin edited the grants.
+	localOwner := domain.User{ID: "owner-u1", Username: "owneru1", DisplayName: "Owner U1", Role: domain.UserRoleUser, RoleID: domain.RoleIDUser, Enabled: true}
+	if err := server.userStore.CreateUser(localOwner); err != nil {
+		t.Fatal(err)
+	}
+	recorder = adminCall(t, server.handleSetPeerOwner, http.MethodPatch, "/__peers/{id}/owner",
+		map[string]any{"ownerUserId": localOwner.ID}, map[string]string{"id": response.UserID})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("owner update status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
 
 	// 空列表 = 收回全部；下一个请求当场拿不到任何 provider。
 	recorder = adminCall(t, server.handleSetPeerGrants, http.MethodPatch, "/__peers/{id}/grants",
