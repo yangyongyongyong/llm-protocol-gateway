@@ -52,6 +52,7 @@ import {
     composeCustomDomain,
     copyToClipboard,
     defaultProviderChatTestOptions,
+    DEFAULT_NEW_API_KEY_THINKING_DEPTH,
     defaultPublicAccess,
     defaultThinkingValueForField,
     deriveUIDomainFromAPI,
@@ -143,6 +144,7 @@ import {
     thinkingPresetsForProtocol,
     trafficLogKeyLabel,
     trafficLogProviderLabel,
+    toggleProviderSelection,
     trafficLogServing,
     trafficRanksEqual,
     trafficRanksFromMap,
@@ -523,6 +525,8 @@ function App() {
   const [selectedRouteID, setSelectedRouteID] = useState('');
   const [selectedProviderID, setSelectedProviderID] = useState('');
   const [selectedExportProviderIDs, setSelectedExportProviderIDs] = useState<string[]>([]);
+  // Provider 批量选择的 Shift 锚点：记录上一次单击/区间起点的可见顺序索引。
+  const providerSelectionAnchorRef = useRef<string>('');
   const providerImportInputRef = useRef<HTMLInputElement | null>(null);
   const [selectedOutputProtocol, setSelectedOutputProtocol] = useState<Protocol>('openai_chat');
   const [publicDraft, setPublicDraft] = useState<PublicAccessSettings>(defaultPublicAccess);
@@ -795,7 +799,7 @@ function App() {
     outputProtocol: 'openai_chat' as Protocol,
     modelOverride: '',
     modelAliases: {} as Record<string, string>,
-    thinkingDepthOverride: '',
+    thinkingDepthOverride: DEFAULT_NEW_API_KEY_THINKING_DEPTH,
     maxOutputTokens: 0,
     streamEnabled: true,
     codexForceFast: false,
@@ -1210,8 +1214,9 @@ function App() {
         ownerName={authStatus?.scope === 'all' || canDo('usage.all') ? providerOwnerName(provider) : undefined}
         groupName={isAdminUser ? providerGroupByID.get((provider.groupId || '').trim())?.name : undefined}
         highlightQuery={providersSearchQuery}
-        onToggleSelect={() => toggleExportProviderSelection(provider.id)}
-        onClick={() => {
+        onToggleSelect={(shiftKey) => toggleExportProviderSelection(provider.id, shiftKey)}
+        onClick={(shiftKey) => toggleExportProviderSelection(provider.id, shiftKey)}
+        onOpen={() => {
           setSelectedProviderID(provider.id);
           showToast(`已选择输入 Provider：${provider.name}`);
         }}
@@ -3450,7 +3455,7 @@ function App() {
       outputProtocol: selectedOutputProtocol || 'openai_chat',
       modelOverride: '',
       modelAliases: {},
-      thinkingDepthOverride: '',
+      thinkingDepthOverride: DEFAULT_NEW_API_KEY_THINKING_DEPTH,
       maxOutputTokens: 0,
       streamEnabled: true,
       codexForceFast: false,
@@ -3490,7 +3495,6 @@ function App() {
         providerId,
         outputProtocol,
         outputEndpointId: template?.outputEndpointId || '',
-        mode: template?.mode || 'auto',
         enabled: true,
       }),
     });
@@ -4325,21 +4329,55 @@ function App() {
     }
   }
 
-  function toggleExportProviderSelection(providerID: string) {
-    setSelectedExportProviderIDs((current) => (
-      current.includes(providerID)
-        ? current.filter((id) => id !== providerID)
-        : [...current, providerID]
-    ));
+  function toggleExportProviderSelection(providerID: string, shiftKey = false) {
+    const visibleIDs = [
+      ...providerRenderGroups.regular.map((provider) => provider.id),
+      ...providerRenderGroups.peerGroups.flatMap((group) => group.items.map((provider) => provider.id)),
+    ];
+    setSelectedExportProviderIDs((current) => {
+      const next = toggleProviderSelection(current, visibleIDs, providerID, providerSelectionAnchorRef.current, shiftKey);
+      providerSelectionAnchorRef.current = next.anchorID;
+      return next.selectedIDs;
+    });
   }
 
   function selectAllExportProviders() {
     setSelectedExportProviderIDs(sortedProviders.map((provider) => provider.id));
+    providerSelectionAnchorRef.current = sortedProviders[0]?.id || '';
   }
 
   function clearExportProviderSelection() {
     setSelectedExportProviderIDs([]);
+    providerSelectionAnchorRef.current = '';
   }
+
+  // Input Provider 页的批量选择快捷键：Esc 清空全部勾选。
+  //
+  // 只在确实有勾选、且没有更高优先级的上下文时接管：
+  // - 弹窗自己优先处理 Escape（modal 的捕获监听在 document 上）；
+  // - 输入框/文本域里 Escape 交给浏览器（例如清空检索）；
+  // - 展开的菜单/下拉先关自己。
+  // 否则用户只是想在搜索框退出编辑，却会把一整批勾选撤掉。
+  useEffect(() => {
+    if (activeNav !== 'input-providers' || selectedExportProviderIDs.length === 0) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing) return;
+      // 输入框本身只挡“仍在编辑”的情况。点击 Provider 卡片时焦点可能还停在
+      // 搜索框上，但用户按 Esc 的意图是撤销选择；搜索框为空时不该阻止。
+      const target = event.target as HTMLElement | null;
+      if (target) {
+        const editable = target.closest('input, textarea, select, [contenteditable="true"]') as HTMLInputElement | HTMLTextAreaElement | null;
+        if (editable && (editable.value || '').trim() !== '') return;
+        if (target.closest('[role="dialog"], [role="menu"], [role="listbox"], [role="combobox"]')) return;
+      }
+      if (document.querySelector('[role="dialog"], [role="menu"], [role="listbox"]')) return;
+      event.preventDefault();
+      clearExportProviderSelection();
+      showToast('已取消全部 Provider 选择');
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [activeNav, selectedExportProviderIDs.length]);
 
 
   function providersExportFilename() {
@@ -4439,7 +4477,6 @@ function App() {
           providerId,
           outputProtocol: routeDraft.outputProtocol,
           outputEndpointId: endpoint?.id,
-          mode: 'auto',
           enabled: true,
         }),
       });
@@ -5052,8 +5089,6 @@ function App() {
     }
   }
 
-  const outputProtocol = selectedEndpoint?.protocol || selectedRoute?.outputProtocol || selectedOutputProtocol;
-  const routeAction = selectedProvider ? (outputProtocol === selectedProvider.protocol ? 'pass_through' : 'convert') : 'not_configured';
   const localURL = endpointURL(selectedEndpoint);
   const publicAccess = state.publicAccess || defaultPublicAccess;
   const tunnel = publicAccess.tunnel;

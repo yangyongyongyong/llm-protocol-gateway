@@ -7850,7 +7850,7 @@ html[data-theme="dark"] .quota-next { background: var(--surface-strong); }
     78px
     minmax(172px, 1.4fr)
     84px
-    44px
+    98px
     66px 66px 76px 76px
     76px
     98px
@@ -7940,8 +7940,16 @@ html[data-theme="dark"] .quota-next { background: var(--surface-strong); }
 /* 位次算不出来（密钥的备选链后来被改过）：只说「换过」，不编一个数字出来。 */
 .tlog-served.unknown { background: var(--surface-sunken); color: var(--muted); }
 .tlog-proto {
-  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  display: flex; align-items: center; gap: 4px;
+  min-width: 0; overflow: hidden; white-space: nowrap;
   color: var(--subtle); font-family: var(--mono); font-size: var(--fs-sm);
+}
+.tlog-proto > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.tlog-fallback {
+  flex-shrink: 0; padding: 1px 4px; border-radius: 4px;
+  background: var(--amber-soft); color: var(--amber-text);
+  font-family: var(--mono); font-size: var(--fs-xs); font-style: normal; font-weight: 700;
+  line-height: 1.35;
 }
 .tlog-latency.ok { color: var(--green-text); }
 .tlog-latency.warn { color: var(--amber-text); }

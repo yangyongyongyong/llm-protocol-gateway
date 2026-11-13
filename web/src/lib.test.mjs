@@ -63,6 +63,11 @@ const pollers = await import(pathToFileURL(join(outDir, 'pollers.js')).href);
 const usagePoll = await import(pathToFileURL(join(outDir, 'usage_poll.js')).href);
 const modelMerge = await import(pathToFileURL(join(outDir, 'model_merge.js')).href);
 
+test('新建 API 密钥默认思考深度为 max', () => {
+  assert.equal(lib.DEFAULT_NEW_API_KEY_THINKING_DEPTH, 'max');
+  assert.ok(lib.SELECTABLE_THINKING_DEPTHS.includes(lib.DEFAULT_NEW_API_KEY_THINKING_DEPTH));
+});
+
 test('GatewayState 归一化：Provider 分组缺省为空数组', () => {
   const state = lib.normalizeGatewayState({providers: [{id: 'p1', name: 'p1', groupId: 'g1'}]});
   assert.deepEqual(state.providerGroups, []);
@@ -373,7 +378,7 @@ test('serverDayBounds：「今日」取服务器那一天，而不是浏览器�
 
 // ── 客户端调用示例（lib.tsx buildApiKeyPublicCurl）──────────────────────────
 const geminiKey = {id: 'k1', name: 'gem', key: 'sk-x', routeId: 'r1'};
-const geminiRoute = {id: 'r1', name: 'g', outputEndpointId: 'e1', providerId: 'p1', outputProtocol: 'gemini', mode: 'convert', enabled: true};
+const geminiRoute = {id: 'r1', name: 'g', outputEndpointId: 'e1', providerId: 'p1', outputProtocol: 'gemini', enabled: true};
 const geminiEndpoints = [{id: 'e1', name: 'Gemini', protocol: 'gemini', basePath: '/v1beta', listenHost: '127.0.0.1', listenPort: 18093, publicAccessEnabled: false}];
 
 test('Gemini 密钥的示例 curl 用 x-goog-api-key（Google SDK 的认证头），不发 Bearer', () => {
@@ -807,14 +812,69 @@ test('Claude 配置：model 固定写 default[1m]，换模型不用重写 settin
   assert.doesNotMatch(text, /some-real-model/, '不该把真实模型名写进客户端配置');
 });
 
-test('API 日志协议缩写：oc / or / cl，不再共用首字母 O', () => {
+test('API 日志链路：缺元数据不等于直连，egress 身份缺失显示 →?', () => {
+  assert.deepEqual(
+    lib.trafficLogPeerChain({}),
+    {text: '—', title: '这条日志没有留存链路元数据（可能是旧日志，或请求在写入链路信息前中断）；是否直连未知', peered: false},
+  );
+  const brokenEgress = lib.trafficLogPeerChain({peerDirection: 'egress'});
+  assert.equal(brokenEgress.text, '→?');
+  assert.equal(brokenEgress.peered, true);
+  assert.match(brokenEgress.title, /身份未返回/);
+  const unknownIngress = lib.trafficLogPeerChain({peerDirection: 'ingress'});
+  assert.equal(unknownIngress.text, '←?');
+  assert.equal(unknownIngress.peered, true);
+  const realEgress = lib.trafficLogPeerChain({egress: 'gw_b7f1bf7ecae9b451', peerDirection: 'egress'});
+  assert.equal(realEgress.text, '→…e9b451');
+  assert.equal(realEgress.peered, true);
+});
+
+test('Provider 选择：单击切换、Shift 按可见顺序闭区间选择', () => {
+  const visible = ['a', 'b', 'c', 'd', 'e'];
+  let state = lib.toggleProviderSelection([], visible, 'b', '', false);
+  assert.deepEqual(state.selectedIDs, ['b']);
+  assert.equal(state.anchorID, 'b');
+  state = lib.toggleProviderSelection(state.selectedIDs, visible, 'd', state.anchorID, true);
+  assert.deepEqual(state.selectedIDs, ['b', 'c', 'd']);
+  assert.equal(state.anchorID, 'b');
+  // 反向 Shift 也必须选同一段，不清空之前的选择。
+  state = lib.toggleProviderSelection(state.selectedIDs, visible, 'a', state.anchorID, true);
+  assert.deepEqual(state.selectedIDs, ['b', 'c', 'd', 'a']);
+  // 单击已选项取消；取消后它成为新的锚点。
+  state = lib.toggleProviderSelection(state.selectedIDs, visible, 'c', state.anchorID, false);
+  assert.deepEqual(state.selectedIDs, ['b', 'd', 'a']);
+  assert.equal(state.anchorID, 'c');
+});
+
+test('API 日志：原生直通失败后回退转换要有标记', () => {
+  const fallback = lib.trafficLogNativeFallback({
+    protocolFlow: 'OpenAI Responses -> OpenAI Chat',
+    analysis: {attempts: [
+      {providerId: 'p', reason: 'native_passthrough_failed', error: 'Post "https://up/v1/responses": EOF', ms: 5125, deferred: true},
+      {providerId: 'p', status: 200, reason: 'served', ms: 10775},
+    ]},
+  });
+  assert.equal(fallback.label, '直通失败');
+  assert.match(fallback.title, /回退到 Provider 声明协议/);
+  assert.match(fallback.title, /EOF/);
+  assert.match(fallback.title, /5125ms/);
+  assert.equal(lib.trafficLogNativeFallback({
+    protocolFlow: 'OpenAI Responses -> OpenAI Chat',
+    analysis: {attempts: [{providerId: 'p', status: 200, reason: 'served'}]},
+  }), null);
+});
+
+test('API 日志协议缩写：oc / or / cl，同协议写 oc->oc', () => {
   assert.equal(lib.protocolShortCode('OpenAI Chat'), 'oc');
   assert.equal(lib.protocolShortCode('OpenAI Responses'), 'or');
   assert.equal(lib.protocolShortCode('Claude'), 'cl');
+  assert.equal(lib.protocolShortCode('oc'), 'oc');
   // 完整流向：上游 -> 客户端，两侧各用自己的缩写。
-  assert.equal(lib.compactProtocolFlow('OpenAI Chat -> Claude'), 'oc→cl');
-  assert.equal(lib.compactProtocolFlow('OpenAI Chat -> OpenAI Responses'), 'oc→or');
+  assert.equal(lib.compactProtocolFlow('OpenAI Chat -> Claude'), 'oc->cl');
+  assert.equal(lib.compactProtocolFlow('OpenAI Chat -> OpenAI Responses'), 'oc->or');
   // 未知协议保留首字母大写，空值不伪装成某种协议。
   assert.equal(lib.protocolShortCode('Gemini'), 'G');
+  assert.equal(lib.compactProtocolFlow('OpenAI Chat -> OpenAI Chat'), 'oc->oc');
+  assert.equal(lib.compactProtocolFlow('OpenAI Chat'), 'oc->oc');
   assert.equal(lib.compactProtocolFlow(''), '—');
 });

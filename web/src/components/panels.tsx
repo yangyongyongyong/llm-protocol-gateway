@@ -1000,10 +1000,26 @@ function MatchText({ text, query }: { text: string; query?: string }) {
   );
 }
 
-export function ProviderCard({ active, selected, name, providerId, protocol, tone, url, defaultModel, modelCount, usedCount, requestCount, todayTokens, myTodayTokens, healthStatus, nextRetryAt, testing, chatTesting, readOnly, selectable, providerDisabled, onToggleEnabled, onToggleRTK, subtitle, icon, provider, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, isQoderPAT, qoderPATConnected, isWorkBuddy, workBuddyConnected, cursorBridge, ownerName, groupName, highlightQuery, onToggleSelect, onClick, onTest, onChatTest, onConformance, onEdit, onClone, onDelete, layout = 'card' }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; defaultModel?: string; modelCount?: number; usedCount: number; requestCount?: number; todayTokens?: number; myTodayTokens?: number; healthStatus: string; nextRetryAt?: string; testing: boolean; chatTesting?: boolean; readOnly?: boolean; selectable?: boolean; providerDisabled?: boolean; onToggleEnabled?: () => void; onToggleRTK?: () => void; subtitle?: string; icon?: string; provider?: Provider; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; isQoderPAT?: boolean; qoderPATConnected?: boolean; isWorkBuddy?: boolean; workBuddyConnected?: boolean; cursorBridge?: CursorBridgeRuntime; ownerName?: string; groupName?: string; highlightQuery?: string; onToggleSelect: () => void; onClick: () => void; onTest?: () => void; onChatTest?: () => void; onConformance?: () => void; onEdit?: () => void; onClone?: () => void; onDelete?: () => void; layout?: 'card' | 'list' }) {
+export function ProviderCard({ active, selected, name, providerId, protocol, tone, url, defaultModel, modelCount, usedCount, requestCount, todayTokens, myTodayTokens, healthStatus, nextRetryAt, testing, chatTesting, readOnly, selectable, providerDisabled, onToggleEnabled, onToggleRTK, subtitle, icon, provider, isClaudeOAuth, claudeOAuthConnected, isCursorOAuth, cursorOAuthConnected, isChatGPTOAuth, chatgptOAuthConnected, isQoderPAT, qoderPATConnected, isWorkBuddy, workBuddyConnected, cursorBridge, ownerName, groupName, highlightQuery, onToggleSelect, onClick, onOpen, onTest, onChatTest, onConformance, onEdit, onClone, onDelete, layout = 'card' }: { active?: boolean; selected?: boolean; name: string; providerId: string; protocol: string; tone: BadgeTone; url: string; defaultModel?: string; modelCount?: number; usedCount: number; requestCount?: number; todayTokens?: number; myTodayTokens?: number; healthStatus: string; nextRetryAt?: string; testing: boolean; chatTesting?: boolean; readOnly?: boolean; selectable?: boolean; providerDisabled?: boolean; onToggleEnabled?: () => void; onToggleRTK?: () => void; subtitle?: string; icon?: string; provider?: Provider; isClaudeOAuth?: boolean; claudeOAuthConnected?: boolean; isCursorOAuth?: boolean; cursorOAuthConnected?: boolean; isChatGPTOAuth?: boolean; chatgptOAuthConnected?: boolean; isQoderPAT?: boolean; qoderPATConnected?: boolean; isWorkBuddy?: boolean; workBuddyConnected?: boolean; cursorBridge?: CursorBridgeRuntime; ownerName?: string; groupName?: string; highlightQuery?: string; /** selectable 时单击整卡切换勾选；checkbox 与 Shift 区间共用它。 */ onToggleSelect: (shiftKey?: boolean) => void; /** selectable 时也用于整卡单击；非 selectable 时用于打开详情。 */ onClick: (shiftKey?: boolean) => void; /** 双击或标题按钮打开详情/编辑（不改变勾选）。 */ onOpen?: () => void; onTest?: () => void; onChatTest?: () => void; onConformance?: () => void; onEdit?: () => void; onClone?: () => void; onDelete?: () => void; layout?: 'card' | 'list' }) {
   // 订阅类（ZCode / Trae）由后端返回的凭证对象决定卡片显示什么：整张 Provider 传进来
   // 比再加六个布尔参数更省事，也不会漏掉以后新增的连接方式。
   const connectKind = provider ? providerConnectKind(provider) : 'api_key';
+  // 整卡单击的语义：可批量选择时切换勾选；只读/无选择权限时仍打开详情。
+  // Shift 透传给父级做可见顺序区间选择。双击和标题按钮保留详情入口。
+  const handleCardClick = (event: React.MouseEvent) => {
+    if (selectable) {
+      onToggleSelect(event.shiftKey);
+      return;
+    }
+    onClick(false);
+  };
+  const handleOpen = () => {
+    if (onOpen) {
+      onOpen();
+      return;
+    }
+    onClick(false);
+  };
   const inheritedCard = connectKind === 'peer' ? provider?.peerGrants?.card : undefined;
   const inheritedAuthLabel = provider && inheritedCard ? peerProviderCardAuthLabel(provider) : '';
   const zcodeConnected = !!provider?.zcodeOAuth?.connected;
@@ -1094,10 +1110,10 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
   );
   if (layout === 'list') {
     return (
-      <div className={`provider-list-row${active ? ' active' : ''}${selected ? ' selected' : ''}${providerDisabled ? ' provider-disabled' : ''}`} onClick={onClick}>
+      <div className={`provider-list-row${active ? ' active' : ''}${selected ? ' selected' : ''}${providerDisabled ? ' provider-disabled' : ''}`} onClick={handleCardClick} onDoubleClick={handleOpen}>
         {selectable ? (
           <label className="provider-list-check" onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
-            <input type="checkbox" checked={!!selected} onChange={onToggleSelect} aria-label={`选择 ${name}`} />
+            <input type="checkbox" checked={!!selected} onChange={(event) => onToggleSelect(event.nativeEvent instanceof MouseEvent && event.nativeEvent.shiftKey)} aria-label={`选择 ${name}`} />
           </label>
         ) : <span className="provider-list-check" />}
         <span className="provider-list-icon"><BrandIcon icon={icon} name={name} size={18} /></span>
@@ -1106,8 +1122,8 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
             <button
               type="button"
               className="provider-list-name provider-name-btn"
-              onClick={(event) => { event.stopPropagation(); onClick(); }}
-              title={`选中 ${name}`}
+              aria-pressed={selectable ? !!selected : undefined}
+              title={selectable ? `${selected ? '取消选择' : '选择'} ${name}` : `打开 ${name}`}
             >
               <MatchText text={name} query={highlightQuery} />
             </button>
@@ -1165,7 +1181,7 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
     // 而 ARIA 规定 button 的子节点是 presentational —— 读屏会把整卡念成一个按钮，
     // 里面的控件就消失了。键盘入口改由标题按钮承担（.provider-name-btn），
     // 鼠标仍然可以点整卡。
-    <div className={`provider-card clickable ${active ? 'active' : ''} ${selected ? 'selected' : ''} ${providerDisabled ? 'provider-disabled' : ''}`} onClick={onClick}>
+    <div className={`provider-card clickable ${active ? 'active' : ''} ${selected ? 'selected' : ''} ${providerDisabled ? 'provider-disabled' : ''}`} onClick={handleCardClick} onDoubleClick={handleOpen}>
       <div className="provider-head">
         {/* 品牌图标：一屏十几张卡时，认图比认字快；匹配不到厂商就退回名称首字。 */}
         <span className="provider-icon">
@@ -1177,8 +1193,8 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
           <button
             type="button"
             className="provider-name provider-name-btn"
-            onClick={(event) => { event.stopPropagation(); onClick(); }}
-            title={`选中 ${name}`}
+            aria-pressed={selectable ? !!selected : undefined}
+            title={selectable ? `${selected ? '取消选择' : '选择'} ${name}` : `打开 ${name}`}
           >
             <MatchText text={name} query={highlightQuery} />
           </button>
@@ -1187,7 +1203,7 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
         </div>
         {selectable ? (
           <label className="provider-check" onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
-            <input type="checkbox" checked={!!selected} onChange={onToggleSelect} aria-label={`选择 ${name}`} />
+            <input type="checkbox" checked={!!selected} onChange={(event) => onToggleSelect(event.nativeEvent instanceof MouseEvent && event.nativeEvent.shiftKey)} aria-label={`选择 ${name}`} />
           </label>
         ) : null}
       </div>

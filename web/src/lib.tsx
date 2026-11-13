@@ -139,6 +139,9 @@ export const THINKING_DEPTH_OPTIONS = ['low', 'medium', 'high', 'xhigh'] as cons
  */
 export const SELECTABLE_THINKING_DEPTHS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 
+/** 新建 API 密钥时的默认思考深度。 */
+export const DEFAULT_NEW_API_KEY_THINKING_DEPTH = 'max';
+
 export const CODEX_MODEL_CATALOG_REL = '.codex/lpg-model-catalog.json';
 
 export const CODEX_MODEL_CATALOG_DISPLAY = `~/${CODEX_MODEL_CATALOG_REL}`;
@@ -793,13 +796,40 @@ export function shortGatewayId(id: string): string {
 }
 
 /**
+ * Provider 卡片的选择手势：单击切换勾选，Shift+单击按可见顺序选区间。
+ *
+ * 选择顺序必须与页面实际渲染顺序一致。上游网关成员会在页面里按分组重排，
+ * 所以调用方传入的是 renderProviderGroups 展开后的可见顺序，而不是原始
+ * state.providers。Shift 区间沿用已勾选项的并集语义，不把之前的选择清空。
+ */
+export function toggleProviderSelection(selectedIDs: string[], visibleIDs: string[], providerID: string, anchorID: string, shiftKey: boolean): { selectedIDs: string[]; anchorID: string } {
+  const selected = new Set(selectedIDs);
+  if (shiftKey && anchorID && visibleIDs.includes(anchorID) && visibleIDs.includes(providerID)) {
+    const from = visibleIDs.indexOf(anchorID);
+    const to = visibleIDs.indexOf(providerID);
+    const start = Math.min(from, to);
+    const end = Math.max(from, to);
+    for (let i = start; i <= end; i += 1) selected.add(visibleIDs[i]);
+    return {selectedIDs: [...selected], anchorID};
+  }
+  if (selected.has(providerID)) {
+    selected.delete(providerID);
+  } else {
+    selected.add(providerID);
+  }
+  return {selectedIDs: [...selected], anchorID: providerID};
+}
+
+/**
  * API 日志「链路」一列：这条请求从哪来、往哪去。
  *
  * 设计稿原本要拆成「请求入口」「请求出口」两列，但绝大多数请求两头都空，两列
  * 就是两块恒定的空白；而真实出现时又总是成对出现（A→B→C 的 B 两头都有）。合成
  * 一格，宽度省一半，读起来还是同一句话。
  *
- * - 两头都空 → 直连。不给空白：空白会被读成「这一列没有数据」，可它其实一致有。
+ * - 两头都空且方向为空 → 链路元数据未知（旧日志或提前中断）。不写“直连”，
+ *   因为空字段只说明没留下证据，不能反证它没有经过对端网关。
+ * - 方向为 egress 但 ID 缺失 → 显示 →?，表示确实尝试过转发、但父网关身份没拿到。
  * - ingress  → 下游网关把请求送了进来，本机是它的上游。
  * - egress   → 本机把请求转给了上游网关，本机是它的下游。
  * 三级链路时两者同时出现，此时 peerOrigin 才是真正的起点。
@@ -811,16 +841,41 @@ export function trafficLogPeerChain(log: LogEntry): { text: string; title: strin
   const ingress = (log.ingress || '').trim();
   const egress = (log.egress || '').trim();
   const origin = (log.peerOrigin || '').trim();
+  const direction = (log.peerDirection || '').trim().toLowerCase();
   if (!ingress && !egress) {
-    return { text: '直连', title: '客户端直连本机、本机直连 Provider：这条请求没有经过任何对端网关', peered: false };
+    // peerDirection 说明这确实是一次对端转发，只是父网关身份没落地
+    // （客户端取消、超时、连接失败会发生在响应头到达前）。这时不能写“直连”，
+    // 否则会把一次真实链路误报成本地请求。
+    if (direction === 'egress') {
+      return {
+        text: '→?',
+        title: '本机已尝试转发至上游网关，但父网关身份未返回（请求可能被取消或超时）；链路元数据缺失，不能据此判定为直连',
+        peered: true,
+      };
+    }
+    if (direction === 'ingress') {
+      return {
+        text: '←?',
+        title: '请求来自下游网关，但下游网关身份未写入日志；链路元数据缺失，不能据此判定为直连',
+        peered: true,
+      };
+    }
+    // 旧日志没有 direction 字段：既可能真的是本地直连，也可能是改版前没有
+    // 记录链路。不要用“直连”冒充已知事实，明确标出未知。
+    return {
+      text: '—',
+      title: '这条日志没有留存链路元数据（可能是旧日志，或请求在写入链路信息前中断）；是否直连未知',
+      peered: false,
+    };
   }
   const text = [
     ingress ? `←${shortGatewayId(ingress)}` : '',
-    egress ? `→${shortGatewayId(egress)}` : '',
+    egress ? `→${shortGatewayId(egress)}` : direction === 'egress' ? '→?' : '',
   ].filter(Boolean).join(' ');
   const lines: string[] = [];
   if (ingress) lines.push(`来自下游网关 ${ingress}`);
   if (egress) lines.push(`转发至上游网关 ${egress}`);
+  if (!egress && direction === 'egress') lines.push('转发至上游网关：身份未返回（链路元数据缺失）');
   if (origin && origin !== ingress) lines.push(`链路起点：${origin}`);
   // peerPath 是请求已经过的网关（发起方开始、不含本机）。两级链路相邻方已经
   // 说清，只有更长才需要把它拼成一条完整链展示。
@@ -1025,6 +1080,26 @@ export function replayPlan(log: LogEntry): ReplayPlan | null {
   return null;
 }
 
+/**
+ * API 日志里“同协议直通失败后回退转换”的标记。
+ *
+ * 主列 protocolFlow 记录的是最终成功路径（例如 or->oc），只看它会把前面那次
+ * 原生 Responses 尝试藏掉。调度轨迹里有 native_passthrough_failed 时，这里
+ * 返回一段可直接展示的标记与排错提示；普通转换或普通直通没有这个标记。
+ */
+export function trafficLogNativeFallback(log: LogEntry): { label: string; error: string; title: string } | null {
+  const attempt = (log.analysis?.attempts || []).find((item) => item.reason === 'native_passthrough_failed');
+  if (!attempt) return null;
+  const error = (attempt.error || '').trim();
+  const elapsed = attempt.ms && attempt.ms > 0 ? `${attempt.ms}ms` : '';
+  const title = [
+    '同协议直通失败，已回退到 Provider 声明协议做转换',
+    error ? `错误：${error}` : '',
+    elapsed ? `直通耗时：${elapsed}` : '',
+  ].filter(Boolean).join('\n');
+  return {label: '直通失败', error, title};
+}
+
 /** 重放请求头。密钥只进 Authorization，调用方负责不把它写进任何展示文本。 */
 export function buildReplayHeaders(plan: ReplayPlan, key: string): Record<string, string> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` };
@@ -1155,7 +1230,7 @@ export function formatRouteTestDiagnostics(result: RouteTestResult) {
       `route: ${diagnostics.routeId || result.routeId || '-'} (${diagnostics.routeName || '-'})`,
       `provider: ${diagnostics.providerId || result.providerId || '-'} (${diagnostics.providerProtocol || '-'})`,
       `output: ${diagnostics.outputProtocol || '-'}`,
-      `flow: ${diagnostics.protocolFlow || result.protocolFlow || '-'} · action=${diagnostics.action || result.action || '-'} · mode=${diagnostics.mode || '-'}`,
+      `flow: ${diagnostics.protocolFlow || result.protocolFlow || '-'} · action=${diagnostics.action || result.action || '-'}`,
       `model: ${diagnostics.model || result.model || '-'}`,
       `status: HTTP ${diagnostics.status ?? result.status ?? '-'}`,
       `gateway: ${diagnostics.gatewayUrl || result.gatewayUrl || '-'}`,
@@ -1370,6 +1445,9 @@ export function protocolLabel(protocol: Protocol) {
 export function protocolShortCode(label: string) {
   const value = label.trim().toLowerCase();
   if (!value) return '?';
+  if (value === 'cl') return 'cl';
+  if (value === 'or') return 'or';
+  if (value === 'oc') return 'oc';
   if (value.startsWith('claude')) return 'cl';
   if (value.startsWith('openai responses')) return 'or';
   if (value.startsWith('openai chat')) return 'oc';
@@ -1379,7 +1457,13 @@ export function protocolShortCode(label: string) {
 export function compactProtocolFlow(label: string) {
   if (!label) return '—';
   const [from, to] = label.split('->').map((part) => part.trim());
-  return to ? `${protocolShortCode(from)}→${protocolShortCode(to)}` : protocolShortCode(from);
+  const fromCode = protocolShortCode(from);
+  if (to) return `${fromCode}->${protocolShortCode(to)}`;
+  // 老日志的同协议直通行只存了一个协议名；展示时补成同进同出，
+  // 与新日志的 "oc->oc" 保持同一口径。非协议的单值（如 embeddings）
+  // 仍按原样显示，不要伪造一个协议。
+  const known = /^(openai chat|openai responses|claude|oc|or|cl)$/i.test(from);
+  return known ? `${fromCode}->${fromCode}` : fromCode;
 }
 
 export function protocolFromLabel(label: string): Protocol {

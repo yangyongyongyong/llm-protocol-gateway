@@ -749,7 +749,6 @@ export type Route = {
   outputEndpointId: string;
   providerId: string;
   outputProtocol: Protocol;
-  mode: 'auto' | 'pass_through' | 'convert';
   enabled: boolean;
 };
 
@@ -1113,11 +1112,11 @@ export type LogEntry = {
   clientHost?: string;
   clientIp?: string;
   accessSource?: 'lan' | 'public' | 'local' | string;
-  // 父子网关透传的链路标记。三者都空 = 一次纯本地请求（和引入父子功能之前
-  // 完全一样），界面据此决定要不要显示链路。
+  // 父子网关透传的链路标记。都空通常是一次纯本地请求；但旧日志与提前中断的
+  // 请求也可能没有这些字段，界面必须区分“已知直连”和“链路未知”。
   /** 把这次请求送进来的下游网关 ID（空 = 客户端直连本机）。 */
   ingress?: string;
-  /** 本机把这次请求转发出去的上游网关 ID（空 = 本机直连 provider）。 */
+  /** 本机把这次请求转发出去的上游网关 ID（可能因取消/超时为空）。 */
   egress?: string;
   /** 这次透传要对账的对端网关 ID：有 ingress 取 ingress，否则取 egress。 */
   peerGatewayId?: string;
@@ -1369,7 +1368,6 @@ export type RouteTestDiagnostics = {
   gatewayUrl?: string;
   action?: string;
   protocolFlow?: string;
-  mode?: string;
   model?: string;
   status?: number;
   requestBody?: string;

@@ -16,6 +16,7 @@ import {
     summarizeReplayBody,
     trafficLogKeyLabel,
     trafficLogKeyTitle,
+    trafficLogNativeFallback,
     trafficLogPeerChain,
     trafficLogProviderLabel,
     trafficLogServing
@@ -100,7 +101,7 @@ const SCHEDULE_REASONS: Record<string, { text: string; tone: 'green' | 'amber' |
   not_assigned: { text: '未授权', tone: 'slate' },
   decision_failed: { text: 'Provider 不存在', tone: 'slate' },
   client_gone: { text: '客户端已断开', tone: 'slate' },
-  native_passthrough_failed: { text: '直通失败·转转换', tone: 'amber' },
+  native_passthrough_failed: { text: '直通失败 → 转换', tone: 'amber' },
 };
 
 export function ScheduleTracePanel({ log, providers }: { log: LogEntry; providers: Provider[] }) {
@@ -261,7 +262,7 @@ export function TrafficLogTable({ logs, providers, routes, apiKeys, onOpen, fres
           <span>实际模型</span>
           <span title="上游实际收到的推理设置">推理强度</span>
           <span title="实际承接这条请求的 Provider 与账号；带「备N」标记的是首选未服务、由备选第 N 位接的">供应商 · 账号</span>
-          <span title="这条请求的来路与去向：←下游网关 ID 表示由它送进来，→上游网关 ID 表示本机转给了它；「直连」表示没经过任何对端网关">链路</span>
+          <span title="这条请求的来路与去向：←下游网关 ID 表示由它送进来，→上游网关 ID 表示本机转给了它；「—」表示旧日志没有链路元数据，无法判定是否直连">链路</span>
           <span>协议</span>
           <span className="num">输入</span>
           <span className="num">输出</span>
@@ -283,6 +284,7 @@ export function TrafficLogTable({ logs, providers, routes, apiKeys, onOpen, fres
           // providerId 记的就是真正服务的那条：与路由首选不一致，说明这条走了备选。
           const serving = trafficLogServing(log, providers, routes || [], apiKeys || []);
           const peerChain = trafficLogPeerChain(log);
+          const nativeFallback = trafficLogNativeFallback(log);
           const failoverTitle = serving
             ? `首选「${providerDisplayLabel(serving.primary, '未绑定')}」未承接，本条由${serving.rank ? `备选 ${serving.rank}` : '其他 Provider'}「${providerDisplayLabel(provider, log.providerId || '未知')}」服务`
             : undefined;
@@ -316,9 +318,11 @@ export function TrafficLogTable({ logs, providers, routes, apiKeys, onOpen, fres
               <span className={`tlog-peer${peerChain.peered ? ' peered' : ''}`} title={peerChain.title}>
                 {peerChain.text}
               </span>
-              <span className="tlog-proto" title={`${actionLabel(log.action)} · ${log.protocolFlow || '未知流向'}（oc=OpenAI Chat，or=OpenAI Responses，cl=Claude）· ${log.path}`}>
-                {compactProtocolFlow(log.protocolFlow)}
-              </span>              <span className="num">{fmtNum(log.inputTokens)}</span>
+              <span className="tlog-proto" title={`${actionLabel(log.action)} · ${log.protocolFlow || '未知流向'}（oc=OpenAI Chat，or=OpenAI Responses，cl=Claude）· ${log.path}${nativeFallback ? `\n${nativeFallback.title}` : ''}`}>
+                <span>{compactProtocolFlow(log.protocolFlow)}</span>
+                {nativeFallback ? <i className="tlog-fallback">直通失败</i> : null}
+              </span>
+              <span className="num">{fmtNum(log.inputTokens)}</span>
               <span className="num">{fmtNum(log.outputTokens)}</span>
               <span className="num" title="写入提示缓存的 token（已计入输入）">{fmtNum(log.cacheWriteTokens)}</span>
               <span className="num" title="命中缓存读取的 token（已计入输入）">{fmtNum(log.cacheTokens)}</span>
