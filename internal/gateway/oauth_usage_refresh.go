@@ -161,6 +161,12 @@ func (s *Server) refreshAllOAuthUsage(ctx context.Context) {
 			if provider.ChatGPTOAuth != nil && strings.TrimSpace(provider.ChatGPTOAuth.RefreshToken) != "" {
 				s.refreshChatGPTOAuthUsage(provider.ID)
 			}
+		case domain.AuthTypeQoderPAT, domain.AuthTypeQoderCN:
+			// Qoder's usage endpoint needs the device token, not the job token.
+			// Keep the read-only snapshot warm for the console and for peer cards.
+			if provider.QoderPAT != nil && !provider.QoderPAT.Disconnected && strings.TrimSpace(provider.QoderPAT.DeviceToken) != "" {
+				s.refreshQoderUsage(provider.ID)
+			}
 		case domain.AuthTypeWorkBuddy, domain.AuthTypeWorkBuddyAI:
 			// WorkBuddy records the refresh token's month-long life, not the
 			// access token's, so the sweep can only learn the token is dead by
@@ -382,6 +388,26 @@ func (s *Server) refreshChatGPTOAuthUsage(providerID string) {
 	unlock := s.lockOAuthUsageFetch(cacheKey)
 	defer unlock()
 	s.refreshChatGPTOAuthUsageHoldingLock(providerID)
+}
+
+// refreshQoderUsage keeps the Qoder credit snapshot warm for the local card
+// and for peer provider cards. Qoder usage is read with the device token; PAT-only
+// connections have no quota endpoint and are skipped by the caller.
+func (s *Server) refreshQoderUsage(providerID string) {
+	cacheKey := s.oauthUsageCacheKeyFor("qoder", providerID)
+	unlock := s.lockOAuthUsageFetch(cacheKey)
+	defer unlock()
+	provider, err := s.router.ProviderByID(providerID)
+	if err != nil || provider.Disabled || !isQoderProvider(provider) || provider.QoderPAT == nil || provider.QoderPAT.Disconnected {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	updated, quota := s.qoderQuotaFor(ctx, provider)
+	if quota.Error != "" {
+		return
+	}
+	s.oauthUsageCache.setForAccount(cacheKey, oauthUsageAccountID(updated), quota)
 }
 
 // refreshWorkBuddyUsage sweeps an account's credit meter, which doubles as the

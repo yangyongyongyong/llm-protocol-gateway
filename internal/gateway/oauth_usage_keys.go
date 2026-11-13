@@ -69,6 +69,21 @@ func oauthUsageAccountID(provider domain.Provider) string {
 				}
 			}
 		}
+	case domain.AuthTypeQoderPAT, domain.AuthTypeQoderCN:
+		if provider.QoderPAT != nil {
+			// Qoder's UID is the stable account identity. The access/device
+			// tokens rotate independently of the account.
+			if id := strings.TrimSpace(provider.QoderPAT.UID); id != "" {
+				material = "account:" + id
+			} else if email := strings.TrimSpace(provider.QoderPAT.Email); email != "" {
+				material = "email:" + strings.ToLower(email)
+			} else if pat := strings.TrimSpace(provider.QoderPAT.PAT); pat != "" {
+				material = "pat:" + pat
+			} else {
+				material = "device:" + strings.TrimSpace(provider.QoderPAT.DeviceToken)
+			}
+		}
+
 	case domain.AuthTypeWorkBuddy, domain.AuthTypeWorkBuddyAI:
 		if provider.WorkBuddy != nil {
 			if id := strings.TrimSpace(provider.WorkBuddy.UserID); id != "" {

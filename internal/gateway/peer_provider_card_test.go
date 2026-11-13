@@ -80,3 +80,31 @@ func TestPeerProviderCardCarriesWorkBuddyCredits(t *testing.T) {
 		t.Fatalf("child provider lost inherited card: %+v", rows[0].PeerGrants)
 	}
 }
+
+// Qoder 也必须像 WorkBuddy 一样把额度沿 Peer 卡片快照传给下游；只传
+// authType/accountLabel 会让继承卡片看起来“已连接但永远没有额度”。
+func TestPeerProviderCardCarriesQoderCredits(t *testing.T) {
+	provider := domain.Provider{
+		ID: "qoder-main", Name: "Qoder CN", Protocol: domain.ProtocolOpenAIChat,
+		BaseURL: "https://gateway.qoder.com.cn", AuthType: domain.AuthTypeQoderCN,
+		QoderPAT: &domain.QoderCredential{UID: "uid-qoder-1", AccountLabel: "qoder-account", Connected: true},
+	}
+	server := NewServer(NewRouter(domain.GatewayState{Providers: []domain.Provider{provider}}), monitor.NewStore())
+	key := server.oauthUsageCacheKeyFor("qoder", provider.ID)
+	server.oauthUsageCache.setForAccount(key, oauthUsageAccountID(provider), qoderQuota{
+		Plan:      "Pro",
+		FetchedAt: "2026-11-14T00:00:00Z",
+		Windows: []qoderQuotaWindow{{
+			Name: "Credits", Used: 42, Amount: 42, Limit: 100, Unit: "credits",
+			ResetsAt: "2026-12-01T00:00:00Z",
+		}},
+	})
+
+	card := server.peerProviderCardFor(provider, nil)
+	if card.Usage == nil || card.Usage.Title != "Qoder 积分" || card.Usage.Plan != "Pro" {
+		t.Fatalf("Qoder card usage = %+v", card.Usage)
+	}
+	if len(card.Usage.Buckets) != 1 || card.Usage.Buckets[0].Utilization != 42 || card.Usage.Buckets[0].Note != "42 / 100 credits" {
+		t.Fatalf("Qoder usage buckets = %+v", card.Usage.Buckets)
+	}
+}

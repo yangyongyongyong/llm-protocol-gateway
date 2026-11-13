@@ -139,6 +139,29 @@ func (s *Server) peerProviderUsageFor(provider domain.Provider) *domain.PeerProv
 		}
 		return result
 
+	case isQoderProvider(provider):
+		value, ok := cached("qoder")
+		quota, typeOK := value.(qoderQuota)
+		if !ok || !typeOK {
+			return nil
+		}
+		buckets := make([]domain.PeerProviderUsageBucket, 0, len(quota.Windows))
+		for _, window := range quota.Windows {
+			note := ""
+			if window.Limit > 0 {
+				note = fmt.Sprintf("%.0f / %.0f %s", window.Amount, window.Limit, window.Unit)
+			}
+			buckets = append(buckets, domain.PeerProviderUsageBucket{
+				Label: window.Name, Utilization: window.Used, Note: note, ResetsAt: window.ResetsAt,
+			})
+		}
+		result := usage("Qoder 积分", quota.FetchedAt, buckets)
+		if result != nil {
+			result.Plan = quota.Plan
+			result.Message = quota.Error
+		}
+		return result
+
 	case provider.ZCode != nil || isZhipuBaseURL(provider.BaseURL):
 		value, ok := cached("zhipu")
 		report, typeOK := value.(ZhipuUsageReport)

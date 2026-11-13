@@ -79,7 +79,30 @@ func (s *Server) handleQoderUsage(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	_, quota := s.qoderQuotaFor(ctx, provider)
+	cacheKey := s.oauthUsageCacheKeyFor("qoder", providerID)
+	forceRefresh := strings.EqualFold(r.URL.Query().Get("refresh"), "1") || strings.EqualFold(r.URL.Query().Get("refresh"), "true")
+	if forceRefresh {
+		s.oauthUsageCache.invalidate(cacheKey)
+	} else if cached, ok := s.oauthUsageCache.getAllowStale(cacheKey); ok {
+		if quota, ok := cached.(qoderQuota); ok {
+			writeJSON(w, http.StatusOK, quota)
+			return
+		}
+	}
+	unlock := s.lockOAuthUsageFetch(cacheKey)
+	defer unlock()
+	if !forceRefresh {
+		if cached, ok := s.oauthUsageCache.get(cacheKey); ok {
+			if quota, ok := cached.(qoderQuota); ok {
+				writeJSON(w, http.StatusOK, quota)
+				return
+			}
+		}
+	}
+	updated, quota := s.qoderQuotaFor(ctx, provider)
+	if quota.Error == "" {
+		s.oauthUsageCache.setForAccount(cacheKey, oauthUsageAccountID(updated), quota)
+	}
 	view := s.checkinViewFor(provider)
 	quota.Checkin = &view
 	writeJSON(w, http.StatusOK, quota)
