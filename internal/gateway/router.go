@@ -2642,8 +2642,30 @@ func (r *Router) decideLockedForProtocol(route domain.Route, providerID string, 
 		InputProtocol:   provider.Protocol,
 		Mode:            mode,
 		Action:          action,
-		ConversionLabel: fmt.Sprintf("%s -> %s", provider.Protocol.DisplayName(), protocol.DisplayName()),
+		ConversionLabel: conversionLabel(protocol, provider.Protocol),
 	}, nil
+}
+
+// conversionLabel 拼出日志里那一列「协议流」，方向按数据实际流动的顺序：
+// 客户端协议 -> 上游协议。
+//
+// 只按两端协议是否相同来决定显示什么，不再看 action：
+//
+//	两端相同  → 只写一个名字（直通，不存在转换）
+//	两端不同  → "<客户端> -> <上游>"
+//
+// 曾经在这里按 action == "pass_through" 就只写客户端协议，那是错的：pass_through
+// 是「不许转换」，不是「两端协议相同」。一条 pass_through 路由完全可能收到与上游
+// 不同协议的请求（上游只认 Chat，客户端偏发 Responses），这时日志只剩一个
+// "OpenAI Responses"，把上游实际是 Chat 这个关键事实吞掉了——而那恰恰是排查
+// 400 最需要看的信息。
+func conversionLabel(clientProtocol, upstreamProtocol domain.Protocol) string {
+	client := clientProtocol.DisplayName()
+	upstream := upstreamProtocol.DisplayName()
+	if clientProtocol == upstreamProtocol {
+		return client
+	}
+	return client + " -> " + upstream
 }
 
 func (r *Router) ActiveOpenAIChatRoute() (domain.Route, error) {

@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -274,6 +275,9 @@ func (s *Store) migrate() error {
 	}
 	if err := ensureHostMetricsTable(tx); err != nil {
 		return fmt.Errorf("migrate host_metrics_samples: %w", err)
+	}
+	if err := reverseLegacyProtocolFlow(tx); err != nil {
+		return fmt.Errorf("migrate protocol_flow direction: %w", err)
 	}
 	if err := addColumnIfMissing(tx, "api_keys", "model_aliases", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return fmt.Errorf("migrate: %w", err)
@@ -1494,6 +1498,65 @@ func setSetting(tx *sql.Tx, key, value string) error {
 	_, err := tx.Exec(`INSERT INTO settings (key, value) VALUES (?, ?)
 		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
 	return err
+}
+
+// protocolFlowDirectionSettingKey 记录「协议流方向已订正」这件事，避免重复翻转。
+const protocolFlowDirectionSettingKey = "protocol_flow_direction_v2"
+
+// reverseLegacyProtocolFlow 把改版前写反的 protocol_flow 翻正。
+//
+// 2026-11-13 之前，日志里那一列写的是 "<上游> -> <客户端>"；之后改成了
+// "<客户端> -> <上游>"，直通则只写一个协议名。方向变了，monitor 的
+// OutputProtocolFromFlow 又按左侧取「输出协议」，所以旧行必须在数据上翻一次，
+// 否则协议用量会算到相反的那条协议头上。
+//
+// 只动带箭头的行：直通行本来就只有协议名，翻转没意义。旧行全部出自当时那段
+// 直通分支拼错的标签（都是 pass_through 却带着箭头），零 token 的失败请求占绝
+// 大多数，翻错的代价很小；不翻则是长期的口径偏差。
+//
+// 用 settings 里的一次性标记保证幂等：迁移会在每次启动时跑，没有标记就会把
+// 已经是新方向的行再翻回去。
+func reverseLegacyProtocolFlow(tx *sql.Tx) error {
+	var done string
+	err := tx.QueryRow(`SELECT value FROM settings WHERE key = ?`, protocolFlowDirectionSettingKey).Scan(&done)
+	if err == nil && strings.TrimSpace(done) == "done" {
+		return nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	rows, err := tx.Query(`SELECT DISTINCT protocol_flow FROM request_logs WHERE protocol_flow LIKE '%->%'`)
+	if err != nil {
+		return err
+	}
+	flows := make([]string, 0, 16)
+	for rows.Next() {
+		var flow string
+		if scanErr := rows.Scan(&flow); scanErr != nil {
+			_ = rows.Close()
+			return scanErr
+		}
+		flows = append(flows, flow)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	_ = rows.Close()
+	for _, flow := range flows {
+		left, right, ok := strings.Cut(flow, "->")
+		if !ok {
+			continue
+		}
+		reversed := strings.TrimSpace(right) + " -> " + strings.TrimSpace(left)
+		if reversed == flow {
+			continue
+		}
+		if _, err := tx.Exec(`UPDATE request_logs SET protocol_flow = ? WHERE protocol_flow = ?`, reversed, flow); err != nil {
+			return err
+		}
+	}
+	return setSetting(tx, protocolFlowDirectionSettingKey, "done")
 }
 
 // MigrateFromJSON performs the one-time import from a legacy config.json into

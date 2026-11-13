@@ -1472,7 +1472,7 @@ func (s *Server) executeProtocolFlowWithFailover(
 			nativeDecision := attemptDecision
 			nativeDecision.Action = "pass_through"
 			nativeDecision.InputProtocol = nativeProtocol
-			nativeDecision.ConversionLabel = fmt.Sprintf("%s -> %s", nativeProtocol.DisplayName(), nativeProtocol.DisplayName())
+			nativeDecision.ConversionLabel = conversionLabel(nativeProtocol, nativeProtocol)
 			nativeReq := cloneRequestMap(attemptReq)
 			nativeReq["model"] = attemptModel
 			nativeWriter := newFailoverResponseWriter(w, true)

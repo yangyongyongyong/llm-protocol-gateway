@@ -668,15 +668,33 @@ func MergeModelDayStats(items []ModelDayStats, canonical func(string) string) []
 }
 
 // OutputProtocolFromFlow extracts the client-facing (output) protocol from a
-// request log's protocol_flow, which is stored as "<provider> -> <output>"
-// (e.g. "Claude -> OpenAI Responses"). Returns "" for rejected/unknown flows.
+// request log's protocol_flow.
+//
+// 现行格式是 "<客户端> -> <上游>"（如 "OpenAI Responses -> OpenAI Chat"），客户端
+// 协议在左边；直通只写一个协议名（如 "OpenAI Chat"）。
+//
+// 历史遗留：2026-11-13 之前写入的行是反的（"上游 -> 客户端"）。两种方向在字符
+// 上无法区分——"Claude -> OpenAI Chat" 在新旧格式下都是合法且等长的表达，只是
+// 含义相反。因此这里统一按新格式取左侧，并对旧行做一次数据订正，而不是在解析
+// 时猜方向：猜错一次就会把协议用量算到另一条协议头上。
+//
+// 旧行都是当时 pass_through 分支写出来的假转换标签（19 行，全部 400 失败、零
+// token），订正脚本见 store 的 protocol_flow_direction 迁移。
 func OutputProtocolFromFlow(flow string) string {
 	flow = strings.TrimSpace(flow)
+	if name := protocolFlowName(flow); name != "" {
+		return name
+	}
 	idx := strings.LastIndex(flow, "->")
 	if idx < 0 {
 		return ""
 	}
-	switch out := strings.TrimSpace(flow[idx+2:]); out {
+	return protocolFlowName(flow[:idx])
+}
+
+// protocolFlowName 把一个片段规整成已知的协议显示名；不是已知协议时返回空串。
+func protocolFlowName(fragment string) string {
+	switch out := strings.TrimSpace(fragment); out {
 	case "OpenAI Chat", "OpenAI Responses", "Claude":
 		return out
 	default:
