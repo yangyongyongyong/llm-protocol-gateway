@@ -132,7 +132,17 @@ func ApplyCodex(e CodexEndpoint) (CodexResult, error) {
 		return res, err
 	}
 	block := codexProviderBlock(e, providerID)
-	merged := block + "\n" + stripCodexBlock(existing)
+	// 顺序不能换：先摘掉我们上次写的那段，再清掉别的 provider 表，最后把新的
+	// 这段放到最前面。反过来做的话，stripForeignProviderTables 会把我们刚拼好
+	// 的 [model_providers.<id>] 也当成"别人的"删掉。
+	//
+	// 一键写入的语义是「这台机器的 Codex 从此只认这个网关」，所以历史遗留的
+	// provider 定义（magpie 留下的那批指向 127.0.0.1:3425 的、手工加的等）一并
+	// 清掉。它们留着只会让 codex --profile 里出现连不上的选项，报错还指向废弃
+	// 地址。表外的一切（[projects]、[plugins]、[desktop]、用户自己的顶层键）
+	// 一个字符都不动。
+	remainder := stripForeignProviderTables(stripCodexBlock(existing))
+	merged := block + "\n" + remainder
 	if existing != "" && merged == existing {
 		res.Unchanged = true
 		return res, nil
@@ -304,29 +314,41 @@ func codexProviderBlock(e CodexEndpoint, providerID string) string {
 	}
 	b.WriteString("approval_policy = \"never\"\n")
 	b.WriteString("sandbox_mode = \"danger-full-access\"\n\n")
-	b.WriteString(fmt.Sprintf("[model_providers.%s]\n", providerID))
 	name := strings.TrimSpace(e.ProviderName)
 	if name == "" {
 		name = providerID
 	}
-	b.WriteString(fmt.Sprintf("name = %s\n", tomlString(name)))
-	b.WriteString(fmt.Sprintf("base_url = %s\n", tomlString(strings.TrimRight(strings.TrimSpace(e.BaseURL), "/"))))
-	b.WriteString("wire_api = \"responses\"\n")
-	// requires_openai_auth 决定的是「登录界面」，不是「请求带什么凭据」。
+	// 这一段必须写成内联表（点号键 + { ... }），不能写成 [model_providers.<id>]。
 	//
-	// Codex 0.149+ 的行为（cc-switch 在 live/project/codex.rs 里注释得很清楚）：
-	// 这个值为 true 而 auth.json 里没有能用的登录时，Codex 卡在登录页不放；
-	// 为 false 时它直接用表里的 experimental_bearer_token 发请求。我们的凭据
-	// 本来就走 bearer，所以必须写 false——写 true 就会出现「配置明明对，一进
-	// TUI 还是要你选登录方式」。
+	// 原因：表头一旦出现就不会闭合——TOML 里没有任何语法能把当前表关掉，拿注释
+	// 去"结束"它只是自欺。而本工具这段是插在文件最前面的，用表头写法会把用户
+	// 原本写在顶层的配置（approvals_reviewer、notify 之类）全部吞进 provider 表。
+	// Codex 读到的就是 "Codex is ignoring 1 unrecognized configuration setting:
+	// model_providers.<id>.approvals_reviewer is ignored"，而且设置静默不生效。
 	//
-	// 保持官方登录（KeepOfficialLogin）时才写 true：那时 auth.json 里有一份真
-	// 登录，Codex 认它，账号信息和 token 刷新都照常。
-	b.WriteString(fmt.Sprintf("requires_openai_auth = %t\n", e.KeepOfficialLogin))
-	// Codex 0.118+ 会先试 WebSocket 连 /v1/responses（OpenAI 内部协议，第三方
-	// 网关接不住，只会 405 再退回 HTTPS）。显式关掉，省掉那几轮重试。
-	b.WriteString("supports_websockets = false\n")
-	b.WriteString(fmt.Sprintf("experimental_bearer_token = %s\n", tomlString(strings.TrimSpace(e.Token))))
+	// 点号键 + 内联表不开启表上下文：写完这一行之后仍是顶层，后面的用户配置该
+	// 是什么就是什么。TOML 规范明确允许在点号键建出来的表上再用 [a.b] 定义子表
+	// （"The [table] form can, however, be used to define sub-tables within tables
+	// defined via dotted keys."），所以用户已有的 [model_providers.magpie] 之类
+	// 依然合法。
+	//
+	// requires_openai_auth 决定的是「登录界面」，不是「请求带什么凭据」：
+	// 为 true 而 auth.json 里没有能用的登录时，Codex 卡在登录页不放；为 false
+	// 时它直接用 experimental_bearer_token 发请求。我们的凭据本来就走 bearer，
+	// 所以必须写 false。保持官方登录（KeepOfficialLogin）时才写 true——那时
+	// auth.json 里有一份真登录，Codex 认它，账号信息和 token 刷新都照常。
+	//
+	// supports_websockets 固定 false：Codex 0.118+ 会先试 WebSocket 连
+	// /v1/responses（OpenAI 内部协议，第三方网关接不住，只会 405 再退回 HTTPS）。
+	// 显式关掉，省掉那几轮重试。
+	b.WriteString(fmt.Sprintf(
+		"model_providers.%s = { name = %s, base_url = %s, wire_api = \"responses\", requires_openai_auth = %t, supports_websockets = false, experimental_bearer_token = %s }\n",
+		tomlKey(providerID),
+		tomlString(name),
+		tomlString(strings.TrimRight(strings.TrimSpace(e.BaseURL), "/")),
+		e.KeepOfficialLogin,
+		tomlString(strings.TrimSpace(e.Token)),
+	))
 	b.WriteString(codexBlockEnd + "\n")
 	return b.String()
 }
@@ -362,10 +384,109 @@ func stripCodexBlock(text string) string {
 	return result
 }
 
+// stripForeignProviderTables 摘掉所有 [model_providers.*] 表，只留我们自己那段。
+//
+// 一键写入的语义是「这台机器的 Codex 从此只认这个网关」。历史遗留的 provider
+// 定义（magpie 写过一堆指向 127.0.0.1:3425 的，还有各种手工加的）留在文件里只会
+// 制造困惑：`codex --profile` 还能选到已经连不上的那几项，报错也指向废弃地址。
+//
+// 边界很窄，只认两种行：
+//   - 表头本身：`[model_providers.<id>]`
+//   - 它的子表：`[model_providers.<id>.something]`（例如 .env、.http_headers）
+//
+// 一个表的作用域到下个表头为止，所以碰到任何 `[...]` 就结束当前表的删除。
+// 表外的内容（顶层键、[projects]、[plugins]、[desktop] …）一个字符都不动——
+// 那些是 Codex 自己的配置，和 provider 无关。
+//
+// 顶层还可能有 `model_provider = "x"`、`openai_base_url = ...` 这类指向旧
+// provider 的键。它们不在本次范围内：Caller 会重新写一份正确的 model_provider，
+// 而其余顶层键属于用户自己的选择，猜错一次就是删掉别人的配置。
+func stripForeignProviderTables(text string) string {
+	if text == "" {
+		return ""
+	}
+	lines := strings.Split(text, "\n")
+	out := make([]string, 0, len(lines))
+	skipping := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(strings.TrimRight(line, "\r"))
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			// 任何表头都会结束上一张表的删除；只有 model_providers.* 重新开启。
+			skipping = isModelProviderTableHeader(trimmed)
+			if skipping {
+				continue
+			}
+		}
+		if skipping {
+			// 表内的键值行（含空行、注释）都属于这张表。
+			continue
+		}
+		out = append(out, line)
+	}
+	return compressBlankRuns(out)
+}
+
+// isModelProviderTableHeader 判断一个表头是否属于 [model_providers.*]。
+//
+// 点号键里的 id 可能带引号（见 tomlKey），所以不能用简单的前缀匹配：先剥掉
+// "model_providers." 再判断剩下部分是不是一个合法的表名后缀。
+func isModelProviderTableHeader(header string) bool {
+	inner := strings.TrimSuffix(strings.TrimPrefix(header, "["), "]")
+	inner = strings.TrimSpace(inner)
+	const prefix = "model_providers."
+	if !strings.HasPrefix(inner, prefix) {
+		return false
+	}
+	rest := strings.TrimPrefix(inner, prefix)
+	// 至少要有 id；子表（.env 之类）也算，因为它们挂在同一个 provider 上。
+	return strings.TrimSpace(rest) != ""
+}
+
+// compressBlankRuns 把连续空行收成一个，并去掉首尾多余空行。
+//
+// 删掉一整张表后原位置常常留下两三行空白；不收一下文件会越写越空。
+func compressBlankRuns(lines []string) string {
+	out := make([]string, 0, len(lines))
+	blank := false
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			if blank {
+				continue
+			}
+			blank = true
+			out = append(out, line)
+			continue
+		}
+		blank = false
+		out = append(out, line)
+	}
+	return strings.TrimSpace(strings.Join(out, "\n")) + "\n"
+}
+
 // tomlString 把任意字符串写成一个 TOML basic string。
 //
 // 不用手写转义：密钥里出现引号或反斜杠并不罕见，json.Marshal 产生的是同一种
 // 双引号字符串语法（TOML basic string 与 JSON string 规则一致），直接借用。
+// tomlKey 把 provider id 写成一个合法的 TOML 键片段（点号键的左半边）。
+//
+// 形如 model_providers.<id> 的点号键里，<id> 含点、空格或非 ASCII 时必须加引号，
+// 否则 TOML 会把 lpg.dev 读成 model_providers.lpg.dev 三级嵌套。裸键只允许
+// A-Za-z0-9_-，其余一律借用 tomlString 的双引号写法。
+func tomlKey(value string) string {
+	if value == "" {
+		return `""`
+	}
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+			continue
+		default:
+			return tomlString(value)
+		}
+	}
+	return value
+}
+
 func tomlString(value string) string {
 	encoded, err := json.Marshal(value)
 	if err != nil {

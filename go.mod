@@ -3,7 +3,9 @@ module github.com/luca/llm-protocol-gateway
 go 1.26.1
 
 require (
+	github.com/BurntSushi/toml v1.6.0
 	github.com/pierrec/xxHash v0.1.5
+	github.com/refraction-networking/utls v1.8.2
 	github.com/shirou/gopsutil/v4 v4.26.9
 	golang.org/x/crypto v0.54.0
 	golang.org/x/sys v0.48.0
@@ -21,7 +23,6 @@ require (
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/power-devops/perfstat v0.0.0-20260805114148-88456608a4f6 // indirect
-	github.com/refraction-networking/utls v1.8.2 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/tklauser/go-sysconf v0.4.0 // indirect
 	github.com/tklauser/numcpus v0.12.0 // indirect

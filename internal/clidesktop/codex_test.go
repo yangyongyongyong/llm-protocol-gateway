@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/BurntSushi/toml"
 )
 
 // Codex 的一键写入：配置是 TOML，没有"命名块"，所以用一对注释行圈住本工具管理
@@ -43,7 +45,7 @@ func TestApplyCodexWritesProviderBlock(t *testing.T) {
 		`model_provider = "lpg"`,
 		`model = "gpt-5.6-terra"`,
 		`model_reasoning_effort = "high"`,
-		`[model_providers.lpg]`,
+		`model_providers.lpg = {`,
 		`base_url = "https://gw.example.com/openai/v1"`,
 		`wire_api = "responses"`,
 		`experimental_bearer_token = "sk-gw-test"`,
@@ -146,8 +148,78 @@ func TestApplyCodexReplacesPreviousBlock(t *testing.T) {
 	if !strings.Contains(text, `experimental_bearer_token = "sk-gw-rotated"`) || !strings.Contains(text, `model = "gpt-6"`) {
 		t.Fatalf("新值没写进去：\n%s", text)
 	}
-	if strings.Count(text, "[model_providers.lpg]") != 1 {
+	if strings.Count(text, "model_providers.lpg = {") != 1 {
 		t.Fatalf("provider 表出现了多份：\n%s", text)
+	}
+}
+
+// 回归测试：块里绝不能出现 [model_providers.<id>] 表头。
+//
+// 表头不会闭合——TOML 没有语法能把当前表关掉，而那对 #### 注释只是注释。
+// 本工具的块写在文件最前面，一旦用表头写法，用户原本写在顶层的配置就会被
+// 吞进 provider 表，Codex 随即报
+//
+//	Codex is ignoring 1 unrecognized configuration setting.
+//	user (~/.codex/config.toml): model_providers.<id>.approvals_reviewer is ignored.
+//
+// 而且设置静默不生效。这个 bug 从 2026-08 起就在线上，就是它。
+func TestApplyCodexBlockDoesNotSwallowUserTopLevelKeys(t *testing.T) {
+	home := withHome(t)
+	path := filepath.Join(home, ".codex", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 用户的顶层配置写在文件里，位置就在我们的块后面、第一个用户表之前。
+	userConfig := "approvals_reviewer = \"user\"\n\n[features]\nremote_compaction_v2 = false\n"
+	if err := os.WriteFile(path, []byte(userConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ApplyCodex(codexEndpoint()); err != nil {
+		t.Fatalf("ApplyCodex: %v", err)
+	}
+	raw, _ := os.ReadFile(path)
+	text := string(raw)
+
+	if strings.Contains(text, "[model_providers.") {
+		t.Fatalf("块里不能出现表头，否则会吞掉用户的顶层键：\n%s", text)
+	}
+
+	// 关键断言：approvals_reviewer 仍解析在顶层，没被归进 provider 表。
+	root, err := parseTOML(t, raw)
+	if err != nil {
+		t.Fatalf("写出来的配置不是合法 TOML：%v\n%s", err, text)
+	}
+	if got := root["approvals_reviewer"]; got != "user" {
+		t.Fatalf("approvals_reviewer 应当留在顶层，实际 %v", got)
+	}
+	providers, _ := root["model_providers"].(map[string]any)
+	lpg, _ := providers["lpg"].(map[string]any)
+	if _, leaked := lpg["approvals_reviewer"]; leaked {
+		t.Fatalf("approvals_reviewer 被吞进了 provider 表：%v", lpg)
+	}
+	if lpg["base_url"] != "https://gw.example.com/openai/v1" {
+		t.Fatalf("provider 内联表没写对：%v", lpg)
+	}
+}
+
+// provider id 含点号时必须加引号，否则 model_providers.a.b 会变成三级嵌套，
+// Codex 读不到 provider 定义。
+func TestApplyCodexQuotesDottedProviderID(t *testing.T) {
+	home := withHome(t)
+	e := codexEndpoint()
+	e.ProviderID = "lpg.dev"
+	if _, err := ApplyCodex(e); err != nil {
+		t.Fatalf("ApplyCodex: %v", err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
+	root, err := parseTOML(t, raw)
+	if err != nil {
+		t.Fatalf("不是合法 TOML：%v\n%s", err, raw)
+	}
+	providers, _ := root["model_providers"].(map[string]any)
+	if _, ok := providers["lpg.dev"].(map[string]any); !ok {
+		t.Fatalf("点号 id 应被引号包住成单个键：%v", providers)
 	}
 }
 
@@ -414,4 +486,17 @@ func TestApplyCodexWritesRequiresOpenAIAuthTrueWhenKeepingOfficialLogin(t *testi
 	if !strings.Contains(string(config), "requires_openai_auth = true") {
 		t.Fatalf("保留官方登录时应当写 true：\n%s", config)
 	}
+}
+
+// parseTOML 用真正的 TOML 解析器验形。
+//
+// 断言"配置能不能被 Codex 读懂"必须走解析器，不能用字符串包含：这次那个 bug
+// 恰恰是文件在字符层面看着完全正常、解析结果却层级错位。
+func parseTOML(t *testing.T, raw []byte) (map[string]any, error) {
+	t.Helper()
+	var root map[string]any
+	if err := toml.Unmarshal(raw, &root); err != nil {
+		return nil, err
+	}
+	return root, nil
 }
