@@ -1127,39 +1127,6 @@ html[data-theme="dark"] .badge.slate { color: #cbd5e1; }
 .provider-card-grid .provider-card { margin-bottom: 0; }
 @media (max-width: 560px) { .provider-card-grid { grid-template-columns: 1fr; } }
 
-/* Provider 页也吃满可视高度（与日志页同一套口径）：面板底边与侧栏底边齐平，
-   头部与筛选固定，卡片区在面板内滚动；否则 Provider 少时面板下方留着一条空带。 */
-@media (min-width: 901px) {
-  .section-full.providers-page,
-  .section-full.providers-page > .card.panel {
-    display: flex;
-    flex-direction: column;
-    min-width: 0;
-  }
-  .section-full.providers-page { height: calc(100dvh - 32px); }
-  .section-full.providers-page > .card.panel { flex: 1 1 auto; min-height: 0; }
-  .section-full.providers-page > .card.panel > .panel-header,
-  .section-full.providers-page > .card.panel > .provider-group-toolbar,
-  .section-full.providers-page > .card.panel > .providers-filter-toolbar,
-  .section-full.providers-page > .card.panel > .providers-toolbar,
-  .section-full.providers-page > .card.panel > .hint-text { flex: 0 0 auto; }
-  .section-full.providers-page .provider-card-grid,
-  .section-full.providers-page .provider-list {
-    flex: 1 1 auto;
-    min-height: 0;
-    overflow-y: auto;
-  }
-  /* 行高必须显式 max-content：容器被钉成确定高度后，auto 行会按 min-content 压缩
-     （40 张卡时每行只剩 30px，卡片内容被 overflow:hidden 裁掉）；align-content:start
-     则防止卡片少时默认的 stretch 把仅有的几行拉满整块区域。 */
-  .section-full.providers-page .provider-card-grid {
-    align-content: start;
-    grid-auto-rows: max-content;
-  }
-  /* 紧凑列表整块滚动，表头随内容走掉就认不出列，钉在容器顶部。 */
-  .section-full.providers-page .provider-list-head { position: sticky; top: 0; z-index: 1; }
-}
-
 .route-list, .model-list, .log-list { display: grid; gap: 10px; }
 .route-card, .provider-card, .model-card {
   padding: 14px 16px;
@@ -1247,6 +1214,14 @@ html[data-theme="dark"] .badge.slate { color: #cbd5e1; }
 .provider-card.provider-disabled .provider-subtitle,
 .provider-card.provider-disabled .provider-card-meta { opacity: 0.9; }
 .provider-card.provider-disabled:hover { border-color: var(--border-strong); }
+/* Provider 卡上的今日 Token：只显示格式化后的数字本身，完整值放 title。 */
+.provider-token-usage {
+  margin-left: auto; flex: 0 0 auto;
+  color: var(--muted); font-family: var(--mono); font-size: 11px;
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.provider-token-usage b { color: var(--text); font-weight: 700; }
+.provider-list-metrics .provider-token-usage { color: var(--muted); }
 .provider-actions { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
 .provider-actions .btn { height: 30px; padding: 0 10px; font-size: var(--fs-base); }
 .protocol-pair { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
@@ -13138,7 +13113,20 @@ html[data-theme="dark"] .wb-task-badge[data-tone="ok"] { color: #6ee7b7; border-
   font-size: var(--fs-base);
 }
 .peer-downstream-row {
-  grid-template-columns: minmax(150px, 1.3fr) minmax(130px, 1fr) minmax(150px, 1.2fr) minmax(120px, 0.9fr) auto;
+  grid-template-columns:
+    minmax(145px, 1.2fr) minmax(120px, 0.9fr) minmax(160px, 1.05fr)
+    minmax(145px, 1.1fr) minmax(110px, 0.8fr) auto;
+}
+.peer-owner-cell { display: grid; gap: 4px; min-width: 0; }
+.peer-owner-select {
+  width: 100%; min-width: 0; height: 28px;
+  border: 1px solid var(--border); border-radius: var(--r-sm);
+  background: var(--surface); color: var(--text); font: inherit; font-size: 11.5px;
+  padding: 0 7px;
+}
+.peer-grant-audit {
+  color: var(--subtle); font-size: 10.5px; line-height: 1.35;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .peer-upstream-row-head {
   font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.02em;
@@ -13194,6 +13182,7 @@ html[data-theme="dark"] .wb-task-badge[data-tone="ok"] { color: #6ee7b7; border-
     row-gap: 6px;
   }
   .peer-upstream-main { grid-column: 1 / -1; }
+  .peer-downstream-row > :not(.peer-upstream-main):not(.peer-upstream-actions) { grid-column: 1 / -1; }
   .peer-upstream-actions { grid-column: 1 / -1; justify-content: flex-start; }
 }
 

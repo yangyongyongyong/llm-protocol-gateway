@@ -307,6 +307,28 @@ test('Provider 排序：首次绘制排一次，之后轮询不再重排，显�
   assert.equal(usagePoll.providerRankOrder({previous: ['a', 'b'], ready: true, force: true}), 'rank');
 });
 
+test('Provider 卡片今日 Token：只有原值 / 万 / 亿三档', () => {
+  assert.equal(lib.formatProviderTokenValue(0), '0');
+  assert.equal(lib.formatProviderTokenValue(3001), '3001');
+  assert.equal(lib.formatProviderTokenValue(9999), '9999');
+  assert.equal(lib.formatProviderTokenValue(10000), '1万');
+  assert.equal(lib.formatProviderTokenValue(12345), '1.23万');
+  assert.equal(lib.formatProviderTokenValue(12000), '1.2万');
+  assert.equal(lib.formatProviderTokenValue(1_000_000), '100万');
+  assert.equal(lib.formatProviderTokenValue(100_000_000), '1亿');
+  assert.equal(lib.formatProviderTokenValue(121_000_000), '1.21亿');
+  assert.equal(lib.formatProviderTokenValue(99_999_999), '1亿');
+});
+
+test('Provider 排序：上游总量未知时回退到本机用量，不把未知当成 0', () => {
+  // 实测场景：peer WorkBuddy 本机用了 7863 万，但父网关还没下发 todayTokens。
+  assert.equal(usagePoll.providerRankTokenTotal(78_633_091, undefined), 78_633_091);
+  // 父端全量已下发时优先它；若父端快照暂时落后于本机观测，取较大值避免回落。
+  assert.equal(usagePoll.providerRankTokenTotal(78_633_091, 1_200_000_000), 1_200_000_000);
+  assert.equal(usagePoll.providerRankTokenTotal(78_633_091, 70_000_000), 78_633_091);
+  assert.equal(usagePoll.providerRankTokenTotal(0, 0), 0);
+});
+
 test('Provider 排序：按计数降序、同数按名字', () => {
   const counts = {a: 3, b: 10, c: 3};
   const names = {a: '乙', b: '甲', c: '丙'};

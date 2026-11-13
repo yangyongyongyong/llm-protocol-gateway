@@ -390,6 +390,8 @@ func (s *Store) migrate() error {
 		// 所有行不需要回填。
 		{"kind", "TEXT NOT NULL DEFAULT ''"},
 		{"gateway_id", "TEXT NOT NULL DEFAULT ''"},
+		// owner_user_id 只用于 peer 行：下游网关归属的真实用户。空表示未归属。
+		{"owner_user_id", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		if err := addColumnIfMissing(tx, "users", column.name, column.definition); err != nil {
 			return fmt.Errorf("migrate users: %w", err)
@@ -402,6 +404,22 @@ func (s *Store) migrate() error {
 	// Role assignment of shared resources: which providers a "granted"-scope
 	// user may bind keys to. Kept separate from the role so changing a role
 	// does not silently widen or narrow an individual's grants.
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS peer_grant_audits (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		peer_user_id TEXT NOT NULL,
+		actor_user_id TEXT NOT NULL DEFAULT '',
+		actor_username TEXT NOT NULL DEFAULT '',
+		actor_display_name TEXT NOT NULL DEFAULT '',
+		grant_mode TEXT NOT NULL DEFAULT '',
+		before_provider_ids TEXT NOT NULL DEFAULT '[]',
+		after_provider_ids TEXT NOT NULL DEFAULT '[]',
+		created_at TEXT NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("migrate peer_grant_audits: %w", err)
+	}
+	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_peer_grant_audits_peer_created ON peer_grant_audits(peer_user_id, created_at DESC, id DESC)`); err != nil {
+		return fmt.Errorf("migrate peer_grant_audits index: %w", err)
+	}
 	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS user_resource_grants (
 		user_id TEXT NOT NULL,
 		resource_id TEXT NOT NULL,

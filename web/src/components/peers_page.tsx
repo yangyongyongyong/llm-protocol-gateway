@@ -5,7 +5,7 @@ import {confirmDialog} from '../dialogs';
 import {IconSelect, IconSelectOption} from './selects';
 import type {GrantTarget} from './rbac_types';
 import {ProviderGrantPicker} from './provider_grant_picker';
-import type {PeerGateway, PeerUpstream, PeerUpstreamsResponse, PeersResponse, Protocol} from '../types';
+import type {PeerGateway, PeerOwnerOption, PeerUpstream, PeerUpstreamsResponse, PeersResponse, Protocol} from '../types';
 
 async function errorTextFrom(response: Response): Promise<string> {
   try {
@@ -122,6 +122,7 @@ export function PeersPage({
   const [upstreamsError, setUpstreamsError] = useState('');
 
   const [peers, setPeers] = useState<PeerGateway[]>([]);
+  const [peerOwners, setPeerOwners] = useState<PeerOwnerOption[]>([]);
   const [localGatewayId, setLocalGatewayId] = useState('');
   const [maxHops, setMaxHops] = useState(0);
   const [maxHopsDraft, setMaxHopsDraft] = useState('');
@@ -177,10 +178,21 @@ export function PeersPage({
     }
   }, [canView]);
 
+  const loadPeerOwners = useCallback(async () => {
+    if (!canView) return;
+    try {
+      const payload = await jsonRequest<{ owners?: PeerOwnerOption[] }>(`${API_BASE}/__peers/owners`);
+      setPeerOwners(payload.owners || []);
+    } catch {
+      setPeerOwners([]);
+    }
+  }, [canView]);
+
   useEffect(() => {
     void loadUpstreams();
     void loadPeers();
-  }, [loadUpstreams, loadPeers]);
+    void loadPeerOwners();
+  }, [loadUpstreams, loadPeers, loadPeerOwners]);
 
   // 删掉上游（普通 provider 删除）之后视觉上应当立刻消失，所以两个列表一起刷。
   const refreshAll = useCallback(async () => {
@@ -262,6 +274,23 @@ export function PeersPage({
       setTestResults((current) => ({...current, [id]: {ok: false, text: `测试连接失败：${(error as Error).message}`}}));
       setUpstreamsError('');
       await loadUpstreams();
+    } finally {
+      setBusyId('');
+    }
+  };
+
+  const savePeerOwner = async (peer: PeerGateway, ownerUserId: string) => {
+    setBusyId(peer.userId);
+    try {
+      await jsonRequest(`${API_BASE}/__peers/${encodeURIComponent(peer.userId)}/owner`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ownerUserId }),
+      });
+      await loadPeers();
+      onChanged?.();
+    } catch (error) {
+      setPeersError((error as Error).message);
     } finally {
       setBusyId('');
     }
@@ -355,7 +384,9 @@ export function PeersPage({
           <div>
             <h2 className="panel-title">网关互联</h2>
             <p className="panel-desc">
-              把本机接到另一个网关，或管理注册到本机的下游网关。透传的请求由上游用自己的凭据转发、记在它的账上，本机不接触上游凭据。
+              把本机接到另一个网关，或者管理注册到本机的下游网关。透传的请求由上游用它自己的凭据转发、记在它的账上；
+              本机从不接触上游的凭据。上游授权给你的每个 Provider 都会作为普通 Provider 平铺在「输入 Provider」页，
+              可以单独绑进 API 密钥（含备选）——地址与凭据仍由本页维护，改授权只在上游那边改。
             </p>
           </div>
           <div className="panel-header-actions">
@@ -512,6 +543,7 @@ export function PeersPage({
               <div className="peer-upstream-row peer-upstream-row-head peer-downstream-row">
                 <span>下游</span>
                 <span>网关身份</span>
+                <span>所属用户 / 最近授权</span>
                 <span>授权 Provider</span>
                 <span>最近送进来的请求</span>
                 <span />
@@ -527,6 +559,34 @@ export function PeersPage({
                     <div className="peer-upstream-url" title={peer.username}>{peer.username}</div>
                   </div>
                   <div><code className="peer-gateway-code">{peer.gatewayId || '—'}</code></div>
+                  <div className="peer-owner-cell">
+                    {canManage ? (
+                      <select
+                        className="peer-owner-select"
+                        value={peer.ownerUserId || ''}
+                        disabled={busy(peer.userId)}
+                        aria-label={`设置 ${peer.name || peer.username} 的所属用户`}
+                        onChange={(event) => void savePeerOwner(peer, event.target.value)}
+                      >
+                        <option value="">未归属（不计入个人）</option>
+                        {peer.ownerUserId && !peerOwners.some((owner) => owner.userId === peer.ownerUserId) ? (
+                          <option value={peer.ownerUserId}>{peer.ownerName || peer.ownerUserId}</option>
+                        ) : null}
+                        {peerOwners.map((owner) => (
+                          <option key={owner.userId} value={owner.userId}>
+                            {owner.displayName?.trim() || owner.username}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <span>{peer.ownerName || '未归属'}</span>
+                    )}
+                    <div className="peer-grant-audit" title={peer.lastGrantedByUserId ? `授权人 ID：${peer.lastGrantedByUserId}` : undefined}>
+                      {peer.lastGrantedAt
+                        ? `最近授权 ${peer.lastGrantedByName || peer.lastGrantedByUserId || '未知'} · ${formatTime(peer.lastGrantedAt)}`
+                        : '尚无人工授权记录'}
+                    </div>
+                  </div>
                   <div className="peer-upstream-models">
                     {peer.grantMode === 'all' ? (
                       <div className="peer-grant-all-summary">

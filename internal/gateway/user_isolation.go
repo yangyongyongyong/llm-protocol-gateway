@@ -300,6 +300,41 @@ func (s *Server) ownedKeyIDs(userID string) []string {
 	return ids
 }
 
+// ownedKeyIDsForUsage returns the traffic sources that belong to one human for
+// the Provider card's "mine" number:
+//   - ordinary API keys explicitly owned by that user;
+//   - peer-gateway keys whose peer account has owner_user_id set to that user.
+//
+// Ownerless downstream gateways are deliberately ignored: there is no reliable
+// person to attribute them to, so they remain only in the all-users total.
+func (s *Server) ownedKeyIDsForUsage(userID string) []string {
+	userID = strings.TrimSpace(userID)
+	if userID == "" || userID == legacyAdminUserID {
+		userID = s.adminOwnerID()
+	}
+	if userID == "" {
+		return nil
+	}
+	peerOwned := map[string]bool{}
+	if s.userStore != nil {
+		if users, err := s.userStore.ListUsers(); err == nil {
+			for _, user := range users {
+				if user.IsPeer() && strings.TrimSpace(user.OwnerUserID) == userID {
+					peerOwned[user.ID] = true
+				}
+			}
+		}
+	}
+	ids := make([]string, 0)
+	for _, key := range s.router.State().APIKeys {
+		owner := strings.TrimSpace(key.OwnerUserID)
+		if owner == userID || peerOwned[owner] {
+			ids = append(ids, key.ID)
+		}
+	}
+	return ids
+}
+
 // logOwnerFilterAdmin is the sentinel value the admin-only request-log "所属用户"
 // filter uses to mean "keys with no owner (legacy admin-owned keys)", matching
 // the frontend's LOG_OWNER_FILTER_ADMIN constant. It is distinct from the empty

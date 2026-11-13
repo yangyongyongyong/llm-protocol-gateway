@@ -90,7 +90,9 @@ func (s *Store) ApplyUsageDeltas(deltas []monitor.UsagePersistDelta) error {
 }
 
 // BackfillUsageKeyDimensions preserves permanent totals and byte counters while
-// replacing only dimensions recoverable from retained request logs.
+// replacing only dimensions recoverable from retained request logs. Downstream
+// gateway dimensions joined that set in schema v4, so a one-time replay also
+// rebuilds them without touching the authoritative day totals.
 func (s *Store) BackfillUsageKeyDimensions(since time.Time, deltas []monitor.UsagePersistDelta) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -129,7 +131,7 @@ func (s *Store) BackfillUsageKeyDimensions(since time.Time, deltas []monitor.Usa
 		if day < sinceDay {
 			continue
 		}
-		if _, err := tx.Exec(`DELETE FROM usage_daily_buckets WHERE day = ? AND bucket_type IN ('key_provider', 'key_model', 'key_protocol')`, day); err != nil {
+		if _, err := tx.Exec(`DELETE FROM usage_daily_buckets WHERE day = ? AND bucket_type IN ('key_provider', 'key_model', 'key_protocol', 'key_downstream_gateway', 'downstream_gateway')`, day); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(`UPDATE usage_daily_buckets SET status_2xx=0, status_4xx=0, status_5xx=0, status_other=0, latency_sum=0, ttft_sum=0, ttft_count=0 WHERE day = ? AND bucket_type='api_key'`, day); err != nil {
@@ -147,6 +149,9 @@ func (s *Store) BackfillUsageKeyDimensions(since time.Time, deltas []monitor.Usa
 			continue
 		}
 		if err := upsertUsageKeyDimensionsTx(tx, delta); err != nil {
+			return err
+		}
+		if err := upsertUsageDownstreamTx(tx, delta); err != nil {
 			return err
 		}
 		var s2, s4, s5, other, ttftCount int64
@@ -193,11 +198,26 @@ func applyUsageDeltaTx(tx *sql.Tx, delta monitor.UsagePersistDelta) error {
 			return err
 		}
 	}
+	if err := upsertUsageDownstreamTx(tx, delta); err != nil {
+		return err
+	}
 	return upsertUsageKeyDimensionsTx(tx, delta)
 }
 
+// upsertUsageDownstreamTx 写全量下游网关桶，供管理员查看所有下游；Key
+// 维度桶由 upsertUsageKeyDimensionsTx 一并写入，供普通用户按名下 Key 隔离。
+// 只有 ingress 事件带 PeerGatewayID，因此本机转发到父网关的 egress 流量
+// 永远不会混进“下游用量”。
+func upsertUsageDownstreamTx(tx *sql.Tx, delta monitor.UsagePersistDelta) error {
+	gatewayID := delta.PeerGatewayID
+	if gatewayID == "" {
+		return nil
+	}
+	return upsertUsageBucket(tx, delta.Day, "downstream_gateway", gatewayID, "", delta, false)
+}
+
 func upsertUsageKeyDimensionsTx(tx *sql.Tx, delta monitor.UsagePersistDelta) error {
-	for _, dimension := range []struct{ kind, id string }{{"key_provider", delta.ProviderID}, {"key_model", delta.Model}, {"key_protocol", delta.OutputProtocol}} {
+	for _, dimension := range []struct{ kind, id string }{{"key_provider", delta.ProviderID}, {"key_model", delta.Model}, {"key_protocol", delta.OutputProtocol}, {"key_downstream_gateway", delta.PeerGatewayID}} {
 		if dimension.id == "" {
 			continue
 		}
@@ -307,12 +327,13 @@ func (s *Store) LoadUsageSince(since time.Time) (map[string]monitor.UsageDayBuck
 		dayBuckets, ok := out[day]
 		if !ok {
 			dayBuckets = monitor.UsageDayBuckets{
-				ByKey:      make(map[string]monitor.UsageDayBuckets),
-				ByAPIKey:   make(map[string]monitor.APIKeyDayStats),
-				ByProvider: make(map[string]monitor.ProviderDayStats),
-				ByModel:    make(map[string]monitor.ModelDayStats),
-				ByUser:     make(map[string]monitor.UserDayStats),
-				ByProtocol: make(map[string]monitor.ProtocolDayStats),
+				ByKey:               make(map[string]monitor.UsageDayBuckets),
+				ByAPIKey:            make(map[string]monitor.APIKeyDayStats),
+				ByProvider:          make(map[string]monitor.ProviderDayStats),
+				ByModel:             make(map[string]monitor.ModelDayStats),
+				ByUser:              make(map[string]monitor.UserDayStats),
+				ByProtocol:          make(map[string]monitor.ProtocolDayStats),
+				ByDownstreamGateway: make(map[string]monitor.DownstreamGatewayDayStats),
 			}
 		}
 		stats := monitor.APIKeyDayStats{
@@ -350,7 +371,7 @@ func (s *Store) LoadUsageSince(since time.Time) (map[string]monitor.UsageDayBuck
 			child.TTFTSum = ttftSum
 			child.TTFTCount = ttftCount
 			dayBuckets.ByKey[bucketID] = child
-		case "key_provider", "key_model", "key_protocol":
+		case "key_provider", "key_model", "key_protocol", "key_downstream_gateway":
 			var identity []string
 			if err := json.Unmarshal([]byte(bucketID), &identity); err != nil || len(identity) != 2 {
 				return nil, nil, fmt.Errorf("invalid usage key dimension %q", bucketID)
@@ -382,8 +403,27 @@ func (s *Store) LoadUsageSince(since time.Time) (map[string]monitor.UsageDayBuck
 					Protocol: id, RequestCount: reqCount, InputTokens: inTok, OutputTokens: outTok,
 					CacheTokens: cacheTok, CacheWriteTokens: cacheWriteTok, CostMicros: costMicros, PricedCount: pricedCount,
 				}
+			case "key_downstream_gateway":
+				if child.ByDownstreamGateway == nil {
+					child.ByDownstreamGateway = make(map[string]monitor.DownstreamGatewayDayStats)
+				}
+				child.ByDownstreamGateway[id] = monitor.DownstreamGatewayDayStats{
+					GatewayID: id, RequestCount: reqCount, InputTokens: inTok, OutputTokens: outTok,
+					CacheTokens: cacheTok, CacheWriteTokens: cacheWriteTok, CostMicros: costMicros, PricedCount: pricedCount,
+				}
 			}
 			dayBuckets.ByKey[identity[0]] = child
+		case "downstream_gateway":
+			dayBuckets.ByDownstreamGateway[bucketID] = monitor.DownstreamGatewayDayStats{
+				GatewayID:        bucketID,
+				RequestCount:     reqCount,
+				InputTokens:      inTok,
+				OutputTokens:     outTok,
+				CacheTokens:      cacheTok,
+				CacheWriteTokens: cacheWriteTok,
+				CostMicros:       costMicros,
+				PricedCount:      pricedCount,
+			}
 		case "provider":
 			dayBuckets.ByProvider[bucketID] = monitor.ProviderDayStats{
 				ProviderID:       bucketID,

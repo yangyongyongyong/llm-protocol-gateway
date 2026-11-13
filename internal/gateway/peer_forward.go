@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/luca/llm-protocol-gateway/internal/domain"
 )
@@ -94,13 +95,20 @@ func (s *Server) handlePeerProviders(w http.ResponseWriter, r *http.Request) {
 	p := s.principalForUserID(account.User.ID)
 	allowed := s.allowedProviderIDsForPrincipal(p)
 	state := s.router.State()
+	// 下游卡片上的“总量”必须是父网关的全量今日用量，而不是子网关自己的转发量。
+	// 只读一次内存日聚合，再按 Provider 建表，避免为每张卡重复扫统计。
+	todayTokens := make(map[string]int64, len(state.Providers))
+	for _, stats := range s.logs.TodayStats(time.Now()).ByProvider {
+		todayTokens[stats.ProviderID] = stats.InputTokens + stats.OutputTokens
+	}
 	out := make([]peerProviderView, 0, len(allowed))
 	for _, provider := range state.Providers {
 		if provider.Disabled || provider.Deleted || !allowed[provider.ID] {
 			continue
 		}
 		view := peerProviderView{ID: provider.ID, Name: provider.Name, Protocol: string(provider.Protocol), Models: []string{}}
-		view.Card = s.peerProviderCardFor(provider)
+		total := todayTokens[provider.ID]
+		view.Card = s.peerProviderCardFor(provider, &total)
 		if len(provider.ProtocolSupport) > 0 {
 			view.ProtocolSupport = append([]string(nil), provider.ProtocolSupport...)
 		}

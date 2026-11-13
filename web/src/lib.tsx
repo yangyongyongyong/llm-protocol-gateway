@@ -2176,7 +2176,7 @@ export const PROVIDER_CONNECT_FILTERS: Array<{ id: '' | ProviderConnectKind; lab
   { id: '', label: '全部连接方式' },
   { id: 'api_key', label: 'API Key' },
   { id: 'self_register', label: '内网穿透自助注册' },
-  { id: 'peer', label: '上游网关（父子透传）' },
+  { id: 'peer', label: '上游网关' },
   { id: 'claude_oauth', label: 'Claude OAuth' },
   { id: 'cursor_oauth', label: 'Cursor OAuth' },
   { id: 'chatgpt_oauth', label: 'ChatGPT OAuth' },
@@ -4045,6 +4045,28 @@ export function modelSelectOptionLabel(model: Model) {
   const tierText = tier ? `${tier.label} ${tier.multiplier}` : '';
   const head = tierText ? `${label}（${tierText}）` : label;
   return suffix ? `${head} · ${suffix}` : head;
+}
+
+/**
+ * Provider 卡片上的今日 Token 总量：只保留「原值 / 万 / 亿」三档。
+ * 万、亿最多两位小数，并去掉无意义的尾零；<1 万直接显示整数，不加任何单位文本。
+ */
+export function formatProviderTokenValue(value: number) {
+  const total = Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;
+  const scaled = (amount: number, unit: string) => {
+    const text = amount.toFixed(2)
+      .replace(/\.00$/, '')
+      .replace(/(\.\d)0$/, '$1');
+    return `${text}${unit}`;
+  };
+  if (total >= 100_000_000) return scaled(total / 100_000_000, '亿');
+  if (total >= 10_000) {
+    const wan = total / 10_000;
+    // 9999.999 万四舍五入后会变成 10000 万，直接进位到 1 亿更自然。
+    if (Number(wan.toFixed(2)) >= 10_000) return scaled(total / 100_000_000, '亿');
+    return scaled(wan, '万');
+  }
+  return String(total);
 }
 
 export function formatCompactCount(value: number) {

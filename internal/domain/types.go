@@ -477,6 +477,10 @@ type PeerProviderCard struct {
 	AccountLabel string             `json:"accountLabel,omitempty"`
 	Connected    bool               `json:"connected,omitempty"`
 	Usage        *PeerProviderUsage `json:"usage,omitempty"`
+	// TodayTokens 是父网关今天在这个 Provider 上的全量 Token（输入 + 输出），
+	// 包含父端所有用户与下游流量。指针用于区分“上游没下发/旧版未知”(nil) 和
+	// “上游明确统计为 0”；子网关绝不拿本机转发量冒充这个总量。
+	TodayTokens *int64 `json:"todayTokens,omitempty"`
 }
 
 // PeerProviderUsage 是上游额度面板的只读投影。子网关只展示，不负责刷新；
@@ -505,6 +509,10 @@ func (c PeerProviderCard) Clone() PeerProviderCard {
 		usage := *c.Usage
 		usage.Buckets = append([]PeerProviderUsageBucket(nil), c.Usage.Buckets...)
 		out.Usage = &usage
+	}
+	if c.TodayTokens != nil {
+		tokens := *c.TodayTokens
+		out.TodayTokens = &tokens
 	}
 	return out
 }
@@ -1076,6 +1084,25 @@ type User struct {
 	// 为空。它比用户名可靠：用户名可以改，网关身份不会，所以环路检测和用量
 	// 对账都以它为准。
 	GatewayID string `json:"gatewayId,omitempty"`
+	// OwnerUserID 只对 kind=peer 有意义：这个下游网关归属哪个真实用户。
+	// 空 = 尚未人工归属；这类流量仍进入 Provider 总量，但不进入任何人的个人
+	// Token 统计。它和「最近授权人」分开，后续管理员调授权不会转移归属。
+	OwnerUserID string `json:"ownerUserId,omitempty"`
+}
+
+// PeerGrantAudit records one manual downstream-grant change. Actor identity is
+// snapshotted so the history remains readable even after the account is renamed
+// or deleted.
+type PeerGrantAudit struct {
+	ID                int64    `json:"id"`
+	PeerUserID        string   `json:"peerUserId"`
+	ActorUserID       string   `json:"actorUserId"`
+	ActorUsername     string   `json:"actorUsername,omitempty"`
+	ActorDisplayName  string   `json:"actorDisplayName,omitempty"`
+	GrantMode         string   `json:"grantMode,omitempty"`
+	BeforeProviderIDs []string `json:"beforeProviderIds"`
+	AfterProviderIDs  []string `json:"afterProviderIds"`
+	CreatedAt         string   `json:"createdAt"`
 }
 
 // UserKind 区分 users 表里两类完全不同东西。

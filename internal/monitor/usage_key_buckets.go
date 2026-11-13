@@ -1,6 +1,9 @@
 package monitor
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // Key dimensions survive request-log retention and can be safely combined only
 // after selecting the keys visible to the authenticated user.
@@ -80,6 +83,23 @@ func recordKeyUsage(day *usageDayStats, keyID string, event UsageEvent, input, c
 			p.PricedCount++
 		}
 	}
+	// 下游网关流量也要挂到 Key 维度下，普通用户按自己名下 Key 统计时才能
+	// 看到“我的哪个下游网关用了多少”，同时不会串到别人的 Key。
+	if gatewayID := strings.TrimSpace(event.PeerGatewayID); gatewayID != "" && strings.EqualFold(strings.TrimSpace(event.PeerDirection), "ingress") {
+		if child.byDownstream[gatewayID] == nil {
+			child.byDownstream[gatewayID] = &DownstreamGatewayDayStats{GatewayID: gatewayID}
+		}
+		d := child.byDownstream[gatewayID]
+		d.RequestCount++
+		d.InputTokens += input
+		d.OutputTokens += event.OutputTokens
+		d.CacheTokens += cache
+		d.CacheWriteTokens += event.CacheWriteTokens
+		d.CostMicros += event.CostMicros
+		if event.Priced {
+			d.PricedCount++
+		}
+	}
 }
 
 func usageDayFromBuckets(b UsageDayBuckets) *usageDayStats {
@@ -103,6 +123,10 @@ func usageDayFromBuckets(b UsageDayBuckets) *usageDayStats {
 	for id, v := range b.ByProtocol {
 		copied := v
 		day.byProtocol[id] = &copied
+	}
+	for id, v := range b.ByDownstreamGateway {
+		copied := v
+		day.byDownstream[id] = &copied
 	}
 	return day
 }
@@ -162,10 +186,45 @@ func keyDimensionDays(days map[string]*usageDayStats, keys map[string]struct{}) 
 				p.CostMicros += v.CostMicros
 				p.PricedCount += v.PricedCount
 			}
+			for id, v := range child.byDownstream {
+				if merged.byDownstream[id] == nil {
+					merged.byDownstream[id] = &DownstreamGatewayDayStats{GatewayID: id}
+				}
+				d := merged.byDownstream[id]
+				d.RequestCount += v.RequestCount
+				d.InputTokens += v.InputTokens
+				d.OutputTokens += v.OutputTokens
+				d.CacheTokens += v.CacheTokens
+				d.CacheWriteTokens += v.CacheWriteTokens
+				d.CostMicros += v.CostMicros
+				d.PricedCount += v.PricedCount
+			}
 		}
 		selected[date] = merged
 	}
 	return selected
+}
+
+// TodayProviderStatsForKeys returns one provider breakdown for the selected
+// keys. It reads the already-persisted key×provider dimensions, so callers do
+// not need to scan request logs or maintain a second aggregate.
+func (s *Store) TodayProviderStatsForKeys(now time.Time, keyIDs []string) []ProviderDayStats {
+	localNow := now.Local()
+	dayStart := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, localNow.Location())
+	keySet := make(map[string]struct{}, len(keyIDs))
+	for _, id := range keyIDs {
+		if trimmed := strings.TrimSpace(id); trimmed != "" {
+			keySet[trimmed] = struct{}{}
+		}
+	}
+	if len(keySet) == 0 {
+		return nil
+	}
+	s.mu.RLock()
+	selectedDays := keyDimensionDays(s.usageByDay, keySet)
+	_, _, providers, _, _ := mergeUsageDays(selectedDays, dayStart, dayStart.AddDate(0, 0, 1))
+	s.mu.RUnlock()
+	return sortProviderStats(providers)
 }
 
 func keyPeriodDimensions(days map[string]*usageDayStats, from, to time.Time, period *PeriodStatsSnapshot) {
@@ -173,4 +232,5 @@ func keyPeriodDimensions(days map[string]*usageDayStats, from, to time.Time, per
 	period.ByProvider = sortProviderStats(providers)
 	period.ByModel = sortModelDayStats(models)
 	period.ByProtocol = sortProtocolStats(mergeProtocolDays(days, from, to))
+	period.ByDownstreamGateway = sortDownstreamGatewayStats(mergeDownstreamGatewayDays(days, from, to))
 }

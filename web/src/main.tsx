@@ -21,7 +21,7 @@ import {MachineStatusPage} from './components/machine_status';
 import {runCloudflareAuthPoll} from './pollers';
 import {PwaInstallButton, PwaInstallPrompt} from './components/pwa_install';
 import {registerPwaServiceWorker, startPwaInstallCapture} from './pwa_install_store';
-import {providerRankOrder, rankProviderIDs} from './usage_poll';
+import {providerRankOrder, providerRankTokenTotal, rankProviderIDs} from './usage_poll';
 import {type MergedModel, mergeModelsAcrossAccounts} from './model_merge';
 import {
     activePublicBaseURL,
@@ -257,6 +257,37 @@ function trafficRankScopeOf(auth: AdminAuthStatus | null): string {
   return uiCacheScope(auth);
 }
 
+// API Key 页选中的密钥是纯 UI 偏好，不放进 Cookie：它不需要发给服务端，也不该让
+// 每个模型请求都多带一段无关数据。这里按用户隔离存在 localStorage，且不设 TTL，
+// 刷新页面、切走再回来都恢复上次选择；不同登录账号不会互串。
+const API_KEY_SELECTION_STORAGE_PREFIX = 'llm-gateway-api-key-selection:v1:';
+
+/** 当前登录用户对应的 API Key 选中项存储键。 */
+function apiKeySelectionStorageKey(auth: AdminAuthStatus | null | undefined): string {
+  return `${API_KEY_SELECTION_STORAGE_PREFIX}${uiCacheScope(auth)}`;
+}
+
+/** 读取上次选中的 API Key ID；存储不可用或内容非法时返回空串。 */
+function readStoredSelectedApiKeyID(auth: AdminAuthStatus | null | undefined): string {
+  try {
+    return (localStorage.getItem(apiKeySelectionStorageKey(auth)) || '').trim();
+  } catch {
+    return '';
+  }
+}
+
+/** 保存当前选中的 API Key ID；空 ID 表示清除选择。 */
+function writeStoredSelectedApiKeyID(auth: AdminAuthStatus | null | undefined, keyID: string): void {
+  try {
+    const storageKey = apiKeySelectionStorageKey(auth);
+    const trimmed = keyID.trim();
+    if (trimmed) localStorage.setItem(storageKey, trimmed);
+    else localStorage.removeItem(storageKey);
+  } catch {
+    // 隐私模式 / quota 写不进去时只影响记忆，不影响当前页面交互。
+  }
+}
+
 // 旧版「普通用户」：没有权限列表的会话按旧白名单兜底（navVisibleFor 内部处理）。
 function isLegacyUserAuth(auth: AdminAuthStatus | null | undefined): boolean {
   return auth?.role === 'user';
@@ -364,8 +395,8 @@ function App() {
   const [serverTimeZone, setServerTimeZone] = useState(() => (bootSession.state?.serverTimeZone || ''));
   const [state, setState] = useState<GatewayState>(() => bootSession.state || fallbackState);
   // 输入 Provider 列表的顺序：只在进入这一页的首次绘制、或点了「获取模型」时按
-  // 近 3 日请求量重排。日志轮询照常更新计数，但顺序冻结——请求量每分钟都可能
-  // 交叉，跟着轮询重排会让卡片在光标底下换位，点 ▸ 编辑 落到另一张卡上。
+  // 今日 Token 用量重排。用量轮询照常更新数字，但顺序冻结——Token 用量每分钟都
+  // 可能交叉，跟着轮询重排会让卡片在光标底下换位，点 ▸ 编辑 落到另一张卡上。
   const [providerRankSnapshot, setProviderRankSnapshot] = useState<{ scope: string; order: string[] | null }>(() => ({
     scope: trafficRankScopeOf(bootSession.auth),
     order: null,
@@ -641,7 +672,8 @@ function App() {
   const [routeModalOpen, setRouteModalOpen] = useState(false);
   const [editingRouteID, setEditingRouteID] = useState('');
   const [apiKeyModalOpen, setApiKeyModalOpen] = useState(false);
-  const [selectedApiKeyID, setSelectedApiKeyID] = useState('');
+  const [selectedApiKeyID, setSelectedApiKeyID] = useState(() => readStoredSelectedApiKeyID(bootSession.auth));
+  const apiKeySelectionScope = uiCacheScope(authStatus);
   const [checkedApiKeyIDs, setCheckedApiKeyIDs] = useState<string[]>([]);
   const apiKeyCheckAnchorRef = useRef<number | null>(null);
   const [apiKeyKeyword, setApiKeyKeyword] = useState('');
@@ -666,6 +698,36 @@ function App() {
   const copiedApiKeyTimer = useRef<number | null>(null);
   // 今日 / 本月用量：与用量页同源（/__request-stats），只取按密钥聚合的两块。
   const [apiKeyUsageSnapshot, setApiKeyUsageSnapshot] = useState<ApiKeyUsageSource | null>(null);
+
+  /** 切换并记住当前 API Key；创建后、列表点击、表格点击和抽屉打开都走这里。 */
+  function selectApiKey(keyID: string): void {
+    const trimmed = keyID.trim();
+    setSelectedApiKeyID(trimmed);
+    writeStoredSelectedApiKeyID(authStatus, trimmed);
+  }
+
+  /** 清除上次选择；删除当前密钥或批量删除命中它时调用。 */
+  function clearSelectedApiKey(): void {
+    setSelectedApiKeyID('');
+    writeStoredSelectedApiKeyID(authStatus, '');
+  }
+
+  // 登录身份变化时切换到该用户自己的上次选择。只在 scope 真变时执行，避免
+  // authStatus 对象刷新把用户当前正在看的密钥重置回旧值。
+  useEffect(() => {
+    setSelectedApiKeyID(readStoredSelectedApiKeyID(authStatus));
+  }, [apiKeySelectionScope]);
+
+  // 同源的其他标签页切换了密钥时同步过来；刷新或独立打开的新标签页也能恢复。
+  useEffect(() => {
+    const storageKey = apiKeySelectionStorageKey(authStatus);
+    const onStorage = (event: StorageEvent) => {
+      if (event.storageArea !== localStorage || event.key !== storageKey) return;
+      setSelectedApiKeyID((event.newValue || '').trim());
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, [apiKeySelectionScope]);
   const [providerDraft, setProviderDraft] = useState({
     name: '我的 OpenAI 对话 Provider',
     protocol: 'openai_chat' as Protocol,
@@ -778,28 +840,52 @@ function App() {
   // request counts actually change (avoids the cache→stats jump).
   const trafficRankScope = uiCacheScope(authStatus);
   const [cachedTrafficRanks, setCachedTrafficRanks] = useState<TrafficRankCache>(() => (
-    readUICache<TrafficRankCache>(uiCacheScope(bootSession.auth), 'traffic-ranks')
+    readUICache<TrafficRankCache>(uiCacheScope(bootSession.auth), 'traffic-ranks-v2')
     || { providers: {}, models: {} }
   ));
 
   const recentActivityCutoffMs = useMemo(() => Date.now() - 3 * 24 * 60 * 60 * 1000, [logs, requestStats]);
 
-  const liveProviderRequestCounts = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const log of logs) {
-      const ts = new Date(log.time).getTime();
-      if (!Number.isFinite(ts) || ts < recentActivityCutoffMs) continue;
-      const providerID = log.providerId || '';
-      if (!providerID) continue;
-      counts.set(providerID, (counts.get(providerID) || 0) + 1);
-    }
-    for (const item of requestStats?.range?.byProvider || requestStats?.month?.byProvider || []) {
+  // Provider 卡片默认按「今日 Token 用量」倒序。inputTokens 已包含缓存命中，
+  // 所以口径就是 inputTokens + outputTokens，不再额外加 cacheTokens。
+  const liveProviderTokenTotals = useMemo(() => {
+    const totals = new Map<string, number>();
+    for (const item of requestStats?.today?.byProvider || []) {
       if (!item.providerId) continue;
-      const current = counts.get(item.providerId) || 0;
-      if (item.requestCount > current) counts.set(item.providerId, item.requestCount);
+      const total = Math.max(0, item.inputTokens || 0) + Math.max(0, item.outputTokens || 0);
+      totals.set(item.providerId, total);
     }
-    return counts;
-  }, [logs, requestStats, recentActivityCutoffMs]);
+    return totals;
+  }, [requestStats]);
+
+  // 第二行小字：当前登录用户名下 Key（含其下游网关）的今日 Token。
+  const myProviderTokenTotals = useMemo(() => {
+    const source = requestStats?.today?.myByProvider;
+    if (!source) return liveProviderTokenTotals;
+    const totals = new Map<string, number>();
+    for (const item of source) {
+      if (!item.providerId) continue;
+      totals.set(item.providerId, Math.max(0, item.inputTokens || 0) + Math.max(0, item.outputTokens || 0));
+    }
+    return totals;
+  }, [requestStats, liveProviderTokenTotals]);
+
+  // Provider 排序值：本地 Provider 用本机全量；上游成员优先用父网关下发的
+  // 今日全量，父端尚未下发时回退到本机已观测的转发量。卡片展示仍严格区分
+  // “上游总量”和“我的用量”，这个回退只用于排序，不会把本地值伪装成上游总量。
+  const providerSortTokenTotals = useMemo(() => {
+    const totals = new Map(liveProviderTokenTotals);
+    for (const provider of state.providers) {
+      if (providerConnectKind(provider) !== 'peer') continue;
+      const total = providerRankTokenTotal(
+        liveProviderTokenTotals.get(provider.id) || 0,
+        provider.peerGrants?.card?.todayTokens,
+      );
+      if (total > 0) totals.set(provider.id, total);
+      else totals.delete(provider.id);
+    }
+    return totals;
+  }, [liveProviderTokenTotals, state.providers]);
 
   const liveModelRequestCounts = useMemo(() => {
     const counts = new Map<string, number>();
@@ -815,13 +901,28 @@ function App() {
     return counts;
   }, [logs, recentActivityCutoffMs]);
 
-  const liveTrafficReady = liveProviderRequestCounts.size > 0 || liveModelRequestCounts.size > 0
-    || Boolean(requestStats?.range?.byProvider?.length || requestStats?.month?.byProvider?.length);
+  // 近 3 日每个 Provider 的请求次数：卡片页脚显示它，让「哪台上游在忙」有据可查。
+  // 排序已改为按今日 Token（见 providerOrder），这个数只作展示，不参与排序。
+  const recentProviderRequestCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const log of logs) {
+      const ts = new Date(log.time).getTime();
+      if (!Number.isFinite(ts) || ts < recentActivityCutoffMs) continue;
+      const providerID = (log.providerId || '').trim();
+      if (!providerID) continue;
+      counts.set(providerID, (counts.get(providerID) || 0) + 1);
+    }
+    return counts;
+  }, [logs, recentActivityCutoffMs]);
+
+  const rankCacheReady = requestStats != null || liveModelRequestCounts.size > 0;
 
   useEffect(() => {
-    if (!liveTrafficReady) return;
+    if (!rankCacheReady) return;
     const next: TrafficRankCache = {
-      providers: trafficRanksFromMap(liveProviderRequestCounts),
+      // providers 这个字段现在保存的是「今日 Token 总量」，用于 Provider 卡片排序；
+      // models 仍保存模型请求次数，两套口径互不影响。
+      providers: trafficRanksFromMap(providerSortTokenTotals),
       models: trafficRanksFromMap(liveModelRequestCounts),
     };
     if (
@@ -831,25 +932,23 @@ function App() {
       return;
     }
     setCachedTrafficRanks(next);
-    writeUICache(trafficRankScope, 'traffic-ranks', next);
-  }, [liveTrafficReady, liveProviderRequestCounts, liveModelRequestCounts, trafficRankScope, cachedTrafficRanks]);
+    writeUICache(trafficRankScope, 'traffic-ranks-v2', next);
+  }, [rankCacheReady, providerSortTokenTotals, liveModelRequestCounts, trafficRankScope, cachedTrafficRanks]);
 
-  const recentProviderRequestCounts = useMemo(() => {
-    if (liveTrafficReady) return liveProviderRequestCounts;
+  const recentProviderTokenTotals = useMemo(() => {
+    if (requestStats != null) return providerSortTokenTotals;
     return mapFromTrafficRanks(cachedTrafficRanks.providers);
-  }, [liveTrafficReady, liveProviderRequestCounts, cachedTrafficRanks.providers]);
+  }, [requestStats, providerSortTokenTotals, cachedTrafficRanks.providers]);
 
   const recentModelRequestCounts = useMemo(() => {
-    if (liveTrafficReady) return liveModelRequestCounts;
+    if (rankCacheReady) return liveModelRequestCounts;
     return mapFromTrafficRanks(cachedTrafficRanks.models);
-  }, [liveTrafficReady, liveModelRequestCounts, cachedTrafficRanks.models]);
+  }, [rankCacheReady, liveModelRequestCounts, cachedTrafficRanks.models]);
 
   const providerRankScope = trafficRankScopeOf(authStatus);
-  const providerRankingReady = liveTrafficReady;
-  const cachedProviderRanks = useMemo(
-    () => mapFromTrafficRanks(cachedTrafficRanks.providers),
-    [cachedTrafficRanks.providers],
-  );
+  // 今日 Token 总量真正有数据后才冻结排序快照。若当天确实完全没有用量，
+  // 下面的兜底排序会按名称稳定展示，不会把一份“统计尚未就绪”的空表冻结下来。
+  const providerRankingReady = providerSortTokenTotals.size > 0;
 
   // 换账号（作用域变了）或停在这页之外：清掉这一把顺序，回到「等下重排」。
   useEffect(() => {
@@ -857,18 +956,18 @@ function App() {
     setProviderRankSnapshot({ scope: providerRankScope, order: null });
   }, [activeNav, providerRankScope, providerRankSnapshot.scope]);
 
-  // 用户主动点了「获取模型」：按当下最新计数重排这一页的 Provider。
+  // 用户主动点了「获取模型」：按当下最新今日 Token 用量重排这一页的 Provider。
   const [providerRankRefreshTick, setProviderRankRefreshTick] = useState(0);
 
-  // 快照：进入这一页的首次绘制（或刚点了「获取模型」）才按当时的计数排一次；
-  // 之后日志轮询只更新数字，顺序不动。
+  // 快照：进入这一页的首次绘制（或刚点了「获取模型」）才按当时的今日 Token 排一次；
+  // 之后用量轮询只更新数字，顺序不动。
   const rankedOrder = useMemo(() => {
     const decision = providerRankOrder({ previous: providerRankSnapshot.order, ready: providerRankingReady, force: false });
     if (decision !== 'rank') return null;
     const providers = state.providers;
-    return rankProviderIDs(providers.map((provider) => provider.id), (id) => recentProviderRequestCounts.get(id) || 0, (id) => providers.find((provider) => provider.id === id)?.name || id);
+    return rankProviderIDs(providers.map((provider) => provider.id), (id) => recentProviderTokenTotals.get(id) || 0, (id) => providers.find((provider) => provider.id === id)?.name || id);
     // providerRankRefreshTick 只是让显式刷新重新排一次的触发器。
-  }, [providerRankSnapshot.order, providerRankingReady, state.providers, recentProviderRequestCounts, providerRankRefreshTick]);
+  }, [providerRankSnapshot.order, providerRankingReady, state.providers, recentProviderTokenTotals, providerRankRefreshTick]);
   useEffect(() => {
     if (rankedOrder == null || providerRankSnapshot.order === rankedOrder) return;
     setProviderRankSnapshot((current) => (current.order === rankedOrder ? current : { ...current, order: rankedOrder }));
@@ -898,15 +997,16 @@ function App() {
       const added = state.providers.filter((provider) => !rankedIDs.has(provider.id)).sort(byName);
       ordered = [...ranked, ...added];
     } else {
-      // 还没排过（统计请求没回来）：沿用上个会话缓存的计数排，首次绘制后不再跳。
+      // 还没排过（统计没回来）：有今日统计就按今日 Token 排，首次统计回来前
+      // 退回上个会话缓存的排序值，首次绘制后不再跳。
       ordered = [...state.providers].sort((a, b) => {
-        const ca = cachedProviderRanks.get(a.id) || 0;
-        const cb = cachedProviderRanks.get(b.id) || 0;
+        const ca = recentProviderTokenTotals.get(a.id) || 0;
+        const cb = recentProviderTokenTotals.get(b.id) || 0;
         if (ca !== cb) return cb - ca;
         return byName(a, b);
       });
     }
-    // 用户显式选了别的口径就照用户的：请求量（默认，保持上面的顺序）、名字、状态。
+    // 用户显式选了别的口径就照用户的：用量（默认，保持上面的顺序）、名字、状态。
     if (providersSortMode === 'name') return [...ordered].sort(byName);
     if (providersSortMode === 'status') {
       return [...ordered].sort((a, b) => {
@@ -915,7 +1015,7 @@ function App() {
       });
     }
     return ordered;
-  }, [state.providers, providerOrder, cachedProviderRanks, providersSortMode]);
+  }, [state.providers, providerOrder, recentProviderTokenTotals, providersSortMode]);
 
   const providersSearch = useMemo(() => {
     const query = providersSearchQuery.trim();
@@ -1052,18 +1152,18 @@ function App() {
   }, [filteredProviders]);
 
   /**
-   * 一张 Provider 卡片。抽成函数是因为它现在要在两处渲染：本地 Provider 那片
-   * 平铺列表，和每条上游下面那一组（组里的成员行和本地卡片长得一样）。
+   * 一张 Provider 卡片。本地 Provider 与上游网关成员共用同一个平铺列表和同一套
+   * 滚动容器；上游成员靠卡片上的「上游网关」徽章和顶部连接方式筛选区分，不再
+   * 单独占一个固定下半屏区域。
    */
   const renderProviderCard = (provider: Provider) => {
     const usedCount = (state.apiKeys || []).filter((key) => (
       apiKeyReferencesProvider(key, state.routes, provider.id)
     )).length;
-    // 排序口径是「近 3 日请求量」，那这个数就得出现在卡上：否则顺序无从验证，
-    // 操作员只能每次从头扫一遍。0 也照常显示——"没有流量"同样是有用的信息。
+    // 页脚要显示近 3 日请求量：0 也照常显示——"没有流量"同样是有用的信息。
     const requestCount = recentProviderRequestCounts.get(provider.id) || 0;
-    // 上游网关的成员行按上游给自己的名字原样展示（分组标题已经写着属于哪条上游），
-    // 账号位留空——它没有账号，把上游名再写一遍只是重复标题。
+    // 上游成员也显示完整 Provider 名（「上游名 · 成员名」），与本地 Provider 平铺
+    // 在同一列表里；账号位只放继承下来的人工可读标签，没有就不重复写上游名。
     const peer = providerConnectKind(provider) === 'peer';
     return (
       <ProviderCard
@@ -1071,7 +1171,7 @@ function App() {
         layout={providerCardDensity === 'compact' ? 'list' : 'card'}
         active={selectedProvider?.id === provider.id}
         selected={selectedExportProviderIDs.includes(provider.id)}
-        name={peer ? peerProviderMemberName(provider) : provider.name}
+        name={provider.name}
         providerId={provider.id}
         protocol={protocolLabel(provider.protocol)}
         tone={protocolTone(provider.protocol)}
@@ -1080,6 +1180,8 @@ function App() {
         modelCount={(provider.models || []).length}
         usedCount={usedCount}
         requestCount={requestCount}
+        todayTokens={peer ? provider.peerGrants?.card?.todayTokens : (recentProviderTokenTotals.get(provider.id) ?? 0)}
+        myTodayTokens={myProviderTokenTotals.get(provider.id) || 0}
         healthStatus={provider.healthStatus || 'unchecked'}
         nextRetryAt={provider.nextRetryAt}
         testing={testingProviderID === provider.id}
@@ -1368,6 +1470,17 @@ function App() {
     }
     return filteredApiKeys[0];
   }, [state.apiKeys, selectedApiKeyID, filteredApiKeys]);
+
+  // 上次选中的密钥被删除、失去权限，或当前账号第一次进入时，自动落到当前筛选下
+  // 的第一把密钥，并把这次回退也记下来，避免下次继续查找失效 ID。
+  useEffect(() => {
+    if (activeNav !== 'api-keys') return;
+    const keys = state.apiKeys || [];
+    if (keys.length === 0) return;
+    if (selectedApiKeyID && keys.some((item) => item.id === selectedApiKeyID)) return;
+    const fallback = filteredApiKeys[0]?.id || keys[0]?.id || '';
+    if (fallback) selectApiKey(fallback);
+  }, [activeNav, apiKeySelectionScope, filteredApiKeys, selectedApiKeyID, state.apiKeys]);
 
   useEffect(() => {
     try {
@@ -4369,10 +4482,12 @@ function App() {
       if (!response.ok) throw new Error(await response.text());
       const created = await response.json() as APIKey;
       setApiKeyModalOpen(false);
-      setSelectedApiKeyID(created.id);
       setApiKeyKeyword('');
       showToast(`已创建 API 密钥：${created.name}`);
       await refreshState(false);
+      // 先让列表包含新 Key，再选中；否则“失效 ID 自动回退第一项”的 effect 会在
+      // refreshState 完成前把刚创建、尚未出现在旧 state 里的 ID 误判为失效。
+      selectApiKey(created.id);
       await refreshAppLogs();
       await copy(created.key);
     } catch (error) {
@@ -4702,7 +4817,7 @@ function App() {
       showToast(`已删除 API 密钥：${key.name}`);
       setCheckedApiKeyIDs((current) => current.filter((id) => id !== key.id));
       if (selectedApiKeyID === key.id) {
-        setSelectedApiKeyID('');
+        clearSelectedApiKey();
       }
       await refreshState(false);
       await refreshAppLogs();
@@ -4850,7 +4965,7 @@ function App() {
       const deleted = results.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []);
       const failed = results.length - deleted.length;
       if (selectedApiKeyID && deleted.includes(selectedApiKeyID)) {
-        setSelectedApiKeyID('');
+        clearSelectedApiKey();
       }
       setCheckedApiKeyIDs((current) => current.filter((id) => !deleted.includes(id)));
       apiKeyCheckAnchorRef.current = null;
@@ -5342,7 +5457,7 @@ function App() {
                   ownerLabel={apiKeyOwnerName}
                   filters={apiKeyFiltersProps}
                   saving={saving}
-                  onSelect={(key) => setSelectedApiKeyID(key.id)}
+                  onSelect={(key) => selectApiKey(key.id)}
                   onToggleCheck={toggleApiKeyCheck}
                   onSelectAll={selectAllFilteredApiKeys}
                   onClearSelection={clearApiKeyChecks}
@@ -5395,9 +5510,9 @@ function App() {
                 onToggleCheck={toggleApiKeyCheck}
                 onSelectAll={selectAllFilteredApiKeys}
                 onClearSelection={clearApiKeyChecks}
-                onSelect={(key) => setSelectedApiKeyID(key.id)}
+                onSelect={(key) => selectApiKey(key.id)}
                 onOpenDrawer={(key) => {
-                  setSelectedApiKeyID(key.id);
+                  selectApiKey(key.id);
                   setApiKeyDrawerOpen(true);
                 }}
                 onCopyKey={copyApiKeyValue}
@@ -5460,7 +5575,7 @@ function App() {
                   <p className="panel-desc">
                     {isNormalUser
                       ? '展示管理员授权给你的 Provider（只读）及自己创建的 Provider（可编辑 / 克隆 / 删除 / 测试）。删除时绑定的 API 密钥引用会自动重置为空。'
-                      : '自定义上游 Provider，按近 3 日请求量排序；勾选后可批量导出 / 导入配置（含 OAuth 元数据）。删除时绑定的 API 密钥引用会自动重置为空。'}
+                      : '自定义上游 Provider，默认按今日 Token 用量倒序；勾选后可批量导出 / 导入配置（含 OAuth 元数据）。删除时绑定的 API 密钥引用会自动重置为空。'}
                   </p>
                 </div>
                 {isNormalUser && canDo('providers.create') ? (
@@ -5638,7 +5753,7 @@ function App() {
                   <span className="providers-sort-toggle" role="group" aria-label="列表排序">
                     <span className="providers-sort-toggle-label">排序</span>
                     {([
-                      ['requests', '请求量'],
+                      ['requests', '用量'],
                       ['status', '异常优先'],
                       ['name', '名称'],
                     ] as const).map(([value, label]) => (
@@ -5648,7 +5763,7 @@ function App() {
                         className={`providers-sort-btn${providersSortMode === value ? ' active' : ''}`}
                         aria-pressed={providersSortMode === value}
                         onClick={() => setProvidersSortMode(value)}
-                        title={value === 'requests' ? '按近 3 日请求量降序（卡片页脚显示该数值）' : value === 'status' ? '把异常待试与已停用排到前面' : '按名称排序'}
+                        title={value === 'requests' ? '按今日 Token 用量降序（进入页面时冻结顺序）' : value === 'status' ? '把异常待试与已停用排到前面' : '按名称排序'}
                       >
                         {label}
                       </button>
@@ -5692,6 +5807,7 @@ function App() {
                     {providersSearchQuery.trim() ? ` · 检索「${providersSearchQuery.trim()}」` : ''}
                     {providersConnectFilter ? ` · ${providerConnectLabel(providersConnectFilter)}` : ''}
                     {isAdminUser && providerGroupFilter !== 'all' ? ` · 分组「${providerGroupFilter === UNGROUPED_PROVIDER_GROUP ? '未分组' : (providerGroupByID.get(providerGroupFilter)?.name || '未知')}」` : ''}
+                    {' · 今日 Token 倒序'}
                   </span>
                   {selectedExportProviderIDs.length > 0 ? (
                     <span className="providers-toolbar-actions">

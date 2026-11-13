@@ -53,6 +53,30 @@ func usageEvent(now time.Time, model string, input, output, cache int64) UsageEv
 	}
 }
 
+func TestTodayProviderStatsForKeysScopesToOwnedKeys(t *testing.T) {
+	now := time.Date(2026, 11, 13, 15, 0, 0, 0, time.Local)
+	store := NewStore()
+	for _, event := range []UsageEvent{
+		{Time: now, APIKeyID: "my-key", APIKeyName: "mine", UserID: "u1", ProviderID: "p1", Status: 200, InputTokens: 100, OutputTokens: 10},
+		{Time: now, APIKeyID: "my-key", APIKeyName: "mine", UserID: "u1", ProviderID: "p2", Status: 200, InputTokens: 20, OutputTokens: 2},
+		{Time: now, APIKeyID: "other-key", APIKeyName: "other", UserID: "u2", ProviderID: "p1", Status: 200, InputTokens: 300, OutputTokens: 30},
+	} {
+		store.ApplyUsageEventSync(event)
+	}
+
+	stats := store.TodayProviderStatsForKeys(now, []string{"my-key"})
+	byID := make(map[string]ProviderDayStats, len(stats))
+	for _, item := range stats {
+		byID[item.ProviderID] = item
+	}
+	if got := byID["p1"]; got.InputTokens != 100 || got.OutputTokens != 10 {
+		t.Fatalf("own p1 = %+v, want only my-key traffic", got)
+	}
+	if got := byID["p2"]; got.InputTokens != 20 || got.OutputTokens != 2 {
+		t.Fatalf("own p2 = %+v", got)
+	}
+}
+
 func TestApplyUsageEventSyncModelRanking(t *testing.T) {
 	now := time.Date(2026, 7, 8, 15, 0, 0, 0, time.Local)
 	store := NewStore()

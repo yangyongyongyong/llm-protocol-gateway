@@ -11,10 +11,13 @@ type UsagePersistDelta struct {
 	ProviderID     string
 	Model          string // empty when model bucket should not increment
 	OutputProtocol string // empty when protocol bucket should not increment
-	StatusClass    string // 2xx | 4xx | 5xx | other
-	InputTokens    int64
-	OutputTokens   int64
-	CacheTokens    int64
+	// PeerGatewayID 是这次 ingress 流量来自哪个下游网关。空表示普通本地请求，
+	// 或本机转发到上游的 egress 流量：下游网关用量只统计别人送进来的请求。
+	PeerGatewayID string
+	StatusClass   string // 2xx | 4xx | 5xx | other
+	InputTokens   int64
+	OutputTokens  int64
+	CacheTokens   int64
 	// CacheWriteTokens is the cache-creation half of the prompt; CostMicros is
 	// the request's priced cost (micro US dollars), summed across a day's
 	// requests. Both stay 0 for history aggregated before they existed.
@@ -39,20 +42,23 @@ func pricedIncrement(priced bool) int64 {
 
 // UsageDayBuckets is a serializable daily usage snapshot for DB load/bootstrap.
 type UsageDayBuckets struct {
-	Total       APIKeyDayStats
-	ByAPIKey    map[string]APIKeyDayStats
-	ByProvider  map[string]ProviderDayStats
-	ByModel     map[string]ModelDayStats
-	ByUser      map[string]UserDayStats
-	ByKey       map[string]UsageDayBuckets
-	ByProtocol  map[string]ProtocolDayStats
-	Status2xx   int64
-	Status4xx   int64
-	Status5xx   int64
-	StatusOther int64
-	LatencySum  int64
-	TTFTSum     int64
-	TTFTCount   int64
+	Total      APIKeyDayStats
+	ByAPIKey   map[string]APIKeyDayStats
+	ByProvider map[string]ProviderDayStats
+	ByModel    map[string]ModelDayStats
+	ByUser     map[string]UserDayStats
+	ByKey      map[string]UsageDayBuckets
+	ByProtocol map[string]ProtocolDayStats
+	// ByDownstreamGateway 是 ingress 流量的下游网关维度；ByKey 里的同名字段
+	// 用于普通用户按自己名下的 Key 做隔离统计。
+	ByDownstreamGateway map[string]DownstreamGatewayDayStats
+	Status2xx           int64
+	Status4xx           int64
+	Status5xx           int64
+	StatusOther         int64
+	LatencySum          int64
+	TTFTSum             int64
+	TTFTCount           int64
 }
 
 // UsageDailyStore persists per-day usage aggregates to SQLite.

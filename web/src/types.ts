@@ -52,6 +52,8 @@ export type ConsoleUser = {
   kind?: 'peer' | string;
   /** kind=peer 才有：这个下游网关的稳定身份（gw_…）。 */
   gatewayId?: string;
+  /** kind=peer 才有：下游网关归属的真实用户；空 = 尚未人工归属。 */
+  ownerUserId?: string;
 };
 
 export type TunnelRuntime = {
@@ -876,6 +878,20 @@ export type PeerGateway = {
   grantMode?: 'selected' | 'all';
   /** 最近这段时间它送进来的请求数，用来一眼看出活跃/挂空。 */
   ingressRequests: number;
+  /** 下游归属的真实用户；空 = 未归属，不计入任何人的个人 Token。 */
+  ownerUserId?: string;
+  ownerName?: string;
+  /** 最近一次人工调整授权的人与时间（审计信息，不等于归属）。 */
+  lastGrantedByUserId?: string;
+  lastGrantedByName?: string;
+  lastGrantedAt?: string;
+};
+
+/** 「把下游归属给谁」的可选本地用户。 */
+export type PeerOwnerOption = {
+  userId: string;
+  username: string;
+  displayName?: string;
 };
 
 export type PeersResponse = {
@@ -960,6 +976,8 @@ export type PeerProviderCard = {
   accountLabel?: string;
   connected?: boolean;
   usage?: PeerProviderUsage;
+  /** 父网关今日在这个 Provider 上的全量 Token；旧版父网关不下发时为空。 */
+  todayTokens?: number;
 };
 
 /** 一条 peer provider 上的授权快照（后端 Provider.PeerGrants 的投影）。 */
@@ -1148,6 +1166,22 @@ export type ProviderDayStats = {
   pricedCount?: number;
 };
 
+/** 某个下游网关送到本机的 ingress 用量；名称由服务端按当前 peer 账号解析。 */
+export type DownstreamGatewayDayStats = {
+  gatewayId: string;
+  gatewayName?: string;
+  requestCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheTokens: number;
+  /** 缓存写入 token（已含在 inputTokens 内，单价不同）。旧数据缺省。 */
+  cacheWriteTokens?: number;
+  /** 按网关价格表算出的成本（微美元）。旧数据与未计价一律缺省，不显示成 0。 */
+  costMicros?: number;
+  /** 有价格行的请求数：成本除以它才是覆盖率。 */
+  pricedCount?: number;
+};
+
 export type ModelDayStats = {
   model: string;
   requestCount: number;
@@ -1230,7 +1264,10 @@ export type RequestStatsSnapshot = {
     lastRequest?: LogEntry;
     byApiKey: APIKeyDayStats[];
     byProvider?: ProviderDayStats[];
+    /** 当前登录用户名下 Key 按 Provider 的今日汇总；无所属用户的下游网关不计入。 */
+    myByProvider?: ProviderDayStats[];
     byModel?: ModelDayStats[];
+    byDownstreamGateway?: DownstreamGatewayDayStats[];
     byUser?: UserDayStats[];
     byProtocol?: ProtocolDayStats[];
   };
@@ -1240,6 +1277,7 @@ export type RequestStatsSnapshot = {
     byApiKey: APIKeyDayStats[];
     byProvider?: ProviderDayStats[];
     byModel?: ModelDayStats[];
+    byDownstreamGateway?: DownstreamGatewayDayStats[];
     byUser?: UserDayStats[];
     byProtocol?: ProtocolDayStats[];
   };
@@ -1249,6 +1287,7 @@ export type RequestStatsSnapshot = {
     byApiKey: APIKeyDayStats[];
     byProvider?: ProviderDayStats[];
     byModel?: ModelDayStats[];
+    byDownstreamGateway?: DownstreamGatewayDayStats[];
     byUser?: UserDayStats[];
     byProtocol?: ProtocolDayStats[];
   };

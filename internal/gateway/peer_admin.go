@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/luca/llm-protocol-gateway/internal/domain"
 	"github.com/luca/llm-protocol-gateway/internal/monitor"
@@ -24,6 +25,13 @@ type peerSummary struct {
 	Name      string `json:"name,omitempty"`
 	Enabled   bool   `json:"enabled"`
 	CreatedAt string `json:"createdAt,omitempty"`
+	// OwnerUserID / OwnerName 是这个下游网关归属的真实用户，而不是 peer 账号
+	// 自己。空表示尚未人工归属；个人 Token 统计只认这里显式归属的流量。
+	OwnerUserID     string `json:"ownerUserId,omitempty"`
+	OwnerName       string `json:"ownerName,omitempty"`
+	LastGrantedByID string `json:"lastGrantedByUserId,omitempty"`
+	LastGrantedBy   string `json:"lastGrantedByName,omitempty"`
+	LastGrantedAt   string `json:"lastGrantedAt,omitempty"`
 	// LastSeenAt 来自它那把对端密钥的最后使用时间。
 	LastSeenAt string `json:"lastSeenAt,omitempty"`
 	// KeyID 是凭据行的 ID，方便管理员在上游的密钥页里对照；不含任何密钥内容。
@@ -43,6 +51,21 @@ const (
 	peerGrantModeSelected = "selected"
 	peerGrantModeAll      = "all"
 )
+
+// peerGrantAuditStore is deliberately separate from UserStore: test/minimal
+// stores can still serve peer administration without implementing audit
+// persistence, while the SQLite store provides the complete history.
+type peerGrantAuditStore interface {
+	AddPeerGrantAudit(domain.PeerGrantAudit) error
+	LatestPeerGrantAudits() (map[string]domain.PeerGrantAudit, error)
+}
+
+// peerOwnerOption is one selectable human owner for a downstream gateway.
+type peerOwnerOption struct {
+	UserID      string `json:"userId"`
+	Username    string `json:"username"`
+	DisplayName string `json:"displayName,omitempty"`
+}
 
 // normalizePeerGrantMode 归一化授权模式；旧版控制台不带字段时按指定列表处理。
 func normalizePeerGrantMode(raw string) (string, error) {
@@ -76,6 +99,16 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 			keys[strings.TrimSpace(key.OwnerUserID)] = key
 		}
 	}
+	usersByID := make(map[string]domain.User, len(users))
+	for _, user := range users {
+		usersByID[user.ID] = user
+	}
+	var latestAudits map[string]domain.PeerGrantAudit
+	if auditStore, ok := s.userStore.(peerGrantAuditStore); ok {
+		if audits, auditErr := auditStore.LatestPeerGrantAudits(); auditErr == nil {
+			latestAudits = audits
+		}
+	}
 	out := make([]peerSummary, 0)
 	for _, user := range users {
 		if !user.IsPeer() {
@@ -93,8 +126,17 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 			Name:               strings.TrimSpace(user.DisplayName),
 			Enabled:            user.Enabled,
 			CreatedAt:          user.CreatedAt,
+			OwnerUserID:        strings.TrimSpace(user.OwnerUserID),
 			GrantedProviderIDs: grantedProviderIDs,
 			GrantMode:          grantMode,
+		}
+		if owner := usersByID[item.OwnerUserID]; owner.ID != "" {
+			item.OwnerName = firstNonEmpty(owner.DisplayName, owner.Username, owner.ID)
+		}
+		if audit, ok := latestAudits[user.ID]; ok {
+			item.LastGrantedByID = audit.ActorUserID
+			item.LastGrantedBy = firstNonEmpty(audit.ActorDisplayName, audit.ActorUsername, audit.ActorUserID)
+			item.LastGrantedAt = audit.CreatedAt
 		}
 		if item.GrantedProviderIDs == nil {
 			item.GrantedProviderIDs = []string{}
@@ -273,6 +315,83 @@ func (s *Server) handleSetPeerMaxHops(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"hops": effective})
 }
 
+// handlePeerOwnerOptions returns the human accounts a downstream gateway may be
+// assigned to. Peer accounts themselves are excluded: a gateway cannot own
+// another gateway as a person.
+func (s *Server) handlePeerOwnerOptions(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePermission(w, r, domain.PermPeersView) {
+		return
+	}
+	if s.userStore == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "user store is not configured")
+		return
+	}
+	users, err := s.userStore.ListUsers()
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	out := make([]peerOwnerOption, 0)
+	for _, user := range users {
+		if user.IsPeer() || !user.Enabled {
+			continue
+		}
+		out = append(out, peerOwnerOption{
+			UserID: user.ID, Username: user.Username, DisplayName: user.DisplayName,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		left := firstNonEmpty(out[i].DisplayName, out[i].Username, out[i].UserID)
+		right := firstNonEmpty(out[j].DisplayName, out[j].Username, out[j].UserID)
+		return left < right
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"owners": out})
+}
+
+// handleSetPeerOwner assigns a downstream gateway to one human account. It is
+// independent from grant changes: later administrators may update grants
+// without transferring ownership.
+func (s *Server) handleSetPeerOwner(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePermission(w, r, domain.PermPeersManage) {
+		return
+	}
+	if s.userStore == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "user store is not configured")
+		return
+	}
+	peer, err := s.userStore.UserByID(r.PathValue("id"))
+	if err != nil {
+		writeOpenAIError(w, http.StatusNotFound, "peer not found")
+		return
+	}
+	if !peer.IsPeer() {
+		writeOpenAIError(w, http.StatusBadRequest, "this account is not a peer gateway")
+		return
+	}
+	var payload struct {
+		OwnerUserID string `json:"ownerUserId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	ownerID := strings.TrimSpace(payload.OwnerUserID)
+	if ownerID != "" {
+		owner, err := s.userStore.UserByID(ownerID)
+		if err != nil || owner.IsPeer() || !owner.Enabled {
+			writeOpenAIError(w, http.StatusBadRequest, "owner must be an existing enabled local user")
+			return
+		}
+	}
+	peer.OwnerUserID = ownerID
+	if err := s.userStore.UpdateUser(peer); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.logs.AddApp("info", "peer owner updated", fmt.Sprintf("peer=%s owner=%s", peer.Username, firstNonEmpty(ownerID, "<unassigned>")))
+	writeJSON(w, http.StatusOK, map[string]any{"userId": peer.ID, "ownerUserId": ownerID})
+}
+
 // handleSetPeerGrants 修改一个已注册下游网关的授权。
 //
 // 注册时的预置授权（applyPeerRequestedGrants）只是一次快照；上游的授权应当
@@ -311,6 +430,29 @@ func (s *Server) handleSetPeerGrants(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	identity := s.requestIdentity(r)
+	actorID := strings.TrimSpace(identity.UserID)
+	if actorID == "" || actorID == legacyAdminUserID {
+		actorID = s.adminOwnerID()
+	}
+	actorName := strings.TrimSpace(identity.Username)
+	actorDisplayName := ""
+	if actor, actorErr := s.userStore.UserByID(actorID); actorErr == nil {
+		actorDisplayName = strings.TrimSpace(actor.DisplayName)
+		if actorName == "" {
+			actorName = actor.Username
+		}
+	}
+	// First human grant act establishes the durable owner. Later grant changes
+	// never transfer ownership automatically.
+	if strings.TrimSpace(user.OwnerUserID) == "" {
+		user.OwnerUserID = actorID
+		if err := s.userStore.UpdateUser(user); err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	_, beforeGranted := s.peerGrantState(user.ID)
 	if mode == peerGrantModeAll {
 		if err := s.setPeerAllProviders(user.ID); err != nil {
 			writeOpenAIError(w, http.StatusInternalServerError, err.Error())
@@ -332,6 +474,16 @@ func (s *Server) handleSetPeerGrants(w http.ResponseWriter, r *http.Request) {
 	allProviders, granted := s.peerGrantState(user.ID)
 	if granted == nil {
 		granted = []string{}
+	}
+	if auditStore, ok := s.userStore.(peerGrantAuditStore); ok {
+		if err := auditStore.AddPeerGrantAudit(domain.PeerGrantAudit{
+			PeerUserID: user.ID, ActorUserID: actorID, ActorUsername: actorName,
+			ActorDisplayName: actorDisplayName, GrantMode: mode,
+			BeforeProviderIDs: beforeGranted, AfterProviderIDs: granted,
+			CreatedAt: time.Now().Format(time.RFC3339),
+		}); err != nil {
+			s.logs.AddApp("warn", "peer grant audit not saved", fmt.Sprintf("peer=%s: %v", user.Username, err))
+		}
 	}
 	if allProviders {
 		s.logs.AddApp("info", "peer grants updated", fmt.Sprintf("%s (%s) → 全部 Provider（动态，当前 %d 个）", user.Username, user.GatewayID, len(granted)))

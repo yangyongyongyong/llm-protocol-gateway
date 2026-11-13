@@ -95,34 +95,41 @@ type UsageEvent struct {
 	TxBytes   int64
 	LatencyMs int64
 	TTFTMs    int64
+	// PeerGatewayID/PeerDirection tag cross-gateway traffic. Only ingress rows
+	// (a downstream gateway sending work into this gateway) enter the
+	// downstream-gateway usage dimension.
+	PeerGatewayID string
+	PeerDirection string
 }
 
 type usageDayStats struct {
-	total       APIKeyDayStats
-	byKey       map[string]*usageDayStats
-	byAPIKey    map[string]*APIKeyDayStats
-	byProvider  map[string]*ProviderDayStats
-	byModel     map[string]*ModelDayStats
-	byUser      map[string]*UserDayStats
-	byProtocol  map[string]*ProtocolDayStats
-	status2xx   int64
-	status4xx   int64
-	status5xx   int64
-	statusOther int64
-	latencySum  int64
-	ttftSum     int64
-	ttftCount   int64
+	total        APIKeyDayStats
+	byKey        map[string]*usageDayStats
+	byAPIKey     map[string]*APIKeyDayStats
+	byProvider   map[string]*ProviderDayStats
+	byModel      map[string]*ModelDayStats
+	byUser       map[string]*UserDayStats
+	byProtocol   map[string]*ProtocolDayStats
+	byDownstream map[string]*DownstreamGatewayDayStats
+	status2xx    int64
+	status4xx    int64
+	status5xx    int64
+	statusOther  int64
+	latencySum   int64
+	ttftSum      int64
+	ttftCount    int64
 }
 
 func newUsageDayStats() *usageDayStats {
 	return &usageDayStats{
-		total:      APIKeyDayStats{APIKeyName: "全部"},
-		byKey:      make(map[string]*usageDayStats),
-		byAPIKey:   make(map[string]*APIKeyDayStats),
-		byProvider: make(map[string]*ProviderDayStats),
-		byModel:    make(map[string]*ModelDayStats),
-		byUser:     make(map[string]*UserDayStats),
-		byProtocol: make(map[string]*ProtocolDayStats),
+		total:        APIKeyDayStats{APIKeyName: "全部"},
+		byKey:        make(map[string]*usageDayStats),
+		byAPIKey:     make(map[string]*APIKeyDayStats),
+		byProvider:   make(map[string]*ProviderDayStats),
+		byModel:      make(map[string]*ModelDayStats),
+		byUser:       make(map[string]*UserDayStats),
+		byProtocol:   make(map[string]*ProtocolDayStats),
+		byDownstream: make(map[string]*DownstreamGatewayDayStats),
 	}
 }
 
@@ -292,6 +299,23 @@ func (s *Store) applyUsageEventLocked(event UsageEvent) UsagePersistDelta {
 		providerStats.PricedCount++
 	}
 
+	if gatewayID := strings.TrimSpace(event.PeerGatewayID); gatewayID != "" && strings.EqualFold(strings.TrimSpace(event.PeerDirection), "ingress") {
+		downstream, ok := day.byDownstream[gatewayID]
+		if !ok {
+			downstream = &DownstreamGatewayDayStats{GatewayID: gatewayID}
+			day.byDownstream[gatewayID] = downstream
+		}
+		downstream.RequestCount++
+		downstream.InputTokens += inputTokens
+		downstream.OutputTokens += event.OutputTokens
+		downstream.CacheTokens += cacheTokens
+		downstream.CacheWriteTokens += cacheWriteTokens
+		downstream.CostMicros += event.CostMicros
+		if event.Priced {
+			downstream.PricedCount++
+		}
+	}
+
 	userStats, ok := day.byUser[userID]
 	if !ok {
 		userStats = &UserDayStats{UserID: userID}
@@ -396,9 +420,15 @@ func (s *Store) applyUsageEventLocked(event UsageEvent) UsagePersistDelta {
 		Model:          modelForBucket,
 		OutputProtocol: outputProtocol,
 		StatusClass:    statusBucket(event.Status),
-		InputTokens:    inputTokens,
-		OutputTokens:   event.OutputTokens,
-		CacheTokens:    cacheTokens,
+		PeerGatewayID: func() string {
+			if strings.EqualFold(strings.TrimSpace(event.PeerDirection), "ingress") {
+				return strings.TrimSpace(event.PeerGatewayID)
+			}
+			return ""
+		}(),
+		InputTokens:  inputTokens,
+		OutputTokens: event.OutputTokens,
+		CacheTokens:  cacheTokens,
 		// Cost is carried per request, and PricedCount says whether it counted:
 		// a day's cost sum alone cannot tell "cheap" from "mostly unpriced".
 		CacheWriteTokens: cacheWriteTokens,
@@ -516,13 +546,14 @@ func (s *Store) periodStatsSince(since time.Time, periodLabel string) PeriodStat
 func (s *Store) periodStatsSinceLocked(since time.Time, periodLabel string) PeriodStatsSnapshot {
 	total, byAPIKey, byProvider, byModel, byUser := mergeUsageDays(s.usageByDay, since, time.Time{})
 	return PeriodStatsSnapshot{
-		Period:     periodLabel,
-		Total:      total,
-		ByAPIKey:   sortAPIKeyStats(byAPIKey),
-		ByProvider: sortProviderStats(byProvider),
-		ByModel:    sortModelDayStats(byModel),
-		ByUser:     sortUserStats(byUser),
-		ByProtocol: sortProtocolStats(mergeProtocolDays(s.usageByDay, since, time.Time{})),
+		Period:              periodLabel,
+		Total:               total,
+		ByAPIKey:            sortAPIKeyStats(byAPIKey),
+		ByProvider:          sortProviderStats(byProvider),
+		ByModel:             sortModelDayStats(byModel),
+		ByDownstreamGateway: sortDownstreamGatewayStats(mergeDownstreamGatewayDays(s.usageByDay, since, time.Time{})),
+		ByUser:              sortUserStats(byUser),
+		ByProtocol:          sortProtocolStats(mergeProtocolDays(s.usageByDay, since, time.Time{})),
 	}
 }
 
@@ -535,13 +566,14 @@ func (s *Store) periodStatsInRange(from, to time.Time, periodLabel string) Perio
 func (s *Store) periodStatsInRangeLocked(from, to time.Time, periodLabel string) PeriodStatsSnapshot {
 	total, byAPIKey, byProvider, byModel, byUser := mergeUsageDays(s.usageByDay, from, to)
 	return PeriodStatsSnapshot{
-		Period:     periodLabel,
-		Total:      total,
-		ByAPIKey:   sortAPIKeyStats(byAPIKey),
-		ByProvider: sortProviderStats(byProvider),
-		ByModel:    sortModelDayStats(byModel),
-		ByUser:     sortUserStats(byUser),
-		ByProtocol: sortProtocolStats(mergeProtocolDays(s.usageByDay, from, to)),
+		Period:              periodLabel,
+		Total:               total,
+		ByAPIKey:            sortAPIKeyStats(byAPIKey),
+		ByProvider:          sortProviderStats(byProvider),
+		ByModel:             sortModelDayStats(byModel),
+		ByDownstreamGateway: sortDownstreamGatewayStats(mergeDownstreamGatewayDays(s.usageByDay, from, to)),
+		ByUser:              sortUserStats(byUser),
+		ByProtocol:          sortProtocolStats(mergeProtocolDays(s.usageByDay, from, to)),
 	}
 }
 
@@ -561,14 +593,15 @@ func (s *Store) todayStatsFromCountersLocked(dayStart time.Time) TodayStatsSnaps
 		lastRequest = &copied
 	}
 	return TodayStatsSnapshot{
-		Date:        dayStart.Format("2006-01-02"),
-		Total:       total,
-		LastRequest: lastRequest,
-		ByAPIKey:    sortAPIKeyStats(byAPIKey),
-		ByProvider:  sortProviderStats(byProvider),
-		ByModel:     sortModelDayStats(byModel),
-		ByUser:      sortUserStats(byUser),
-		ByProtocol:  sortProtocolStats(mergeProtocolDays(s.usageByDay, dayStart, time.Time{})),
+		Date:                dayStart.Format("2006-01-02"),
+		Total:               total,
+		LastRequest:         lastRequest,
+		ByAPIKey:            sortAPIKeyStats(byAPIKey),
+		ByProvider:          sortProviderStats(byProvider),
+		ByModel:             sortModelDayStats(byModel),
+		ByDownstreamGateway: sortDownstreamGatewayStats(mergeDownstreamGatewayDays(s.usageByDay, dayStart, time.Time{})),
+		ByUser:              sortUserStats(byUser),
+		ByProtocol:          sortProtocolStats(mergeProtocolDays(s.usageByDay, dayStart, time.Time{})),
 	}
 }
 
@@ -858,9 +891,10 @@ func mergeUsageDaysForKeys(byDay map[string]*usageDayStats, from, to time.Time, 
 func periodStatsForKeysLocked(byDay map[string]*usageDayStats, from, to time.Time, keySet map[string]struct{}, periodLabel string) PeriodStatsSnapshot {
 	total, byAPIKey := mergeUsageDaysForKeys(byDay, from, to, keySet)
 	return PeriodStatsSnapshot{
-		Period:   periodLabel,
-		Total:    total,
-		ByAPIKey: sortAPIKeyStats(byAPIKey),
+		Period:              periodLabel,
+		Total:               total,
+		ByAPIKey:            sortAPIKeyStats(byAPIKey),
+		ByDownstreamGateway: sortDownstreamGatewayStats(mergeDownstreamGatewayDays(byDay, from, to)),
 	}
 }
 
@@ -968,6 +1002,55 @@ func CacheHitRate(promptTotal, cacheHits int64) float64 {
 		return 0
 	}
 	return rate
+}
+
+func sortDownstreamGatewayStats(byGateway map[string]*DownstreamGatewayDayStats) []DownstreamGatewayDayStats {
+	out := make([]DownstreamGatewayDayStats, 0, len(byGateway))
+	for _, stats := range byGateway {
+		out = append(out, *stats)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].RequestCount == out[j].RequestCount {
+			return out[i].GatewayID < out[j].GatewayID
+		}
+		return out[i].RequestCount > out[j].RequestCount
+	})
+	return out
+}
+
+func mergeDownstreamGatewayDays(byDay map[string]*usageDayStats, from, to time.Time) map[string]*DownstreamGatewayDayStats {
+	loc := from.Location()
+	if to.IsZero() {
+		to = time.Date(9999, 1, 1, 0, 0, 0, 0, loc)
+	}
+	fromDay := time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, loc)
+	toDay := time.Date(to.Year(), to.Month(), to.Day(), 0, 0, 0, 0, loc)
+	if to.Hour() > 0 || to.Minute() > 0 || to.Second() > 0 || to.Nanosecond() > 0 {
+		toDay = toDay.AddDate(0, 0, 1)
+	}
+	out := make(map[string]*DownstreamGatewayDayStats)
+	for dayKey, dayStats := range byDay {
+		day, err := time.ParseInLocation("2006-01-02", dayKey, loc)
+		if err != nil || day.Before(fromDay) || !day.Before(toDay) {
+			continue
+		}
+		for id, stats := range dayStats.byDownstream {
+			target, ok := out[id]
+			if !ok {
+				copied := *stats
+				out[id] = &copied
+				continue
+			}
+			target.RequestCount += stats.RequestCount
+			target.InputTokens += stats.InputTokens
+			target.OutputTokens += stats.OutputTokens
+			target.CacheTokens += stats.CacheTokens
+			target.CacheWriteTokens += stats.CacheWriteTokens
+			target.CostMicros += stats.CostMicros
+			target.PricedCount += stats.PricedCount
+		}
+	}
+	return out
 }
 
 func sortProviderStats(byProvider map[string]*ProviderDayStats) []ProviderDayStats {

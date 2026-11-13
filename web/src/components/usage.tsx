@@ -79,6 +79,7 @@ function exportUsage(stats: RequestStatsSnapshot, from: string, to: string) {
   for (const [name, rows] of [
     ['模型', (period?.byModel || []).map(r => ({ ...r, name: r.model }))],
     ['Provider', (period?.byProvider || []).map(r => ({ ...r, name: r.providerId }))],
+    ['下游网关', (period?.byDownstreamGateway || []).map(r => ({ ...r, name: r.gatewayName || r.gatewayId }))],
     ['API 密钥', (period?.byApiKey || []).map(r => ({ ...r, name: r.apiKeyName || r.apiKeyId }))],
     ['输出协议', (period?.byProtocol || []).map(r => ({ ...r, name: r.protocol }))],
     ['用户', (period?.byUser || []).map(r => ({ ...r, name: r.userName || r.userId }))],
@@ -180,6 +181,15 @@ function Overview({ stats, providers, models, isNormalUser, metric, onMetricChan
     .sort((a, b) => metricValue(b, metric) - metricValue(a, metric))
     .slice(0, 8)
     .map(p => ({ ...providerUsageParts(p.providerId, providers), value: metricValue(p, metric) }));
+  const downstreamItems = [...(range?.byDownstreamGateway || [])]
+    .filter(row => metricValue(row, metric) > 0)
+    .sort((a, b) => metricValue(b, metric) - metricValue(a, metric))
+    .slice(0, 8)
+    .map(row => ({
+      label: row.gatewayName || row.gatewayId,
+      value: metricValue(row, metric),
+      sub: `${row.requestCount.toLocaleString()} 次 · ${formatCompactCount((row.inputTokens || 0) + (row.outputTokens || 0))} Token`,
+    }));
   const protocolItems = (range?.byProtocol || []).map(p => ({ label: p.protocol, value: metricValue(p, metric) }));
   const activeModels = (range?.byModel || []).filter(m => m.requestCount > 0).length;
   const activeProviders = (range?.byProvider || []).filter(p => p.requestCount > 0).length;
@@ -260,6 +270,12 @@ function Overview({ stats, providers, models, isNormalUser, metric, onMetricChan
           items={accountItems}
           formatValue={metricFormat(metric)}
         />
+        {downstreamItems.length > 0 && <RankBars
+          title="下游网关消耗排行"
+          subtitle={`按${metricLabel(metric)} Top 8 · 仅统计它送进本机的请求`}
+          items={downstreamItems}
+          formatValue={metricFormat(metric)}
+        />}
       </div>
     </div>
     {hasTrafficBytes && <div className="usage-charts-full">

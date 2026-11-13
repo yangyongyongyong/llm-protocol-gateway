@@ -67,9 +67,9 @@ export function usageRequestKey(path: string, query?: Record<string, string | un
 // ── 输入 Provider 列表的排序 ───────────────────────────────────────────────
 
 /**
- * providerRankOrder 决定「近 3 日请求量」排序的一把快照：只在进入这一页的
- * 首次绘制、或用户点「刷新/获取模型」时按最新计数重排；5 秒的日志轮询只更新
- * 数字、不动顺序。请求量每分钟都可能交叉，跟着轮询重排会让卡片在光标底下换位，
+ * providerRankOrder 决定「今日 Token 用量」排序的一把快照：只在进入这一页的
+ * 首次绘制、或用户点「刷新/获取模型」时按最新用量重排；后台轮询只更新数字、
+ * 不动顺序。Token 用量每分钟都可能交叉，跟着轮询重排会让卡片在光标底下换位，
  * 点 ▸ 编辑 落到另一张卡上。
  */
 export function providerRankOrder(input: {
@@ -83,6 +83,22 @@ export function providerRankOrder(input: {
   if (!input.ready) return 'wait';
   if (input.previous == null || input.force) return 'rank';
   return 'keep';
+}
+
+/**
+ * Provider 排序使用的今日 Token：优先父网关下发的上游全量，父端尚未下发时
+ * 回退到本机已经观测到的转发量。不能把“上游未知”当成 0，否则有本机用量的
+ * peer Provider 会和完全没用的 Provider 同分，最后被名称顺序排到后面。
+ *
+ * 上游全量通常已经包含本机转发量；用 max 而不是相加，既避免重复计数，也能
+ * 在父端快照暂时落后时继续使用较新的本机观测值。
+ */
+export function providerRankTokenTotal(localTotal: number, upstreamTotal?: number): number {
+  const local = Number.isFinite(localTotal) ? Math.max(0, localTotal) : 0;
+  const upstream = typeof upstreamTotal === 'number' && Number.isFinite(upstreamTotal)
+    ? Math.max(0, upstreamTotal)
+    : 0;
+  return Math.max(local, upstream);
 }
 
 /** 按计数把当前 Provider 排成新顺序；再按这把顺序摆上一个快照里的已知 id。 */
