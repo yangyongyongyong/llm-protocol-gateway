@@ -71,7 +71,7 @@ func (s *silentUntilReleased) Close() error { return nil }
 
 // 客户端在「上游刚开口就静默」的阶段断开时，这次请求持有的并发槽位必须很快放掉：
 // 心跳真的发到已断开的连接上会写失败，读循环随即结束、defer 里的 release 跑掉。
-// 心跳不出去（见上面的测试）时这里只能等上游自己结束或 120 秒空闲守卫，同一账号
+// 心跳不出去（见上面的测试）时这里只能等上游自己结束或 600 秒空闲守卫，同一账号
 // （maxConcurrentRequests=1）后续请求全被 429。
 func TestClientGoneReleasesTheProviderSlotQuickly(t *testing.T) {
 	release := make(chan struct{})
@@ -119,7 +119,7 @@ func TestClientGoneReleasesTheProviderSlotQuickly(t *testing.T) {
 	_ = conn.Close()
 
 	// 一个心跳间隔之后（写入已失败、处理函数已返回）再发第二个请求：等待时间远小于
-	// 上游静默时的 120 秒空闲守卫，所以只有「断开被及时察觉」才可能拿到回答。
+	// 上游静默时的 600 秒空闲守卫，所以只有「断开被及时察觉」才可能拿到回答。
 	time.Sleep(sseHeartbeatInterval + 2*time.Second)
 	request, _ := http.NewRequest(http.MethodPost, front.URL+"/anthropic/v1/messages", strings.NewReader(body))
 	request.Host = "gateway.example.com"

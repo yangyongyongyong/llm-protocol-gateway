@@ -18,6 +18,7 @@ import {
 } from './components/api_key_console';
 import {UsagePage} from './components/usage';
 import {MachineStatusPage} from './components/machine_status';
+import {DesktopUpdateCard, DesktopUpdateToast} from './components/desktop_update';
 import {runCloudflareAuthPoll} from './pollers';
 import {PwaInstallButton, PwaInstallPrompt} from './components/pwa_install';
 import {registerPwaServiceWorker, startPwaInstallCapture} from './pwa_install_store';
@@ -46,6 +47,7 @@ import {
     chatgptAccountLabelFriendly,
     chatTestToastText,
     chatTestVerdictFromBody,
+    routeTestResultFromBody,
     clearUICache,
     clientGatewayRoot,
     compactRequestAdapterJSON,
@@ -189,6 +191,7 @@ import {
     ChatTestContext,
     CloudflareZoneOption,
     ConsoleUser,
+    DesktopAutostartStatus,
     GatewayState,
     KeyProfile,
     LegacyRequestStatsSnapshot,
@@ -663,6 +666,10 @@ function App() {
   const [providerModelsID, setProviderModelsID] = useState('');
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  // 登录时自动启动不落网关数据库：每次打开设置页/窗口回到前台都重新读
+  // macOS 的 LaunchAgent 状态，避免 UI 与系统设置各说各话。
+  const [desktopAutostart, setDesktopAutostart] = useState<DesktopAutostartStatus | null>(null);
+  const [desktopAutostartBusy, setDesktopAutostartBusy] = useState(false);
   // 导入单独一个 busy 标记：设置 saving 会把右侧面板顶部四个按钮全禁用，`导入` 按钮被禁后
   // chip 从鼠标下方消失，浏览器随即丢掉按钮的 hover，一次性结果气泡刚出现就跟着消失。
   const [importingProviders, setImportingProviders] = useState(false);
@@ -1760,6 +1767,18 @@ function App() {
     if (activeNav === 'public-access') {
       void refreshPublicControlTokenStatus();
     }
+    if (activeNav === 'settings') {
+      void refreshDesktopAutostart();
+      const onFocus = () => { void refreshDesktopAutostart(); };
+      const onVisibility = () => { if (isPageVisible()) onFocus(); };
+      window.addEventListener('focus', onFocus);
+      document.addEventListener('visibilitychange', onVisibility);
+      return () => {
+        window.removeEventListener('focus', onFocus);
+        document.removeEventListener('visibilitychange', onVisibility);
+      };
+    }
+    return undefined;
   }, [activeNav]);
 
   useEffect(() => {
@@ -2444,6 +2463,72 @@ function App() {
     }
   }
 
+  async function updateHostMetricsEnabled(enabled: boolean): Promise<void> {
+    setSaving(true);
+    try {
+      const response = await fetch(`${API_BASE}/__settings/host-metrics`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const data = await response.json() as { hostMetricsDisabled?: boolean };
+      setState((current) => ({ ...current, hostMetricsDisabled: data.hostMetricsDisabled === true }));
+      showToast(enabled ? '已开启机器状态动态采集' : '已关闭机器状态动态采集');
+    } catch (error) {
+      showToast(`更新机器状态设置失败：${String(error)}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function refreshDesktopAutostart(showError = false): Promise<void> {
+    try {
+      const response = await fetchWithTimeout(`${API_BASE}/__desktop/autostart`, { credentials: 'same-origin' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const status = await response.json() as DesktopAutostartStatus;
+      setDesktopAutostart(status);
+    } catch (error) {
+      if (showError) showToast(`读取开机自动启动状态失败：${String(error)}`);
+    }
+  }
+
+  async function updateDesktopAutostart(enabled: boolean): Promise<void> {
+    setDesktopAutostartBusy(true);
+    try {
+      const response = await fetch(`${API_BASE}/__desktop/autostart`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const status = await response.json() as DesktopAutostartStatus;
+      setDesktopAutostart(status);
+      if (enabled && status.needsApproval) {
+        showToast('已写入 macOS 启动项，但系统设置里把它关掉了；请到登录项里允许');
+      } else {
+        showToast(status.enabled ? '已开启登录时自动打开 App' : '已关闭登录时自动打开 App');
+      }
+    } catch (error) {
+      showToast(`更新开机自动启动失败：${String(error)}`);
+      void refreshDesktopAutostart();
+    } finally {
+      setDesktopAutostartBusy(false);
+    }
+  }
+
+  async function openDesktopLoginItems(): Promise<void> {
+    try {
+      const response = await fetch(`${API_BASE}/__desktop/autostart/open-login-items`, {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
+      if (!response.ok) throw new Error(await response.text());
+    } catch (error) {
+      showToast(`打开系统登录项失败：${String(error)}`);
+    }
+  }
+
   // confirmedUsageBatch 记住服务端确认过的攒批设置：blur 没有改动时不再发请求。
   const confirmedUsageBatch = useRef<{ size: number; wait: number }>({ size: 0, wait: 0 });
   async function updateUsageBatch(maxSize: number, maxWaitSeconds: number): Promise<boolean> {
@@ -2891,12 +2976,9 @@ function App() {
     const text = await response.text();
     // 协议缺失也不再直接当 JSON 解析：有些反代会把它去掉，体仍是 JSON。
     if (contentType.includes('json') || /^\s*[[{]/.test(text)) {
-      const verdict = chatTestVerdictFromBody(text, response.status);
-      // 失败应答（权限不足、路由不存在……）是 {"error":{...}} 信封，没有 success /
-      // status；补成完整的失败结果，弹窗与提示才说得清原因。
-      return verdict.success
-        ? { ...(JSON.parse(text) as RouteTestResult) }
-        : { success: false, status: response.status, error: verdict.error };
+      // 后端失败时仍会带 model / status / diagnostics / transportError。
+      // 这里必须保留整份结果，不能只留下一个 error 字段。
+      return routeTestResultFromBody(text, response.status);
     }
     return {
       success: false,
@@ -2991,7 +3073,7 @@ function App() {
       kind: 'route',
       id: route.id,
       title: `路由对话测试 · ${route.name}`,
-      description: '测试网关转发后的输出接口（客户端实际调用的 URL）。',
+      description: '测试该路由当前绑定的首选 Provider（客户端实际调用的 URL）；不套用 API Key 的备选 Provider 链。',
       curlLabel: '网关 curl 预览',
       endpointLabel: 'gateway',
       hintLine: boundKey ? undefined : '客户端实际使用时需携带绑定该路由的 API 密钥；应用内测试会自动指定路由。',
@@ -4067,13 +4149,13 @@ function App() {
     }
   }
 
-  // 保存该 Provider 的首包超时（秒）。留空或 0 = 不限制：网关只约束「等不到响应头」
-  // 的那一段，已经开播的长回答/长思考不会被切断。
+  // 保存该 Provider 的首包超时（秒）。留空或 0 = 使用网关默认 600 秒：网关只约束
+  // 「等不到响应头」的那一段，已经开播的长回答/长思考不会被切断。
   async function saveProviderFirstPacketTimeout(providerID: string) {
     const raw = providerFirstPacketRef.current?.value.trim() ?? '';
     const seconds = raw === '' ? 0 : Number(raw);
     if (!Number.isFinite(seconds) || seconds < 0 || seconds > 600) {
-      showToast('首包超时请填 0–600 秒（0 表示不限制）');
+      showToast('首包超时请填 0–600 秒（0 表示使用网关默认 600 秒）');
       return;
     }
     setSaving(true);
@@ -4085,7 +4167,7 @@ function App() {
         body: JSON.stringify({ seconds }),
       });
       if (!response.ok) throw new Error(await response.text());
-      showToast(seconds > 0 ? `已设置首包超时 ${seconds}s` : '已取消首包超时限制');
+      showToast(seconds > 0 ? `已设置首包超时 ${seconds}s` : '已改用网关默认首包超时 600s');
       await refreshState(false);
     } catch (error) {
       showToast(`保存首包超时失败：${String(error)}`);
@@ -5241,6 +5323,7 @@ function App() {
 
   return (
     <>
+      <DesktopUpdateToast onToast={showToast} onOpenSettings={() => goToPage('settings')} />
       {upgradeAvailable && (
         <div className="upgrade-toast" role="status" aria-live="polite">
           <div className="upgrade-toast-head">
@@ -5289,7 +5372,9 @@ function App() {
             <div className="brand-logo"><img src="/logo.svg" alt="" aria-hidden="true" /></div>
             <div className="brand-text">
               <div className="brand-title">协议网关</div>
-              <div className="brand-subtitle">LLM Protocol Gateway</div>
+              <div className="brand-subtitle brand-version" title={`LLM Protocol Gateway · ${CURRENT_APP_VERSION ? `v${CURRENT_APP_VERSION}` : 'dev'}`}>
+                {CURRENT_APP_VERSION ? `v${CURRENT_APP_VERSION}` : 'dev'}
+              </div>
             </div>
             <div className="brand-actions">
               <a
@@ -7129,7 +7214,11 @@ function App() {
           )}
 
           {activeNav === 'machine' && navVisibleFor(permissions, 'machine', legacyUser) && (
-            <MachineStatusPage onToast={showToast} />
+            <MachineStatusPage
+              onToast={showToast}
+              enabled={!state.hostMetricsDisabled}
+              onOpenSettings={() => goToPage('settings')}
+            />
           )}
 
           {activeNav === 'settings' && navVisibleFor(permissions, 'settings', legacyUser) && (
@@ -7148,6 +7237,55 @@ function App() {
                     {' · '}管理页公网 {publicDraft.exposeUi === false ? '关' : (liveUIPublicURL ? '开' : '待绑定')}
                     {' · '}API 公网 {publicDraft.exposeApi === false ? '关' : (livePublicURL && customTunnelActive ? '开' : '待绑定')}
                 </div>
+              </div>
+              {desktopAutostart?.available ? (
+                <div className="card panel">
+                  <div className="panel-header">
+                    <div>
+                      <h2 className="panel-title">开机自动启动</h2>
+                      <p className="panel-desc">登录这台 Mac 后自动打开 App，网关、管理页与后台任务随 App 一起启动。</p>
+                    </div>
+                    <Badge tone={desktopAutostart.needsApproval ? 'amber' : desktopAutostart.enabled ? 'green' : 'slate'}>
+                      {desktopAutostart.needsApproval ? '系统已关闭' : desktopAutostart.enabled ? '已开启' : '已关闭'}
+                    </Badge>
+                  </div>
+                  <div className="mon-set-switches">
+                    <Switch
+                      checked={desktopAutostart.enabled}
+                      label="登录 macOS 时自动打开 App"
+                      disabled={desktopAutostartBusy}
+                      onChange={(enabled) => void updateDesktopAutostart(enabled)}
+                    />
+                  </div>
+                  {desktopAutostart.needsApproval ? (
+                    <div className="mon-set-notice">
+                      <span className="mon-set-notice-label">需要允许</span>
+                      <span className="mon-set-notice-text">启动项已经写入，但你在 macOS 系统设置里把它关掉了，因此登录时不会打开 App。</span>
+                      <button className="btn btn-sm mon-set-notice-btn" type="button" onClick={() => void openDesktopLoginItems()}>打开登录项</button>
+                    </div>
+                  ) : null}
+                  {desktopAutostart.message ? <div className="hint-text">{desktopAutostart.message}</div> : null}
+                  <div className="hint-text">首次安装启动时默认开启；之后你手动关闭会保持关闭。开关直接读写 macOS 登录项，不在网关数据库里另存布尔值；你在系统设置里改动后，回到这里会自动刷新。</div>
+                </div>
+              ) : null}
+              <DesktopUpdateCard onToast={showToast} />
+              <div className="card panel">
+                <div className="panel-header">
+                  <div>
+                    <h2 className="panel-title">机器状态动态采集</h2>
+                    <p className="panel-desc">持续采集网关所在主机的 CPU、内存、磁盘、网卡与进程指标，供机器状态页和趋势图使用。</p>
+                  </div>
+                </div>
+                <label className="toggle-row" style={{display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer'}}>
+                  <input
+                    type="checkbox"
+                    checked={!state.hostMetricsDisabled}
+                    disabled={saving}
+                    onChange={(event) => void updateHostMetricsEnabled(event.target.checked)}
+                  />
+                  <span>开启机器状态动态采集</span>
+                </label>
+                <div className="hint-text">关闭后停止后台采样，机器状态页与诊断接口会显示已关闭；重新开启即可恢复。设置会持久化，重启网关后仍保留。</div>
               </div>
               <div className="card panel">
                 <div className="panel-header"><div><h2 className="panel-title">应用日志</h2><p className="panel-desc">应用级日志，支持在 UI 内切换级别：debug / info / warn / error。</p></div><button className="btn" onClick={() => void refreshAppLogs()}>刷新日志</button></div>
@@ -8364,7 +8502,7 @@ function App() {
                         max={1000}
                         step={1}
                         defaultValue={editingProvider.maxConcurrentRequests || ''}
-                        placeholder="不限制"
+                        placeholder="默认 600"
                         disabled={saving}
                       />
                       <span className="knob-input-unit">个</span>
@@ -8416,7 +8554,7 @@ function App() {
                           max={600}
                           step={1}
                           defaultValue={editingProvider.firstPacketTimeoutSec || ''}
-                          placeholder="不限制"
+                          placeholder="默认 600"
                           disabled={saving}
                           aria-label="首包超时（秒）"
                         />
@@ -8424,7 +8562,7 @@ function App() {
                       </span>
                       <button className="btn btn-sm" disabled={saving} onClick={() => void saveProviderFirstPacketTimeout(editingProvider.id)}>保存</button>
                     </span>
-                    <InfoTip text="网关等这台上游给出「响应头」的最长时间，超时即放弃它、继续这条密钥链路上的下一个 Provider；留空或 0 = 不限制。它只约束开流之前的等待，上游已经开播的思考或长回答不会被切断。适合挂在容易假死的上游上。" />
+                    <InfoTip text="网关等这台上游给出「响应头」的最长时间，超时即放弃它、继续这条密钥链路上的下一个 Provider；留空或 0 = 使用网关默认 600 秒（10 分钟）。它只约束开流之前的等待，上游已经开播的思考或长回答不会被切断。适合挂在容易假死的上游上。" />
                   </div>
                   <label className="provider-knob-field">
                     <span>账号分组</span>

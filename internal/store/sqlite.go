@@ -628,6 +628,9 @@ func (s *Store) Load(defaultState domain.GatewayState) (domain.GatewayState, err
 	if raw := strings.TrimSpace(s.setting("webExposed")); raw != "" {
 		state.WebExposed = raw == "1" || strings.EqualFold(raw, "true")
 	}
+	if raw := strings.TrimSpace(s.setting("hostMetricsDisabled")); raw != "" {
+		state.HostMetricsDisabled = raw == "1" || strings.EqualFold(raw, "true")
+	}
 	if raw := s.setting("providerRequestAdapters"); raw != "" {
 		var adapters map[string]*domain.RequestAdapter
 		if err := json.Unmarshal([]byte(raw), &adapters); err == nil {
@@ -921,6 +924,13 @@ func (s *Store) Save(state domain.GatewayState) error {
 		webExposedValue = "true"
 	}
 	if err := setSetting(tx, "webExposed", webExposedValue); err != nil {
+		return err
+	}
+	hostMetricsDisabledValue := "false"
+	if state.HostMetricsDisabled {
+		hostMetricsDisabledValue = "true"
+	}
+	if err := setSetting(tx, "hostMetricsDisabled", hostMetricsDisabledValue); err != nil {
 		return err
 	}
 	adapters := make(map[string]*domain.RequestAdapter, len(state.Providers))

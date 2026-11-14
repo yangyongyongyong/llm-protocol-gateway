@@ -8,6 +8,10 @@ ARCH="${ARCH:-arm64}"
 # 前端与二进制都要带同一个值，否则控制台的升级判断会错位（release.yml 会校验）。
 APP_VERSION="${GATEWAY_APP_VERSION:-${CURRENT_APP_VERSION:-0.0.0-dev}}"
 export GATEWAY_APP_VERSION="$APP_VERSION"
+LDFLAGS="-X github.com/luca/llm-protocol-gateway/internal/gateway.BuildVersion=$APP_VERSION -X github.com/luca/llm-protocol-gateway/desktop.version=$APP_VERSION"
+if [[ -n "${UPDATE_PUBLIC_KEY:-}" ]]; then
+  LDFLAGS="$LDFLAGS -X github.com/luca/llm-protocol-gateway/internal/desktopupdate.SignaturePublicKey=$UPDATE_PUBLIC_KEY"
+fi
 # Wails packaging needs sysctl (in /usr/sbin); keep a sane PATH for non-interactive shells.
 export PATH="/usr/sbin:/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin:${HOME}/go/bin:${PATH}"
 
@@ -52,7 +56,7 @@ echo "==> wails build ($PLATFORM, version $APP_VERSION)"
   # 确实带着本次 tag 的版本号，缺了这一步 macOS 包会全部判失败。
   "$WAILS_BIN" build -platform "$PLATFORM" -clean \
     -tags desktop_ui \
-    -ldflags "-X github.com/luca/llm-protocol-gateway/internal/gateway.BuildVersion=$APP_VERSION"
+    -ldflags "$LDFLAGS"
 )
 
 APP_PATH="$ROOT/desktop/build/bin/LLM Protocol Gateway.app"
@@ -63,6 +67,18 @@ fi
 if [[ -z "${APP_PATH:-}" || ! -d "$APP_PATH" ]]; then
   echo "build finished but .app not found under desktop/build/bin" >&2
   ls -la "$ROOT/desktop/build/bin" || true
+  exit 1
+fi
+
+# Wails takes productVersion from wails.json unless the bundle is patched. The
+# build version is the single source of truth: stamp both plist keys and fail
+# the build if Wails or a future template silently keeps its placeholder.
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$APP_PATH/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $APP_VERSION" "$APP_PATH/Contents/Info.plist"
+SHORT_VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_PATH/Contents/Info.plist")"
+BUNDLE_VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP_PATH/Contents/Info.plist")"
+if [[ "$SHORT_VERSION" != "$APP_VERSION" || "$BUNDLE_VERSION" != "$APP_VERSION" ]]; then
+  echo "App 版本戳不一致：期望 $APP_VERSION，Info.plist=$SHORT_VERSION/$BUNDLE_VERSION" >&2
   exit 1
 fi
 

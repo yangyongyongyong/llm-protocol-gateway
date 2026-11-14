@@ -333,10 +333,14 @@ type hostMetricsSampler struct {
 	subscribers atomic.Int64
 
 	collecting atomic.Bool // true while the sampler loop is alive (tests / debug)
+	// enabled is the persisted machine-status switch. The loop stays alive but
+	// skips collection while false, so disabling it costs no host sampling work.
+	enabled atomic.Bool
 }
 
 func newHostMetricsSampler(stores ...hostMetricsStore) *hostMetricsSampler {
 	h := &hostMetricsSampler{ready: make(chan struct{})}
+	h.enabled.Store(true)
 	if len(stores) > 0 {
 		h.store = stores[0]
 	}
@@ -349,8 +353,11 @@ func newHostMetricsSampler(stores ...hostMetricsStore) *hostMetricsSampler {
 func (h *hostMetricsSampler) Start() {
 	h.startOnce.Do(func() {
 		h.restore()
-		// Synchronous first sample so the first paint is never empty.
-		h.refresh()
+		// Synchronous first sample so the first paint is never empty, unless the
+		// operator explicitly disabled machine sampling before startup.
+		if h.enabled.Load() {
+			h.refresh()
+		}
 		close(h.ready)
 		go h.loop()
 	})
@@ -433,6 +440,15 @@ func (h *hostMetricsSampler) active() bool {
 	return time.Since(h.lastRequest) < hostMetricsActiveWindow
 }
 
+// SetEnabled pauses or resumes collection without tearing down the loop.
+func (h *hostMetricsSampler) SetEnabled(enabled bool) {
+	h.enabled.Store(enabled)
+	h.touch()
+	if enabled {
+		h.Start()
+	}
+}
+
 func (h *hostMetricsSampler) loop() {
 	h.collecting.Store(true)
 	defer h.collecting.Store(false)
@@ -443,6 +459,10 @@ func (h *hostMetricsSampler) loop() {
 	defer ticker.Stop()
 	lastSample := time.Now()
 	for tick := range ticker.C {
+		if !h.enabled.Load() {
+			lastSample = tick
+			continue
+		}
 		interval := hostMetricsIdleInterval
 		if h.active() {
 			interval = hostMetricsPollInterval
@@ -590,6 +610,10 @@ func (s *Server) handleHostMetrics(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireAdmin(w, r); !ok {
 		return
 	}
+	if s.router.HostMetricsDisabled() {
+		writeOpenAIError(w, http.StatusConflict, "机器状态动态采集已关闭")
+		return
+	}
 	writeJSON(w, http.StatusOK, s.hostSampler().Snapshot())
 }
 
@@ -599,6 +623,9 @@ func (s *Server) handleHostMetrics(w http.ResponseWriter, r *http.Request) {
 // a restart left a hole exactly as wide as the gap until the next visit, and
 // SQLite — which does keep every point it was handed — had nothing to restore.
 func (s *Server) StartHostMetrics() {
+	sampler := s.hostSampler()
+	sampler.SetEnabled(!s.router.HostMetricsDisabled())
+	sampler.Start()
 	s.hostMetricsPump()
 }
 

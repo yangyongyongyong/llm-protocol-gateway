@@ -34,6 +34,10 @@ func (s *Server) handleHostMetricsSnapshot(w http.ResponseWriter, r *http.Reques
 	if _, ok := s.requireAdmin(w, r); !ok {
 		return
 	}
+	if s.router.HostMetricsDisabled() {
+		writeOpenAIError(w, http.StatusConflict, "机器状态动态采集已关闭")
+		return
+	}
 	w.Header().Set("Cache-Control", "no-store")
 	first := collectHostMetrics(nil)
 	time.Sleep(hostMetricsResolutionStep)
@@ -59,6 +63,10 @@ func (s *Server) handleHostDiagnostics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	if s.router.HostMetricsDisabled() {
+		writeOpenAIError(w, http.StatusConflict, "机器状态动态采集已关闭")
 		return
 	}
 	first := collectHostMetrics(nil)

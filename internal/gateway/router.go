@@ -199,6 +199,24 @@ func (r *Router) WebExposed() bool {
 	return r.state.WebExposed
 }
 
+func (r *Router) SetHostMetricsDisabled(disabled bool) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.HostMetricsDisabled = disabled
+}
+
+func (r *Router) HostMetricsDisabled() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.state.HostMetricsDisabled
+}
+
 func (r *Router) UpdatePublicAccess(settings domain.PublicAccessSettings) domain.PublicAccessSettings {
 	r.mu.Lock()
 	defer r.mu.Unlock()

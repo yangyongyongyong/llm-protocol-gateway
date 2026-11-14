@@ -674,7 +674,7 @@ export type Provider = {
   // 开启后网关转发前用 rtk pipe 过滤 tool_result 里的命令输出。
   rtkCompress?: boolean;
   // 首包超时（秒，管理员，通过 POST /__providers/{id}/first-packet-timeout 单独保存）：
-  // 网关等这台上游返回响应头的最长时间，超时即换下一个 Provider。0/缺省 = 不限制，
+  // 网关等这台上游返回响应头的最长时间，超时即换下一个 Provider。0/缺省 = 使用网关默认 600 秒，
   // 且只约束开流前的等待，不会切断已经在输出的回答。
   firstPacketTimeoutSec?: number;
   // 实测这台上游支持哪些线协议（新建/改 baseUrl 后由后台自动探测写下）。
@@ -1004,6 +1004,16 @@ export type PeerUpstreamsResponse = {
   protocols: Protocol[];
 };
 
+/** macOS 登录项状态；Available=false 表示当前不是 App（如无头 CLI / 非 macOS）。 */
+export type DesktopAutostartStatus = {
+  available: boolean;
+  enabled: boolean;
+  needsApproval?: boolean;
+  mechanism?: string;
+  appPath?: string;
+  message?: string;
+};
+
 export type GatewayState = {
   providerGroups: ProviderGroup[];
   providers: Provider[];
@@ -1029,6 +1039,8 @@ export type GatewayState = {
   usageBatchMaxWaitSeconds?: number;
   /** When true, HTTP binds 0.0.0.0 (LAN / tunnel). When false, loopback only. */
   webExposed?: boolean;
+  /** 机器状态动态采集是否关闭；缺省 false 保持旧版常驻采样行为。 */
+  hostMetricsDisabled?: boolean;
   dataPaths?: DataPaths;
   cursorBridge?: CursorBridgeRuntime;
   /** 本网关的稳定身份；重装不变。父子对接靠它互相识别。 */

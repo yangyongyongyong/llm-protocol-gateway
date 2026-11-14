@@ -13,7 +13,7 @@
   "info": {
     "companyName": "Luca",
     "productName": "LLM Protocol Gateway",
-    "productVersion": "0.1.3",
+    "productVersion": "0.0.0",
     "copyright": "Copyright Luca",
     "comments": "Local LLM protocol gateway"
   }

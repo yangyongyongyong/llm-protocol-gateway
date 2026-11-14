@@ -260,7 +260,16 @@ function MainResult({ result, running }: { result: RouteTestResult | null; runni
         {answer?.usage ? <span>{answer.usage}</span> : null}
         {result.targetUrl || result.upstreamUrl ? <span title={result.targetUrl || result.upstreamUrl}>上游 <b>{shortHost(result.targetUrl || result.upstreamUrl || '')}</b></span> : null}
       </div>
-      {answer?.error ? <div className="chat-test-error">{answer.error}</div> : null}
+      {(() => {
+        // 有结构化诊断时优先给 transportError / 上游 errorMessage；这比
+        // 只有一句 HTTP 状态更能说明到底是地址不通、超时还是上游拒绝。
+        const diagnosticError = result.diagnostics?.transportError
+          || result.diagnostics?.errorMessage
+          || result.error
+          || answer?.error
+          || '';
+        return diagnosticError ? <div className="chat-test-error">{diagnosticError}</div> : null;
+      })()}
       {answer?.reasoning ? (
         <details className="chat-test-reasoning">
           <summary>思考内容（{answer.reasoning.length} 字符）</summary>
@@ -272,7 +281,7 @@ function MainResult({ result, running }: { result: RouteTestResult | null; runni
       ) : result.success ? (
         <div className="chat-test-text subtle">响应里没有可读的正文，看下面的原始报文。</div>
       ) : null}
-      <details className="chat-test-details" open={!result.success && !answer?.error}>
+      <details className="chat-test-details" open={!result.success}>
         <summary>原始请求与响应</summary>
         <div className="chat-test-details-head">
           <span>{result.success ? '响应报文' : '诊断信息'}</span>

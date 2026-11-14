@@ -333,10 +333,10 @@ type Provider struct {
 	// FirstPacketTimeoutSec bounds how long one attempt to this provider may
 	// wait for the upstream's response headers before the gateway abandons it
 	// and moves to the next provider in the key's chain. 0 (the default) means
-	// no limit. The timer covers only the wait for headers: once they arrive it
-	// is stopped, so a long reasoning stream or a slow body is never cut short,
-	// and a provider that thinks for two minutes before answering is not
-	// mistaken for a hung one.
+	// use the gateway's 600s header wait. A positive value overrides that for
+	// this provider. The timer covers only the wait for headers: once they
+	// arrive it is stopped, so a long reasoning stream or a slow body is never
+	// cut short.
 	FirstPacketTimeoutSec int `json:"firstPacketTimeoutSec,omitempty"`
 	// ProtocolSupport 是这台上游「实测支持哪些线协议」的结论，由创建/变更
 	// baseUrl 之后的后台探测写下（见 gateway.detectProviderProtocols）。
@@ -918,7 +918,7 @@ type APIKey struct {
 	MaxOutputTokens int `json:"maxOutputTokens,omitempty"`
 	// FirstPacketTimeoutSec 是这个 Key 的「等上游响应头」上限，覆盖它名下所有
 	// Provider。0 = 不单独设，按各 Provider 自己的 FirstPacketTimeoutSec（再没有
-	// 就落到网关默认的 120s 空闲窗口）。
+	// 就落到网关默认的 600s 响应头等待）。
 	//
 	// 为什么要在 Key 上再放一个：同一个 Provider 可能同时服务「秒回的聊天」和
 	// 「先想两分钟再开口」的重模型，Provider 级的一个数答不了两种用法；而调用方
@@ -1178,6 +1178,9 @@ type GatewayState struct {
 	// (500 events / 60s).
 	UsageBatchMaxSize        int `json:"usageBatchMaxSize,omitempty"`
 	UsageBatchMaxWaitSeconds int `json:"usageBatchMaxWaitSeconds,omitempty"`
+	// HostMetricsDisabled turns off the machine-status sampler and its endpoints.
+	// False (the zero value) preserves the historical always-on behavior.
+	HostMetricsDisabled bool `json:"hostMetricsDisabled,omitempty"`
 	// WebExposed controls whether the HTTP server binds all interfaces (0.0.0.0)
 	// so LAN / tunnel clients can reach the management UI and APIs. When false,
 	// the server listens on 127.0.0.1 only (local App / loopback).

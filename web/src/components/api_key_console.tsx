@@ -1729,8 +1729,8 @@ function MaxOutputTokensField({value, disabled, onSave}: {value: number; disable
  * 这个 Key 等上游「响应头」的上限。
  *
  * 只覆盖「请求已发出、上游还没开口」这一段：一旦响应头到了，长回答、慢 stream
- * 都不受影响。默认 0 表示按各 Provider 自己的设置走（再没有就是网关的 120s
- * 空闲窗口）——同一个 Provider 可能既跑秒回的聊天又跑先想两分钟的模型，所以这
+ * 都不受影响。默认 0 表示按各 Provider 自己的设置走（再没有就是网关的 600s
+ * 响应头等待）——同一个 Provider 可能既跑秒回的聊天又跑先想两分钟的模型，所以这
  * 个值放在 Key 上才答得了「我这把钥匙要等多久」。
  */
 function FirstPacketTimeoutField({value, disabled, onSave}: {value: number; disabled: boolean; onSave: (value: number) => Promise<void>}) {
@@ -1748,7 +1748,7 @@ function FirstPacketTimeoutField({value, disabled, onSave}: {value: number; disa
     <div className="akc-field">
       <div className="akc-label-row">
         <label>等待响应头（秒）</label>
-        <InfoTip text="从请求发出到上游返回响应头的上限。只影响「还没开口」这一段，一旦开始返回就不会被打断。留空或 0 = 按 Provider 的设置走（默认 120 秒）。" />
+        <InfoTip text="从请求发出到上游返回响应头的上限。只影响「还没开口」这一段，一旦开始返回就不会被打断。留空或 0 = 按 Provider 的设置走（网关默认 600 秒）。" />
       </div>
       <input
         type="number"

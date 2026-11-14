@@ -355,6 +355,41 @@ export function chatTestVerdictFromBody(bodyText: string, httpStatus: number): C
   return { success: false, httpStatus, error: readable || `HTTP ${httpStatus}` };
 }
 
+/**
+ * routeTestResultFromBody 解析控制台路由测试的完整应答。失败时后端仍会
+ * 返回 model / status / diagnostics / responseBody；这些字段是排查上游问题
+ * 的唯一现场，不能像错误信封那样只剩一句 error。
+ */
+export function routeTestResultFromBody(bodyText: string, httpStatus: number): RouteTestResult {
+  const verdict = chatTestVerdictFromBody(bodyText, httpStatus);
+  let parsed: Record<string, unknown> | null = null;
+  try {
+    const raw = JSON.parse(bodyText) as unknown;
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) parsed = raw as Record<string, unknown>;
+  } catch {
+    parsed = null;
+  }
+  if (!parsed) {
+    return { success: false, status: httpStatus, error: verdict.error || `HTTP ${httpStatus}` };
+  }
+  const { error: rawError, ...rest } = parsed;
+  const diagnostics = rest.diagnostics as RouteTestResult['diagnostics'];
+  const parsedStatus = typeof rest.status === 'number' && rest.status > 0
+    ? rest.status
+    : diagnostics?.status && diagnostics.status > 0 ? diagnostics.status : httpStatus;
+  const result: RouteTestResult = {
+    ...(rest as RouteTestResult),
+    success: verdict.success,
+    status: parsedStatus,
+    error: typeof rawError === 'string' ? rawError : verdict.error,
+  };
+  // 错误信封没有 diagnostics 时，把原始 JSON 留下来；至少失败现场不会消失。
+  if (!verdict.success && !result.diagnostics && !result.responseBody && !result.preview) {
+    result.preview = bodyText.slice(0, 4000);
+  }
+  return result;
+}
+
 /** chatTestToastText 给对话测试写一句提示：错误说原因，不再出现 undefined。 */
 export function chatTestToastText(verdict: ChatTestVerdict) {
   if (verdict.success) return `对话测试成功：HTTP ${verdict.status ?? verdict.httpStatus ?? 200}`;

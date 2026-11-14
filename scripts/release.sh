@@ -238,7 +238,7 @@ build_desktop() {
     # 版本号也要注入，否则桌面里的控制台会一直显示开发版本。
     CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" GOFLAGS=-mod=mod \
       go build -trimpath -buildvcs=true -tags desktop,production,desktop_ui \
-      -ldflags "-s -w -H windowsgui -X github.com/luca/llm-protocol-gateway/internal/gateway.BuildVersion=$VERSION" \
+      -ldflags "-s -w -H windowsgui -X github.com/luca/llm-protocol-gateway/internal/gateway.BuildVersion=$VERSION -X github.com/luca/llm-protocol-gateway/desktop.version=$VERSION ${UPDATE_PUBLIC_KEY:+-X github.com/luca/llm-protocol-gateway/internal/desktopupdate.SignaturePublicKey=$UPDATE_PUBLIC_KEY}" \
       -o "$out" .
     rm -f "$syso"
     trap - RETURN

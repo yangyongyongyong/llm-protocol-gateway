@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # 生成并打印本次发布的版本号。
 #
-# 版本号同时注入两个地方，二者必须一致，否则控制台无法判断“后端已升级”：
-#   1. 后端二进制   go build -ldflags "-X .../internal/gateway.BuildVersion=<版本>"
-#   2. 前端资源     GATEWAY_APP_VERSION=<版本> npm run build  → __APP_VERSION__
+# 发布版本只有这一个输入；各平台构建脚本必须把它注入所有产物：
+#   1. 后端二进制   gateway.BuildVersion 与 desktop.version
+#   2. 前端资源     GATEWAY_APP_VERSION → __APP_VERSION__
+#   3. macOS 包     Info.plist 的 CFBundleShortVersionString / CFBundleVersion
 #
 # 格式：YYYYMMDD.HHMMSS（UTC）。等长、可直接按字符串比较，不会因为版本号
 # 位数变化而比错。可用 GATEWAY_APP_VERSION 覆盖（手工发版 / 回滚到旧版本）。

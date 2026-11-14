@@ -159,10 +159,15 @@ function stopStream() {
     stream.stop = null;
 }
 
-function useHostHistory(): {history: HostHistory; status: HostStreamStatus} {
+function useHostHistory(enabled: boolean): {history: HostHistory; status: HostStreamStatus} {
     const [history, setHistory] = useState<HostHistory>(() => loadHistory());
     const [status, setStatus] = useState<HostStreamStatus>('connecting');
     useEffect(() => {
+        if (!enabled) {
+            setHistory({points: [], last: null, lastAt: 0});
+            setStatus('forbidden');
+            return undefined;
+        }
         const listener = (next: HostHistory, nextStatus: HostStreamStatus) => {
             setHistory(next);
             setStatus(nextStatus);
@@ -174,7 +179,7 @@ function useHostHistory(): {history: HostHistory; status: HostStreamStatus} {
             stream.listeners.delete(listener);
             if (stream.listeners.size === 0) stopStream();
         };
-    }, []);
+    }, [enabled]);
     return {history, status};
 }
 
@@ -750,8 +755,8 @@ function DiagnosisCard({diagnosis, loading, onRefresh}: {diagnosis: HostDiagnosi
 
 // ---------------------------------------------------------------- 页面
 
-export function MachineStatusPage({onToast}: {onToast: (message: string) => void}) {
-    const {history, status} = useHostHistory();
+export function MachineStatusPage({onToast, enabled = true, onOpenSettings}: {onToast: (message: string) => void; enabled?: boolean; onOpenSettings?: () => void}) {
+    const {history, status} = useHostHistory(enabled);
     // 满速采样间隔由服务端下发；降级轮询时也按同一个节奏画断档判定。
     const pollMs = hostMetricsPollMs();
     const metrics = history.last;
@@ -797,6 +802,26 @@ export function MachineStatusPage({onToast}: {onToast: (message: string) => void
         link.remove();
         window.setTimeout(() => setDownloading(false), 1200);
     }, []);
+
+    if (!enabled) {
+        return (
+            <section className="section-full machine-page">
+                <div className="machine-top">
+                    <div className="machine-top-main">
+                        <h2 className="panel-title">机器状态</h2>
+                        <p className="machine-top-note">机器状态动态采集已关闭，后台不会继续采样主机指标。</p>
+                    </div>
+                    <div className="machine-top-side">
+                        <span className="badge slate">已关闭</span>
+                        {onOpenSettings ? <button className="btn primary" type="button" onClick={onOpenSettings}>去设置开启</button> : null}
+                    </div>
+                </div>
+                <div className="card panel">
+                    <div className="empty-state">在「设置 → 机器状态动态采集」中开启后，这里会恢复实时指标、趋势图和诊断。</div>
+                </div>
+            </section>
+        );
+    }
 
     const lastAt = history.lastAt || (metrics?.collectedAt ? Date.parse(metrics.collectedAt) : 0);
     // 网关在没人看时是 15 秒一档，30 秒没新点才算真的断（重启 / 挂起）。

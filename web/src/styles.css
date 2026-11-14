@@ -412,6 +412,11 @@ html[data-theme="dark"] *:hover::-webkit-scrollbar-thumb { background: rgba(152,
   color: var(--sidebar-subtle); font-size: var(--fs-sm); line-height: 1.3;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+.brand-version {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
 
 /* 收起开关：常态低对比，hover 才显形 */
 .sidebar-toggle {

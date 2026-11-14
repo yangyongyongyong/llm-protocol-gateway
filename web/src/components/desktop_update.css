@@ -1,0 +1,47 @@
+.desktop-update-versions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 6px 0 12px;
+  color: var(--subtle);
+  font-size: 13px;
+}
+.desktop-update-versions strong { color: var(--text); font-weight: 650; }
+.desktop-update-version-sep { color: var(--subtle); }
+.desktop-update-checked { margin-left: auto; font-size: 12px; }
+.desktop-update-switches { margin-bottom: 10px; }
+.desktop-update-interval { max-width: 220px; margin-bottom: 10px; }
+.desktop-update-progress-wrap { margin: 10px 0; }
+.desktop-update-progress {
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--surface-sunken);
+  border: 1px solid var(--border);
+}
+.desktop-update-progress > span {
+  display: block;
+  height: 100%;
+  min-width: 2px;
+  border-radius: inherit;
+  background: var(--accent, #6d5dfc);
+  transition: width .25s ease;
+}
+.desktop-update-error {
+  margin: 10px 0;
+  padding: 9px 11px;
+  border: 1px solid color-mix(in srgb, #dc4c64 45%, var(--border));
+  border-radius: 8px;
+  background: color-mix(in srgb, #dc4c64 10%, var(--surface));
+  color: #dc4c64;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.desktop-update-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.desktop-update-toast { top: 150px; }
+.desktop-update-toast .desktop-update-progress { margin: 8px 0 4px; }
+@media (max-width: 680px) {
+  .desktop-update-toast { top: 12px; }
+  .desktop-update-checked { width: 100%; margin-left: 0; }
+}

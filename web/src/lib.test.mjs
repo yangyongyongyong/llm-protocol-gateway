@@ -438,6 +438,40 @@ test('失败应答的错误信封：提示里是那句话，不是 undefined', (
   assert.ok(!toast.includes('undefined'), toast);
 });
 
+test('路由测试失败保留模型、真实状态和诊断，不被外层 HTTP 200 覆盖', () => {
+  const body = {
+    success: false,
+    routeId: 'r1',
+    providerId: 'p1',
+    model: 'deepseek-v4.1-flash',
+    status: 429,
+    protocolFlow: 'oc -> oc',
+    error: '上游频率限制',
+    diagnostics: {
+      status: 429,
+      model: 'deepseek-v4.1-flash',
+      transportError: 'Post "https://upstream.example/chat/completions": EOF',
+      errorMessage: '上游频率限制',
+      responseBody: '{"code":6004}',
+    },
+  };
+  const result = lib.routeTestResultFromBody(JSON.stringify(body), 200);
+  assert.equal(result.success, false);
+  assert.equal(result.status, 429, '内层 429 不能被外层 200 覆盖');
+  assert.equal(result.model, 'deepseek-v4.1-flash');
+  assert.equal(result.diagnostics.transportError, body.diagnostics.transportError);
+  assert.equal(result.diagnostics.responseBody, body.diagnostics.responseBody);
+});
+
+test('错误信封没有诊断时保留原始 JSON，诊断区仍看得到内容', () => {
+  const text = JSON.stringify({error: {message: 'permission denied'}});
+  const result = lib.routeTestResultFromBody(text, 403);
+  assert.equal(result.success, false);
+  assert.equal(result.status, 403);
+  assert.equal(result.error, 'permission denied');
+  assert.equal(result.preview, text);
+});
+
 test('正常应答按 success 判定，成功提示带模型侧状态码', () => {
   const ok = lib.chatTestVerdictFromBody(JSON.stringify({success: true, status: 200, routeId: 'r1', error: ''}), 200);
   assert.equal(ok.success, true);

@@ -16,6 +16,14 @@ import (
 // value cannot park a request longer than any client is willing to wait.
 const maxFirstPacketTimeoutSec = 600
 
+// upstreamHeaderWait matches Magpie's 10-minute wait for a vendor to begin
+// answering. Long reasoning models can spend minutes before the first SSE
+// event; a two-minute default cut healthy turns into provider faults.
+//
+// It only covers the wait for response headers. Per-provider and per-key
+// first-packet overrides can shorten it when a provider is known to be flaky.
+const upstreamHeaderWait = 10 * time.Minute
+
 // upstreamIdleTimeout bounds how long a stream may go silent *after* its
 // headers arrived. Without it a vendor that accepts the request and then stops
 // sending leaves the turn hanging until the client gives up, and the gateway
@@ -23,12 +31,9 @@ const maxFirstPacketTimeoutSec = 600
 //
 // The window is generous on purpose: a Claude turn can think for a while
 // between frames, and the heartbeat the gateway itself sends every 15s does
-// not count — this is the upstream's silence, not ours.
-//
-// 300s rather than the old 120s: reasoning models routinely think for minutes
-// before the first frame, and cutting them at two minutes turned a slow-but-fine
-// answer into a provider fault. Per-provider and per-key overrides still win.
-const upstreamIdleTimeout = 300 * time.Second
+// not count — this is the upstream's silence, not ours. Keep it aligned with
+// Magpie's 10-minute first-byte patience.
+const upstreamIdleTimeout = 10 * time.Minute
 
 // errUpstreamIdleTimeout is what a silent upstream is reported as. Like
 // errUpstreamFirstPacketTimeout it is not a context error, so the failover loop
@@ -60,7 +65,7 @@ func newUpstreamTransport() *http.Transport {
 		// Covers the wait for response headers on an HTTP/1 connection, which
 		// is where a vendor that accepts the request and then never answers
 		// would otherwise hold the caller forever.
-		ResponseHeaderTimeout: upstreamIdleTimeout,
+		ResponseHeaderTimeout: upstreamHeaderWait,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          maxUpstreamConns,
 		MaxIdleConnsPerHost:   32,

@@ -174,6 +174,10 @@ func (s *Server) handleHostMetricsStream(w http.ResponseWriter, r *http.Request)
 	if _, ok := s.requireAdmin(w, r); !ok {
 		return
 	}
+	if s.router.HostMetricsDisabled() {
+		writeOpenAIError(w, http.StatusConflict, "机器状态动态采集已关闭")
+		return
+	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeOpenAIError(w, http.StatusInternalServerError, "streaming unsupported")
@@ -231,6 +235,9 @@ func (s *Server) handleHostMetricsStream(w http.ResponseWriter, r *http.Request)
 		case <-ctx.Done():
 			return
 		case <-heartbeat.C:
+			if s.router.HostMetricsDisabled() {
+				return
+			}
 			if _, err := w.Write(sseHeartbeatComment); err != nil {
 				return
 			}

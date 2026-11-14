@@ -16,4 +16,10 @@ func TestExtractResponseErrorMessageIgnoresNilError(t *testing.T) {
 	if got := extractResponseErrorMessage([]byte(`{"error":{"message":"boom","type":"api_error"}}`)); got != "boom" {
 		t.Fatalf("real error = %q, want boom", got)
 	}
+	if got := extractResponseErrorMessage([]byte(`{"code":6004,"msg":"您的使用量已超出频率限制"}`)); got != "6004: 您的使用量已超出频率限制" {
+		t.Fatalf("WorkBuddy error = %q", got)
+	}
+	if got := extractResponseErrorMessage([]byte(`{"code":0,"msg":"ok"}`)); got != "" {
+		t.Fatalf("successful code envelope must not look like an error: %q", got)
+	}
 }

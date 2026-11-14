@@ -13,7 +13,9 @@ import (
 	"time"
 
 	"github.com/luca/llm-protocol-gateway/internal/app"
+	appstartup "github.com/luca/llm-protocol-gateway/internal/autostart"
 	"github.com/luca/llm-protocol-gateway/internal/clidesktop"
+	"github.com/luca/llm-protocol-gateway/internal/desktopupdate"
 	"github.com/luca/llm-protocol-gateway/internal/gateway"
 	"github.com/luca/llm-protocol-gateway/internal/packaged"
 	"github.com/wailsapp/wails/v2/pkg/menu"
@@ -30,6 +32,9 @@ type App struct {
 	// ready closes when startup has finished (gateway listening or quitting),
 	// so the bootstrap page never navigates to a port that is not open yet.
 	ready chan struct{}
+	// updater is owned by the native shell; the gateway only exposes its state.
+	updater       *desktopupdate.Manager
+	updaterCancel context.CancelFunc
 }
 
 func NewApp() *App {
@@ -167,6 +172,7 @@ func (a *App) startup(ctx context.Context) {
 	cfg := app.Config{
 		Port:          app.DefaultPort,
 		PreferEnvAddr: false,
+		Version:       appVersion(),
 	}
 	if err := a.rt.Start(cfg); err != nil {
 		_, _ = runtime.MessageDialog(ctx, runtime.MessageDialogOptions{
@@ -180,6 +186,12 @@ func (a *App) startup(ctx context.Context) {
 	if err := a.rt.WaitHealthy(8 * time.Second); err != nil {
 		slog.Warn("gateway health wait", "error", err)
 	}
+	// A fresh install opens at login by default. The package records a one-time
+	// choice marker so a later manual Off is never overridden on the next launch.
+	if err := appstartup.New().EnsureDefault(); err != nil {
+		slog.Warn("desktop autostart first-install default failed", "error", err)
+	}
+	a.startDesktopUpdater()
 	markReady()
 	a.verifyLocalUI()
 }
@@ -266,6 +278,12 @@ func (a *App) domReady(ctx context.Context) {
 }
 
 func (a *App) shutdown(_ context.Context) {
+	if a.updaterCancel != nil {
+		a.updaterCancel()
+	}
+	if a.updater != nil {
+		a.updater.Close()
+	}
 	// The runtime's own budget, not a shorter one: every step of Stop (drain,
 	// landing the deferred writes, closing the DB) needs room to finish, and Stop
 	// guarantees it returns inside this deadline either way.
@@ -274,6 +292,43 @@ func (a *App) shutdown(_ context.Context) {
 	if err := a.rt.Stop(shutdownCtx); err != nil {
 		slog.Error("gateway shutdown failed", "error", err)
 	}
+}
+
+// startDesktopUpdater wires the native updater to the gateway's local state.
+// It never runs before the server is listening, so the first console poll sees
+// the same update state the background loop uses.
+func (a *App) startDesktopUpdater() {
+	if a.rt == nil || a.rt.Server() == nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var updater *desktopupdate.Manager
+	updater = desktopupdate.New(desktopupdate.Options{Version: appVersion()})
+	a.rt.Server().SetExternalURLOpener(func(raw string) error {
+		if a.ctx == nil {
+			return fmt.Errorf("desktop shell is not ready")
+		}
+		runtime.BrowserOpenURL(a.ctx, raw)
+		return nil
+	})
+	updater.SetIdleCheck(func() bool {
+		server := a.rt.Server()
+		return server == nil || server.CurrentInFlight() == 0
+	})
+	updater.SetRestartHook(func() error {
+		bundle := updater.AppBundle()
+		if err := desktopupdate.Relaunch(bundle); err != nil {
+			return err
+		}
+		if a.ctx != nil {
+			runtime.Quit(a.ctx)
+		}
+		return nil
+	})
+	a.rt.Server().SetDesktopUpdater(updater)
+	updater.Start(ctx)
+	a.updater = updater
+	a.updaterCancel = cancel
 }
 
 // LocalURL returns the loopback management URL.

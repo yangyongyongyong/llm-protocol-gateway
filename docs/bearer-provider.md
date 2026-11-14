@@ -195,7 +195,7 @@ Key 级（也可存进"方案" `KeyProfile`，切方案一起切），空 = 现�
 ### 6.4 首包超时（假死的上游换掉，而不是拖死）
 Provider 上的 `firstPacketTimeoutSec`：网关等这台**响应头**的最长时间，超时即放弃这次尝试、
 继续下一个候选。定时器只管到响应头到达为止，所以开播之后思考两分钟的模型不会被误伤
-（`doUpstreamHTTP`，`internal/gateway/upstream_timeout.go`；上限 600s，0 = 不限制 = 旧行为）。
+（`doUpstreamHTTP`，`internal/gateway/upstream_timeout.go`；上限 600s，0 = 使用网关默认 600s）。
 
 实现上它返回的是自定义错误而不是 `context.Canceled`——后者会被 5.2 的判定当成
 "客户端已经断开"而停止 failover。专用接口保存：`POST /__providers/{id}/first-packet-timeout`

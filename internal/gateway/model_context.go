@@ -46,28 +46,6 @@ func attachAPIKeyMaxOutputTokens(r *http.Request, key domain.APIKey, matched boo
 
 type codexForceFastKey struct{}
 
-// routeTestTokenKey carries the one-shot token that marks a request the gateway
-// itself makes for the console's "对话测试" (testRoute). It is a value in the
-// request's own context, so only a request this process built can hold it: a
-// client can name the X-Gateway-Route-Id / X-Gateway-Internal-Test headers, but
-// it cannot put anything into the context of the request it sends.
-type routeTestTokenKey struct{}
-
-func withRouteTestToken(ctx context.Context) context.Context {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return context.WithValue(ctx, routeTestTokenKey{}, true)
-}
-
-func routeTestTokenFrom(ctx context.Context) bool {
-	if ctx == nil {
-		return false
-	}
-	marked, _ := ctx.Value(routeTestTokenKey{}).(bool)
-	return marked
-}
-
 func withCodexForceFast(ctx context.Context) context.Context {
 	if ctx == nil {
 		ctx = context.Background()

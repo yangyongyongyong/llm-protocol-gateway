@@ -182,6 +182,7 @@ jobs:
         env:
           GATEWAY_APP_VERSION: ${{ needs.gate.outputs.version }}
           VERSION: ${{ needs.gate.outputs.version }}
+          UPDATE_PUBLIC_KEY: ${{ vars.UPDATE_PUBLIC_KEY }}
         run: |
           set -euo pipefail
           npm ci --no-audit --no-fund --prefix web
@@ -207,6 +208,15 @@ jobs:
             symbols="$(strings "$APP/Contents/MacOS/LLM Protocol Gateway")"
             grep -qF "$VERSION" <<<"$symbols"
             plutil -lint "$APP/Contents/Info.plist"
+            SHORT_VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Contents/Info.plist")"
+            BUNDLE_VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP/Contents/Info.plist")"
+            if [[ "$SHORT_VERSION" != "$VERSION" || "$BUNDLE_VERSION" != "$VERSION" ]]; then
+              echo "::error::macOS App 的 Info.plist 版本不一致：期望 $VERSION，实际 $SHORT_VERSION/$BUNDLE_VERSION"
+              exit 1
+            fi
+            build_info="$(go version -m "$APP/Contents/MacOS/LLM Protocol Gateway")"
+            grep -qF -- "-X github.com/luca/llm-protocol-gateway/internal/gateway.BuildVersion=$VERSION" <<<"$build_info"
+            grep -qF -- "-X github.com/luca/llm-protocol-gateway/desktop.version=$VERSION" <<<"$build_info"
 
             STAGE="$(mktemp -d)/llm-protocol-gateway-$VERSION"
             mkdir -p "$STAGE"
@@ -268,6 +278,8 @@ jobs:
           cache-dependency-path: web/package-lock.json
 
       - name: Build desktop exe
+        env:
+          UPDATE_PUBLIC_KEY: ${{ vars.UPDATE_PUBLIC_KEY }}
         run: |
           set -euo pipefail
           npm ci --no-audit --no-fund --prefix web
@@ -332,7 +344,8 @@ jobs:
         env:
           GATEWAY_APP_VERSION: ${{ needs.gate.outputs.version }}
           # App.version 来自 build tag；-ldflags 末尾覆盖它，让控制台看到真实版本号
-          DESKTOP_LDFLAGS: -X github.com/luca/llm-protocol-gateway/internal/gateway.BuildVersion=${{ needs.gate.outputs.version }}
+          UPDATE_PUBLIC_KEY: ${{ vars.UPDATE_PUBLIC_KEY }}
+          DESKTOP_LDFLAGS: -X github.com/luca/llm-protocol-gateway/internal/gateway.BuildVersion=${{ needs.gate.outputs.version }} -X github.com/luca/llm-protocol-gateway/desktop.version=${{ needs.gate.outputs.version }}
         run: |
           npm ci --no-audit --no-fund --prefix web
           GATEWAY_APP_VERSION="$GATEWAY_APP_VERSION" npm --prefix web run build
@@ -340,7 +353,7 @@ jobs:
           bash scripts/bundle-desktop-assets.sh
           cd desktop
           # desktop_ui：把 web/dist 内嵌进二进制，AppImage/deb 被单独拷走也能打开控制台。
-          wails build -tags "webkit2_41,desktop_ui" -ldflags "$DESKTOP_LDFLAGS"
+          wails build -tags "webkit2_41,desktop_ui" -ldflags "$DESKTOP_LDFLAGS ${UPDATE_PUBLIC_KEY:+-X github.com/luca/llm-protocol-gateway/internal/desktopupdate.SignaturePublicKey=$UPDATE_PUBLIC_KEY}"
 
       - name: Smoke test (headless X)
         run: |
@@ -420,18 +433,6 @@ jobs:
           path: assets
           merge-multiple: true
 
-      - name: Checksums
-        working-directory: assets
-        run: |
-          find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.dmg' \) \
-            -printf '%P\n' | sort | xargs sha256sum >SHA256SUMS
-          cat SHA256SUMS
-          n=$(wc -l <SHA256SUMS)
-          if [ "$n" -lt 14 ]; then
-            echo "::error::应有 14 个产物，实际 $n 个"
-            exit 1
-          fi
-
       - name: Release notes
         run: |
           VERSION="${{ needs.gate.outputs.version }}"
@@ -470,6 +471,60 @@ jobs:
             printf '<!-- lang:zh -->\n'
           } >notes.md
           cat notes.md
+
+      - name: Update manifest and checksums
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+          REPO: ${{ github.repository }}
+          UPDATE_PUBLIC_KEY: ${{ vars.UPDATE_PUBLIC_KEY }}
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          if [ -n "${UPDATE_PUBLIC_KEY:-}" ] && [ -z "${UPDATE_SIGNING_KEY:-}" ]; then
+            echo "::error::UPDATE_PUBLIC_KEY is set, but UPDATE_SIGNING_KEY is missing; the app would reject this unsigned update"
+            exit 1
+          fi
+          BUNDLED_PUBLIC_KEY="$(tr -d '[:space:]' < internal/desktopupdate/update_public_key.txt)"
+          if [ -n "${UPDATE_PUBLIC_KEY:-}" ] && [ "$UPDATE_PUBLIC_KEY" != "$BUNDLED_PUBLIC_KEY" ]; then
+            echo "::error::UPDATE_PUBLIC_KEY 与仓库内置公钥不一致；先轮换 internal/desktopupdate/update_public_key.txt"
+            exit 1
+          fi
+          python3 scripts/release/update-manifest.py \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --repo "$REPO" \
+            --assets assets \
+            --notes-file notes.md \
+            --output assets/update.json
+          if [ -n "${UPDATE_SIGNING_KEY:-}" ]; then
+            keyfile="$(mktemp)"
+            sigfile="$(mktemp)"
+            printf '%s\n' "$UPDATE_SIGNING_KEY" >"$keyfile"
+            openssl pkeyutl -sign -rawin -inkey "$keyfile" -in assets/update.json -out "$sigfile"
+            base64 <"$sigfile" >assets/update.json.sig
+            rm -f "$keyfile" "$sigfile"
+            python3 - <<'PY_SIG'
+import base64
+from pathlib import Path
+sig = base64.b64decode(Path("assets/update.json.sig").read_text(), validate=True)
+if len(sig) != 64:
+    raise SystemExit(f"update.json.sig is not a raw Ed25519 signature: {len(sig)} bytes")
+PY_SIG
+            echo "update.json signed with UPDATE_SIGNING_KEY (base64 Ed25519)"
+          else
+            echo "::warning::UPDATE_SIGNING_KEY is not configured; update.json has no Ed25519 signature"
+          fi
+          (
+            cd assets
+            find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.dmg' -o -name 'update.json' -o -name 'update.json.sig' \) \
+              -printf '%P\n' | sort | xargs sha256sum >SHA256SUMS
+            cat SHA256SUMS
+            n=$(wc -l <SHA256SUMS)
+            if [ "$n" -lt 15 ]; then
+              echo "::error::应有至少 15 个文件（14 个产物 + update.json），实际 $n 个"
+              exit 1
+            fi
+          )
 
       - name: Publish
         env:

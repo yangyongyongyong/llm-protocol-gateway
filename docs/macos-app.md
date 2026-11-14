@@ -90,3 +90,44 @@ GATEWAY_ADDR=0.0.0.0:18093 ./.cache/gateway-dev
 ```
 
 `GATEWAY_ADDR` 仍可覆盖绑定地址；此时 UI 切换 `webExposed` 会持久化偏好，但需去掉环境变量后重启才能真正 rebind。
+
+## App 自动更新
+
+桌面 App 内置原生更新器（`internal/desktopupdate`），窗口关闭后仍随 App 进程检查：
+
+- 启动约 5 秒后检查一次，之后按设置每 1 / 6 / 24 小时检查；
+- 默认自动检查、自动下载、空闲时自动重启安装；
+- 自动安装会等待网关没有模型请求；手动点击安装则立即重启；
+- macOS 只替换完整 `.app`，不会覆盖正在运行的可执行文件；
+- 更新地址：`https://github.com/yangyongyongyong/llm-protocol-gateway/releases/latest/download/update.json`；
+- 如果最新 Release 暂时没有 `update.json`，会回退到 GitHub Releases API；
+- 每份安装包必须匹配清单中的 SHA-256；
+- 设置页「App 自动更新」可以打开/关闭自动检查、自动下载和空闲自动安装。
+
+发布工作流会为每个 Release 生成 `update.json`。如果仓库配置了更新签名：
+
+1. `UPDATE_PUBLIC_KEY`：Repository variable，放 Ed25519 raw public key 的 base64；
+2. `UPDATE_SIGNING_KEY`：Repository secret，放 Ed25519 private key 的 PEM 文本。
+
+签名会生成 `update.json.sig`。公钥固定在本仓库的 `internal/desktopupdate/update_public_key.txt` 并自动编进 App，不依赖构建机环境变量；`UPDATE_SIGNING_KEY` 私钥只保存在 GitHub Secret。`UPDATE_PUBLIC_KEY` 仅作为 CI/发版的显式覆盖值。
+
+生成一对发布签名密钥：
+
+```bash
+openssl genpkey -algorithm ED25519 -out update-signing-key.pem
+openssl pkey -in update-signing-key.pem -pubout -outform DER \
+  | tail -c 32 | base64 > update-public-key.txt
+```
+
+`update-public-key.txt` 的内容提交到 `internal/desktopupdate/update_public_key.txt`（如有轮换，同时更新 `UPDATE_PUBLIC_KEY`）；`update-signing-key.pem` 的内容只放到 `UPDATE_SIGNING_KEY`。私钥不要提交到仓库。
+
+## 版本号唯一来源
+
+发布版本的唯一输入是 release tag（例如 `v1.0.20`）。构建脚本必须把同一个版本写入：
+
+- 前端 `__APP_VERSION__`
+- 网关 `gateway.BuildVersion`
+- 桌面 `desktop.version`
+- macOS `Info.plist` 的 `CFBundleShortVersionString` 与 `CFBundleVersion`
+
+`desktop/wails.json` 里的 `productVersion` 只是 Wails 的本地占位值，发布时会被构建脚本覆盖；不要再把它当成版本源。发布 workflow 会在上传前校验以上字段，缺一项即失败，避免出现清单写 1.0.20、安装包写 0.1.3 的错位。

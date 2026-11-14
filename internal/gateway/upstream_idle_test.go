@@ -88,8 +88,8 @@ func TestDoUpstreamHTTPGuardsTheBody(t *testing.T) {
 
 // The transport every provider request uses must not wait forever for headers.
 func TestUpstreamTransportHasHeaderTimeout(t *testing.T) {
-	if upstreamTransport.ResponseHeaderTimeout != upstreamIdleTimeout {
-		t.Fatalf("ResponseHeaderTimeout = %v, want %v", upstreamTransport.ResponseHeaderTimeout, upstreamIdleTimeout)
+	if upstreamTransport.ResponseHeaderTimeout != upstreamHeaderWait {
+		t.Fatalf("ResponseHeaderTimeout = %v, want %v", upstreamTransport.ResponseHeaderTimeout, upstreamHeaderWait)
 	}
 	if upstreamTransport.MaxIdleConns != maxUpstreamConns {
 		t.Fatalf("MaxIdleConns = %d, want %d", upstreamTransport.MaxIdleConns, maxUpstreamConns)

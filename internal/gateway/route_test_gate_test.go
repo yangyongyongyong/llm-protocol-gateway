@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/luca/llm-protocol-gateway/internal/domain"
 	"github.com/luca/llm-protocol-gateway/internal/monitor"
@@ -46,7 +47,7 @@ func routeGateState(upstreamURL string) domain.GatewayState {
 // 而控制台接口（Claude / Gemini / Chat 的转换入口）本来对不带 key 的请求一律 401：
 // 任何人只要知道一条路由 id（/__state 里就有），带上这两个头就能跳过校验、直接
 // 用 Provider 自己的上游凭据发请求，既不记 key 额度也不归因到任何 key。
-// 现在这个捷径只认「本进程自己发的」请求（request context 里的 routeTestToken）。
+// 现在这个捷径只认本进程签发的短时 HMAC 令牌；普通请求头无法伪造。
 func TestClientCannotClaimTheRouteTestShortcut(t *testing.T) {
 	upstream, upstreamCalls := routeGateUpstream(t)
 	server := NewServer(NewRouter(routeGateState(upstream.URL)), monitor.NewStore())
@@ -102,33 +103,36 @@ func TestAnAPIKeyIsAccepted(t *testing.T) {
 	}
 }
 
-// internalTestRouteID 是这段判定的唯一入口：两个头齐了还不够，请求自己得带着
-// 服务端发的标记；标记只在服务端代码里放得进去。
-func TestInternalTestRouteIDRequiresTheServerSideMark(t *testing.T) {
+// internalTestRouteID is the only door into the route-test shortcut. The route
+// id must be paired with a fresh signature made by this process: a client can
+// copy both headers, but it cannot mint the HMAC.
+func TestInternalTestRouteIDRequiresSignedServerToken(t *testing.T) {
+	now := time.Now()
 	cases := []struct {
-		name     string
-		headers  bool
-		marked   bool
-		wantOK   bool
-		wantRout string
+		name      string
+		routeID   string
+		token     string
+		wantOK    bool
+		wantRoute string
 	}{
-		{name: "headers only, no mark", headers: true, marked: false, wantOK: false},
-		{name: "mark only, no headers", headers: false, marked: true, wantOK: false},
-		{name: "headers and mark", headers: true, marked: true, wantOK: true, wantRout: "r1"},
+		{name: "route header only", routeID: "r1", token: "", wantOK: false},
+		{name: "unsigned legacy value", routeID: "r1", token: "1", wantOK: false},
+		{name: "token for another route", routeID: "r1", token: routeTestToken("r2", now), wantOK: false},
+		{name: "expired token", routeID: "r1", token: routeTestToken("r1", now.Add(-routeTestTokenTTL-time.Minute)), wantOK: false},
+		{name: "fresh signed token", routeID: "r1", token: routeTestToken("r1", now), wantOK: true, wantRoute: "r1"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
-			if tc.headers {
-				request.Header.Set(headerGatewayRouteID, "r1")
-				request.Header.Set(headerGatewayInternalTest, "1")
+			if tc.routeID != "" {
+				request.Header.Set(headerGatewayRouteID, tc.routeID)
 			}
-			if tc.marked {
-				request = request.WithContext(withRouteTestToken(request.Context()))
+			if tc.token != "" {
+				request.Header.Set(headerGatewayInternalTest, tc.token)
 			}
 			routeID, ok := internalTestRouteID(request)
-			if ok != tc.wantOK || routeID != tc.wantRout {
-				t.Fatalf("internalTestRouteID = (%q, %v), want (%q, %v)", routeID, ok, tc.wantRout, tc.wantOK)
+			if ok != tc.wantOK || routeID != tc.wantRoute {
+				t.Fatalf("internalTestRouteID = (%q, %v), want (%q, %v)", routeID, ok, tc.wantRoute, tc.wantOK)
 			}
 		})
 	}

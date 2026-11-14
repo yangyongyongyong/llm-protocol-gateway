@@ -4,6 +4,10 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +25,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/luca/llm-protocol-gateway/internal/autostart"
 	"github.com/luca/llm-protocol-gateway/internal/cursor"
 	"github.com/luca/llm-protocol-gateway/internal/domain"
 	"github.com/luca/llm-protocol-gateway/internal/monitor"
@@ -33,29 +38,67 @@ const (
 	headerGatewayInternalTest = "X-Gateway-Internal-Test"
 )
 
+const routeTestTokenTTL = 2 * time.Minute
+
+// routeTestSecret is generated once per gateway process. The route-test
+// shortcut needs to survive a real HTTP hop (the test calls the loopback data
+// plane), so a context value cannot carry the proof: context values are not
+// serialized over the network. A short-lived HMAC token does, while remaining
+// impossible for a client to forge. The token is scoped to the route id and
+// expires even if it is copied out of a local request.
+var routeTestSecret = func() []byte {
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err == nil {
+		return secret
+	}
+	// rand.Read failing is effectively impossible, but a deterministic process
+	// secret is still safer than accepting an unsigned "1".
+	sum := sha256.Sum256([]byte(strconv.FormatInt(time.Now().UnixNano(), 10)))
+	return sum[:]
+}()
+
+func routeTestToken(routeID string, now time.Time) string {
+	expires := now.Add(routeTestTokenTTL).Unix()
+	mac := hmac.New(sha256.New, routeTestSecret)
+	_, _ = fmt.Fprintf(mac, "%s\n%d", routeID, expires)
+	return fmt.Sprintf("%d.%s", expires, hex.EncodeToString(mac.Sum(nil)))
+}
+
+func validRouteTestToken(routeID, token string, now time.Time) bool {
+	expiresText, signature, ok := strings.Cut(strings.TrimSpace(token), ".")
+	if !ok || expiresText == "" || signature == "" {
+		return false
+	}
+	expires, err := strconv.ParseInt(expiresText, 10, 64)
+	if err != nil || expires < now.Unix() || expires > now.Add(routeTestTokenTTL+time.Minute).Unix() {
+		return false
+	}
+	mac := hmac.New(sha256.New, routeTestSecret)
+	_, _ = fmt.Fprintf(mac, "%s\n%d", routeID, expires)
+	want, err := hex.DecodeString(signature)
+	if err != nil {
+		return false
+	}
+	return hmac.Equal(want, mac.Sum(nil))
+}
+
 // internalTestRouteID returns the route a request names as its own test target,
-// and whether the request really is one of the gateway's own route tests.
+// and whether the request carries a valid short-lived gateway signature.
 //
-// The headers alone are not proof: every one of them is client-chosen, so a
-// bare "X-Gateway-Internal-Test: 1" with a known route id let any caller — no
-// API key, no session — spend a provider's credential through that route, with
-// no key quota and no attribution. Route ids show up in /__state and in shared
-// configs, so that was one short string away from open access. What a client
-// cannot forge is the request's context: testRoute marks its own request there
-// (withRouteTestToken) and nothing else in the process does.
+// Headers alone are client-chosen, so the route id is not enough: without the
+// signed token any caller could spend a provider's credential with no key
+// attribution. The token travels in the header because the test performs a real
+// loopback HTTP request; it never travels in curl diagnostics.
 func internalTestRouteID(r *http.Request) (string, bool) {
 	routeID := strings.TrimSpace(r.Header.Get(headerGatewayRouteID))
-	if routeID == "" || !internalTestRequest(r) {
+	if routeID == "" || !internalTestRequest(r, routeID) {
 		return "", false
 	}
 	return routeID, true
 }
 
-// internalTestRequest reports whether this request really is one of the
-// gateway's own route tests (see internalTestRouteID): the header names it, and
-// the server put the mark in its context.
-func internalTestRequest(r *http.Request) bool {
-	return strings.TrimSpace(r.Header.Get(headerGatewayInternalTest)) == "1" && routeTestTokenFrom(r.Context())
+func internalTestRequest(r *http.Request, routeID string) bool {
+	return validRouteTestToken(routeID, r.Header.Get(headerGatewayInternalTest), time.Now())
 }
 
 type StateSaver interface {
@@ -192,6 +235,17 @@ type Server struct {
 	// chats carry the reply up front. Runtime-only, as magpie's plugin keeps
 	// it for the run.
 	workBuddyAfterTools sync.Map
+	// externalURLOpener opens a vetted release page in the user's browser. The
+	// Wails WebView blocks window.open, so desktop actions go back through the
+	// native process instead.
+	externalURLOpener func(string) error
+	// desktopAutostart is the macOS login-time record behind the Settings row.
+	// It is an interface so handlers can be tested without touching the real
+	// ~/Library/LaunchAgents. The system record remains the source of truth.
+	desktopAutostart autostart.Manager
+	// desktopUpdater is the optional App-owned self-update service. It is nil
+	// in headless builds; handlers then return an unavailable status.
+	desktopUpdater desktopUpdater
 	// webExposedChange is invoked when the UI toggles LAN/Web exposure so the
 	// process owner (CLI runtime / desktop app) can rebind the HTTP listener.
 	webExposedChange func(enabled bool) error
@@ -293,6 +347,7 @@ func NewServer(router *Router, logs *monitor.Store, stateSaver ...StateSaver) *S
 		rtk:                     newRTKCompressor(),
 		requestLogRetentionDays: 7,
 		authThrottle:            newAuthThrottle(),
+		desktopAutostart:        autostart.New(),
 	}
 	if days := router.State().RequestLogRetentionDays; days > 0 {
 		server.requestLogRetentionDays = days
@@ -408,6 +463,12 @@ func (s *Server) SetWebExposedChangeHandler(fn func(enabled bool) error) {
 	s.webExposedChange = fn
 }
 
+// SetExternalURLOpener lets the desktop shell open a validated release page in
+// the system browser. Headless gateways leave it nil.
+func (s *Server) SetExternalURLOpener(fn func(string) error) {
+	s.externalURLOpener = fn
+}
+
 // SaveState persists the current router state (including webExposed).
 func (s *Server) SaveState() error {
 	return s.saveState()
@@ -433,6 +494,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /__auth/password", s.handleAuthPassword)
 	mux.HandleFunc("GET /__state", s.handleState)
 	mux.HandleFunc("GET /__settings/paths", s.handleSettingsPaths)
+	mux.HandleFunc("GET /__desktop/autostart", s.handleDesktopAutostart)
+	mux.HandleFunc("PATCH /__desktop/autostart", s.handleSetDesktopAutostart)
+	mux.HandleFunc("POST /__desktop/autostart/open-login-items", s.handleOpenDesktopLoginItems)
+	mux.HandleFunc("GET /__desktop/update", s.handleDesktopUpdate)
+	mux.HandleFunc("POST /__desktop/update/check", s.handleDesktopUpdateCheck)
+	mux.HandleFunc("POST /__desktop/update/download", s.handleDesktopUpdateDownload)
+	mux.HandleFunc("POST /__desktop/update/install", s.handleDesktopUpdateInstall)
+	mux.HandleFunc("POST /__desktop/update/open-release", s.handleDesktopUpdateOpenRelease)
+	mux.HandleFunc("PATCH /__desktop/update/settings", s.handleDesktopUpdateSettings)
 	mux.HandleFunc("GET /__logs", s.handleLogs)
 	mux.HandleFunc("GET /__request-stats", s.handleRequestStats)
 	mux.HandleFunc("GET /__usage-analysis", s.handleUsageAnalysis)
@@ -444,6 +514,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /__settings/request-log-retention", s.handleSetRequestLogRetention)
 	mux.HandleFunc("PATCH /__settings/log-2xx-bodies", s.handleSetLog2xxBodies)
 	mux.HandleFunc("PATCH /__settings/usage-batch", s.handleSetUsageBatch)
+	mux.HandleFunc("PATCH /__settings/host-metrics", s.handleSetHostMetrics)
 	// Monitoring center: the unified event stream. The legacy /__alerts* routes
 	// and their scanner are gone; multi_ip/concurrent_ip detection now runs in
 	// the monitoring collector, and MigrateMonitoringV1 still folds the frozen
@@ -1957,6 +2028,34 @@ func (s *Server) handleSetLog2xxBodies(w http.ResponseWriter, r *http.Request) {
 // handleSetUsageBatch tunes how the async usage worker batches its commits.
 // Takes effect on the next gateway start: the worker reads the thresholds once
 // when it launches, so changing them live would race with it.
+// handleSetHostMetrics toggles the machine-status sampler. The setting is
+// persisted with the rest of the gateway state, so a restart keeps the choice.
+func (s *Server) handleSetHostMetrics(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.Enabled == nil {
+		writeOpenAIError(w, http.StatusBadRequest, `body must be {"enabled": true|false}`)
+		return
+	}
+	enabled := *payload.Enabled
+	previous := s.router.HostMetricsDisabled()
+	s.router.SetHostMetricsDisabled(!enabled)
+	if err := s.saveState(); err != nil {
+		s.router.SetHostMetricsDisabled(previous)
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to save host metrics setting: "+err.Error())
+		return
+	}
+	s.hostSampler().SetEnabled(enabled)
+	if s.logs != nil {
+		s.logs.AddApp("info", "host metrics setting updated", fmt.Sprintf("enabled=%v", enabled))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled":             enabled,
+		"hostMetricsDisabled": !enabled,
+	})
+}
+
 func (s *Server) handleSetUsageBatch(w http.ResponseWriter, r *http.Request) {
 	var payload struct {
 		MaxSize        *int `json:"maxSize"`
@@ -5074,7 +5173,7 @@ func (s *Server) serveOpenAIPassThrough(w http.ResponseWriter, r *http.Request, 
 	// 嵌入和音频不是「协议」，是独立的端点能力：它们没有 Claude / Responses
 	// 版本可转换，所以这条链路的输出协议必须真的是 OpenAI Chat。这和聊天入口
 	// 的多协议放宽是两回事——那边每条端点都自带协议，这边只有一种形状。
-	if gatewayKeyMatched && !internalTestRequest(r) && route.OutputProtocol != domain.ProtocolOpenAIChat {
+	if gatewayKeyMatched && route.OutputProtocol != domain.ProtocolOpenAIChat {
 		writeRouteProtocolMismatch(w, route, domain.ProtocolOpenAIChat)
 		s.recordRequestLogFromRequest(r, started, matchedKey, gatewayKeyMatched, route.ID, route.ProviderID, "", "rejected", route.OutputProtocol.DisplayName()+" endpoint mismatch", r.URL.Path, http.StatusBadRequest, TokenUsage{}, body, routeProtocolMismatchBody(route, domain.ProtocolOpenAIChat))
 		return
@@ -5922,6 +6021,20 @@ func extractResponseErrorMessage(responseBody []byte) string {
 	if detail := strings.TrimSpace(stringValue(payload["detail"])); detail != "" {
 		return detail
 	}
+	// WorkBuddy and several OpenAI-compatible relays return their real error
+	// as top-level {"code":6004,"msg":"..."}. The code is what separates an
+	// error from a successful {"code":0,"msg":"ok"} envelope.
+	if topMessage := firstNonEmpty(stringValue(payload["msg"]), stringValue(payload["message"])); topMessage != "" {
+		code := strings.TrimSpace(stringValue(payload["code"]))
+		success, hasSuccess := payload["success"].(bool)
+		failedCode := code != "" && code != "0" && code != "200"
+		if failedCode || (hasSuccess && !success) {
+			if failedCode {
+				return code + ": " + topMessage
+			}
+			return topMessage
+		}
+	}
 	if payload["type"] == "error" {
 		if errorValue, ok := payload["error"].(map[string]any); ok {
 			return formatAPIErrorMessage(errorValue)
@@ -5954,14 +6067,16 @@ func responseHeaderMap(headers http.Header) map[string]string {
 	return result
 }
 
-func buildRouteTestReproduceCurl(gatewayURL, routeID, requestBody string) string {
+func buildRouteTestReproduceCurl(gatewayURL string, protocol domain.Protocol, requestBody string) string {
 	escapedBody := strings.ReplaceAll(requestBody, "'", `'\''`)
+	authHeader := "Authorization: Bearer <bound-api-key>"
+	if protocol == domain.ProtocolClaude {
+		authHeader = "x-api-key: <bound-api-key>"
+	}
 	return fmt.Sprintf(
-		"curl -sv '%s' \\\n  -H 'Content-Type: application/json' \\\n  -H '%s: %s' \\\n  -H '%s: 1' \\\n  -d '%s'",
+		"# The console test uses a short-lived server signature; replay with an API key bound to this route.\ncurl -sv '%s' \\\n  -H 'Content-Type: application/json' \\\n  -H '%s' \\\n  -d '%s'",
 		gatewayURL,
-		headerGatewayRouteID,
-		routeID,
-		headerGatewayInternalTest,
+		authHeader,
 		escapedBody,
 	)
 }
@@ -5991,7 +6106,7 @@ func buildRouteTestDiagnostics(route domain.Route, provider domain.Provider, dec
 		"responseBody":     string(responseBody),
 		"responseHeaders":  responseHeaders,
 		"errorMessage":     errorMessage,
-		"reproduceCurl":    buildRouteTestReproduceCurl(gatewayURL, route.ID, requestBody),
+		"reproduceCurl":    buildRouteTestReproduceCurl(gatewayURL, route.OutputProtocol, requestBody),
 	}
 	return diagnostics
 }
@@ -5999,11 +6114,7 @@ func buildRouteTestDiagnostics(route domain.Route, provider domain.Provider, dec
 func (s *Server) testRoute(r *http.Request, routeID string, requestModel string, message string, started time.Time) (map[string]any, int) {
 	route, err := s.router.RouteByID(routeID)
 	if err != nil {
-		return map[string]any{"success": false, "error": err.Error(), "latencyMs": time.Since(started).Milliseconds()}, http.StatusNotFound
-	}
-	decision, err := s.router.Decide(route.ID)
-	if err != nil {
-		return map[string]any{"success": false, "routeId": route.ID, "error": err.Error(), "latencyMs": time.Since(started).Milliseconds()}, http.StatusBadGateway
+		return map[string]any{"success": false, "model": strings.TrimSpace(requestModel), "error": err.Error(), "latencyMs": time.Since(started).Milliseconds()}, http.StatusNotFound
 	}
 	model := s.router.ResolveModel(route, "", requestModel)
 	if provider, err := s.router.ProviderForRoute(route); err == nil {
@@ -6012,13 +6123,23 @@ func (s *Server) testRoute(r *http.Request, routeID string, requestModel string,
 	if strings.TrimSpace(model) == "" {
 		model = "request-model-not-set"
 	}
+	decision, err := s.router.Decide(route.ID)
+	if err != nil {
+		return map[string]any{
+			"success": false, "routeId": route.ID, "model": model,
+			"error": err.Error(), "latencyMs": time.Since(started).Milliseconds(),
+		}, http.StatusBadGateway
+	}
 	if strings.TrimSpace(message) == "" {
 		message = "ping from Protocol Gateway route test"
 	}
 
 	provider, err := s.router.ProviderForRoute(route)
 	if err != nil {
-		return map[string]any{"success": false, "routeId": route.ID, "error": err.Error(), "latencyMs": time.Since(started).Milliseconds()}, http.StatusBadGateway
+		return map[string]any{
+			"success": false, "routeId": route.ID, "model": model,
+			"error": err.Error(), "latencyMs": time.Since(started).Milliseconds(),
+		}, http.StatusBadGateway
 	}
 	upstreamURL := ""
 	if provider.Protocol == domain.ProtocolOpenAIChat {
@@ -6027,9 +6148,12 @@ func (s *Server) testRoute(r *http.Request, routeID string, requestModel string,
 		upstreamURL = strings.TrimSpace(provider.BaseURL)
 	}
 
-	gatewayURL, err := gatewayOutputURL(s.router.State(), route.OutputProtocol)
+	gatewayURL, err := s.gatewayOutputURL(route.OutputProtocol)
 	if err != nil {
-		return map[string]any{"success": false, "routeId": route.ID, "error": err.Error(), "latencyMs": time.Since(started).Milliseconds()}, http.StatusBadGateway
+		return map[string]any{
+			"success": false, "routeId": route.ID, "providerId": provider.ID,
+			"model": model, "error": err.Error(), "latencyMs": time.Since(started).Milliseconds(),
+		}, http.StatusBadGateway
 	}
 
 	payload := map[string]any{
@@ -6064,8 +6188,7 @@ func (s *Server) testRoute(r *http.Request, routeID string, requestModel string,
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set(headerGatewayRouteID, route.ID)
-	request.Header.Set(headerGatewayInternalTest, "1")
-	request = request.WithContext(withRouteTestToken(request.Context()))
+	request.Header.Set(headerGatewayInternalTest, routeTestToken(route.ID, time.Now()))
 
 	client := &http.Client{Timeout: 60 * time.Second}
 	response, err := client.Do(request)
@@ -6140,12 +6263,25 @@ func (s *Server) testRoute(r *http.Request, routeID string, requestModel string,
 	return result, http.StatusOK
 }
 
-func gatewayOutputURL(state domain.GatewayState, protocol domain.Protocol) (string, error) {
+// gatewayOutputURL is the address this process itself should call for an
+// output protocol. It must use the actual listener, not endpoint.ListenHost:
+// ListenHost is the address advertised to LAN clients (and can be a LAN IP
+// while the App is bound to 127.0.0.1). Using the advertised host made the
+// console route test dial a port that was not listening and report a useless
+// transport failure.
+func (s *Server) gatewayOutputURL(protocol domain.Protocol) (string, error) {
+	state := s.router.State()
 	for _, endpoint := range state.Endpoints {
 		if endpoint.Protocol != protocol {
 			continue
 		}
-		base := strings.TrimRight(fmt.Sprintf("http://%s:%d%s", endpoint.ListenHost, endpoint.ListenPort, endpoint.BasePath), "/")
+		host := "127.0.0.1"
+		if addr := strings.TrimSpace(s.listenAddr); addr != "" {
+			if parsedHost, _, err := net.SplitHostPort(addr); err == nil && parsedHost != "" && parsedHost != "0.0.0.0" && parsedHost != "::" {
+				host = parsedHost
+			}
+		}
+		base := strings.TrimRight("http://"+net.JoinHostPort(host, strconv.Itoa(s.localGatewayPort()))+endpoint.BasePath, "/")
 		switch protocol {
 		case domain.ProtocolOpenAIChat:
 			return base + "/chat/completions", nil

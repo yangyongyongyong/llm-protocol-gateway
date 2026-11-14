@@ -32,10 +32,53 @@ export async function fetchLatestAppVersion(): Promise<string> {
     return typeof data.version === 'string' ? data.version.trim() : '';
 }
 
-/** 后端版本是否比本页新。两者都是构建时间戳或语义版本，直接按字符串比较即可。 */
+type ParsedVersion = { nums: [number, number, number]; pre: string };
+
+function parseVersion(value: string): ParsedVersion | null {
+    let v = value.trim().replace(/^v/, '');
+    v = v.split('+')[0];
+    const dash = v.indexOf('-');
+    const core = dash >= 0 ? v.slice(0, dash) : v;
+    const pre = dash >= 0 ? v.slice(dash + 1) : '';
+    const parts = core.split('.');
+    if (parts.length !== 3) return null;
+    const nums = parts.map((part) => Number(part));
+    if (nums.some((n) => !Number.isInteger(n) || n < 0)) return null;
+    return {nums: [nums[0], nums[1], nums[2]], pre};
+}
+
+function comparePrerelease(a: string, b: string): number {
+    if (a === b) return 0;
+    if (!a) return 1;
+    if (!b) return -1;
+    const as = a.split('.');
+    const bs = b.split('.');
+    for (let i = 0; i < Math.min(as.length, bs.length); i += 1) {
+        const an = /^\d+$/.test(as[i]) ? Number(as[i]) : null;
+        const bn = /^\d+$/.test(bs[i]) ? Number(bs[i]) : null;
+        if (an != null && bn != null) {
+            if (an !== bn) return an > bn ? 1 : -1;
+        } else if (an != null) {
+            return -1;
+        } else if (bn != null) {
+            return 1;
+        } else if (as[i] !== bs[i]) {
+            return as[i] > bs[i] ? 1 : -1;
+        }
+    }
+    return as.length === bs.length ? 0 : as.length > bs.length ? 1 : -1;
+}
+
+/** 版本是否严格更新。构建时间戳不是合法 semver 时保持旧行为。 */
 export function isNewerVersion(latest: string, current: string): boolean {
     if (!latest || !current) return false;
-    return latest !== current && latest > current;
+    const a = parseVersion(latest);
+    const b = parseVersion(current);
+    if (!a || !b) return latest !== current && latest > current;
+    for (let i = 0; i < 3; i += 1) {
+        if (a.nums[i] !== b.nums[i]) return a.nums[i] > b.nums[i];
+    }
+    return comparePrerelease(a.pre, b.pre) > 0;
 }
 
 /** 用户已经对这个版本点过“稍后再说”。 */
