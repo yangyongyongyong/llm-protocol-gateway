@@ -25,6 +25,7 @@ const (
 	attemptReasonServed                = "served"
 	attemptReasonUpstreamError         = "upstream_error"
 	attemptReasonModelBusy             = "model_busy"
+	attemptReasonModelUnavailable      = "model_unavailable"
 	attemptReasonStreamInterrupted     = "stream_interrupted"
 	attemptReasonTransportError        = "transport_error"
 	attemptReasonFirstPacketTimeout    = "first_packet_timeout"

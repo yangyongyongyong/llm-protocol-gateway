@@ -238,6 +238,7 @@ func (r *Router) UpdatePublicAccess(settings domain.PublicAccessSettings) domain
 	// / partial updates omit these bools (JSON false zero-value) and must not wipe
 	// the independently configured public surfaces.
 	if settings.Mode == domain.PublicAccessModeCustomDomain ||
+		settings.Mode == domain.PublicAccessModeExternalDNS ||
 		current.CustomDomain != "" ||
 		current.UIDomain != "" {
 		current.ExposeAPI = settings.ExposeAPI
@@ -293,7 +294,34 @@ func normalizePublicAccess(state *domain.GatewayState) {
 	switch {
 	case !settings.Enabled:
 		settings.Status = "disabled"
-		settings.StatusMessage = "Public access is disabled. Enable it to use a Cloudflare quick tunnel URL, or configure a purchased Cloudflare domain such as lucadesign.uk."
+		settings.StatusMessage = "公网访问未开启。可启用 Cloudflare 临时隧道、Cloudflare 域名或外部 DNS。"
+	case settings.Mode == domain.PublicAccessModeExternalDNS:
+		settings.Provider = "external"
+		settings.RuntimeURL = ""
+		settings.TunnelName = ""
+		settings.TunnelToken = ""
+		settings.CredentialsFile = ""
+		settings.TunnelConfigFile = ""
+		if settings.ExposeAPI && settings.CustomDomain != "" {
+			settings.PublicBaseURL = "https://" + settings.CustomDomain
+		}
+		if settings.ExposeUI && settings.UIDomain != "" {
+			settings.UIPublicBaseURL = "https://" + settings.UIDomain
+		}
+		missingAPI := settings.ExposeAPI && settings.CustomDomain == ""
+		missingUI := settings.ExposeUI && settings.UIDomain == ""
+		if (!settings.ExposeAPI && !settings.ExposeUI) || missingAPI || missingUI {
+			settings.Status = "external_dns_incomplete"
+			settings.StatusMessage = "外部 DNS 模式至少需要一个已启用的域名。DNS、TLS 证书和反向代理需在本网关之外配置。"
+		} else {
+			settings.Status = "external_dns_active"
+			settings.StatusMessage = "外部 DNS 域名已生效；DNS、TLS 证书和反向代理由本网关之外的平台维护。"
+			if settings.PublicBaseURL != "" {
+				settings.RuntimeURL = settings.PublicBaseURL
+			} else if settings.UIPublicBaseURL != "" {
+				settings.RuntimeURL = settings.UIPublicBaseURL
+			}
+		}
 	case settings.Provider != "cloudflare":
 		settings.Status = "unsupported"
 		settings.StatusMessage = "Only the Cloudflare control-plane scaffold is available in this MVP."

@@ -7,7 +7,7 @@ export type Protocol = 'openai_chat' | 'openai_responses' | 'claude' | 'gemini';
 
 export type ThemeMode = 'light' | 'dark' | 'system';
 
-export type PublicAccessMode = 'random_tunnel' | 'custom_domain';
+export type PublicAccessMode = 'random_tunnel' | 'custom_domain' | 'external_dns';
 
 export type AdminAuthStatus = {
   configured: boolean;
@@ -662,6 +662,8 @@ export type Provider = {
   // 'unavailable' — a live upstream request just failed against this
   // provider, and the background recovery loop will re-probe it at this time.
   nextRetryAt?: string;
+  /** 运行期模型级冷却：其他模型仍可用，不能把整张 Provider 判为异常。 */
+  modelAvailability?: ProviderModelAvailability[];
   // 创建该 Provider 的控制台用户；空 = 管理员创建。普通用户对自己创建的
   // Provider 拥有编辑/克隆/删除/对话测试/获取模型权限。
   ownerUserId?: string;
@@ -722,6 +724,12 @@ export type Provider = {
   zcodeOAuth?: ZCodeOAuthInfo;
   traeOAuth?: TraeOAuthInfo;
   requestAdapter?: RequestAdapter;
+};
+
+export type ProviderModelAvailability = {
+  model: string;
+  reason?: string;
+  nextRetryAt?: string;
 };
 
 export type ProvidersImportResult = {

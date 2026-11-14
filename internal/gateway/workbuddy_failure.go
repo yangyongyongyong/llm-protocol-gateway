@@ -159,9 +159,9 @@ func workBuddyFailureVerdictOf(code int) (workBuddyFailureVerdict, string, bool)
 
 // workBuddyFailoverClass maps a verdict onto this gateway's failover classes.
 //
-// failoverBusy is the class that means "advance the chain, penalise nobody",
-// which is precisely what a model-level refusal needs: the next provider gets a
-// chance and the account keeps its record clean.
+// failoverBusy is the class that means "advance the chain, do not penalise the
+// account", which is precisely what a model-level refusal needs: the next
+// provider gets a chance and the model layer may rest only this exact pair.
 func workBuddyFailoverClass(verdict workBuddyFailureVerdict) (failoverClass, bool) {
 	switch verdict {
 	case workBuddyVerdictModelLimited, workBuddyVerdictBusy:
@@ -182,30 +182,46 @@ func workBuddyFailoverClass(verdict workBuddyFailureVerdict) (failoverClass, boo
 // It answers ok=false when no known code is present, so the generic classifier
 // still gets the last word on everything else.
 func classifyWorkBuddyFailure(status int, body []byte) (failoverClass, string, bool) {
+	class, _, reason, ok := classifyWorkBuddyFailureScoped(status, body)
+	return class, reason, ok
+}
+
+// classifyWorkBuddyFailureScoped is the same decision with the failure's
+// availability scope made explicit. WorkBuddy's model codes must never be
+// written into the Provider-wide ledger: the account can still serve every
+// other model.
+func classifyWorkBuddyFailureScoped(status int, body []byte) (failoverClass, availabilityScope, string, bool) {
 	// A 402 is the one status the vendor uses for a spent plan; it carries no code
 	// this table knows, and keeping it here avoids a second special case elsewhere.
 	if status == http.StatusPaymentRequired {
-		return failoverHard, "http_402_payment", true
+		return failoverHard, availabilityScopeProvider, "http_402_payment", true
 	}
 	// The free model's daily window: the account is healthy, the allowance is spent
 	// until a stated instant. Before this branch a 429 here was read as a soft
 	// throttle and rested the whole account after a few hits.
 	if status == http.StatusTooManyRequests && workBuddyIsFreeWindowRefusal(body) {
-		return failoverBusy, "wb_free_model_window", true
+		return failoverBusy, availabilityScopeModel, "wb_free_model_window", true
 	}
 	code, ok := workBuddyFailureCode(body)
 	if !ok {
-		return failoverNone, "", false
+		return failoverNone, availabilityScopeRequest, "", false
 	}
 	verdict, reason, known := workBuddyFailureVerdictOf(code)
 	if !known {
-		return failoverNone, "", false
+		return failoverNone, availabilityScopeRequest, "", false
 	}
 	class, mapped := workBuddyFailoverClass(verdict)
 	if !mapped {
-		return failoverNone, "", false
+		return failoverNone, availabilityScopeRequest, "", false
 	}
-	return class, reason, true
+	switch verdict {
+	case workBuddyVerdictModelLimited, workBuddyVerdictBusy:
+		return class, availabilityScopeModel, reason, true
+	case workBuddyVerdictPromptRefused, workBuddyVerdictClientShape:
+		return class, availabilityScopeRequest, reason, true
+	default:
+		return class, availabilityScopeProvider, reason, true
+	}
 }
 
 // ---- model-level rests ------------------------------------------------------

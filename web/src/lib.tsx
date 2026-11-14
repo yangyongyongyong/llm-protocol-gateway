@@ -628,7 +628,7 @@ export const defaultPublicAccess: PublicAccessSettings = {
   exposeUi: true,
   expose: 'all',
   status: 'disabled',
-  statusMessage: '公网访问未开启。可一键开启 Cloudflare 快速隧道，或绑定已购买的 Cloudflare 域名。',
+  statusMessage: '公网访问未开启。可开启 Cloudflare 临时隧道、绑定 Cloudflare 域名，或登记外部 DNS 域名。',
 };
 
 export const fallbackState: GatewayState = {
@@ -1854,14 +1854,18 @@ export function tunnelStatusLabel(status?: string) {
 
 export function publicAccessMetricValue(enabled: boolean, mode: string) {
   if (!enabled) return '仅局域网';
-  if (mode === 'custom_domain') return '自有域名';
-  return '随机隧道';
+  if (mode === 'external_dns') return '外部 DNS';
+  if (mode === 'custom_domain') return 'Cloudflare 域名';
+  return '临时隧道';
 }
 
 export function publicAccessStatusLabel(status: string) {
   switch (status) {
+    case 'disabled': return '未开启';
     case 'runtime_url_recorded': return '已记录公网地址';
     case 'configured_pending_tunnel': return '已配置，待启动隧道';
+    case 'external_dns_active': return '外部 DNS 已启用';
+    case 'external_dns_incomplete': return '外部 DNS 待补全';
     case 'waiting_for_tunnel': return '等待隧道';
     case 'unsupported': return '不支持';
     case 'error': return '连接失败';
@@ -3529,6 +3533,11 @@ export function clientGatewayRoot(endpoints: OutputEndpoint[], publicBase: strin
 }
 
 export function activePublicBaseURL(publicAccess: PublicAccessSettings, tunnelRunning: boolean) {
+  if (!publicAccess.enabled) return '';
+  if (publicAccess.mode === 'external_dns') {
+    if (publicAccess.exposeApi === false) return '';
+    return publicAccess.publicBaseUrl || (publicAccess.customDomain ? `https://${publicAccess.customDomain}` : '');
+  }
   if (!tunnelRunning) return '';
   if (publicAccess.mode === 'custom_domain' && publicAccess.exposeApi === false) return '';
   const tunnel = publicAccess.tunnel;
@@ -3536,6 +3545,11 @@ export function activePublicBaseURL(publicAccess: PublicAccessSettings, tunnelRu
 }
 
 export function activeUIPublicBaseURL(publicAccess: PublicAccessSettings, tunnelRunning: boolean) {
+  if (!publicAccess.enabled) return '';
+  if (publicAccess.mode === 'external_dns') {
+    if (publicAccess.exposeUi === false) return '';
+    return publicAccess.uiPublicBaseUrl || (publicAccess.uiDomain ? `https://${publicAccess.uiDomain}` : '');
+  }
   if (!tunnelRunning) return '';
   if (publicAccess.mode === 'custom_domain' && publicAccess.exposeUi === false) return '';
   const tunnel = publicAccess.tunnel;
@@ -3991,15 +4005,16 @@ export function normalizeDomainInput(value: string) {
 }
 
 export function publicStatusTone(status: string): BadgeTone {
-  if (status === 'runtime_url_recorded') return 'green';
+  if (status === 'runtime_url_recorded' || status === 'external_dns_active') return 'green';
   if (status === 'configured_pending_tunnel') return 'blue';
+  if (status === 'external_dns_incomplete') return 'amber';
   if (status === 'waiting_for_tunnel') return 'amber';
   if (status === 'unsupported' || status === 'error') return 'red';
   return 'slate';
 }
 
-export function publicAccessURL(endpoint: OutputEndpoint | undefined, tunnelRunning: boolean) {
-  if (!tunnelRunning || !endpoint?.publicUrl) return '隧道未启动，请先在「公网访问」页启动隧道';
+export function publicAccessURL(endpoint: OutputEndpoint | undefined, publicActive: boolean) {
+  if (!publicActive || !endpoint?.publicUrl) return '公网访问未启用，请先在「公网访问」页配置入口';
   return endpoint.publicUrl;
 }
 

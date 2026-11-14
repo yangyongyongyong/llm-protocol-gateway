@@ -32,9 +32,8 @@ const (
 	failoverPromptRefusal
 	// failoverBusy advances the chain but rests nobody: the vendor said the
 	// model is busy/queued (Qoder's 10605), which is a property of the model at
-	// this moment, not of the account. Cooling the account down for it sends
-	// the next request into the same queue with one fewer place to try, and the
-	// recovery loop then walks it right back into the queue.
+	// this moment, not of the account. The exact Provider+Model pair may still
+	// get a short model-level rest; the account-wide ladder must not see it.
 	failoverBusy
 )
 
@@ -115,6 +114,11 @@ type providerUnavailableState struct {
 	nextRetry time.Time
 	hard      bool
 	reason    string
+	// probeModel is the canonical model used by the failed request when one was
+	// known. A Provider-wide mark still uses it as a second, exact-model gate
+	// before recovery; an ambiguous error must never be cleared by a different
+	// model answering successfully.
+	probeModel string
 }
 
 type providerSoftFailureState struct {
@@ -547,13 +551,21 @@ func (w *failoverResponseWriter) FlushError() {
 // hard failures use the longer recovery interval; soft (repeated transient)
 // failures use a shorter TTL. Safe for concurrent use.
 func (s *Server) markProviderUnavailable(providerID string, hard bool, reason, retryAfter string, body []byte) {
-	s.setProviderUnavailable(providerID, hard, reason, retryAfter, body, true)
+	s.setProviderUnavailableWithModel(providerID, "", hard, reason, retryAfter, body, true)
+}
+
+// markProviderUnavailableForModel is the Provider-wide variant that remembers
+// the exact upstream model that exposed the failure. The recovery loop uses
+// this model for the final availability check whenever /models alone cannot
+// prove that generation is back.
+func (s *Server) markProviderUnavailableForModel(providerID, model string, hard bool, reason, retryAfter string, body []byte) {
+	s.setProviderUnavailableWithModel(providerID, model, hard, reason, retryAfter, body, true)
 }
 
 // refreshProviderUnavailableCountdown extends nextRetryAt without re-logging
 // a fresh "marked unavailable" event (used by the recovery loop).
 func (s *Server) refreshProviderUnavailableCountdown(providerID string, hard bool, reason, retryAfter string, body []byte) {
-	s.setProviderUnavailable(providerID, hard, reason, retryAfter, body, false)
+	s.setProviderUnavailableWithModel(providerID, "", hard, reason, retryAfter, body, false)
 }
 
 // setProviderUnavailableUntil holds providerID out of rotation until at, without
@@ -569,10 +581,12 @@ func (s *Server) setProviderUnavailableUntil(providerID string, at time.Time, ha
 	if s.providerAvailability == nil {
 		s.providerAvailability = make(map[string]providerUnavailableState)
 	}
+	probeModel := s.providerAvailability[providerID].probeModel
 	s.providerAvailability[providerID] = providerUnavailableState{
-		nextRetry: at,
-		hard:      hard,
-		reason:    truncateReason(reason),
+		nextRetry:  at,
+		hard:       hard,
+		reason:     truncateReason(reason),
+		probeModel: probeModel,
 	}
 	s.providerAvailabilityMu.Unlock()
 }
@@ -685,6 +699,66 @@ func (s *Server) classifyProviderFailover(providerID string, status int, body []
 		utilPtr = &u
 	}
 	return classifyProviderFailover(status, body, err, utilPtr)
+}
+
+// classifyProviderFailoverScoped classifies the same failure while keeping the
+// availability target explicit. WorkBuddy's code table is authoritative; for
+// generic providers only wording that names a model is allowed to create a
+// model-scoped mark. Ambiguous account throttles stay Provider-scoped so the
+// gateway does not repeatedly hit an account that is actually spent.
+func (s *Server) classifyProviderFailoverScoped(providerID string, status int, body []byte, err error) (failoverClass, availabilityScope, string) {
+	if err == nil && s.providerIsWorkBuddy(providerID) {
+		if class, scope, reason, ok := classifyWorkBuddyFailureScoped(status, body); ok {
+			return class, scope, reason
+		}
+	}
+	class, reason := s.classifyProviderFailover(providerID, status, body, err)
+	scope := genericFailureScope(class, status, body, err)
+	if scope == availabilityScopeRequest && modelSpecificFailureText(status, body, err) {
+		// A model-not-found / model-not-allowed refusal is failover-worthy for
+		// another account even when the generic 400 table would otherwise call it
+		// a client-shape error.
+		return failoverBusy, availabilityScopeModel, "model_restricted"
+	}
+	return class, scope, reason
+}
+
+func genericFailureScope(class failoverClass, status int, body []byte, err error) availabilityScope {
+	switch class {
+	case failoverPromptRefusal, failoverNone:
+		return availabilityScopeRequest
+	case failoverBusy:
+		return availabilityScopeModel
+	}
+	if modelSpecificFailureText(status, body, err) {
+		return availabilityScopeModel
+	}
+	return availabilityScopeProvider
+}
+
+// modelSpecificFailureText is intentionally narrow. A bare word "model" in a
+// provider incident page is not enough to let one model bypass an account-level
+// quota; the refusal must say that the model itself is missing, restricted or
+// throttled.
+func modelSpecificFailureText(status int, body []byte, err error) bool {
+	if status != http.StatusBadRequest && status != http.StatusForbidden && status != http.StatusNotFound && status != http.StatusTooManyRequests {
+		return false
+	}
+	text := strings.ToLower(string(body))
+	if err != nil {
+		text += " " + strings.ToLower(err.Error())
+	}
+	for _, hint := range []string{
+		"换其他模型", "切换其他模型", "该模型", "此模型", "模型不可用", "模型未授权", "模型受限", "模型频率",
+		"model not found", "model is not available", "model unavailable", "model unsupported",
+		"model rate limit", "model is rate limited", "model limit", "model is not allowed",
+		"not allowed for user type", "model is busy", "model_busy", "this model",
+	} {
+		if strings.Contains(text, hint) {
+			return true
+		}
+	}
+	return false
 }
 
 // providerIsWorkBuddy reports whether this provider is a WorkBuddy account.
@@ -971,6 +1045,14 @@ func parseProviderCooldownHint(retryAfter string, body []byte, now time.Time) pr
 			break
 		}
 	}
+	// Some Chinese upstreams put the reset moment only in human-readable prose,
+	// for example "将在 2026-11-14 20:09:02 UTC+8 重置". Read that as a hint too;
+	// otherwise the exact model would be retried on a guessed ten-minute cycle.
+	if hint.resetsAt.IsZero() {
+		if at, ok := parseHumanResetTime(string(body), now); ok {
+			hint.resetsAt = at
+		}
+	}
 	// Resets are usually carried beside the error code at the top level, but
 	// some envelopes nest them one level down.
 	for _, src := range []map[string]any{
@@ -1106,7 +1188,14 @@ func secondsDuration(secs float64) time.Duration {
 // setProviderUnavailable cools providerID down until the recovery loop proves
 // it back. retryAfter/body carry the upstream's own timing hint; hard failures
 // rest at least providerFailoverRecoveryInterval (see cooldownTTL).
+// setProviderUnavailable is the compatibility form used by tests and paths that
+// do not know an upstream model. Production request paths should prefer
+// setProviderUnavailableWithModel.
 func (s *Server) setProviderUnavailable(providerID string, hard bool, reason, retryAfter string, body []byte, logMark bool) {
+	s.setProviderUnavailableWithModel(providerID, "", hard, reason, retryAfter, body, logMark)
+}
+
+func (s *Server) setProviderUnavailableWithModel(providerID, probeModel string, hard bool, reason, retryAfter string, body []byte, logMark bool) {
 	providerID = strings.TrimSpace(providerID)
 	if providerID == "" {
 		return
@@ -1118,10 +1207,17 @@ func (s *Server) setProviderUnavailable(providerID string, hard bool, reason, re
 	if s.providerAvailability == nil {
 		s.providerAvailability = make(map[string]providerUnavailableState)
 	}
+	// A recovery refresh carries no model of its own; keep the original one so
+	// the next exact-model probe stays tied to the failure that created the mark.
+	probeModel = strings.TrimSpace(probeModel)
+	if probeModel == "" && !logMark {
+		probeModel = s.providerAvailability[providerID].probeModel
+	}
 	s.providerAvailability[providerID] = providerUnavailableState{
-		nextRetry: now.Add(ttl),
-		hard:      hard,
-		reason:    reason,
+		nextRetry:  now.Add(ttl),
+		hard:       hard,
+		reason:     reason,
+		probeModel: probeModel,
 	}
 	s.providerAvailabilityMu.Unlock()
 	if s.resetConsumed(providerID, retryAfter, body, hard, ttl, now) {
@@ -1137,7 +1233,10 @@ func (s *Server) setProviderUnavailable(providerID string, hard bool, reason, re
 	if hard {
 		kind = "hard"
 	}
-	msg := fmt.Sprintf("provider=%s kind=%s reason=%s retry_in=%s", providerID, kind, reason, ttl.Round(time.Second))
+	msg := fmt.Sprintf("provider=%s scope=provider kind=%s reason=%s retry_in=%s", providerID, kind, reason, ttl.Round(time.Second))
+	if probeModel != "" {
+		msg += " probe_model=" + probeModel
+	}
 	if s.logs != nil {
 		s.logs.AddApp("warn", "provider marked unavailable", msg)
 	}
@@ -1156,8 +1255,10 @@ func (s *Server) applyProviderAvailability(provider *domain.Provider) {
 	if provider.Disabled {
 		// 禁用后不展示「异常 / N秒后重试」覆盖层，也不诱导后台重探。
 		provider.NextRetryAt = ""
+		provider.ModelAvailability = nil
 		return
 	}
+	provider.ModelAvailability = s.modelAvailabilityRows(provider.ID)
 	nextRetry, unavailable := s.providerNextRetry(provider.ID)
 	if !unavailable {
 		return
@@ -1174,6 +1275,10 @@ func (s *Server) recordProviderRequestOutcome(providerID string, status int, bod
 	_ = s.applyProviderFailoverOutcome(providerID, status, body, "", err)
 }
 
+func (s *Server) recordProviderRequestOutcomeForModel(providerID, model string, status int, body []byte, err error) {
+	_ = s.applyProviderFailoverOutcomeForModel(providerID, model, status, body, "", err)
+}
+
 // applyProviderFailoverOutcome classifies the attempt, updates soft/hard
 // availability tracking, and returns whether the caller should advance to the
 // next backup provider. retryAfter is the attempt's upstream Retry-After header,
@@ -1182,12 +1287,24 @@ func (s *Server) applyProviderFailoverOutcome(providerID string, status int, bod
 	return s.applyProviderFailoverOutcomeCtx(context.Background(), providerID, status, body, retryAfter, err)
 }
 
+func (s *Server) applyProviderFailoverOutcomeForModel(providerID, model string, status int, body []byte, retryAfter string, err error) bool {
+	return s.applyProviderFailoverOutcomeForModelCtx(context.Background(), providerID, model, status, body, retryAfter, err)
+}
+
 // applyProviderFailoverOutcomeCtx is applyProviderFailoverOutcome with the
 // request's own context, which is where a Qoder failure waits to be charged
 // (see provider_cooldown_qoder.go).
 func (s *Server) applyProviderFailoverOutcomeCtx(ctx context.Context, providerID string, status int, body []byte, retryAfter string, err error) bool {
+	return s.applyProviderFailoverOutcomeForModelCtx(ctx, providerID, "", status, body, retryAfter, err)
+}
+
+// applyProviderFailoverOutcomeForModelCtx records one completed attempt against
+// the exact canonical upstream model. Provider-wide failures keep the old
+// account ledger; explicit model refusals write only the model ledger.
+func (s *Server) applyProviderFailoverOutcomeForModelCtx(ctx context.Context, providerID, model string, status int, body []byte, retryAfter string, err error) bool {
 
 	providerID = strings.TrimSpace(providerID)
+	model = strings.TrimSpace(model)
 	if providerID == "" {
 		return false
 	}
@@ -1195,19 +1312,38 @@ func (s *Server) applyProviderFailoverOutcomeCtx(ctx context.Context, providerID
 		if provider, lookupErr := s.router.ProviderByID(providerID); lookupErr == nil && provider.Disabled {
 			// 已禁用：不再写入 unavailable，也不参与后续重探刷日志。
 			s.markProviderAvailable(providerID)
-			class, _ := s.classifyProviderFailover(providerID, status, body, err)
+			s.markModelAvailable(providerID, model)
+			class, _, _ := s.classifyProviderFailoverScoped(providerID, status, body, err)
 			return class != failoverNone
 		}
 	}
-	class, reason := s.classifyProviderFailover(providerID, status, body, err)
-	if class == failoverNone {
-		// The vendor's own quota wording outlives the classifier: a 400 that
-		// spells out insufficient_quota advances the chain but is not worth a
-		// cooldown mark, while a 429 that does is already soft here.
-		if err == nil {
-			s.markProviderAvailable(providerID)
-		}
+
+	// A real successful attempt is the cheapest possible liveness proof. Clear
+	// only this exact model; another model answering says nothing about it.
+	if err == nil && status >= http.StatusOK && status < http.StatusMultipleChoices {
+		s.markProviderAvailable(providerID)
+		s.markModelAvailable(providerID, model)
 		return false
+	}
+
+	class, scope, reason := s.classifyProviderFailoverScoped(providerID, status, body, err)
+	if class == failoverNone {
+		// A non-2xx that is not failover-worthy is a request-shape refusal. It
+		// must not clear an earlier health mark merely because the HTTP round
+		// trip completed.
+		return false
+	}
+	if scope == availabilityScopeModel {
+		if model != "" {
+			s.markModelUnavailable(providerID, model, class == failoverHard, reason, retryAfter, body)
+		} else if s.logs != nil {
+			s.logs.AddApp("info", "model busy, next account tried", fmt.Sprintf("provider=%s reason=%s", providerID, reason))
+		}
+		return true
+	}
+	if scope == availabilityScopeRequest {
+		// Prompt/client-shape refusals fail over but blame nobody.
+		return true
 	}
 	switch class {
 	case failoverHard:
@@ -1215,14 +1351,14 @@ func (s *Server) applyProviderFailoverOutcomeCtx(ctx context.Context, providerID
 			return true
 		}
 		s.clearSoftFailures(providerID)
-		s.markProviderUnavailable(providerID, true, reason, retryAfter, body)
+		s.markProviderUnavailableForModel(providerID, model, true, reason, retryAfter, body)
 	case failoverSoft:
 		if s.applyQoderCooldown(ctx, providerID, class, status, body, retryAfter, reason, err) {
 			return true
 		}
 		count := s.bumpSoftFailure(providerID)
 		if count >= providerSoftFailureThreshold {
-			s.markProviderUnavailable(providerID, false, fmt.Sprintf("%s consecutive=%d", reason, count), retryAfter, body)
+			s.markProviderUnavailableForModel(providerID, model, false, fmt.Sprintf("%s consecutive=%d", reason, count), retryAfter, body)
 		} else if s.logs != nil {
 			s.logs.AddApp("info", "provider soft failure", fmt.Sprintf(
 				"provider=%s consecutive=%d/%d reason=%s",
@@ -1259,6 +1395,24 @@ func (s *Server) persistAPIKeyActiveProvider(keyID, providerID string) {
 // misleading 502 Bad Gateway.
 var errProviderNotAssigned = errors.New("permission denied")
 
+// errModelUnavailable means the request was refused by the gateway's exact
+// Provider+Model cooldown, not by an exhausted API-key or provider account.
+// Handlers map it to 429 so a client sees a retryable condition and can honor
+// Retry-After instead of treating the model as a permanent 502.
+var errModelUnavailable = errors.New("model temporarily unavailable")
+
+type modelUnavailableError struct {
+	providerID string
+	model      string
+	retryAt    time.Time
+}
+
+func (e *modelUnavailableError) Error() string {
+	return fmt.Sprintf("%s: model %q on provider %q until %s", errModelUnavailable, e.model, e.providerID, e.retryAt.Format(time.RFC3339))
+}
+
+func (e *modelUnavailableError) Unwrap() error { return errModelUnavailable }
+
 // upstreamErrorStatus maps an execute-flow error to the client-facing status.
 // Permission denials are 403, a provider at its own concurrent limit or a key at
 // its own quota is 429 (both with Retry-After), everything else stays a 502
@@ -1266,6 +1420,9 @@ var errProviderNotAssigned = errors.New("permission denied")
 func upstreamErrorStatus(err error) int {
 	if errors.Is(err, errProviderNotAssigned) {
 		return http.StatusForbidden
+	}
+	if errors.Is(err, errModelUnavailable) {
+		return http.StatusTooManyRequests
 	}
 	if errors.Is(err, errProviderSaturated) {
 		return http.StatusTooManyRequests
@@ -1321,7 +1478,7 @@ func (s *Server) executeProtocolFlowWithFailover(
 	if !gatewayKeyMatched {
 		timer := startAttempt()
 		status, usage, body, err := s.executeProtocolFlow(w, r, route, decision, model, req, clientProtocol, skipIncomingAuth)
-		s.recordProviderRequestOutcome(decision.ProviderID, status, body, err)
+		s.recordProviderRequestOutcomeForModel(decision.ProviderID, model, status, body, err)
 		s.noteProviderUsage(decision.ProviderID, usage)
 		noteSingleAttemptTrace(r.Context(), decision.ProviderID, model, status, usage, err, timer.millis())
 		return status, usage, body, decision, model, err
@@ -1331,7 +1488,7 @@ func (s *Server) executeProtocolFlowWithFailover(
 	if len(chain) == 0 {
 		timer := startAttempt()
 		status, usage, body, err := s.executeProtocolFlow(w, r, route, decision, model, req, clientProtocol, skipIncomingAuth)
-		s.recordProviderRequestOutcome(decision.ProviderID, status, body, err)
+		s.recordProviderRequestOutcomeForModel(decision.ProviderID, model, status, body, err)
 		s.noteProviderUsage(decision.ProviderID, usage)
 		noteSingleAttemptTrace(r.Context(), decision.ProviderID, model, status, usage, err, timer.millis())
 		return status, usage, body, decision, model, err
@@ -1461,6 +1618,19 @@ func (s *Server) executeProtocolFlowWithFailover(
 		if resolved, _ := resolveConsumerModelOnProvider(attemptProvider, attemptKey, true, requestModel); strings.TrimSpace(resolved) != "" {
 			attemptModel = resolved
 		}
+		if nextRetry, blocked := s.modelUnavailableForRequest(providerID, attemptModel, time.Now()); blocked {
+			lastStatus = http.StatusTooManyRequests
+			lastErr = &modelUnavailableError{providerID: providerID, model: attemptModel, retryAt: nextRetry}
+			state, _ := s.modelUnavailableSnapshot(providerID, attemptModel)
+			s.logs.AddApp("info", "model unavailable, next account tried", fmt.Sprintf(
+				"key=%s provider=%s model=%s scope=model reason=%s next_probe=%s",
+				matchedKey.ID, providerID, attemptModel, state.reason, nextRetry.Format(time.RFC3339)))
+			noteScheduleAttempt(r.Context(), monitor.RequestAttempt{
+				ProviderID: providerID, Model: attemptModel, Status: http.StatusTooManyRequests,
+				Reason: attemptReasonModelUnavailable, Skipped: true,
+			})
+			continue
+		}
 		attemptReq := cloneRequestMap(req)
 		attemptReq["model"] = attemptModel
 
@@ -1480,6 +1650,10 @@ func (s *Server) executeProtocolFlowWithFailover(
 			status, usage, body, nativeErr := s.executeProtocolFlow(nativeWriter, nativeR, route, nativeDecision, attemptModel, nativeReq, clientProtocol, skipIncomingAuth)
 			elapsed := nativeTimer.millis()
 			if nativeErr == nil && status >= 200 && status < 300 {
+				// The native pass-through bypasses the normal attempt outcome
+				// below. Clear the exact model here; do not touch any other
+				// model's ledger entry.
+				s.applyProviderFailoverOutcomeForModelCtx(r.Context(), providerID, attemptModel, status, body, nativeWriter.UpstreamHeader("Retry-After"), nil)
 				if !nativeWriter.passthrough {
 					nativeWriter.FlushError()
 				}
@@ -1526,6 +1700,7 @@ func (s *Server) executeProtocolFlowWithFailover(
 				if nativeErr == nil {
 					nativeErr = fmt.Errorf("native pass-through ended with HTTP %d", status)
 				}
+				s.applyProviderFailoverOutcomeForModelCtx(r.Context(), providerID, attemptModel, status, body, nativeWriter.UpstreamHeader("Retry-After"), nativeErr)
 				noteScheduleAttempt(r.Context(), monitor.RequestAttempt{
 					ProviderID: providerID, Model: attemptModel, Status: status, Ms: elapsed,
 					Reason: attemptReasonNativePassthroughFail, Error: truncateReason(nativeErr.Error()),
@@ -1603,7 +1778,7 @@ func (s *Server) executeProtocolFlowWithFailover(
 				w.Header().Set("Retry-After", strconv.Itoa(laneWait))
 				return http.StatusTooManyRequests, TokenUsage{}, nil, attemptDecision, attemptModel, execErr
 			}
-			transportFailoverWorthy := s.applyProviderFailoverOutcomeCtx(r.Context(), providerID, 0, nil, "", execErr)
+			transportFailoverWorthy := s.applyProviderFailoverOutcomeForModelCtx(r.Context(), providerID, attemptModel, 0, nil, "", execErr)
 			// Transport errors are worth another account only while nothing of
 			// this turn has reached the client. Once the first byte is out —
 			// a streamed request, or a deferred attempt whose turn was
@@ -1676,7 +1851,7 @@ func (s *Server) executeProtocolFlowWithFailover(
 			return status, usage, respBody, attemptDecision, attemptModel, r.Context().Err()
 		}
 
-		attemptFailoverWorthy := s.applyProviderFailoverOutcomeCtx(r.Context(), providerID, status, respBody, writer.UpstreamHeader("Retry-After"), nil)
+		attemptFailoverWorthy := s.applyProviderFailoverOutcomeForModelCtx(r.Context(), providerID, attemptModel, status, respBody, writer.UpstreamHeader("Retry-After"), nil)
 		if canDefer && attemptFailoverWorthy {
 			noteScheduleAttempt(r.Context(), monitor.RequestAttempt{ProviderID: providerID, Model: attemptModel, Status: status, Ms: elapsed, Reason: attemptFailoverReason(respBody), Error: summarizeUpstreamHTTPError(status, respBody), Deferred: true})
 			writer.Discard()
@@ -1749,6 +1924,14 @@ func (s *Server) executeProtocolFlowWithFailover(
 	}
 
 	if lastErr != nil {
+		var modelErr *modelUnavailableError
+		if errors.As(lastErr, &modelErr) && !modelErr.retryAt.IsZero() {
+			seconds := int(time.Until(modelErr.retryAt).Seconds())
+			if seconds < 1 {
+				seconds = 1
+			}
+			w.Header().Set("Retry-After", strconv.Itoa(seconds))
+		}
 		return lastStatus, lastUsage, lastBody, lastDecision, lastModel, lastErr
 	}
 	return lastStatus, lastUsage, lastBody, lastDecision, lastModel, nil
@@ -1849,6 +2032,13 @@ func (s *Server) recoverAPIKeyPreferredProviders(ctx context.Context) {
 					probeCache[providerID] = false
 					continue
 				}
+				// A model-scoped mark is not proof that the account is back.
+				// Only the exact-model recovery worker may clear it; do not let
+				// a /models success here move the key back to this provider.
+				if s.providerHasModelAvailability(providerID) {
+					probeCache[providerID] = false
+					continue
+				}
 				available = s.probeProviderAvailable(ctx, provider)
 				probeCache[providerID] = available
 			}
@@ -1867,28 +2057,43 @@ func (s *Server) recoverAPIKeyPreferredProviders(ctx context.Context) {
 	}
 }
 
-// reprobeUnavailableProviders re-checks every provider currently marked
-// unavailable by a live request failure (recordProviderRequestOutcome) and
-// clears the mark once a probe succeeds. Providers still down get their
-// retry countdown pushed to the next cycle, matching the console's
-// "N秒后重试" hint. Runs on the same cadence as recoverAPIKeyPreferredProviders.
+// reprobeUnavailableProviders re-checks every Provider currently marked
+// unavailable by a live request failure and, in the same tick, every exact
+// Provider+Model pair whose own countdown is due. A Provider-level probe and a
+// model-level probe have separate ledgers, so one model answering cannot clear
+// another. Providers still down get their retry countdown pushed to the next
+// cycle, matching the console's "N秒后重试" hint.
 func (s *Server) reprobeUnavailableProviders(ctx context.Context) {
+	// Model-scoped marks have their own exact-model worker. Running it even when
+	// the Provider-wide ledger is empty is what makes a WorkBuddy/deepseek mark
+	// recover without waiting for some unrelated glm request.
+	s.reprobeUnavailableModels(ctx)
 	for _, id := range s.providerUnavailableIDs() {
 		provider, err := s.router.ProviderByID(id)
 		if err != nil {
 			// Provider no longer exists: stop tracking it.
 			s.markProviderAvailable(id)
+			s.clearModelAvailabilityForProvider(id)
 			continue
 		}
 		if provider.Disabled {
 			// 管理员已禁用：停止可用性重探，避免无效 /models 刷日志。
 			s.markProviderAvailable(id)
+			s.clearModelAvailabilityForProvider(id)
 			if s.logs != nil {
 				s.logs.AddApp("info", "provider unavailable cleared (disabled)", fmt.Sprintf("provider=%s", id))
 			}
 			continue
 		}
-		if s.probeProviderAvailable(ctx, provider) {
+		prev, _ := s.providerUnavailableSnapshot(id)
+		available := s.probeProviderAvailable(ctx, provider)
+		if strings.TrimSpace(prev.probeModel) != "" {
+			// /models can answer while generation is still exhausted. A Provider
+			// marked while serving a known model is therefore cleared only after
+			// that exact model also answers.
+			available = available && s.probeProviderModelAvailable(ctx, provider, prev.probeModel)
+		}
+		if available {
 			// A Claude subscription's /models probe costs no allowance and
 			// answers even while every window is spent: the account is not back
 			// until its usage reading says a window reopened. Trusting the probe
@@ -1896,7 +2101,6 @@ func (s *Server) reprobeUnavailableProviders(ctx context.Context) {
 			// marked (the log's "marked unavailable 20:00:05" / "provider
 			// recovered 20:00:06"), and the next request was refused again.
 			if at, spent := s.claudeSpentWindowReset(id, time.Now()); spent {
-				prev, _ := s.providerUnavailableSnapshot(id)
 				reason := prev.reason
 				if strings.TrimSpace(reason) == "" {
 					reason = "quota window spent"
@@ -1913,7 +2117,6 @@ func (s *Server) reprobeUnavailableProviders(ctx context.Context) {
 		}
 		// Still unavailable: refresh the countdown for the next cycle,
 		// preserving hard/soft classification from the original mark.
-		prev, _ := s.providerUnavailableSnapshot(id)
 		reason := prev.reason
 		if reason == "" {
 			reason = "reprobe_failed"
@@ -1921,6 +2124,48 @@ func (s *Server) reprobeUnavailableProviders(ctx context.Context) {
 		// A vendor-named reset time is kept: it survives cycles of failed
 		// probes, whose own bodies carry no hint at all.
 		s.refreshProviderUnavailableCountdown(id, prev.hard, reason, "", nil)
+	}
+}
+
+// reprobeUnavailableModels checks only pairs whose own countdown is due. A
+// successful mark is exact: deleting one pair never clears the Provider or any
+// other model. The synthetic request is deliberately tiny (see
+// probeProviderModelAvailable): one short user turn and a 16-token cap.
+func (s *Server) reprobeUnavailableModels(ctx context.Context) {
+	now := time.Now()
+	probes := 0
+	for _, key := range s.modelUnavailableKeys() {
+		state, ok := s.modelUnavailableSnapshot(key.providerID, key.model)
+		if !ok || state.nextRetry.After(now) {
+			continue
+		}
+		// A Provider-wide mark already gates every model; let the Provider
+		// recovery loop prove the account first. Keeping the pair preserves the
+		// exact model for the later probe.
+		if _, down := s.providerUnavailableSnapshot(key.providerID); down {
+			continue
+		}
+		provider, err := s.router.ProviderByID(key.providerID)
+		if err != nil {
+			s.markModelAvailable(key.providerID, key.model)
+			continue
+		}
+		if provider.Disabled {
+			s.markModelAvailable(key.providerID, key.model)
+			continue
+		}
+		if probes >= modelAvailabilityProbesPerCycle {
+			break
+		}
+		probes++
+		if s.probeProviderModelAvailable(ctx, provider, state.model) {
+			s.markModelAvailable(key.providerID, state.model)
+			continue
+		}
+		// A failed probe carries no useful body from the chat-test helper. Keep
+		// the original reason and back it off; the next cycle will try the same
+		// exact model again.
+		s.refreshModelUnavailableCountdown(key.providerID, state.model, state.reason, "", nil)
 	}
 }
 

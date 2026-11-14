@@ -36,6 +36,11 @@ type PublicAccessMode string
 const (
 	PublicAccessModeRandomTunnel PublicAccessMode = "random_tunnel"
 	PublicAccessModeCustomDomain PublicAccessMode = "custom_domain"
+	// PublicAccessModeExternalDNS means the hostnames already resolve through
+	// DNS/TLS/reverse-proxy infrastructure the user manages elsewhere. The
+	// gateway records the hostnames for Host separation and client URLs, but
+	// never starts or manages a tunnel and never writes DNS records.
+	PublicAccessModeExternalDNS PublicAccessMode = "external_dns"
 )
 
 type PublicAccessSettings struct {
@@ -240,6 +245,10 @@ type Provider struct {
 	// (see gateway.StartProviderFailoverRecovery) will re-probe it at this
 	// time. Computed at response time in handleState; never persisted.
 	NextRetryAt string `json:"nextRetryAt,omitempty"`
+	// ModelAvailability is a runtime-only overlay for models that are
+	// temporarily limited on this Provider. It is populated by handleState and
+	// never persisted; HealthStatus remains the account-wide state.
+	ModelAvailability []ProviderModelAvailability `json:"modelAvailability,omitempty"`
 	// OwnerUserID is the console user that created this provider. Empty means
 	// admin-created. A normal user owns the providers they create and may
 	// edit/clone/delete/test them; admins have full access to every provider.
@@ -382,6 +391,15 @@ type Provider struct {
 	// 它不能用于模型流量，只允许调用父网关 /__peer/renew 换取新的对端 bearer。
 	// 这是秘密：json:"-" 保证它不会进入控制台、导出包或 Provider API 响应。
 	PeerRefreshToken string `json:"-"`
+}
+
+// ProviderModelAvailability is the console-facing view of one exact
+// Provider+Model cooldown. It intentionally carries no account state and never
+// includes credentials.
+type ProviderModelAvailability struct {
+	Model       string `json:"model"`
+	Reason      string `json:"reason,omitempty"`
+	NextRetryAt string `json:"nextRetryAt,omitempty"`
 }
 
 // ProviderSelfRegistration is the server-side state backing the self-register

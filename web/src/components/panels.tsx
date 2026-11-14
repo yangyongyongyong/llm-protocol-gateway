@@ -1051,6 +1051,10 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
     </span>
   ));
   const isUnavailable = healthStatus === 'unavailable';
+  const modelRestrictions = provider?.modelAvailability || [];
+  const modelRestrictionHint = modelRestrictions.length
+    ? `仅以下模型临时受限，其他模型仍可用：${modelRestrictions.map((item) => `${item.model}${item.nextRetryAt ? `（${retrySecondsLabel(item.nextRetryAt, Date.now()) || '待探测'}）` : ''}`).join('、')}`
+    : undefined;
   const now = useNowTick(isUnavailable && !!nextRetryAt);
   const retryLabel = isUnavailable ? retrySecondsLabel(nextRetryAt, now) : null;
   const bridgeHint = cursorBridge?.port
@@ -1151,6 +1155,7 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
                 provider 上。显示出来的用处：一眼看出「这里其实也能走 OpenAI，
                 再建一条同样 baseUrl 的 provider 就能让下游直通、不经过转换」。 */}
             {extraProtocolBadges}
+            {modelRestrictions.length ? <Badge tone="amber" title={modelRestrictionHint}>模型受限 {modelRestrictions.length}</Badge> : null}
             {showOAuthBadge ? (
               <Badge tone={oauthConnected ? 'green' : 'amber'}>{oauthBadgeLabel}{oauthConnected ? ' 已连接' : ' 未连接'}</Badge>
             ) : (
@@ -1225,6 +1230,7 @@ export function ProviderCard({ active, selected, name, providerId, protocol, ton
         ) : null}
         <Badge tone="slate">{protocol}</Badge>
         {extraProtocolBadges}
+        {modelRestrictions.length ? <Badge tone="amber" title={modelRestrictionHint}>模型受限 {modelRestrictions.length}</Badge> : null}
         {showOAuthBadge ? (
           <Badge tone={oauthConnected ? 'green' : 'amber'}>{oauthBadgeLabel}{oauthConnected ? ' 已连接' : ' 未连接'}</Badge>
         ) : (

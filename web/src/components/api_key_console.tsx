@@ -30,6 +30,7 @@ import {
   codexCatalogPathForHome,
   copyToClipboard,
   localAgentGatewayRoot,
+  localGatewayLoopbackRoot,
   protocolLabel,
   protocolFromLabel,
   resolveCodexReasoningEffort,
@@ -644,14 +645,13 @@ export type ApiKeyWorkspaceProps = {
   // 没有 keys.delete 时不渲染删除按钮（额度编辑由 canWriteQuota 单独控制）
   canDelete?: boolean;
   testingProviderID: string;
-  tunnelRunning: boolean;
   livePublicURL: string;
   fixedOutputLabels: string[];
   panel: ApiKeyPanelHandlers;
   onToggleEnabled: (key: APIKey) => void;
   onUpdateOwner?: (key: APIKey, ownerUserId: string) => Promise<void>;
   onToast: (message: string) => void;
-  /** 用来拼客户端 Base URL 的公网根地址（管理员开关控制；普通用户固定内网）。 */
+  /** 当前生效的模型 API 公网根地址；临时隧道、Cloudflare 域名、外部 DNS 共用这一入口。 */
   publicBase: string;
   /** 内存视图模式：表格里双击打开抽屉时也复用同一套详情。 */
   onTest?: (key: APIKey, prompt: string) => Promise<RouteTestResult | null>;
@@ -669,17 +669,27 @@ function useCopiedToken(timeoutMs = 1800) {
   return [token, flash] as const;
 }
 
+/** 只有从本机回环打开控制台时，客户端配置才默认走 127.0.0.1；远程
+ * 控制台仍默认公网域名，避免把不可达的本机地址复制给远端用户。 */
+function isLocalConsoleHost() {
+  if (typeof window === 'undefined') return false;
+  const host = window.location.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+}
+
 export function ApiKeyDetailWorkspace(props: ApiKeyWorkspaceProps) {
   const {
     keyItem, providers, models, routes, endpoints, owners, saving, canWriteQuota,
-    testingProviderID, tunnelRunning, livePublicURL, fixedOutputLabels, panel, onToast,
+    testingProviderID, livePublicURL, fixedOutputLabels, panel, onToast,
   } = props;
   const canDelete = props.canDelete !== false;
   const { route, primary, outputProtocol } = apiKeyRouteInfo(keyItem, routes, providers);
   const [tab, setTab] = React.useState<ApiKeyDetailTab>('routing');
-  // 有公网地址（隧道或域名反代）时默认就按公网给配置：绑回环的部署里内网地址
-  // 对浏览器这边根本不通，默认给内网等于默认给一个连不上的 URL。
-  const [publicPreview, setPublicPreview] = React.useState(Boolean(props.publicBase));
+  // 本机回环打开的控制台默认复制 127.0.0.1，避免同机调用绕 Cloudflare；
+  // 远程管理页默认公网域名，避免把远端不可达的回环地址复制出去。
+  const localConsole = isLocalConsoleHost();
+  const [publicPreview, setPublicPreview] = React.useState(Boolean(props.publicBase) && !localConsole);
+  const lastPublicBaseRef = React.useRef(props.publicBase);
   const [copied, flashCopied] = useCopiedToken();
   const [fallbackModalOpen, setFallbackModalOpen] = React.useState(false);
   const profiles = keyItem.profiles || [];
@@ -689,11 +699,18 @@ export function ApiKeyDetailWorkspace(props: ApiKeyWorkspaceProps) {
   const validFallbackIds = fallbackIds.filter((id) => providers.some((item) => item.id === id));
   const staleFallbackCount = fallbackIds.length - validFallbackIds.length;
   const publicAvailable = Boolean(props.publicBase);
-  const effectivePublicBase = publicPreview && publicAvailable ? props.publicBase : '';
 
   React.useEffect(() => {
-    if (!publicAvailable && publicPreview) setPublicPreview(false);
-  }, [publicAvailable, publicPreview]);
+    const publicBaseChanged = lastPublicBaseRef.current !== props.publicBase;
+    lastPublicBaseRef.current = props.publicBase;
+    if (!publicAvailable) {
+      if (publicPreview) setPublicPreview(false);
+      return;
+    }
+    // 远程控制台在绑定方式或域名切换后自动跟随新的 API 公网地址；本机
+    // 控制台保持本机直连，用户仍可手动切到公网。轮询刷新不会覆盖选择。
+    if (publicBaseChanged && !localConsole) setPublicPreview(true);
+  }, [publicAvailable, props.publicBase, publicPreview, localConsole]);
 
   function copy(text: string, message: string, token = 'plain') {
     if (!text) {
@@ -715,10 +732,15 @@ export function ApiKeyDetailWorkspace(props: ApiKeyWorkspaceProps) {
     });
   }
 
-  const clientURL = route ? apiKeyClientBaseURL(route, endpoints, effectivePublicBase) : '';
+  // 本机入口固定走回环，不能拿 endpoints[0].listenHost：开启局域网监听后
+  // 它可能是 0.0.0.0，复制给客户端没有意义。公网入口只在当前 API 公网地址
+  // 真正生效时可用。
+  const localGatewayBase = localGatewayLoopbackRoot(endpoints);
+  const publicGatewayBase = publicAvailable ? props.publicBase.replace(/\/$/, '') : '';
+  const effectiveGatewayBase = publicPreview && publicAvailable ? props.publicBase : localGatewayBase;
+  const clientURL = route ? apiKeyClientBaseURL(route, endpoints, effectiveGatewayBase) : '';
   // 三条端点共用一个网关根地址，路径各不相同（见下面 url 菜单）。
-  const gatewayURL = apiKeyGatewayRoot(endpoints, effectivePublicBase).replace(/\/$/, '');
-  const [urlMenuOpen, setUrlMenuOpen] = React.useState(false);
+  const [urlMenuOpen, setUrlMenuOpen] = React.useState<'local' | 'public' | ''>('');
 
   const tabs: Array<{id: ApiKeyDetailTab; label: string; icon: React.ReactNode}> = [
     {id: 'routing', label: '转发方案与容灾链路', icon: ICONS.shuffle},
@@ -751,48 +773,58 @@ export function ApiKeyDetailWorkspace(props: ApiKeyWorkspaceProps) {
           ) : null}
         </div>
         <div className="akc-detail-actions">
-          {/* 一把 Key 三条端点都能用，所以「复制 URL」要给三条，而不是按输出
-              协议只给一条。用哪条由客户端自己决定——这也正是删掉「输出协议」
-              下拉之后用户该看的东西。 */}
-          <div className="akc-url-picker">
-            <button
-              type="button"
-              className={`akc-action${copied.startsWith('url-') ? ' copied' : ''}`}
-              disabled={!gatewayURL}
-              title={gatewayURL ? '选择要复制的端点地址' : '请先为密钥绑定路由'}
-              onClick={() => setUrlMenuOpen((open) => !open)}
-            >
-              <Icon path={copied.startsWith('url-') ? ICONS.check : ICONS.copy} size={13} />
-              <span>{copied.startsWith('url-') ? '已复制' : '复制 URL'}</span>
-            </button>
-            {urlMenuOpen ? (
-              <div className="akc-url-menu" role="menu">
-                {([
-                  {id: 'claude', label: 'Claude（Messages）', path: '/anthropic'},
-                  {id: 'chat', label: 'OpenAI Chat', path: '/v1'},
-                  {id: 'responses', label: 'OpenAI Responses（Codex）', path: '/openai/v1'},
-                ] as const).map((item) => {
-                  const full = `${gatewayURL}${item.path}`;
-                  return (
-                    <button
-                      key={item.id}
-                      type="button"
-                      role="menuitem"
-                      className="akc-url-menu-item"
-                      title={full}
-                      onClick={() => {
-                        setUrlMenuOpen(false);
-                        copy(full, `已复制 ${item.label} 地址：${full}`, `url-${item.id}`);
-                      }}
-                    >
-                      <span className="akc-url-menu-label">{item.label}</span>
-                      <code className="akc-url-menu-path">{item.path}</code>
-                    </button>
-                  );
-                })}
+          {/* 一把 Key 三条端点都能用；本机和公网各给一个入口，避免同一台
+              机器调用时还要经过 Cloudflare TLS 和回源。 */}
+          {([
+            {id: 'local', label: '复制本机 URL', menuLabel: '本机直连', root: localGatewayBase},
+            {id: 'public', label: '复制公网 URL', menuLabel: '公网域名', root: publicGatewayBase},
+          ] as const).map((target) => {
+            const copiedTarget = copied.startsWith(`url-${target.id}-`);
+            const targetDisabled = !route || !target.root;
+            return (
+              <div className="akc-url-picker" key={target.id}>
+                <button
+                  type="button"
+                  className={`akc-action${copiedTarget ? ' copied' : ''}`}
+                  disabled={targetDisabled}
+                  title={targetDisabled
+                    ? (target.id === 'public' ? '当前没有生效的模型 API 公网地址' : '请先为密钥绑定路由')
+                    : `选择要复制的${target.menuLabel}端点地址`}
+                  onClick={() => setUrlMenuOpen((open) => open === target.id ? '' : target.id)}
+                >
+                  <Icon path={copiedTarget ? ICONS.check : ICONS.copy} size={13} />
+                  <span>{copiedTarget ? '已复制' : target.label}</span>
+                </button>
+                {urlMenuOpen === target.id ? (
+                  <div className="akc-url-menu" role="menu">
+                    {([
+                      {id: 'claude', label: 'Claude（Messages）', path: '/anthropic'},
+                      {id: 'chat', label: 'OpenAI Chat', path: '/v1'},
+                      {id: 'responses', label: 'OpenAI Responses（Codex）', path: '/openai/v1'},
+                    ] as const).map((item) => {
+                      const full = `${target.root}${item.path}`;
+                      return (
+                        <button
+                          key={item.id}
+                          type="button"
+                          role="menuitem"
+                          className="akc-url-menu-item"
+                          title={full}
+                          onClick={() => {
+                            setUrlMenuOpen('');
+                            copy(full, `已复制${target.menuLabel} ${item.label} 地址：${full}`, `url-${target.id}-${item.id}`);
+                          }}
+                        >
+                          <span className="akc-url-menu-label">{item.label}</span>
+                          <code className="akc-url-menu-path">{item.path}</code>
+                        </button>
+                      );
+                    })}
+                  </div>
+                ) : null}
               </div>
-            ) : null}
-          </div>
+            );
+          })}
           <button
             type="button"
             className={`akc-action${copied === 'key' ? ' copied' : ''}`}
@@ -873,7 +905,6 @@ export function ApiKeyDetailWorkspace(props: ApiKeyWorkspaceProps) {
             route={route}
             primary={primary}
             endpoints={endpoints}
-            tunnelRunning={tunnelRunning}
             livePublicURL={livePublicURL}
             clientURL={clientURL}
             publicPreview={publicPreview}
@@ -1555,13 +1586,13 @@ function ParamsTab({
               下面的「协议接入一览」列出三条可用地址，用哪条由客户端自己决定。 */}
           <div className="akc-field">
             <div className="akc-label-row">
-              <label>公网 Base URL 预览</label>
-              <InfoTip text="打开后「复制 URL」与客户端配置使用公网隧道域名；关闭则用内网地址。仅影响复制出来的配置，不影响转发。" />
+              <label>复制地址目标</label>
+              <InfoTip text="客户端配置、Base URL 和 cURL 会跟随这里的选择。本机直连固定使用 127.0.0.1；公网域名使用当前生效的 API 域名（临时隧道 / Cloudflare 自有域名 / 外部 DNS）。仅影响复制出来的配置，不影响转发。" />
             </div>
             <Switch
               checked={publicPreview && publicAvailable}
               disabled={!publicAvailable}
-              label={publicAvailable ? (publicPreview ? '使用公网域名' : '使用内网地址') : '没有公网地址，只能使用内网地址'}
+              label={publicAvailable ? (publicPreview ? '使用公网域名' : '使用本机直连') : '没有公网 API 地址，只能使用本机直连'}
               onChange={onPublicPreviewChange}
             />
           </div>
@@ -1831,7 +1862,6 @@ function ClientTab({
   route,
   primary,
   endpoints,
-  tunnelRunning,
   livePublicURL,
   clientURL,
   publicPreview,
@@ -1846,7 +1876,6 @@ function ClientTab({
   route?: Route;
   primary?: Provider;
   endpoints: OutputEndpoint[];
-  tunnelRunning: boolean;
   livePublicURL: string;
   clientURL: string;
   publicPreview: boolean;
@@ -1859,13 +1888,13 @@ function ClientTab({
 }) {
   const [snippet, setSnippet] = React.useState<'claude' | 'openai' | 'codex'>('claude');
   const [applyingClients, setApplyingClients] = React.useState(false);
-  const gatewayURL = apiKeyGatewayRoot(endpoints, publicPreview && publicAvailable ? livePublicURL : '').replace(/\/$/, '');
-  const publicBase = publicPreview && publicAvailable ? livePublicURL : '';
+  const selectedBase = publicPreview && publicAvailable ? livePublicURL : localGatewayLoopbackRoot(endpoints);
+  const gatewayURL = apiKeyGatewayRoot(endpoints, selectedBase).replace(/\/$/, '');
   // 「一键写入本机」写的是跑网关这台机器上的配置：CLI 与桌面端共用同一个地址。
   // 本机走 127.0.0.1，选了公网 https 域名才用公网。以前 CLI 那半写的是网卡
   // IP，换网络、换网卡、拔掉 Wi-Fi 都会失效，而 127.0.0.1 永远通。
   // （Desktop 的 3p 配置还额外要求 https 或回环 http，这条规则同时满足它。）
-  const localAgentURL = localAgentGatewayRoot(endpoints, publicBase);
+  const localAgentURL = localAgentGatewayRoot(endpoints, selectedBase);
 
   // 直接调后端把本机配置写好：CLI 与桌面端读的是两套文件，后端一次都写。
   const applyLocally = async () => {
@@ -1962,12 +1991,12 @@ function ClientTab({
         <div className="akc-bar-main">
           <span className="akc-bar-label">网关地址：</span>
           <div className="akc-mini-segmented" role="group" aria-label="网关地址类型">
-            <button type="button" className={!publicPreview ? 'active' : ''} onClick={() => onPublicPreviewChange(false)}>内网</button>
+            <button type="button" className={!publicPreview ? 'active' : ''} title={localGatewayLoopbackRoot(endpoints)} onClick={() => onPublicPreviewChange(false)}>本机直连</button>
             <button
               type="button"
               className={publicPreview ? 'active' : ''}
               disabled={!publicAvailable}
-              title={publicAvailable ? livePublicURL : '未配置公网域名 / 隧道'}
+              title={publicAvailable ? livePublicURL : '未配置模型 API 公网地址'}
               onClick={() => onPublicPreviewChange(true)}
             >
               公网域名
@@ -1976,7 +2005,7 @@ function ClientTab({
           <code className="akc-inline-code" title={clientURL}>{clientURL || gatewayURL}</code>
         </div>
         <span className="akc-bar-hint">
-          {livePublicURL ? `公网地址${tunnelRunning ? '（隧道）' : ''} · ${livePublicURL}` : '未配置公网地址，仅内网可用'}
+          {livePublicURL ? `公网 API 地址 · ${livePublicURL}` : '未配置模型 API 公网地址，仅内网可用'}
         </span>
       </div>
 
@@ -2015,7 +2044,7 @@ function ClientTab({
               disabled={!route}
               title="把内置模型名固定为 default[1m]，模型与 Provider 之后全在平台上切"
               onClick={() => onCopy(
-                buildClaudeCodeSwitcherScript(keyItem, endpoints, publicBase),
+                buildClaudeCodeSwitcherScript(keyItem, endpoints, selectedBase),
                 '已复制 Claude Code 一键接入脚本（模型固定为 default[1m]，粘贴到终端执行）',
                 'claude-switcher',
               )}
@@ -2116,18 +2145,18 @@ function ClientTab({
           <div className="akc-card-head">
             <span className="akc-card-title">
               <Icon path={ICONS.code} size={13} />
-              {tunnelRunning ? '公网调用示例' : '局域网调用示例'}（cURL）
+              {publicPreview && publicAvailable ? '公网调用示例' : '内网调用示例'}（cURL）
             </span>
             <button
               type="button"
               className="akc-soft-btn"
-              onClick={() => onCopy(routeTestCurl(route, endpoints, keyItem, publicBase, primary), '已复制 curl')}
+              onClick={() => onCopy(routeTestCurl(route, endpoints, keyItem, selectedBase, primary), '已复制 curl')}
             >
               <Icon path={ICONS.copy} size={13} />
               <span>复制 curl</span>
             </button>
           </div>
-          <div className="akc-code-block plain"><pre>{routeTestCurl(route, endpoints, keyItem, publicBase, primary)}</pre></div>
+          <div className="akc-code-block plain"><pre>{routeTestCurl(route, endpoints, keyItem, selectedBase, primary)}</pre></div>
         </div>
       ) : null}
 

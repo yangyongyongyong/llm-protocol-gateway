@@ -63,6 +63,16 @@ open "desktop/build/bin/LLM Protocol Gateway.app"
 
 安全提示：管理页**无登录**，勿对不可信网络长期暴露；远程优先走 Cloudflare，并仅在必要时段开启。
 
+## 公网访问的三种方式
+
+1. **临时公网地址（Cloudflare Quick Tunnel）**：无需登录，适合测试；地址是临时的 `*.trycloudflare.com`，管理页与 API 共用一个地址。
+2. **Cloudflare 自有域名**：登录 Cloudflare 后使用账户内的域名，由网关创建具名隧道以及 API/UI 的 DNS 路由。
+3. **外部 DNS / 自有反代**：用户只填写 API/管理页域名。网关不创建隧道、不修改 DNS、不申请证书；DNS、TLS、端口转发和反向代理均由用户在其他平台维护。
+
+外部 DNS 是网关级全局配置，所有用户和 API Key 共用同一组 API / 管理页域名，不按用户或 Key 拆分。该模式仍使用 Host 分离：API 域名只提供模型协议和 `/__health`，管理页域名只提供控制台。`PATCH /__public-access` 保存时 `mode=external_dns`，`provider=external`。
+
+页面底部的「公网开关自动化令牌」只允许本机/局域网脚本调用 `POST /__public/control` 开关公网入口，不是模型 API Key，也不能管理 Provider、密钥或用户。
+
 ## 与 LaunchAgent 切换
 
 LaunchAgent 标签：`com.luca.llm-protocol-gateway`。

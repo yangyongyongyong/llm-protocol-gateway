@@ -522,6 +522,11 @@ func (s *Server) testChatGPTOAuthProviderChat(r *http.Request, provider domain.P
 		"store":  false,
 		"stream": true,
 	}
+	if req.MaxTokens > 0 {
+		// Keep availability probes cheap for OAuth accounts too. This is a
+		// ceiling, not a promise to generate that many tokens.
+		payload["max_output_tokens"] = req.MaxTokens
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return map[string]any{"success": false, "providerId": provider.ID, "error": err.Error(), "latencyMs": time.Since(started).Milliseconds()}, http.StatusOK

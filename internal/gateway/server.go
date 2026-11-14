@@ -258,6 +258,11 @@ type Server struct {
 	providerAvailabilityMu sync.Mutex
 	providerAvailability   map[string]providerUnavailableState
 	providerSoftFailures   map[string]providerSoftFailureState
+	// modelAvailability tracks a Provider+canonical-model pair that a live
+	// upstream request found limited. It is separate from the Provider-wide
+	// ledger above so one restricted model cannot hide every other model on a
+	// healthy account. Runtime-only, like providerAvailability.
+	modelAvailability map[modelAvailabilityKey]modelUnavailableState
 
 	// Session affinity (see provider_affinity.go): which provider each
 	// conversation is sticky to. Runtime-only like the availability tracker —
@@ -497,6 +502,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /__desktop/autostart", s.handleDesktopAutostart)
 	mux.HandleFunc("PATCH /__desktop/autostart", s.handleSetDesktopAutostart)
 	mux.HandleFunc("POST /__desktop/autostart/open-login-items", s.handleOpenDesktopLoginItems)
+	mux.HandleFunc("POST /__desktop/open-url", s.handleDesktopOpenExternalURL)
 	mux.HandleFunc("GET /__desktop/update", s.handleDesktopUpdate)
 	mux.HandleFunc("POST /__desktop/update/check", s.handleDesktopUpdateCheck)
 	mux.HandleFunc("POST /__desktop/update/download", s.handleDesktopUpdateDownload)
@@ -2143,7 +2149,18 @@ func (s *Server) handleUpdatePublicAccess(w http.ResponseWriter, r *http.Request
 		writeOpenAIError(w, http.StatusBadRequest, msg)
 		return
 	}
+	if settings.Mode == domain.PublicAccessModeExternalDNS {
+		settings.Provider = "external"
+		if msg := externalDNSPublicAccessError(settings); msg != "" {
+			writeOpenAIError(w, http.StatusBadRequest, msg)
+			return
+		}
+	}
+	previous := s.router.State().PublicAccess
 	updated := s.router.UpdatePublicAccess(settings)
+	if updated.Mode == domain.PublicAccessModeExternalDNS && previous.Mode != domain.PublicAccessModeExternalDNS && s.tunnels != nil {
+		_ = s.tunnels.Stop()
+	}
 	if err := s.saveState(); err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
 		return
@@ -2213,24 +2230,73 @@ func (s *Server) handlePublicStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.withTunnelRuntime(settings))
 }
 
-// handlePublicStart starts a cloudflared tunnel using the current (or provided)
-// public-access settings and returns the updated status.
-func (s *Server) handlePublicStart(w http.ResponseWriter, r *http.Request) {
-	if s.tunnels == nil {
-		writeOpenAIError(w, http.StatusServiceUnavailable, "tunnel manager is not configured")
-		return
+// externalDNSPublicAccessError validates the global external-DNS binding when
+// the operator asks to publish it. The gateway only records hostnames; it does
+// not create DNS, certificates, or a reverse proxy.
+func externalDNSPublicAccessError(settings domain.PublicAccessSettings) string {
+	if !settings.Enabled || settings.Mode != domain.PublicAccessModeExternalDNS {
+		return ""
 	}
+	if msg := PublicHostError(settings.CustomDomain, settings.UIDomain); msg != "" {
+		return msg
+	}
+	if !settings.ExposeAPI && !settings.ExposeUI {
+		return "external DNS requires at least one enabled API/UI hostname"
+	}
+	if settings.ExposeAPI && cleanPublicHost(settings.CustomDomain) == "" {
+		return "external DNS API hostname is not configured"
+	}
+	if settings.ExposeUI && cleanPublicHost(settings.UIDomain) == "" {
+		return "external DNS UI hostname is not configured"
+	}
+	return ""
+}
+
+// handlePublicStart starts a cloudflared tunnel using the current (or provided)
+// public-access settings and returns the updated status. External DNS is a
+// global binding and intentionally does not need a tunnel manager.
+func (s *Server) handlePublicStart(w http.ResponseWriter, r *http.Request) {
+	previous := s.router.State().PublicAccess
+	incomingApplied := false
 	// Optionally accept a settings body to update-then-start in one call.
 	if r.Body != nil {
 		var incoming domain.PublicAccessSettings
 		if err := json.NewDecoder(r.Body).Decode(&incoming); err == nil && (incoming.Mode != "" || incoming.CustomDomain != "" || incoming.Enabled) {
 			incoming.Enabled = true
 			s.router.UpdatePublicAccess(incoming)
-			_ = s.saveState()
+			incomingApplied = true
 		}
 	}
 
-	settings := s.ensureSplitCustomDomains(r.Context())
+	settings := s.router.State().PublicAccess
+	if settings.Mode == domain.PublicAccessModeExternalDNS {
+		if msg := externalDNSPublicAccessError(settings); msg != "" {
+			if incomingApplied {
+				s.router.UpdatePublicAccess(previous)
+			}
+			writeOpenAIError(w, http.StatusConflict, msg)
+			return
+		}
+		if s.tunnels != nil {
+			_ = s.tunnels.Stop()
+		}
+		settings.Enabled = true
+		s.router.UpdatePublicAccess(settings)
+		_ = s.saveState()
+		writeJSON(w, http.StatusOK, s.withTunnelRuntime(s.router.State().PublicAccess))
+		return
+	}
+	if s.tunnels == nil {
+		if incomingApplied {
+			s.router.UpdatePublicAccess(previous)
+		}
+		writeOpenAIError(w, http.StatusServiceUnavailable, "tunnel manager is not configured")
+		return
+	}
+	if incomingApplied {
+		_ = s.saveState()
+	}
+	settings = s.ensureSplitCustomDomains(r.Context())
 	tunnelSettings := s.tunnelSettingsFromPublicAccess(settings)
 
 	state, err := s.tunnels.Start(tunnelSettings)
@@ -2252,7 +2318,7 @@ func (s *Server) RestorePublicAccess() {
 		return
 	}
 	settings := s.router.State().PublicAccess
-	if !settings.Enabled {
+	if !settings.Enabled || settings.Mode == domain.PublicAccessModeExternalDNS {
 		return
 	}
 	if settings.Mode == domain.PublicAccessModeCustomDomain {
@@ -2297,7 +2363,7 @@ func (s *Server) tunnelSettingsFromPublicAccess(settings domain.PublicAccessSett
 		uiDomain = cleanPublicHost(settings.UIDomain)
 	}
 	return tunnel.Settings{
-		Enabled:         true,
+		Enabled:         settings.Mode != domain.PublicAccessModeExternalDNS,
 		Mode:            tunnelModeFromDomain(settings.Mode),
 		CustomDomain:    apiDomain,
 		UIDomain:        uiDomain,
@@ -2351,6 +2417,15 @@ func (s *Server) ensureSplitCustomDomains(ctx context.Context) domain.PublicAcce
 
 // handlePublicStop stops the running cloudflared tunnel.
 func (s *Server) handlePublicStop(w http.ResponseWriter, r *http.Request) {
+	current := s.router.State().PublicAccess
+	if current.Mode == domain.PublicAccessModeExternalDNS {
+		current.Enabled = false
+		current.RuntimeURL = ""
+		s.router.UpdatePublicAccess(current)
+		_ = s.saveState()
+		writeJSON(w, http.StatusOK, s.withTunnelRuntime(s.router.State().PublicAccess))
+		return
+	}
 	if s.tunnels == nil {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "tunnel manager is not configured")
 		return
@@ -2358,7 +2433,7 @@ func (s *Server) handlePublicStop(w http.ResponseWriter, r *http.Request) {
 	state := s.tunnels.Stop()
 	// Mark public access as intentionally stopped so it is not auto-restored on
 	// the next gateway restart. Preserve mode/domain/token/config for re-enable.
-	current := s.router.State().PublicAccess
+	current = s.router.State().PublicAccess
 	current.Enabled = false
 	current.RuntimeURL = ""
 	s.router.UpdatePublicAccess(current)
@@ -2387,6 +2462,10 @@ func (s *Server) applyTunnelURL(state tunnel.State) {
 
 // withTunnelRuntime attaches the live tunnel manager snapshot to a settings copy.
 func (s *Server) withTunnelRuntime(settings domain.PublicAccessSettings) domain.PublicAccessSettings {
+	if settings.Mode == domain.PublicAccessModeExternalDNS {
+		settings.Tunnel = nil
+		return settings
+	}
 	if s.tunnels == nil {
 		return settings
 	}
@@ -4062,6 +4141,9 @@ func (s *Server) testClaudeOAuthProviderChat(r *http.Request, provider domain.Pr
 		"max_tokens": 4096,
 		"stream":     false,
 		"messages":   []map[string]any{{"role": "user", "content": userPrompt}},
+	}
+	if req.MaxTokens > 0 {
+		payload["max_tokens"] = req.MaxTokens
 	}
 	if systemPrompt != "" {
 		payload["system"] = systemPrompt

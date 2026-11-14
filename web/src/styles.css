@@ -2351,6 +2351,7 @@ html[data-theme="dark"] .test-result-card.fail { background: rgba(239, 68, 68, 0
 .test-result-meta { margin-top: 10px; color: var(--subtle); font-family: var(--mono); font-size: var(--fs-sm); overflow-wrap: anywhere; }
 .hint-line { margin-top: 8px; color: var(--muted); font-size: var(--fs-base); font-family: var(--mono); overflow-wrap: anywhere; }
 .hint-line.error { color: var(--red-text); }
+.hint-line.warning { color: var(--amber-text); }
 /* field 内紧跟 label 的 hint-line 是"控件行"（如流式响应 checkbox），
    去掉说明文字的 margin-top，并与左侧输入框同高居中，保证行对齐 */
 .field > label + .hint-line { margin-top: 0; min-height: var(--control-h); align-items: center; }
@@ -3874,6 +3875,34 @@ html[data-theme="dark"] .provider-chip { color: #93c5fd; }
    显式按 HTML 契约兜底：未展开时不渲染 summary 以外的子元素。 */
 details:not([open]) > *:not(summary) { display: none !important; }
 .public-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: end; }
+.public-mode-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+.public-mode-card {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  min-width: 0;
+  padding: 14px;
+  text-align: left;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color .14s ease, background .14s ease, transform .14s ease;
+}
+.public-mode-card:hover { border-color: var(--accent-border); transform: translateY(-1px); }
+.public-mode-card:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-ring); }
+.public-mode-card.active { border-color: var(--accent); background: var(--accent-soft); box-shadow: 0 0 0 1px var(--accent-border) inset; }
+.public-mode-card b { color: var(--text-strong); font-size: var(--fs-md); }
+.public-mode-card span { color: var(--muted); font-size: var(--fs-sm); line-height: 1.5; }
+@media (max-width: 760px) {
+  .public-mode-grid { grid-template-columns: 1fr; }
+}
 .url-label { color: var(--muted); font-size: var(--fs-base); font-weight: 600; white-space: nowrap; }
 
 /* ----------------------------------------------------------------
@@ -5349,6 +5378,12 @@ html[data-theme="dark"] .output-curl-head {
   color: var(--muted);
 }
 .copy-model-btn:hover:not(:disabled) { color: var(--accent-strong); background: var(--accent-soft); }
+.model-status-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .model-tags-row {
   display: flex;
   align-items: center;

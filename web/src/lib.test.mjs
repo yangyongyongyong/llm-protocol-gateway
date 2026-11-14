@@ -912,3 +912,83 @@ test('API 日志协议缩写：oc / or / cl，同协议写 oc->oc', () => {
   assert.equal(lib.compactProtocolFlow('OpenAI Chat'), 'oc->oc');
   assert.equal(lib.compactProtocolFlow(''), '—');
 });
+
+test('外部 DNS 公网地址不依赖 Cloudflare tunnel', () => {
+  const access = {
+    enabled: true,
+    provider: 'external',
+    mode: 'external_dns',
+    exposeApi: true,
+    exposeUi: true,
+    customDomain: 'api.example.com',
+    uiDomain: 'console.example.com',
+    publicBaseUrl: 'https://api.example.com',
+    uiPublicBaseUrl: 'https://console.example.com',
+    expose: 'all',
+    status: 'external_dns_active',
+    statusMessage: '',
+  };
+  assert.equal(lib.activePublicBaseURL(access, false), 'https://api.example.com');
+  assert.equal(lib.activeUIPublicBaseURL(access, false), 'https://console.example.com');
+  assert.equal(lib.publicAccessMetricValue(true, 'external_dns'), '外部 DNS');
+  assert.equal(lib.publicAccessStatusLabel('external_dns_active'), '外部 DNS 已启用');
+  assert.equal(lib.publicAccessStatusLabel('external_dns_incomplete'), '外部 DNS 待补全');
+  assert.equal(lib.activePublicBaseURL({...access, exposeApi: false}, false), '');
+  assert.equal(lib.activeUIPublicBaseURL({...access, enabled: false}, false), '');
+});
+
+test('API Key 复制根地址跟随三种公网方式的唯一 API 域名', () => {
+  const endpoints = [{protocol: 'openai_chat', basePath: '/v1', listenHost: '127.0.0.1', listenPort: 18093}];
+  const cases = [
+    {
+      name: '临时隧道',
+      running: true,
+      access: {
+        enabled: true, provider: 'cloudflare', mode: 'random_tunnel', exposeApi: true, exposeUi: true,
+        expose: 'all', status: 'runtime_url_recorded', statusMessage: '',
+        tunnel: {status: 'running', mode: 'quick', publicUrl: 'https://random.trycloudflare.com', uiPublicUrl: 'https://random.trycloudflare.com'},
+      },
+      want: 'https://random.trycloudflare.com',
+    },
+    {
+      name: 'Cloudflare 自有域名',
+      running: true,
+      access: {
+        enabled: true, provider: 'cloudflare', mode: 'custom_domain', exposeApi: true, exposeUi: true,
+        customDomain: 'api.example.com', uiDomain: 'console.example.com', expose: 'all', status: 'configured_pending_tunnel', statusMessage: '',
+        publicBaseUrl: 'https://api.example.com', uiPublicBaseUrl: 'https://console.example.com',
+        tunnel: {status: 'running', mode: 'custom', publicUrl: 'https://api.example.com', uiPublicUrl: 'https://console.example.com'},
+      },
+      want: 'https://api.example.com',
+    },
+    {
+      name: '外部 DNS',
+      running: false,
+      access: {
+        enabled: true, provider: 'external', mode: 'external_dns', exposeApi: true, exposeUi: true,
+        customDomain: 'api.example.com', uiDomain: 'console.example.com', expose: 'all', status: 'external_dns_active', statusMessage: '',
+        publicBaseUrl: 'https://api.example.com', uiPublicBaseUrl: 'https://console.example.com',
+      },
+      want: 'https://api.example.com',
+    },
+  ];
+
+  for (const item of cases) {
+    assert.equal(lib.activePublicBaseURL(item.access, item.running), item.want, item.name);
+    assert.equal(lib.apiKeyGatewayRoot(endpoints, lib.activePublicBaseURL(item.access, item.running)), item.want, item.name);
+    assert.equal(
+      lib.apiKeyClientBaseURL({outputProtocol: 'openai_chat'}, endpoints, lib.activePublicBaseURL(item.access, item.running)),
+      `${item.want}/v1`,
+      item.name,
+    );
+  }
+
+  // 只开放管理页域名时，UI 域名绝不能作为 API Key 的复制根地址。
+  const uiOnly = {
+    enabled: true, provider: 'external', mode: 'external_dns', exposeApi: false, exposeUi: true,
+    customDomain: '', uiDomain: 'console.example.com', expose: 'all', status: 'external_dns_active', statusMessage: '',
+    publicBaseUrl: '', uiPublicBaseUrl: 'https://console.example.com',
+  };
+  assert.equal(lib.activePublicBaseURL(uiOnly, false), '');
+  assert.equal(lib.apiKeyGatewayRoot(endpoints, lib.activePublicBaseURL(uiOnly, false)), 'http://127.0.0.1:18093');
+});

@@ -185,11 +185,6 @@ func (s *Server) handlePublicAccessControl(w http.ResponseWriter, r *http.Reques
 	if !s.authenticatePublicAccessControlRequest(w, r) {
 		return
 	}
-	if s.tunnels == nil {
-		writeOpenAIError(w, http.StatusServiceUnavailable, "tunnel manager is not configured")
-		return
-	}
-
 	var body struct {
 		Mode    string `json:"mode"`
 		Enabled *bool  `json:"enabled"`
@@ -208,9 +203,11 @@ func (s *Server) handlePublicAccessControl(w http.ResponseWriter, r *http.Reques
 		mode = domain.PublicAccessModeCustomDomain
 	case string(domain.PublicAccessModeRandomTunnel):
 		mode = domain.PublicAccessModeRandomTunnel
+	case string(domain.PublicAccessModeExternalDNS):
+		mode = domain.PublicAccessModeExternalDNS
 	default:
-		writeOpenAIError(w, http.StatusBadRequest, fmt.Sprintf("mode must be %q or %q",
-			domain.PublicAccessModeCustomDomain, domain.PublicAccessModeRandomTunnel))
+		writeOpenAIError(w, http.StatusBadRequest, fmt.Sprintf("mode must be %q, %q or %q",
+			domain.PublicAccessModeCustomDomain, domain.PublicAccessModeRandomTunnel, domain.PublicAccessModeExternalDNS))
 		return
 	}
 
@@ -218,12 +215,34 @@ func (s *Server) handlePublicAccessControl(w http.ResponseWriter, r *http.Reques
 
 	if !*body.Enabled {
 		if current.Mode == mode && current.Enabled {
-			state := s.tunnels.Stop()
+			if mode != domain.PublicAccessModeExternalDNS && s.tunnels != nil {
+				state := s.tunnels.Stop()
+				s.logs.AddApp("info", "public access stopped via control token", fmt.Sprintf("mode=%s status=%s", mode, state.Status))
+			}
 			s.router.UpdatePublicAccess(publicAccessSettingsWithMode(current, mode, false))
 			_ = s.saveState()
-			s.logs.AddApp("info", "public access stopped via control token", fmt.Sprintf("mode=%s status=%s", mode, state.Status))
 		}
 		writeJSON(w, http.StatusOK, s.withTunnelRuntime(s.router.State().PublicAccess))
+		return
+	}
+
+	if mode == domain.PublicAccessModeExternalDNS {
+		next := publicAccessSettingsWithMode(current, mode, true)
+		next.Provider = "external"
+		if msg := externalDNSPublicAccessError(next); msg != "" {
+			writeOpenAIError(w, http.StatusConflict, msg)
+			return
+		}
+		if s.tunnels != nil {
+			_ = s.tunnels.Stop()
+		}
+		updated := s.router.UpdatePublicAccess(next)
+		_ = s.saveState()
+		writeJSON(w, http.StatusOK, s.withTunnelRuntime(updated))
+		return
+	}
+	if s.tunnels == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "tunnel manager is not configured")
 		return
 	}
 

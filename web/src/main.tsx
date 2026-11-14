@@ -100,6 +100,7 @@ import {
     navPathForID,
     navSections,
     navVisibleFor,
+    normalizeDomainInput,
     normalizeGatewayState,
     normalizeRequestStats,
     parseSSEStreamContent,
@@ -210,6 +211,7 @@ import {
     ProvidersImportResult,
     ProviderTestResult,
     ProviderThinkingTestResult,
+    PublicAccessMode,
     PublicAccessSettings,
     RequestAdapter,
     RequestStatsSnapshot,
@@ -533,6 +535,10 @@ function App() {
   const providerImportInputRef = useRef<HTMLInputElement | null>(null);
   const [selectedOutputProtocol, setSelectedOutputProtocol] = useState<Protocol>('openai_chat');
   const [publicDraft, setPublicDraft] = useState<PublicAccessSettings>(defaultPublicAccess);
+  const [publicModeChoice, setPublicModeChoice] = useState<PublicAccessMode>(() => bootSession.state?.publicAccess?.mode || 'random_tunnel');
+  const [externalAPIDomain, setExternalAPIDomain] = useState(() => bootSession.state?.publicAccess?.customDomain || '');
+  const [externalUIDomain, setExternalUIDomain] = useState(() => bootSession.state?.publicAccess?.uiDomain || '');
+  const [externalDNSBusy, setExternalDNSBusy] = useState(false);
   const [customDomainPrefix, setCustomDomainPrefix] = useState('gateway');
   const [uiDomainPrefix, setUIDomainPrefix] = useState('console');
   const [customDomainRoot, setCustomDomainRoot] = useState('');
@@ -1724,6 +1730,17 @@ function App() {
     });
   }, [state.publicAccess]);
 
+  useEffect(() => {
+    setPublicModeChoice(state.publicAccess.mode || 'random_tunnel');
+  }, [state.publicAccess.mode]);
+
+  useEffect(() => {
+    if (state.publicAccess.mode === 'external_dns') {
+      setExternalAPIDomain(state.publicAccess.customDomain || '');
+      setExternalUIDomain(state.publicAccess.uiDomain || '');
+    }
+  }, [state.publicAccess.mode, state.publicAccess.customDomain, state.publicAccess.uiDomain]);
+
   // 日期弹层：点外面或按 Esc 收起。只在打开时挂监听，避免常驻一个 document 级
   // 捕获阶段回调。
   useEffect(() => {
@@ -2701,6 +2718,16 @@ function App() {
     });
   }
 
+  async function openExternalURL(url: string): Promise<void> {
+    const response = await fetch(`${API_BASE}/__desktop/open-url`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url}),
+    });
+    if (!response.ok) throw new Error(await response.text());
+  }
+
   async function connectCloudflareAndBind(options?: { exposeApi?: boolean; exposeUi?: boolean }) {
     const exposeApi = options?.exposeApi ?? (publicDraft.exposeApi !== false);
     const exposeUi = options?.exposeUi ?? (publicDraft.exposeUi !== false);
@@ -2717,7 +2744,7 @@ function App() {
         if (!response.ok) throw new Error(await response.text());
         const data = await response.json() as { loginUrl?: string };
         const loginUrl = data.loginUrl || 'https://dash.cloudflare.com/argotunnel';
-        window.open(loginUrl, '_blank', 'noopener,noreferrer');
+        await openExternalURL(loginUrl);
         showToast('已打开 Cloudflare 授权页，请在浏览器中登录并授权域名');
         authorized = await waitForCloudflareAuthorization();
         if (!authorized) {
@@ -2824,6 +2851,84 @@ function App() {
       showToast(`开启快速隧道失败：${String(error)}`);
     } finally {
       setTunnelBusy(false);
+    }
+  }
+
+  function choosePublicMode(mode: PublicAccessMode) {
+    setPublicModeChoice(mode);
+    if (mode === 'external_dns') {
+      if (!externalAPIDomain && publicDraft.customDomain) setExternalAPIDomain(publicDraft.customDomain);
+      if (!externalUIDomain && publicDraft.uiDomain) setExternalUIDomain(publicDraft.uiDomain);
+    }
+  }
+
+  async function saveExternalDNS(enabled: boolean) {
+    const apiDomain = normalizeDomainInput(externalAPIDomain);
+    const uiDomain = normalizeDomainInput(externalUIDomain);
+    const exposeApi = publicDraft.exposeApi !== false;
+    const exposeUi = publicDraft.exposeUi !== false;
+    if (enabled && !exposeApi && !exposeUi) {
+      showToast('请至少启用「模型 API 公网」或「管理页公网」之一');
+      return;
+    }
+    if (enabled && exposeApi && !apiDomain) {
+      showToast('请填写模型 API 域名');
+      return;
+    }
+    if (enabled && exposeUi && !uiDomain) {
+      showToast('请填写管理页域名');
+      return;
+    }
+    if (apiDomain && uiDomain && apiDomain.toLowerCase() === uiDomain.toLowerCase()) {
+      showToast('API 域名与管理页域名不能相同');
+      return;
+    }
+    setExternalDNSBusy(true);
+    try {
+      const payload: PublicAccessSettings = {
+        ...publicDraft,
+        enabled,
+        provider: 'external',
+        mode: 'external_dns',
+        exposeApi,
+        exposeUi,
+        customDomain: apiDomain,
+        uiDomain,
+        runtimeUrl: '',
+        tunnelName: '',
+        tunnelToken: '',
+        credentialsFile: '',
+        tunnelConfigFile: '',
+        expose: 'all',
+      };
+      const response = await fetch(`${API_BASE}/__public-access`, {
+        method: 'PATCH',
+        credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const updated = await response.json() as PublicAccessSettings;
+      setState((current) => ({...current, publicAccess: updated}));
+      setPublicDraft(updated);
+      setPublicModeChoice('external_dns');
+      setExternalAPIDomain(updated.customDomain || '');
+      setExternalUIDomain(updated.uiDomain || '');
+      await refreshState(false);
+      await refreshAppLogs();
+      if (!enabled) {
+        showToast('已关闭外部 DNS 公网入口');
+      } else {
+        const urls = [
+          updated.exposeApi && apiDomain ? `API https://${apiDomain}` : '',
+          updated.exposeUi && uiDomain ? `管理页 https://${uiDomain}` : '',
+        ].filter(Boolean);
+        showToast(`外部 DNS 公网已启用：${urls.join(' / ')}`);
+      }
+    } catch (error) {
+      showToast(`保存外部 DNS 配置失败：${String(error)}`);
+    } finally {
+      setExternalDNSBusy(false);
     }
   }
 
@@ -5177,9 +5282,16 @@ function App() {
   const tunnelRunning = tunnel?.status === 'running';
   const livePublicURL = activePublicBaseURL(publicAccess, tunnelRunning);
   const liveUIPublicURL = activeUIPublicBaseURL(publicAccess, tunnelRunning);
+  const externalDNSEnabled = publicAccess.enabled && publicAccess.mode === 'external_dns';
+  const externalDNSActive = externalDNSEnabled && (!!livePublicURL || !!liveUIPublicURL);
   // 控制台挂在域名后面时，浏览器手里的 origin 就是客户端真正能用的公网入口，
   // 比网关自报的网卡地址可信。隧道地址仍优先（可与管理台域名分开）。
   const browserOrigin = browserAccessOrigin();
+  const publicActive = tunnelRunning || externalDNSActive || Boolean(browserOrigin);
+  // API Key 页只复制「模型 API」的地址。管理页域名（UI）不能兜底成 API
+  // 地址，否则只开放 UI 域名时会把一个不能跑模型协议的域名复制给客户端。
+  const apiKeyPublicRoot = livePublicURL;
+  // 输出页仍需知道当前浏览器是否已经通过域名访问（例如尚未登记的外部反代）。
   const clientPublicRoot = livePublicURL || browserOrigin;
   const activeTunnelMode = tunnelRunning ? tunnel?.mode : '';
   const quickTunnelActive = tunnelRunning && activeTunnelMode === 'quick';
@@ -5204,23 +5316,23 @@ function App() {
     ? `http://${lanHostHint}:${portHint}`
     : `http://127.0.0.1:${portHint}`;
   const publicControlCurlExamples = [
-    '# 开启「购买域名」公网访问',
+    '# 开启 / 关闭「Cloudflare 自有域名」公有入口',
     `curl -X POST ${publicControlBaseURL}/__public/control \\`,
     '  -H "Authorization: Bearer <令牌>" \\',
     '  -H "Content-Type: application/json" \\',
     `  -d '{"mode":"custom_domain","enabled":true}'`,
     '',
-    '# 关闭「购买域名」公网访问',
-    `curl -X POST ${publicControlBaseURL}/__public/control \\`,
-    '  -H "Authorization: Bearer <令牌>" \\',
-    '  -H "Content-Type: application/json" \\',
-    `  -d '{"mode":"custom_domain","enabled":false}'`,
-    '',
-    '# 开启 / 关闭「免费随机域名」公网访问（把 enabled 换成 false 即为关闭）',
+    '# 开启 / 关闭「临时公网地址」（把 enabled 换成 false 即为关闭）',
     `curl -X POST ${publicControlBaseURL}/__public/control \\`,
     '  -H "Authorization: Bearer <令牌>" \\',
     '  -H "Content-Type: application/json" \\',
     `  -d '{"mode":"random_tunnel","enabled":true}'`,
+    '',
+    '# 开启 / 关闭「外部 DNS / 自有反代」入口',
+    `curl -X POST ${publicControlBaseURL}/__public/control \\`,
+    '  -H "Authorization: Bearer <令牌>" \\',
+    '  -H "Content-Type: application/json" \\',
+    `  -d '{"mode":"external_dns","enabled":true}'`,
   ].join('\n');
   const activeProviderRouteCount = selectedProvider ? (state.apiKeys || []).filter((key) => (
     apiKeyReferencesProvider(key, state.routes, selectedProvider.id)
@@ -5494,8 +5606,8 @@ function App() {
                         <span className="nav-label">{item.label}</span>
                         {item.id === 'public-access' ? (
                           <span
-                            className={`nav-status-dot ${tunnelRunning ? 'on' : 'off'}`}
-                            title={tunnelRunning ? '公网隧道已开启' : '公网隧道已关闭'}
+                            className={`nav-status-dot ${publicActive ? 'on' : 'off'}`}
+                            title={externalDNSActive ? '外部 DNS 公网已配置' : tunnelRunning ? '公网隧道已开启' : '公网访问已关闭'}
                           />
                         ) : null}
                       </a>
@@ -5600,13 +5712,12 @@ function App() {
                     canWriteQuota={canDo('keys.quota')}
                     canDelete={canDo('keys.delete')}
                     testingProviderID={testingProviderID}
-                    tunnelRunning={tunnelRunning}
-                    livePublicURL={clientPublicRoot}
+                    livePublicURL={apiKeyPublicRoot}
                     fixedOutputLabels={fixedOutputLabels}
                     panel={apiKeyPanelProps}
                     onToggleEnabled={toggleApiKeyEnabled}
                     onToast={showToast}
-                    publicBase={clientPublicRoot}
+                    publicBase={apiKeyPublicRoot}
                     onTest={runApiKeySandboxTest}
                   />
                 ) : (
@@ -5663,13 +5774,12 @@ function App() {
                   canWriteQuota={canDo('keys.quota')}
                   canDelete={canDo('keys.delete')}
                   testingProviderID={testingProviderID}
-                  tunnelRunning={tunnelRunning}
-                  livePublicURL={clientPublicRoot}
+                  livePublicURL={apiKeyPublicRoot}
                   fixedOutputLabels={fixedOutputLabels}
                   panel={apiKeyPanelProps}
                   onToggleEnabled={toggleApiKeyEnabled}
                   onToast={showToast}
-                  publicBase={clientPublicRoot}
+                  publicBase={apiKeyPublicRoot}
                   onTest={runApiKeySandboxTest}
                 />
               ) : null}
@@ -6049,15 +6159,17 @@ function App() {
                   <div className="output-hero-title">
                     <span>网关连通状态</span>
                     <Badge tone={clientPublicRoot ? 'green' : 'slate'}>
-                      {tunnelRunning ? '公网穿透运行中' : browserOrigin ? '域名反代访问' : '仅局域网监听'}
+                      {externalDNSActive ? '外部 DNS 已启用' : tunnelRunning ? '公网穿透运行中' : browserOrigin ? '域名反代访问' : '仅局域网监听'}
                     </Badge>
                   </div>
                   <div className="output-hero-desc">
-                    {tunnelRunning
-                      ? `当前已通过 Cloudflare 隧道穿透公网，外网客户端可通过 HTTPS 访问模型 API；Web 管理页具备独立安全鉴权。`
-                      : browserOrigin
-                        ? `当前通过 ${browserOrigin} 提供公网访问，外网客户端直接使用下面的公网地址即可；Web 管理页要求登录。`
-                        : `网关当前仅在本地或局域网提供服务。如需外网访问，请在「公网访问」页一键开启免费隧道或绑定自有域名。`}
+                    {externalDNSActive
+                      ? `当前使用外部 DNS 域名：${[livePublicURL, liveUIPublicURL].filter(Boolean).join(' / ')}。网关只登记 Host，DNS、证书和反向代理由你自行维护。`
+                      : tunnelRunning
+                        ? `当前已通过 Cloudflare 隧道穿透公网，外网客户端可通过 HTTPS 访问模型 API；Web 管理页具备独立安全鉴权。`
+                        : browserOrigin
+                          ? `当前通过 ${browserOrigin} 提供公网访问，外网客户端直接使用下面的公网地址即可；Web 管理页要求登录。`
+                          : `网关当前仅在本地或局域网提供服务。如需外网访问，请在「公网访问」页配置 Cloudflare 隧道或外部 DNS 域名。`}
                   </div>
                 </div>
                 <div className="output-hero-actions">
@@ -6077,7 +6189,7 @@ function App() {
                   const url = endpointURL(endpoint);
                   // 公网地址：隧道给的是每端点完整 URL（含 basePath）；只有域名时按当前
                   // 浏览器 origin 拼，和「复制公网根地址」保持同一口径。
-                  const tunnelEndpointURL = tunnelRunning && endpoint.publicUrl ? publicAccessURL(endpoint, tunnelRunning) : '';
+                  const tunnelEndpointURL = publicActive && endpoint.publicUrl ? publicAccessURL(endpoint, publicActive) : '';
                   const publicEndpointURL = tunnelEndpointURL || (clientPublicRoot ? `${clientPublicRoot}${endpoint.basePath}` : '');
                   const isClaude = endpoint.protocol === 'claude';
                   const isResponses = endpoint.protocol === 'openai_responses';
@@ -6227,7 +6339,7 @@ function App() {
               <div className="panel-header">
                 <div>
                   <h2 className="panel-title">局域网访问</h2>
-                  <p className="panel-desc">总开关：关闭后仅本机 127.0.0.1 可访问；开启后局域网与 Cloudflare 穿透才可用。本机 App 始终可用。</p>
+                  <p className="panel-desc">局域网监听开关：关闭后只监听 127.0.0.1。Cloudflare 隧道需要开启；外部 DNS 若由本机反向代理回源到 127.0.0.1，则可以不开启。</p>
                 </div>
                 <Badge tone={webExposed ? 'green' : 'slate'}>{webExposed ? '已开启' : '仅本机'}</Badge>
               </div>
@@ -6239,15 +6351,42 @@ function App() {
                     disabled={saving}
                     onChange={(e) => void updateWebExposed(e.target.checked)}
                   />
-                  <span>开启局域网 / 穿透访问</span>
+                  <span>开启局域网监听</span>
                 </label>
                 <div className="hint-text">{webExposed
-                    ? '管理页公网需管理员密码；模型 API 使用 API Key。可在下方分别开启管理页或 API 公网。'
-                    : '关闭后局域网与穿透均不可用；若公网隧道在跑会自动停止。'}</div>
+                    ? '当前监听所有网卡。Cloudflare 隧道、局域网客户端和外部反代都可以回源到这里。'
+                    : '当前只监听 127.0.0.1；本机反向代理仍可回源，但局域网客户端与 Cloudflare 隧道不可用。'}</div>
                 <URLRow label="局域网地址" value={lanAccessURL} onCopy={webExposed && lanHostHint ? () => copy(lanAccessURL) : undefined} />
               </div>
             </div>
 
+            <div className="card panel" style={{ gridColumn: '1 / -1' }}>
+              <div className="panel-header">
+                <div>
+                  <h2 className="panel-title">公网访问方式</h2>
+                  <p className="panel-desc">先选择域名由谁提供、由谁维护。三种方式互斥，同一时间只使用一种。</p>
+                </div>
+              </div>
+              <div className="public-mode-grid">
+                <button type="button" className={`public-mode-card ${publicModeChoice === 'random_tunnel' ? 'active' : ''}`} aria-pressed={publicModeChoice === 'random_tunnel'} onClick={() => choosePublicMode('random_tunnel')}>
+                  <b>临时公网地址</b>
+                  <span>Cloudflare Quick Tunnel · 免费、无需账号、地址临时，管理页与 API 共用一个地址。</span>
+                </button>
+                <button type="button" className={`public-mode-card ${publicModeChoice === 'custom_domain' ? 'active' : ''}`} aria-pressed={publicModeChoice === 'custom_domain'} onClick={() => choosePublicMode('custom_domain')}>
+                  <b>Cloudflare 自有域名</b>
+                  <span>登录 Cloudflare，使用账户里的域名；网关自动创建具名隧道和 DNS 路由。</span>
+                </button>
+                <button type="button" className={`public-mode-card ${publicModeChoice === 'external_dns' ? 'active' : ''}`} aria-pressed={publicModeChoice === 'external_dns'} onClick={() => choosePublicMode('external_dns')}>
+                  <b>外部 DNS / 自有反代</b>
+                  <span>直接填写已解析域名；DNS、HTTPS 证书和反向代理由你在其他平台维护。</span>
+                </button>
+              </div>
+              {publicModeChoice === 'random_tunnel' && (customTunnelActive || externalDNSEnabled) ? (
+                <div className="hint-line error">当前正在使用另一条公网路径。切换到临时隧道前，请先关闭当前公网入口。</div>
+              ) : null}
+            </div>
+
+            {publicModeChoice === 'custom_domain' ? (<>
             <div className="card panel">
               <div className="panel-header">
                 <div>
@@ -6372,10 +6511,11 @@ function App() {
                     <div className="hint-text">请先开启「管理页公网」或「模型 API 公网」至少一个开关。</div>
                   ) : null}
                   {quickTunnelActive ? <div className="hint-text">当前正在使用快速隧道，需先关闭后再启域名隧道。</div> : null}
+                  {externalDNSEnabled ? <div className="hint-text">当前正在使用外部 DNS，绑定 Cloudflare 域名后会替换这条公网入口。</div> : null}
                 </div>
                 {tunnel?.status === 'error' && publicAccess.mode === 'custom_domain' ? <div className="hint-line error">{tunnel.message}</div> : null}
                 <details className="public-advanced" open={showManualToken} onToggle={(event) => setShowManualToken((event.currentTarget as HTMLDetailsElement).open)}>
-                  <summary>高级：手动 Token / 快速隧道</summary>
+                  <summary>高级：手动 Tunnel Token</summary>
                   <div className="public-advanced-body">
                     <Field
                       label="隧道 Token"
@@ -6392,33 +6532,88 @@ function App() {
                       >
                         {tunnelBusy ? '启动中…' : '使用 Token 启动'}
                       </button>
-                      {quickTunnelActive ? (
-                        <button className="btn danger" disabled={tunnelBusy} onClick={() => void stopPublicAccess()}>{tunnelBusy ? '处理中…' : '关闭快速隧道'}</button>
-                      ) : (
-                        <button className="btn" disabled={tunnelBusy || customTunnelActive || !webExposed} onClick={() => void startQuickTunnel()}>
-                          {tunnelBusy && !quickTunnelActive ? '开启中…' : '开启快速隧道（临时）'}
-                        </button>
-                      )}
                     </div>
-                    {quickTunnelActive && livePublicURL ? (
-                      <URLRow label="快速隧道地址" value={livePublicURL} onCopy={() => copy(livePublicURL)} />
-                    ) : (
-                      <div className="hint-text">快速隧道为临时单地址，管理页与 API 共用，适合测试。</div>
-                    )}
-                    {tunnel?.status === 'error' && publicAccess.mode === 'random_tunnel' ? <div className="hint-line error">{tunnel.message}</div> : null}
                   </div>
                 </details>
               </div>
             </div>
+            </>) : null}
 
-            <div className="card panel" style={{ gridColumn: '1 / -1' }}>
+            {publicModeChoice === 'random_tunnel' ? (
+              <div className="card panel" style={{ gridColumn: '1 / -1' }}>
+                <div className="panel-header">
+                  <div>
+                    <h2 className="panel-title">临时公网地址</h2>
+                    <p className="panel-desc">Cloudflare Quick Tunnel，无需登录账号。地址临时，每次重新开启可能变化。</p>
+                  </div>
+                  <Badge tone={quickTunnelActive ? 'green' : tunnel?.status === 'error' ? 'red' : 'slate'}>
+                    {quickTunnelActive ? '运行中' : tunnel?.status === 'error' ? '启动失败' : '未开启'}
+                  </Badge>
+                </div>
+                <div className="public-simple-card">
+                  <div className="hint-text">这个模式只有一个公网地址，管理页和模型 API 共用；API 仍需要 Bearer / x-api-key。</div>
+                  <div className="public-simple-actions">
+                    {quickTunnelActive ? (
+                      <button className="btn danger" disabled={tunnelBusy} onClick={() => void stopPublicAccess()}>{tunnelBusy ? '处理中…' : '关闭临时隧道'}</button>
+                    ) : (
+                      <button className="btn primary" disabled={tunnelBusy || customTunnelActive || externalDNSEnabled || !webExposed} onClick={() => void startQuickTunnel()}>
+                        {tunnelBusy ? '开启中…' : '开启临时公网地址'}
+                      </button>
+                    )}
+                  </div>
+                  {!webExposed ? <div className="hint-text">请先开启上方「局域网 / 穿透访问」。</div> : null}
+                  {customTunnelActive ? <div className="hint-text">Cloudflare 自有域名隧道正在运行，请先关闭后再开启临时隧道。</div> : null}
+                  {externalDNSEnabled ? <div className="hint-text">外部 DNS 公网正在使用，请先关闭后再开启临时隧道。</div> : null}
+                  {quickTunnelActive && livePublicURL ? <URLRow label="临时公网地址" value={livePublicURL} onCopy={() => copy(livePublicURL)} /> : null}
+                  {tunnel?.status === 'error' && publicAccess.mode === 'random_tunnel' ? <div className="hint-line error">{tunnel.message}</div> : null}
+                </div>
+              </div>
+            ) : null}
+
+            {publicModeChoice === 'external_dns' ? (
+              <div className="card panel" style={{ gridColumn: '1 / -1' }}>
+                <div className="panel-header">
+                  <div>
+                    <h2 className="panel-title">外部 DNS / 自有反代</h2>
+                    <p className="panel-desc">网关只登记域名并做 API / 管理页 Host 分离，不修改 DNS、不申请证书、不创建隧道。</p>
+                  </div>
+                  <Badge tone={externalDNSActive ? 'green' : externalDNSEnabled ? 'amber' : 'slate'}>
+                    {externalDNSActive ? '已启用' : externalDNSEnabled ? '待补全' : '未启用'}
+                  </Badge>
+                </div>
+                <div className="public-simple-card">
+                  <div className="hint-line warning">这是整个网关唯一的一份公网配置，对所有用户和 API Key 共用；不是按用户或 Key 分别设置。</div>
+                  <div className="mon-set-switches">
+                    <label className="toggle-row"><input type="checkbox" checked={publicDraft.exposeApi !== false} onChange={(e) => setPublicDraft((current) => ({...current, exposeApi: e.target.checked}))} /><span>启用模型 API 公网域名</span></label>
+                    <label className="toggle-row"><input type="checkbox" checked={publicDraft.exposeUi !== false} onChange={(e) => setPublicDraft((current) => ({...current, exposeUi: e.target.checked}))} /><span>启用管理页公网域名</span></label>
+                  </div>
+                  <div className="form-grid compact">
+                    <Field label="模型 API 域名" value={externalAPIDomain} onChange={setExternalAPIDomain} placeholder="api.example.com" />
+                    <Field label="管理页域名" value={externalUIDomain} onChange={setExternalUIDomain} placeholder="console.example.com" />
+                  </div>
+                  <div className="hint-text">只填裸域名，不要带协议、路径或端口。API 域名与管理页域名不能相同。</div>
+                  <div className="hint-line warning">请先在 DNS 平台把域名解析到这台服务器或你的反向代理，并确保 HTTPS 证书、端口转发和反代回源已经可用。网关填域名不会自动让公网可达。</div>
+                  {customTunnelActive ? <div className="hint-text">保存后会停止当前 Cloudflare 域名隧道，并切换到外部 DNS 模式。</div> : null}
+                  <div className="public-simple-actions">
+                    <button className="btn primary" disabled={externalDNSBusy || tunnelBusy} onClick={() => void saveExternalDNS(true)}>{externalDNSBusy ? '保存中…' : '保存并启用外部 DNS'}</button>
+                    {externalDNSEnabled ? <button className="btn danger" disabled={externalDNSBusy || tunnelBusy} onClick={() => void saveExternalDNS(false)}>关闭外部 DNS 公网</button> : null}
+                  </div>
+                  {livePublicURL && publicDraft.exposeApi !== false ? <URLRow label="模型 API 公网" value={livePublicURL} onCopy={() => copy(livePublicURL)} /> : null}
+                  {liveUIPublicURL && publicDraft.exposeUi !== false ? <URLRow label="管理页公网" value={liveUIPublicURL} onCopy={() => copy(liveUIPublicURL)} /> : null}
+                  {publicAccess.statusMessage && publicAccess.mode === 'external_dns' ? <div className="hint-text">{publicAccess.statusMessage}</div> : null}
+                </div>
+              </div>
+            ) : null}
+
+            <details className="public-advanced" style={{ gridColumn: '1 / -1' }}>
+              <summary>高级：公网开关自动化令牌</summary>
+            <div className="card panel">
               <div className="panel-header">
                 <div>
-                  <h2 className="panel-title">远程开关令牌（脚本 / LLM）</h2>
+                  <h2 className="panel-title">公网开关自动化令牌</h2>
                   <p className="panel-desc">
-                    生成一个专用令牌后,脚本或 LLM 可以直接调接口开关公网访问,无需登录控制台。
-                    令牌只能做这一件事,碰不到任何其它管理接口;且该接口<strong>只接受本机 / 局域网调用</strong>,
-                    从公网域名调用会被拒绝。
+                    仅供本机/局域网脚本自动开关公网入口。它不是模型 API Key，不能管理 Provider、密钥或用户，
+                    也不能代替模型请求鉴权。
                   </p>
                 </div>
                 <Badge tone={publicControlTokenConfigured ? 'green' : 'slate'}>
@@ -6438,7 +6633,7 @@ function App() {
                     </div>
                   </div>
                 ) : null}
-                <div className="hint-text">操作：购买域名（custom_domain）与免费随机域名（random_tunnel）各自开关，底层只有一条隧道。安全限制：接口只在本机 / 局域网可用，公网调用一律 403；关掉公网后需回本机重新打开。</div>
+                <div className="hint-text">支持 Cloudflare 隧道和外部 DNS 模式的开关；外部 DNS 不启动隧道。接口仅限本机 / 局域网，公网调用一律 403。</div>
                 <div className="field field-full">
                   <label>调用示例（把 {'<令牌>'} 换成上面复制到的值）</label>
                   <pre className="curl-preview">{publicControlCurlExamples}</pre>
@@ -6472,6 +6667,7 @@ function App() {
                 </div>
               </div>
             </div>
+            </details>
           </section>
           )}
 
@@ -6695,6 +6891,7 @@ function App() {
                     <tbody>
                       {visibleModels.map((model) => {
                         const provider = state.providers.find((item) => item.id === model.providerId);
+                        const modelRestriction = provider?.modelAvailability?.find((item) => item.model.toLowerCase() === model.id.toLowerCase());
                         const isThinking = isThinkingModel(model.id);
                         const isVision = isVisionModel(model.id);
                         const isLongContext = declaredModelWindow(model) >= 128000;
@@ -6732,7 +6929,12 @@ function App() {
                                 onEdit={canDo('providers.edit') ? () => setModelContextTarget({providerId: model.providerId, modelId: model.id}) : undefined}
                               />
                             </td>
-                            <td><Badge tone="slate">{model.inMenu ? '菜单' : '隐藏'}</Badge></td>
+                            <td>
+                              <div className="model-status-badges">
+                                <Badge tone="slate">{model.inMenu ? '菜单' : '隐藏'}</Badge>
+                                {modelRestriction ? <Badge tone="amber" title={modelRestriction.nextRetryAt ? `临时受限，预计 ${modelRestriction.nextRetryAt} 重新探测` : '临时受限，等待重新探测'}>临时受限</Badge> : null}
+                              </div>
+                            </td>
                             <td style={{ textAlign: 'right' }}>
                               <CopyButton
                                 value={model.id}
@@ -6752,6 +6954,7 @@ function App() {
                   <div className="model-grid">
                     {visibleModels.map((model) => {
                       const provider = state.providers.find((item) => item.id === model.providerId);
+                      const modelRestriction = provider?.modelAvailability?.find((item) => item.model.toLowerCase() === model.id.toLowerCase());
                       const isThinking = isThinkingModel(model.id);
                       const isVision = isVisionModel(model.id);
                       const isLongContext = declaredModelWindow(model) >= 128000;
@@ -6780,7 +6983,10 @@ function App() {
                                 </span>
                                 {modelAlias(model) ? <span className="model-id-alias">{modelAlias(model)}</span> : null}
                               </div>
-                              <Badge tone="slate">{model.inMenu ? '菜单' : '隐藏'}</Badge>
+                              <div className="model-status-badges">
+                                <Badge tone="slate">{model.inMenu ? '菜单' : '隐藏'}</Badge>
+                                {modelRestriction ? <Badge tone="amber" title={modelRestriction.nextRetryAt ? `临时受限，预计 ${modelRestriction.nextRetryAt} 重新探测` : '临时受限，等待重新探测'}>临时受限</Badge> : null}
+                              </div>
                             </div>
                             <CopyButton
                               value={model.id}
