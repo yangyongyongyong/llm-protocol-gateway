@@ -532,6 +532,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /__auth/logout", s.handleAuthLogout)
 	mux.HandleFunc("POST /__auth/password", s.handleAuthPassword)
 	mux.HandleFunc("GET /__state", s.handleState)
+	mux.HandleFunc("GET /__gateway-name", s.handleGatewayName)
+	mux.HandleFunc("PATCH /__gateway-name", s.handleSetGatewayName)
 	mux.HandleFunc("GET /__settings/paths", s.handleSettingsPaths)
 	mux.HandleFunc("GET /__desktop/autostart", s.handleDesktopAutostart)
 	mux.HandleFunc("PATCH /__desktop/autostart", s.handleSetDesktopAutostart)
@@ -762,6 +764,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /__peer-upstreams", s.handleRegisterPeerUpstream)
 	mux.HandleFunc("POST /__peer-upstreams/{id}/refresh", s.handleRefreshPeerUpstream)
 	mux.HandleFunc("POST /__peer-upstreams/{id}/reconnect", s.handleReconnectPeerUpstream)
+	mux.HandleFunc("PATCH /__peer-upstreams/{id}", s.handleRenamePeerUpstream)
 	// 断开一条上游＝删掉它这一组的全部成员行（见 handleDisconnectPeerUpstream）。
 	mux.HandleFunc("DELETE /__peer-upstreams/{id}", s.handleDisconnectPeerUpstream)
 	// RBAC: roles, the permission catalog, resource grant targets, and the
@@ -2446,7 +2449,10 @@ func (s *Server) ensureSplitCustomDomains(ctx context.Context) domain.PublicAcce
 	if !setup.IsAuthorized() {
 		return settings
 	}
-	provisioned, err := setup.Provision(ctx, apiDomain, uiDomain, settings.TunnelName, s.localGatewayPort())
+	// A legacy install may still store the old shared default in SQLite. The
+	// tunnel package migrates that sentinel to this machine's derived name; the
+	// persisted copy is updated below through ProvisionResult.
+	provisioned, err := setup.Provision(ctx, apiDomain, uiDomain, settings.TunnelName, s.GatewayID(), s.localGatewayPort())
 	if err != nil {
 		s.logs.AddApp("warn", "custom-domain reprovision skipped", err.Error())
 		return settings
@@ -2701,7 +2707,7 @@ func (s *Server) handleCloudflareBind(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "cloudflare is not authorized yet; complete browser login first")
 		return
 	}
-	provisioned, err := setup.Provision(r.Context(), customDomain, uiDomain, strings.TrimSpace(payload.TunnelName), s.localGatewayPort())
+	provisioned, err := setup.Provision(r.Context(), customDomain, uiDomain, strings.TrimSpace(payload.TunnelName), s.GatewayID(), s.localGatewayPort())
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, err.Error())
 		return

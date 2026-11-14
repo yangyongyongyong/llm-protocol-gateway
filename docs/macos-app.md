@@ -71,6 +71,8 @@ open "desktop/build/bin/LLM Protocol Gateway.app"
 
 外部 DNS 是网关级全局配置，所有用户和 API Key 共用同一组 API / 管理页域名，不按用户或 Key 拆分。该模式仍使用 Host 分离：API 域名只提供模型协议和 `/__health`，管理页域名只提供控制台。`PATCH /__public-access` 保存时 `mode=external_dns`，`provider=external`。
 
+同一个 Cloudflare 账号可以供多台电脑使用。每台电脑的具名隧道名按本机稳定网关身份派生为 `llm-protocol-gateway-<12 位哈希>`，本地配置也写在该身份专属的 `tunnel-<哈希>.yml` 中；两台电脑仍应使用各自的 API/管理页子域名。若远端已存在同名隧道但本机没有其凭据，网关会拒绝自动删除；若 DNS 已指向另一条隧道，网关会拒绝静默覆盖，避免两台电脑互相顶掉。
+
 页面底部的「公网开关自动化令牌」只允许本机/局域网脚本调用 `POST /__public/control` 开关公网入口，不是模型 API Key，也不能管理 Provider、密钥或用户。
 
 ## 防止系统休眠

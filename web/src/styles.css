@@ -13103,6 +13103,13 @@ html[data-theme="dark"] .wb-task-badge[data-tone="ok"] { color: #6ee7b7; border-
    一张页面两半：上半「我连到谁」，下半「谁连到我」。两半用同一套行网格，
    列宽写死成共享模板（12px 的字体、等宽网关 ID 都在这个宽度里放得下），
    这样两个列表上下对齐时读起来是一张表，而不是两张各自为政的卡片。 */
+.peer-local-name-editor {
+  display: inline-flex; align-items: center; gap: 6px; min-width: 0;
+}
+.peer-local-name-editor input {
+  width: 190px; height: 28px; border: 1px solid var(--border); border-radius: var(--r-sm);
+  background: var(--surface); color: var(--text); padding: 0 8px; font: inherit;
+}
 .peers-gateway-id-row {
   display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
   padding: 0 0 12px;
@@ -13155,7 +13162,7 @@ html[data-theme="dark"] .wb-task-badge[data-tone="ok"] { color: #6ee7b7; border-
 .peer-upstream-list { display: flex; flex-direction: column; border-top: 1px solid var(--border); }
 .peer-upstream-row {
   display: grid;
-  grid-template-columns: minmax(160px, 1.4fr) 108px minmax(150px, 1.2fr) minmax(110px, 0.9fr) auto;
+  grid-template-columns: minmax(160px, 1.4fr) minmax(150px, 1.2fr) minmax(110px, 0.9fr) auto;
   align-items: center; gap: 12px;
   padding: 10px 4px; border-bottom: 1px solid var(--border);
   font-size: var(--fs-base);

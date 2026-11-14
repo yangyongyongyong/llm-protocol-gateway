@@ -42,7 +42,6 @@ func TestPeerUpstreamRegisterCreatesProvider(t *testing.T) {
 		"username":             "sub-gw",
 		"password":             "a-strong-password",
 		"name":                 "vps1",
-		"protocol":             "openai_chat",
 		"requestedProviderIds": []string{"parent-model"},
 	})
 	request := httptest.NewRequest(http.MethodPost, "/__peer-upstreams", strings.NewReader(string(body)))
@@ -1126,5 +1125,62 @@ func TestPeerProviderPlansCarryProtocolSupport(t *testing.T) {
 	got := strings.Join(plans[0].ProtocolSupport, ",")
 	if got != "openai_chat,openai_responses,claude" {
 		t.Fatalf("protocolSupport = %q", got)
+	}
+}
+
+func TestPeerUpstreamRenameUpdatesGroupWithoutChangingCredentials(t *testing.T) {
+	server := newPeerTestServer(t)
+	server.SetGatewayID(gwID)
+	registration := peerRegistration{
+		ParentURL: "https://parent.example.com", Token: peerTokenPrefix + "token", RefreshToken: peerRefreshTokenPrefix + "refresh",
+		Username: "sub-gw", UserID: "peer-user", ParentGatewayID: "gw_parent",
+	}
+	granted := []peerProviderView{{ID: "p1", Name: "GPT-4o", Protocol: "openai_chat", Models: []string{"gpt-4o"}}}
+	rows, err := server.createPeerUpstreamProviders(
+		httptest.NewRequest(http.MethodPost, "/__peer-upstreams", nil),
+		"vps1", domain.ProtocolOpenAIChat, registration, granted,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeToken := peerUpstreamToken(rows[0])
+	body := strings.NewReader(`{"name":"vps2"}`)
+	request := httptest.NewRequest(http.MethodPatch, "/__peer-upstreams/"+rows[0].ID, body)
+	request.Header.Set("Content-Type", "application/json")
+	request.Host = "127.0.0.1"
+	request.RemoteAddr = "127.0.0.1:40000"
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	renamed, err := server.router.ProviderByID(rows[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renamed.Name != "vps2 · GPT-4o" {
+		t.Fatalf("renamed provider=%q", renamed.Name)
+	}
+	if peerUpstreamToken(renamed) != beforeToken {
+		t.Fatal("rename must not change the stored peer credential")
+	}
+	if renamed.PeerGrants == nil || renamed.PeerGrants.UpstreamName != "vps2" {
+		t.Fatalf("upstream snapshot=%+v", renamed.PeerGrants)
+	}
+	summary := server.peerUpstreamSummaryOf(rows[0].ID)
+	if summary.UpstreamName != "vps2" {
+		t.Fatalf("summary upstream name=%q", summary.UpstreamName)
+	}
+}
+
+func TestRenamePeerMemberLabelPreservesProviderSuffix(t *testing.T) {
+	for _, tc := range []struct{ current, old, next, want string }{
+		{"vps1 · gpt-4o", "vps1", "vps2", "vps2 · gpt-4o"},
+		{"vps1", "vps1", "vps2", "vps2"},
+		{"custom-name", "vps1", "vps2", "custom-name"},
+	} {
+		if got := renamePeerMemberLabel(tc.current, tc.old, tc.next); got != tc.want {
+			t.Fatalf("rename(%q,%q,%q)=%q want %q", tc.current, tc.old, tc.next, got, tc.want)
+		}
 	}
 }

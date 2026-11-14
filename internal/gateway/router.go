@@ -659,6 +659,25 @@ func (r *Router) AddProvider(provider domain.Provider) (domain.Provider, error) 
 	return provider, nil
 }
 
+// RenameProvider changes only the display label. Unlike UpdateProvider it
+// never touches credentials, models, protocols, or routing metadata.
+func (r *Router) RenameProvider(providerID, name string) (domain.Provider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return domain.Provider{}, fmt.Errorf("provider name is required")
+	}
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID != providerID {
+			continue
+		}
+		r.state.Providers[index].Name = name
+		return r.state.Providers[index], nil
+	}
+	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+}
+
 func (r *Router) UpdateProvider(providerID string, patch domain.Provider) (domain.Provider, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

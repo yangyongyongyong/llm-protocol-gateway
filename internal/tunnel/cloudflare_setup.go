@@ -3,6 +3,8 @@ package tunnel
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -31,9 +33,6 @@ var (
 	tunnelCreateCredPattern = regexp.MustCompile(`(?i)credentials written to (.+\.json)`)
 	tunnelCreateIDPattern   = regexp.MustCompile(`(?i)with id ([0-9a-f-]{36})`)
 	tunnelListRowPattern    = regexp.MustCompile(`^([0-9a-f-]{36})\s+(\S+)`)
-	// cloudflared exits 0 with this even when the CNAME points at a different
-	// (often deleted) tunnel UUID — so we must not trust it alone.
-	alreadyRoutedTunnelPattern = regexp.MustCompile(`(?i)already configured to route to your tunnel\s+tunnelID=([0-9a-f-]{36})`)
 )
 
 // ProvisionResult holds the artifacts produced by a one-time Cloudflare setup.
@@ -81,6 +80,43 @@ func NewCloudflareSetup() *CloudflareSetup {
 		appDir:   defaultCloudflareAppDir,
 		httpDo:   http.DefaultClient.Do,
 	}
+}
+
+// NamedTunnelName derives a stable, collision-resistant cloudflared tunnel
+// name from the gateway's stable identity. 16 hex chars (64 bits) keeps names
+// readable while making collisions between two machines implausible. The name
+// must stay stable across restarts so DNS reuse and credentials keep working.
+func NamedTunnelName(gatewayID string) string {
+	identity := strings.TrimSpace(gatewayID)
+	if identity == "" {
+		identity = "unknown-gateway"
+	}
+	sum := sha256.Sum256([]byte(identity))
+	return "llm-protocol-gateway-" + hex.EncodeToString(sum[:12])
+}
+
+// namedTunnelConfigFile gives each gateway its own config file under the shared
+// Application Support directory. Two machines may share one Cloudflare account;
+// they must not overwrite each other's ingress file.
+func namedTunnelConfigFile(appDir, gatewayID string) string {
+	suffix := strings.TrimPrefix(NamedTunnelName(gatewayID), "llm-protocol-gateway-")
+	return filepath.Join(appDir, "tunnel-"+suffix+".yml")
+}
+
+// legacySharedTunnelName is the old fixed default. Existing installations may
+// still carry it in SQLite; treating it as an explicit identity would keep two
+// machines contending forever, so the gateway migrates it to the derived name.
+const legacySharedTunnelName = "llm-protocol-gateway"
+
+// effectiveTunnelName returns an explicitly chosen non-legacy name or derives a
+// per-gateway name from the stable identity. This migration is intentionally
+// one-way: once a tunnel is provisioned under the derived name, it persists.
+func effectiveTunnelName(configured, gatewayID string) string {
+	configured = strings.TrimSpace(configured)
+	if configured == "" || strings.EqualFold(configured, legacySharedTunnelName) {
+		return NamedTunnelName(gatewayID)
+	}
+	return configured
 }
 
 func defaultCloudflaredHome() (string, error) {
@@ -364,7 +400,7 @@ func (c *CloudflareSetup) StartLogin(ctx context.Context) (string, error) {
 // Provision creates or reuses a named tunnel, routes DNS for the requested
 // hostnames, and writes a config file that points those ingress hostnames at
 // the local gateway port. Either API domain, UI domain, or both may be set.
-func (c *CloudflareSetup) Provision(ctx context.Context, customDomain, uiDomain, tunnelName string, localPort int) (ProvisionResult, error) {
+func (c *CloudflareSetup) Provision(ctx context.Context, customDomain, uiDomain, tunnelName, gatewayID string, localPort int) (ProvisionResult, error) {
 	customDomain = strings.TrimSpace(customDomain)
 	uiDomain = strings.TrimSpace(uiDomain)
 	if customDomain == "" && uiDomain == "" {
@@ -376,9 +412,7 @@ func (c *CloudflareSetup) Provision(ctx context.Context, customDomain, uiDomain,
 	if !c.IsAuthorized() {
 		return ProvisionResult{}, fmt.Errorf("cloudflare is not authorized yet; complete browser login first")
 	}
-	if strings.TrimSpace(tunnelName) == "" {
-		tunnelName = "llm-protocol-gateway"
-	}
+	tunnelName = effectiveTunnelName(tunnelName, gatewayID)
 	if localPort <= 0 {
 		localPort = 18093
 	}
@@ -406,7 +440,7 @@ func (c *CloudflareSetup) Provision(ctx context.Context, customDomain, uiDomain,
 	if err != nil {
 		return ProvisionResult{}, err
 	}
-	configFile := filepath.Join(appDir, "tunnel-config.yml")
+	configFile := namedTunnelConfigFile(appDir, gatewayID)
 	var ingress strings.Builder
 	if customDomain != "" {
 		fmt.Fprintf(&ingress, "  - hostname: %s\n    service: http://127.0.0.1:%d\n", customDomain, localPort)
@@ -471,12 +505,10 @@ func CustomDomainConfigReusable(configFile, credentialsFile, apiDomain, uiDomain
 	return true
 }
 
-// routeDNS creates a CNAME for hostname → tunnel. If the record already exists
-// (Cloudflare API code 1003), retries with --overwrite-dns. Regardless of
-// cloudflared's exit code, we then ensure the zone CNAME actually points at
-// tunnelID — cloudflared often reports "already configured … tunnelID=<old>"
-// with exit 0 (and even --overwrite-dns) when the hostname still targets a
-// deleted/stale tunnel, which surfaces publicly as HTTP 530 / error 1033.
+// routeDNS creates a CNAME for hostname → tunnel. A pre-existing record is
+// never silently stolen from another tunnel: if the final CNAME targets a
+// different tunnel id, this returns an explicit conflict. This is what keeps
+// two machines on one Cloudflare account from fighting over the same hostname.
 func (c *CloudflareSetup) routeDNS(ctx context.Context, tunnelName, tunnelID, hostname string) error {
 	tunnelID = strings.TrimSpace(tunnelID)
 	if tunnelID == "" {
@@ -488,31 +520,28 @@ func (c *CloudflareSetup) routeDNS(ctx context.Context, tunnelName, tunnelID, ho
 		if !dnsRecordConflict(combined) {
 			return fmt.Errorf("route dns for %s: %w", hostname, err)
 		}
-		// Hostname already has A/AAAA/CNAME — overwrite so it points at this tunnel.
-		output, err = c.run(ctx, "tunnel", "route", "dns", "--overwrite-dns", tunnelName, hostname)
-		if err != nil {
-			return fmt.Errorf("route dns for %s (overwrite existing record): %w", hostname, err)
-		}
-	}
-	if routedID, ok := parseAlreadyRoutedTunnelID(output); ok && !strings.EqualFold(routedID, tunnelID) {
-		// Stale route reported; force CLI overwrite before API reconcile.
-		if _, overwriteErr := c.run(ctx, "tunnel", "route", "dns", "--overwrite-dns", tunnelName, hostname); overwriteErr != nil {
-			// Fall through to API ensure — CLI overwrite is best-effort here.
-			_ = overwriteErr
+		// cloudflared offers --overwrite-dns, but that would steal a hostname
+		// already used by another computer. Inspect the current CNAME and allow
+		// the update only when it already points at this same tunnel (for
+		// example a stale record left by an earlier run of this machine).
+		currentTunnelID, owned, inspectErr := c.hostnameCNAMETunnelID(ctx, hostname)
+		if inspectErr == nil && owned && strings.EqualFold(currentTunnelID, tunnelID) {
+			output, err = c.run(ctx, "tunnel", "route", "dns", "--overwrite-dns", tunnelName, hostname)
+			if err != nil {
+				return fmt.Errorf("route dns for %s (repair same tunnel): %w", hostname, err)
+			}
+		} else if owned {
+			return fmt.Errorf("域名 %s 已被另一条隧道占用（%s）。为避免抢走另一台电脑的流量，不会自动覆盖 DNS；请换成本机自己的子域名。", hostname, currentTunnelID)
+		} else if inspectErr != nil {
+			return fmt.Errorf("域名 %s 已有 DNS 记录，但无法确认归属：%v。为避免覆盖另一台电脑，不会自动接管。", hostname, inspectErr)
+		} else {
+			return fmt.Errorf("域名 %s 已有非隧道 DNS 记录。为避免覆盖现有服务，不会自动接管；请换成本机自己的子域名。", hostname)
 		}
 	}
 	if err := c.ensureHostnameCNAME(ctx, hostname, tunnelID); err != nil {
 		return fmt.Errorf("ensure dns for %s → %s: %w", hostname, tunnelID, err)
 	}
 	return nil
-}
-
-func parseAlreadyRoutedTunnelID(output string) (string, bool) {
-	match := alreadyRoutedTunnelPattern.FindStringSubmatch(output)
-	if len(match) < 2 {
-		return "", false
-	}
-	return strings.TrimSpace(match[1]), true
 }
 
 func tunnelCNAMETarget(tunnelID string) string {
@@ -547,13 +576,22 @@ func (c *CloudflareSetup) ensureHostnameCNAME(ctx context.Context, hostname, tun
 	if do == nil {
 		do = http.DefaultClient.Do
 	}
-	target := tunnelCNAMETarget(tunnelID)
 	records, err := c.listDNSRecordsByName(ctx, do, token.APIToken, zoneID, hostname)
 	if err != nil {
 		return err
 	}
+	return c.ensureHostnameCNAMEWithRecords(ctx, do, hostname, tunnelID, token.APIToken, zoneID, records)
+}
+
+func (c *CloudflareSetup) ensureHostnameCNAMEWithRecords(
+	ctx context.Context,
+	do func(*http.Request) (*http.Response, error),
+	hostname, tunnelID, apiToken, zoneID string,
+	records []cloudflareDNSRecord,
+) error {
+	target := tunnelCNAMETarget(tunnelID)
 	if len(records) == 0 {
-		return c.createDNSRecord(ctx, do, token.APIToken, zoneID, map[string]any{
+		return c.createDNSRecord(ctx, do, apiToken, zoneID, map[string]any{
 			"type":    "CNAME",
 			"name":    hostname,
 			"content": target,
@@ -565,19 +603,10 @@ func (c *CloudflareSetup) ensureHostnameCNAME(ctx context.Context, hostname, tun
 		if strings.EqualFold(rec.Type, "CNAME") &&
 			strings.EqualFold(rec.Content, target) &&
 			rec.Proxied {
-			continue
-		}
-		if err := c.updateDNSRecord(ctx, do, token.APIToken, zoneID, rec.ID, map[string]any{
-			"type":    "CNAME",
-			"name":    hostname,
-			"content": target,
-			"proxied": true,
-			"ttl":     1,
-		}); err != nil {
-			return err
+			return nil
 		}
 	}
-	return nil
+	return fmt.Errorf("域名 %s 已经指向另一条隧道（当前 %s，本机 %s）。为避免抢走另一台电脑的流量，不会自动覆盖 DNS；请换成本机自己的子域名。", hostname, strings.TrimSpace(records[0].Content), target)
 }
 
 type cloudflareDNSRecord struct {
@@ -586,6 +615,43 @@ type cloudflareDNSRecord struct {
 	Name    string `json:"name"`
 	Content string `json:"content"`
 	Proxied bool   `json:"proxied"`
+}
+
+// hostnameCNAMETunnelID returns the tunnel UUID currently targeted by hostname.
+// It returns owned=false when no CNAME exists (the caller can create one).
+func (c *CloudflareSetup) hostnameCNAMETunnelID(ctx context.Context, hostname string) (string, bool, error) {
+	path, err := c.originCertPath()
+	if err != nil {
+		return "", false, err
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", false, err
+	}
+	token, err := parseOriginCertToken(raw)
+	if err != nil {
+		return "", false, err
+	}
+	do := c.httpDo
+	if do == nil {
+		do = http.DefaultClient.Do
+	}
+	records, err := c.listDNSRecordsByName(ctx, do, token.APIToken, token.ZoneID, hostname)
+	if err != nil {
+		return "", false, err
+	}
+	for _, rec := range records {
+		if !strings.EqualFold(rec.Type, "CNAME") {
+			continue
+		}
+		content := strings.TrimSpace(rec.Content)
+		if !strings.HasSuffix(strings.ToLower(content), ".cfargotunnel.com") {
+			return "", false, nil
+		}
+		id := strings.TrimSuffix(content, ".cfargotunnel.com")
+		return id, true, nil
+	}
+	return "", false, nil
 }
 
 func (c *CloudflareSetup) listDNSRecordsByName(ctx context.Context, do func(*http.Request) (*http.Response, error), apiToken, zoneID, name string) ([]cloudflareDNSRecord, error) {
@@ -688,20 +754,11 @@ func (c *CloudflareSetup) ensureTunnel(ctx context.Context, name string) (string
 		return tunnelID, credentialsFile, nil
 	}
 	if isMissingTunnelCredentials(findErr) {
-		deleteTarget := name
-		if tunnelID != "" {
-			deleteTarget = tunnelID
-		} else if id, idErr := c.lookupTunnelIDByName(ctx, name); idErr == nil {
-			deleteTarget = id
-		}
-		if _, delErr := c.run(ctx, "tunnel", "delete", "-f", deleteTarget); delErr != nil {
-			return "", "", fmt.Errorf("tunnel %q credentials missing (%v); failed to delete orphaned tunnel for recreate: %w", name, findErr, delErr)
-		}
-		output, err := c.run(ctx, "tunnel", "create", name)
-		if err != nil {
-			return "", "", fmt.Errorf("recreate tunnel %q after missing credentials: %w", name, err)
-		}
-		return parseTunnelCreateOutput(output)
+		// A tunnel with this name exists in the Cloudflare account, but its
+		// credentials are not on this machine. That almost always means another
+		// computer created it. Deleting it here would disconnect that machine;
+		// fail with an actionable conflict instead.
+		return "", "", fmt.Errorf("隧道 %q 已存在于该 Cloudflare 账号，但本机没有它的凭据。为避免顶掉另一台电脑，不会自动删除远端隧道；请给本机使用不同的隧道名，或先在原机器停止并显式清理该隧道。", name)
 	}
 
 	output, err := c.run(ctx, "tunnel", "create", name)
@@ -716,26 +773,10 @@ func (c *CloudflareSetup) ensureTunnel(ctx context.Context, name string) (string
 	if findErr == nil {
 		return tunnelID, credentialsFile, nil
 	}
-	if !isMissingTunnelCredentials(findErr) {
-		return "", "", findErr
+	if isMissingTunnelCredentials(findErr) {
+		return "", "", fmt.Errorf("隧道 %q 已存在，但本机没有它的凭据；不会自动删除其它电脑的隧道。请换一个本机专用隧道名。", name)
 	}
-	if tunnelID == "" {
-		if id, idErr := c.lookupTunnelIDByName(ctx, name); idErr == nil {
-			tunnelID = id
-		}
-	}
-	deleteTarget := name
-	if tunnelID != "" {
-		deleteTarget = tunnelID
-	}
-	if _, delErr := c.run(ctx, "tunnel", "delete", "-f", deleteTarget); delErr != nil {
-		return "", "", fmt.Errorf("tunnel %q credentials missing (%v); failed to delete orphaned tunnel for recreate: %w", name, findErr, delErr)
-	}
-	output, err = c.run(ctx, "tunnel", "create", name)
-	if err != nil {
-		return "", "", fmt.Errorf("recreate tunnel %q after missing credentials: %w", name, err)
-	}
-	return parseTunnelCreateOutput(output)
+	return "", "", findErr
 }
 
 func isMissingTunnelCredentials(err error) bool {
