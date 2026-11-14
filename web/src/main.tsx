@@ -213,6 +213,7 @@ import {
     ProviderThinkingTestResult,
     PublicAccessMode,
     PublicAccessSettings,
+    SleepPreventionStatus,
     RequestAdapter,
     RequestStatsSnapshot,
     Route,
@@ -676,6 +677,8 @@ function App() {
   // macOS 的 LaunchAgent 状态，避免 UI 与系统设置各说各话。
   const [desktopAutostart, setDesktopAutostart] = useState<DesktopAutostartStatus | null>(null);
   const [desktopAutostartBusy, setDesktopAutostartBusy] = useState(false);
+  const [sleepPrevention, setSleepPrevention] = useState<SleepPreventionStatus | null>(null);
+  const [sleepPreventionBusy, setSleepPreventionBusy] = useState(false);
   // 导入单独一个 busy 标记：设置 saving 会把右侧面板顶部四个按钮全禁用，`导入` 按钮被禁后
   // chip 从鼠标下方消失，浏览器随即丢掉按钮的 hover，一次性结果气泡刚出现就跟着消失。
   const [importingProviders, setImportingProviders] = useState(false);
@@ -1786,7 +1789,11 @@ function App() {
     }
     if (activeNav === 'settings') {
       void refreshDesktopAutostart();
-      const onFocus = () => { void refreshDesktopAutostart(); };
+      void refreshSleepPrevention();
+      const onFocus = () => {
+        void refreshDesktopAutostart();
+        void refreshSleepPrevention();
+      };
       const onVisibility = () => { if (isPageVisible()) onFocus(); };
       window.addEventListener('focus', onFocus);
       document.addEventListener('visibilitychange', onVisibility);
@@ -2543,6 +2550,40 @@ function App() {
       if (!response.ok) throw new Error(await response.text());
     } catch (error) {
       showToast(`打开系统登录项失败：${String(error)}`);
+    }
+  }
+
+  async function refreshSleepPrevention(showError = false): Promise<void> {
+    try {
+      const response = await fetchWithTimeout(`${API_BASE}/__desktop/sleep-prevention`, {credentials: 'same-origin'});
+      if (response.status === 403) {
+        setSleepPrevention(null);
+        return;
+      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      setSleepPrevention(await response.json() as SleepPreventionStatus);
+    } catch (error) {
+      if (showError) showToast(`读取防休眠状态失败：${String(error)}`);
+    }
+  }
+
+  async function updateSleepPrevention(enabled: boolean): Promise<void> {
+    setSleepPreventionBusy(true);
+    try {
+      const response = await fetch(`${API_BASE}/__desktop/sleep-prevention`, {
+        method: 'PATCH',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({enabled}),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const status = await response.json() as SleepPreventionStatus;
+      setSleepPrevention(status);
+      showToast(status.active ? '已开启防止系统休眠，显示器仍可关闭' : '已关闭防止系统休眠，恢复系统原有设置');
+    } catch (error) {
+      showToast(`更新防休眠设置失败：${String(error)}`);
+      void refreshSleepPrevention();
+    } finally {
+      setSleepPreventionBusy(false);
     }
   }
 
@@ -7472,6 +7513,35 @@ function App() {
                   ) : null}
                   {desktopAutostart.message ? <div className="hint-text">{desktopAutostart.message}</div> : null}
                   <div className="hint-text">首次安装启动时默认开启；之后你手动关闭会保持关闭。开关直接读写 macOS 登录项，不在网关数据库里另存布尔值；你在系统设置里改动后，回到这里会自动刷新。</div>
+                </div>
+              ) : null}
+              {sleepPrevention?.available ? (
+                <div className="card panel">
+                  <div className="panel-header">
+                    <div>
+                      <h2 className="panel-title">防止系统休眠</h2>
+                      <p className="panel-desc">让网关在无人操作时继续为其他电脑提供服务；关闭后恢复系统原有休眠策略。</p>
+                    </div>
+                    <Badge tone={sleepPrevention.enabled ? (sleepPrevention.active ? 'green' : 'amber') : 'slate'}>
+                      {sleepPrevention.enabled ? (sleepPrevention.active ? '运行中' : '未生效') : '已关闭'}
+                    </Badge>
+                  </div>
+                  <div className="mon-set-switches">
+                    <Switch
+                      checked={sleepPrevention.enabled}
+                      label="阻止系统因空闲进入休眠"
+                      disabled={sleepPreventionBusy || !sleepPrevention.available}
+                      onChange={(enabled) => void updateSleepPrevention(enabled)}
+                    />
+                  </div>
+                  {sleepPrevention.enabled && !sleepPrevention.active ? (
+                    <div className="mon-set-notice">
+                      <span className="mon-set-notice-label">未生效</span>
+                      <span className="mon-set-notice-text">设置已保存，但当前系统没有持有防休眠断言，请关闭后重试。</span>
+                    </div>
+                  ) : null}
+                  {sleepPrevention.message ? <div className="hint-text">{sleepPrevention.message}</div> : null}
+                  <div className="hint-text">默认关闭。开启后只阻止系统因空闲休眠，显示器仍可关闭；合盖、低电量保护、手动关机或系统更新仍可能中断服务。关闭后不再持有任何本应用电源断言。</div>
                 </div>
               ) : null}
               <DesktopUpdateCard onToast={showToast} />

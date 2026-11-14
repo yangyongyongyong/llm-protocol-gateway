@@ -73,6 +73,15 @@ open "desktop/build/bin/LLM Protocol Gateway.app"
 
 页面底部的「公网开关自动化令牌」只允许本机/局域网脚本调用 `POST /__public/control` 开关公网入口，不是模型 API Key，也不能管理 Provider、密钥或用户。
 
+## 防止系统休眠
+
+设置页提供「防止系统休眠」开关，默认关闭。开启后，macOS 使用 `caffeinate -i` 持有系统空闲睡眠断言，Windows 使用 `SetThreadExecutionState(ES_SYSTEM_REQUIRED)`；只阻止系统因空闲休眠，不阻止显示器关闭。
+
+- 关闭开关、退出 App 或正常关闭网关时会释放断言，恢复系统原有休眠策略。
+- 合盖、低电量保护、手动关机、系统更新等仍可能中断网关，不能把它当作 UPS。
+- 该开关只允许本机访问：`GET /__desktop/sleep-prevention`，写入 `PATCH /__desktop/sleep-prevention`，body 为 `{"enabled":true|false}`。
+- 目前仅支持 macOS 和 Windows；Linux 不显示此设置。
+
 ## 与 LaunchAgent 切换
 
 LaunchAgent 标签：`com.luca.llm-protocol-gateway`。

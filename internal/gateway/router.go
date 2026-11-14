@@ -217,6 +217,24 @@ func (r *Router) HostMetricsDisabled() bool {
 	return r.state.HostMetricsDisabled
 }
 
+func (r *Router) SetPreventSleep(enabled bool) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.state.PreventSleep = enabled
+}
+
+func (r *Router) PreventSleep() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.state.PreventSleep
+}
+
 func (r *Router) UpdatePublicAccess(settings domain.PublicAccessSettings) domain.PublicAccessSettings {
 	r.mu.Lock()
 	defer r.mu.Unlock()

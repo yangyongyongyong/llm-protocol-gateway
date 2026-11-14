@@ -1013,6 +1013,15 @@ export type PeerUpstreamsResponse = {
 };
 
 /** macOS 登录项状态；Available=false 表示当前不是 App（如无头 CLI / 非 macOS）。 */
+/** 系统防休眠状态：enabled 是持久化选择，active 是当前 OS 断言是否真的持有。 */
+export type SleepPreventionStatus = {
+  enabled: boolean;
+  available: boolean;
+  active: boolean;
+  platform: string;
+  message?: string;
+};
+
 export type DesktopAutostartStatus = {
   available: boolean;
   enabled: boolean;
@@ -1049,6 +1058,8 @@ export type GatewayState = {
   webExposed?: boolean;
   /** 机器状态动态采集是否关闭；缺省 false 保持旧版常驻采样行为。 */
   hostMetricsDisabled?: boolean;
+  /** 防止系统空闲休眠；缺省 false，关闭时完全遵循系统原有休眠策略。 */
+  preventSleep?: boolean;
   dataPaths?: DataPaths;
   cursorBridge?: CursorBridgeRuntime;
   /** 本网关的稳定身份；重装不变。父子对接靠它互相识别。 */

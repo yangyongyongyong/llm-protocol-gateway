@@ -268,6 +268,7 @@ func (rt *Runtime) Start(cfg Config) error {
 	// upgrade prompt, so it must be set before the first request is served.
 	gateway.SetBuildVersion(cfg.Version)
 	server := gateway.NewServer(router, logs, db)
+	server.RestoreSleepPrevention()
 	// 网关身份要在第一条请求之前就位：环路检测拿它判断"链路里是不是我自己"。
 	// 身份从机器标识派生，重装、清库都不变（用户明确要求"同一台电脑重新安装
 	// app 要身份一样"）；读不到机器标识时退化成库里存的随机值。salt 用库文件
@@ -556,6 +557,7 @@ func (rt *Runtime) Stop(ctx context.Context) error {
 	}
 	if rt.server != nil {
 		rt.server.StopCursorBridge()
+		rt.server.CloseSleepPrevention()
 	}
 	// Drain the HTTP server BEFORE flushing: Shutdown waits (up to the ctx
 	// deadline) for in-flight handlers, and a handler that finishes during that

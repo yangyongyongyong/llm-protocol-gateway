@@ -30,6 +30,7 @@ import (
 	"github.com/luca/llm-protocol-gateway/internal/domain"
 	"github.com/luca/llm-protocol-gateway/internal/monitor"
 	"github.com/luca/llm-protocol-gateway/internal/monitoring"
+	"github.com/luca/llm-protocol-gateway/internal/sleepguard"
 	"github.com/luca/llm-protocol-gateway/internal/tunnel"
 )
 
@@ -243,6 +244,9 @@ type Server struct {
 	// It is an interface so handlers can be tested without touching the real
 	// ~/Library/LaunchAgents. The system record remains the source of truth.
 	desktopAutostart autostart.Manager
+	// sleepGuard owns the opt-in OS idle-sleep assertion. It is process-wide and
+	// independent of the console session; the persisted request lives in GatewayState.
+	sleepGuard sleepguard.Manager
 	// desktopUpdater is the optional App-owned self-update service. It is nil
 	// in headless builds; handlers then return an unavailable status.
 	desktopUpdater desktopUpdater
@@ -353,6 +357,7 @@ func NewServer(router *Router, logs *monitor.Store, stateSaver ...StateSaver) *S
 		requestLogRetentionDays: 7,
 		authThrottle:            newAuthThrottle(),
 		desktopAutostart:        autostart.New(),
+		sleepGuard:              sleepguard.New(),
 	}
 	if days := router.State().RequestLogRetentionDays; days > 0 {
 		server.requestLogRetentionDays = days
@@ -468,6 +473,35 @@ func (s *Server) SetWebExposedChangeHandler(fn func(enabled bool) error) {
 	s.webExposedChange = fn
 }
 
+// RestoreSleepPrevention reapplies the persisted opt-in after the runtime has
+// loaded SQLite state. A failed assertion must not prevent the gateway from
+// serving traffic; the API will expose the desired-vs-active mismatch.
+func (s *Server) RestoreSleepPrevention() {
+	if !s.router.PreventSleep() || s.sleepGuard == nil {
+		return
+	}
+	status, err := s.sleepGuard.Set(true)
+	if err != nil {
+		if s.logs != nil {
+			s.logs.AddApp("warn", "sleep prevention restore failed", err.Error())
+		}
+		return
+	}
+	if s.logs != nil {
+		s.logs.AddApp("info", "sleep prevention restored", fmt.Sprintf("platform=%s active=%v", status.Platform, status.Active))
+	}
+}
+
+// CloseSleepPrevention releases the OS assertion during a clean shutdown.
+func (s *Server) CloseSleepPrevention() {
+	if s.sleepGuard == nil {
+		return
+	}
+	if err := s.sleepGuard.Close(); err != nil && s.logs != nil {
+		s.logs.AddApp("warn", "sleep prevention release failed", err.Error())
+	}
+}
+
 // SetExternalURLOpener lets the desktop shell open a validated release page in
 // the system browser. Headless gateways leave it nil.
 func (s *Server) SetExternalURLOpener(fn func(string) error) {
@@ -502,6 +536,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /__desktop/autostart", s.handleDesktopAutostart)
 	mux.HandleFunc("PATCH /__desktop/autostart", s.handleSetDesktopAutostart)
 	mux.HandleFunc("POST /__desktop/autostart/open-login-items", s.handleOpenDesktopLoginItems)
+	mux.HandleFunc("GET /__desktop/sleep-prevention", s.handleSleepPrevention)
+	mux.HandleFunc("PATCH /__desktop/sleep-prevention", s.handleSetSleepPrevention)
 	mux.HandleFunc("POST /__desktop/open-url", s.handleDesktopOpenExternalURL)
 	mux.HandleFunc("GET /__desktop/update", s.handleDesktopUpdate)
 	mux.HandleFunc("POST /__desktop/update/check", s.handleDesktopUpdateCheck)

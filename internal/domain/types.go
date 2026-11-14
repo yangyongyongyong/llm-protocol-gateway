@@ -1203,6 +1203,10 @@ type GatewayState struct {
 	// so LAN / tunnel clients can reach the management UI and APIs. When false,
 	// the server listens on 127.0.0.1 only (local App / loopback).
 	WebExposed bool `json:"webExposed"`
+	// PreventSleep keeps the gateway host awake while it is serving other
+	// machines. It is off by default so a normal install follows the OS sleep
+	// policy exactly.
+	PreventSleep bool `json:"preventSleep,omitempty"`
 	// DataPaths is runtime-only (not persisted); absolute paths for backup/analysis.
 	DataPaths *DataPaths `json:"dataPaths,omitempty"`
 	// CursorBridge is the live local gRPC bridge status; runtime-only, not persisted.
