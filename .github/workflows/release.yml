@@ -503,7 +503,7 @@ jobs:
             openssl pkeyutl -sign -rawin -inkey "$keyfile" -in assets/update.json -out "$sigfile"
             base64 <"$sigfile" >assets/update.json.sig
             rm -f "$keyfile" "$sigfile"
-            python3 -c 'import base64,pathlib; sig=base64.b64decode(pathlib.Path("assets/update.json.sig").read_text(), validate=True); assert len(sig) == 64, f"update.json.sig is not a raw Ed25519 signature: {len(sig)} bytes"'
+            python3 -c 'import base64,pathlib; raw=pathlib.Path("assets/update.json.sig").read_text(); sig=base64.b64decode("".join(raw.split()), validate=True); assert len(sig) == 64, f"update.json.sig is not a raw Ed25519 signature: {len(sig)} bytes"'
             echo "update.json signed with UPDATE_SIGNING_KEY (base64 Ed25519)"
           else
             echo "::warning::UPDATE_SIGNING_KEY is not configured; update.json has no Ed25519 signature"
