@@ -834,6 +834,11 @@ func (s *Server) Handler() http.Handler {
 
 // publicHostRole returns "api" / "ui" when the request Host matches the
 // dedicated custom-domain hostnames; otherwise "" (combined local/LAN mode).
+//
+// 分离只在两个域名都配好时才成立。只登记了一个域名（单域名部署，或外部反代
+// 只登记 API 域名）时根本没有"另一个域名"可去：按分离处理会把控制台（或模型
+// 接口）直接 404 掉，等于整站下线——错误信息里那句"use the UI domain instead"
+// 也就指向了一个不存在的域名。那种情况必须退回组合模式。
 func (s *Server) publicHostRole(host string) string {
 	host = strings.ToLower(strings.TrimSpace(host))
 	if host == "" {
@@ -848,10 +853,13 @@ func (s *Server) publicHostRole(host string) string {
 	if settings.ExposeUI {
 		uiHost = cleanPublicHost(settings.UIDomain)
 	}
-	if apiHost != "" && strings.EqualFold(host, apiHost) {
+	if apiHost == "" || uiHost == "" {
+		return ""
+	}
+	if strings.EqualFold(host, apiHost) {
 		return "api"
 	}
-	if uiHost != "" && strings.EqualFold(host, uiHost) {
+	if strings.EqualFold(host, uiHost) {
 		return "ui"
 	}
 	return ""

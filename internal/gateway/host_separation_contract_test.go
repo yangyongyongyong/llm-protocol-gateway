@@ -139,3 +139,46 @@ func TestAPIHostAnswers404NotUnauthorizedForConsolePaths(t *testing.T) {
 		}
 	}
 }
+
+// 单域名部署不能按宿主分离处理。
+//
+// 只登记 API 域名、没配 UI 域名时，分离逻辑会把该域名判成 "api"，控制台请求
+// 全部 404——可错误信息让人"改用 UI 域名"，而那个域名根本不存在。外部反代 /
+// 外部 DNS 的单域名安装都是这种配置，升级到带分离的版本后整站直接打不开。
+// 只有两个域名都配好（真正的双域名部署）才做分离。
+func TestPublicHostRoleKeepsSingleDomainCombined(t *testing.T) {
+	server := NewServer(NewRouter(domain.GatewayState{}), monitor.NewStore())
+	settings := server.router.State().PublicAccess
+	settings.Enabled = true
+	settings.Mode = domain.PublicAccessModeExternalDNS
+	settings.Provider = "external"
+	settings.CustomDomain = "gateway.example.com"
+	settings.ExposeAPI = true
+	settings.ExposeUI = false
+	server.router.UpdatePublicAccess(settings)
+
+	if role := server.publicHostRole("gateway.example.com"); role != "" {
+		t.Fatalf("只配 API 域名时 host role = %q，want 组合模式（空）", role)
+	}
+
+	// 配上 UI 域名后才分离。
+	settings.UIDomain = "ui.example.com"
+	settings.ExposeUI = true
+	server.router.UpdatePublicAccess(settings)
+	if role := server.publicHostRole("gateway.example.com"); role != "api" {
+		t.Fatalf("双域名下 API host role = %q，want api", role)
+	}
+	if role := server.publicHostRole("ui.example.com"); role != "ui" {
+		t.Fatalf("双域名下 UI host role = %q，want ui", role)
+	}
+
+	// 只配 UI 域名同理：没有 API 域名可去，保持组合。
+	settings.ExposeAPI = false
+	settings.CustomDomain = ""
+	settings.ExposeUI = true
+	settings.UIDomain = "ui.example.com"
+	server.router.UpdatePublicAccess(settings)
+	if role := server.publicHostRole("ui.example.com"); role != "" {
+		t.Fatalf("只配 UI 域名时 host role = %q，want 组合模式（空）", role)
+	}
+}
