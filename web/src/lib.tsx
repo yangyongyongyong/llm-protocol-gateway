@@ -18,6 +18,7 @@ import {
   ProviderCacheTestResult,
   ProviderChatTestOptions,
   ProviderConnectKind,
+  ProviderGroup,
   ProviderPreset,
   ProviderThinkingTestResult,
   PublicAccessSettings,
@@ -1984,7 +1985,7 @@ export function peerProviderMemberName(provider: Provider): string {
  */
 export function providerShortLabel(provider: Provider): string {
   if (providerConnectKind(provider) === 'peer') return peerProviderMemberName(provider);
-  return shortenAccountLabel(providerAccountLabel(provider));
+  return shortenAccountLabel(providerAccountDetail(provider) || providerAccountLabel(provider));
 }
 
 export function providerAccountLabel(provider: Provider): string {
@@ -2016,6 +2017,48 @@ export function providerAccountLabel(provider: Provider): string {
     case 'peer': return provider.peerGrants?.card?.accountLabel?.trim() || peerUpstreamName(provider);
     default: return '';
   }
+}
+
+function maskedPhoneForDisplay(value: string): string {
+  const raw = value.trim();
+  const compact = raw.replace(/[\s-]/g, '');
+  if (!/^\+?\d{7,15}$/.test(compact)) return raw;
+  const digits = compact.replace(/^\+/, '');
+  const normalized = digits.length === 13 && digits.startsWith('86') ? digits.slice(2) : digits;
+  const prefix = normalized.length === 11 ? 3 : 4;
+  return `${normalized.slice(0, prefix)}****${normalized.slice(-4)}`;
+}
+
+/** WorkBuddy 的已脱敏手机号；旧数据没有独立字段时，从账号标签里的掩码兜底。 */
+export function providerAccountPhone(provider: Provider): string {
+  const direct = (provider.workbuddyOAuth?.phone || provider.peerGrants?.card?.phone || '').trim();
+  if (direct) return maskedPhoneForDisplay(direct);
+  const label = (provider.workbuddyOAuth?.accountLabel || provider.peerGrants?.card?.accountLabel || '').trim();
+  if (/^\+?\d{3,4}\*{4}\d{4}$/.test(label)) return label;
+  return /^\+?[\d\s-]{7,20}$/.test(label) ? maskedPhoneForDisplay(label) : '';
+}
+
+/**
+ * Provider 选择器里名称下面那行「真正能认人」的信息。WorkBuddy 同名账号
+ * 很常见，手机号必须排在账号昵称之前；昵称已经并进 Provider 名称时不再重复。
+ */
+export function providerAccountDetail(provider: Provider): string {
+  const phone = providerAccountPhone(provider);
+  const account = providerAccountLabel(provider).trim();
+  const name = provider.name.trim();
+  const parts: string[] = [];
+  if (phone) parts.push(phone);
+  if (account && account !== phone && account !== name && !name.includes(account)) parts.push(account);
+  return parts.join(' · ');
+}
+
+/** 管理员分组优先；找不到对应分组时让调用方退回原有品牌分组。 */
+export function providerSelectionGroup(provider: Provider, groups: ProviderGroup[]): {id: string; key: string; title: string} | null {
+  const id = (provider.groupId || '').trim();
+  if (!id) return null;
+  const group = groups.find((item) => item.id === id);
+  if (!group) return null;
+  return {id, key: `provider-group:${id}`, title: group.name};
 }
 
 /** 继承自上游的卡片连接类型，翻译成与上游卡片一致的短标签。 */
@@ -2055,9 +2098,13 @@ export function shortenAccountLabel(label: string): string {
 export function providerDisplayLabel(provider: Provider | undefined, missing = '未知 Provider') {
   if (!provider) return missing;
   // 上游网关成员行的名字本来就是「上游 · 成员」，再缀一次上游名只会重复。
-  if (providerConnectKind(provider) === 'peer') return provider.name.trim() || missing;
-  const account = providerAccountLabel(provider);
-  return account && account !== provider.name ? `${provider.name} · ${account}` : provider.name;
+  if (providerConnectKind(provider) === 'peer') {
+    const name = provider.name.trim() || missing;
+    const phone = providerAccountPhone(provider);
+    return phone ? `${name} · ${phone}` : name;
+  }
+  const detail = providerAccountDetail(provider);
+  return detail && detail !== provider.name ? `${provider.name} · ${detail}` : provider.name;
 }
 
 /**
@@ -2421,6 +2468,25 @@ export function fallbackRemove(ids: string[], remove: string[]): string[] {
 }
 
 /**
+ * 分组复选框：保留用户已经点出的顺序，整组新增项只追加一次；取消整组时只
+ * 移除这一组，其他选择顺序不动。
+ */
+export function selectionToggleGroup(ids: string[], groupIds: string[], checked: boolean): string[] {
+  if (!checked) {
+    const drop = new Set(groupIds);
+    return ids.filter((id) => !drop.has(id));
+  }
+  const have = new Set(ids);
+  const next = ids.slice();
+  for (const id of groupIds) {
+    if (!id || have.has(id)) continue;
+    have.add(id);
+    next.push(id);
+  }
+  return next;
+}
+
+/**
  * fallbackMove 把 fromId 挪到 toId 的前面（before）或后面（after）。
  * 只在两边都在链上时生效；位置没变就原样返回，调用方据此跳过保存。
  */
@@ -2439,7 +2505,7 @@ export function fallbackMove(ids: string[], fromId: string, toId: string, after:
  * 协议名任一命中即可。多个词按 AND 收窄（"claude 4947" 只留 Claude 里账号含
  * 4947 的那条）。
  */
-export function providerMatchesQuery(provider: Provider, query: string): boolean {
+export function providerMatchesQuery(provider: Provider, query: string, extra = ''): boolean {
   const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
   if (words.length === 0) return true;
   // providerAccountLabel 只在账号有区分度时才给值（昵称 "1" 这类会被换掉），
@@ -2454,8 +2520,12 @@ export function providerMatchesQuery(provider: Provider, query: string): boolean
     provider.qoderPat?.accountLabel,
     provider.qoderPat?.email,
     provider.workbuddyOAuth?.accountLabel,
+    providerAccountPhone(provider),
+    provider.peerGrants?.card?.accountLabel,
+    provider.peerGrants?.card?.phone,
     provider.id,
     providerConnectKind(provider),
+    extra,
   ].filter(Boolean).join(' ').toLowerCase();
   return words.every((word) => haystack.includes(word));
 }
@@ -2606,8 +2676,8 @@ export function providerUsageParts(providerId: string, providers: Provider[]) {
   if (providerConnectKind(provider) === 'peer') {
     return { label: peerProviderMemberName(provider), sub: peerUpstreamName(provider) };
   }
-  const account = providerAccountLabel(provider);
-  const sub = account && account !== provider.name ? shortenAccountLabel(account) : '';
+  const detail = providerAccountDetail(provider);
+  const sub = detail && detail !== provider.name ? shortenAccountLabel(detail) : '';
   return { label: provider.name, sub };
 }
 

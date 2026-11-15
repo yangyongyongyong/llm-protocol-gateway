@@ -246,6 +246,8 @@ export type WorkBuddyOAuthInfo = {
   connected?: boolean;
   expiresAt?: string;
   accountLabel?: string;
+  /** 已脱敏的登录手机号（如 180****3664），用于区分同名账号。 */
+  phone?: string;
   /** 订阅账号 id（X-User-Id），非敏感，用于区分不同账号。 */
   userId?: string;
   /** 账号所属域（X-Domain），非敏感。 */
@@ -638,7 +640,7 @@ export type RequestAdapter = {
   curlExample?: string;
 };
 
-/** 管理员侧 Provider 分组；只用于归类、筛选和批量操作，不参与权限判定。 */
+/** 管理员维护的 Provider 分组；组名会随可见 Provider 下发给用户用于选择，不参与权限判定。 */
 export type ProviderGroup = {
   id: string;
   name: string;
@@ -667,7 +669,7 @@ export type Provider = {
   // 创建该 Provider 的控制台用户；空 = 管理员创建。普通用户对自己创建的
   // Provider 拥有编辑/克隆/删除/对话测试/获取模型权限。
   ownerUserId?: string;
-  /** 管理员侧分组 ID；普通用户状态中为空，分组不参与任何权限判定。 */
+  /** 管理员维护的分组 ID；普通用户只会在可见 Provider 上收到它，用于按组选择。 */
   groupId?: string;
   // 管理员禁用开关：禁用后普通用户不可见、不可绑定、请求会被拒绝；
   // 新建 Provider 默认启用（字段缺省 = 启用）。
@@ -981,6 +983,8 @@ export type PeerProviderCard = {
   authType?: string;
   vendor?: string;
   accountLabel?: string;
+  /** 父网关已脱敏的 WorkBuddy 登录手机号。 */
+  phone?: string;
   connected?: boolean;
   usage?: PeerProviderUsage;
   /** 父网关今日在这个 Provider 上的全量 Token；旧版父网关不下发时为空。 */

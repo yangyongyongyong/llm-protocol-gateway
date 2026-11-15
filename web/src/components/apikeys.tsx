@@ -37,13 +37,14 @@ import {
     OutputEndpoint,
     Protocol,
     Provider,
+    ProviderGroup,
     RequestStatsSnapshot,
     Route
 } from '../types';
 import {Badge, CopyButton, InfoTip, Modal, Switch} from './ui';
 import {ProviderLabel} from './provider_label';
 import {confirmDialog} from '../dialogs';
-import {providerSelectOptions} from './provider_select';
+import {providerKeySelectOptions} from './provider_select';
 import {FallbackProviderPicker} from './fallback_picker';
 
 /**
@@ -105,6 +106,7 @@ export function ProfileNameDialog({ mode, initial, busy, onSubmit, onClose }: { 
 export function ApiKeyDetailPanel({
   keyItem,
   providers,
+  providerGroups = [],
   routes,
   models,
   endpoints,
@@ -132,6 +134,7 @@ export function ApiKeyDetailPanel({
 }: {
   keyItem: APIKey;
   providers: Provider[];
+  providerGroups?: ProviderGroup[];
   routes: Route[];
   models: Model[];
   endpoints: OutputEndpoint[];
@@ -398,7 +401,7 @@ export function ApiKeyDetailPanel({
                 label="输入 Provider（首选）"
                 value={binding.providerId}
                 disabled={saving}
-                options={providerSelectOptions(providers)}
+                options={providerKeySelectOptions(providers, providerGroups)}
                 onChange={(providerId) => {
                   void onUpdateBinding(keyItem, providerId, binding.outputProtocol);
                 }}
@@ -582,6 +585,7 @@ export function ApiKeyDetailPanel({
         <ApiKeyFallbackProvidersModal
           preferredProviderId={binding.providerId}
           providers={providers}
+          providerGroups={providerGroups}
           models={models}
           selectedIds={fallbackIds}
           modelOverrides={fallbackModelOverrides}
@@ -628,6 +632,7 @@ function FallbackChainRow({ rank, provider, missingLabel, modelLabel, modelUnset
 export function ApiKeyFallbackProvidersModal({
   preferredProviderId,
   providers,
+  providerGroups = [],
   models,
   selectedIds,
   modelOverrides,
@@ -640,6 +645,7 @@ export function ApiKeyFallbackProvidersModal({
 }: {
   preferredProviderId: string;
   providers: Provider[];
+  providerGroups?: ProviderGroup[];
   models: Model[];
   selectedIds: string[];
   modelOverrides: Record<string, string>;
@@ -772,6 +778,7 @@ export function ApiKeyFallbackProvidersModal({
           <>
             <FallbackProviderPicker
               providers={candidates}
+              providerGroups={providerGroups}
               selectedIds={orderedIds}
               sameProtocol={sameProtocol}
               onChange={applyChain}

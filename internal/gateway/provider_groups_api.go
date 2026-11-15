@@ -24,8 +24,9 @@ type providerGroupsReorderPayload struct {
 	IDs []string `json:"ids"`
 }
 
-// handleListProviderGroups 返回管理员侧 Provider 分组。
-// 分组只是控制台归类元数据，普通用户不可见，也不参与请求鉴权。
+// handleListProviderGroups 返回管理员侧 Provider 分组管理列表。
+// 普通用户的 /__state 只会收到自己可见 Provider 使用到的组名；创建、改名、
+// 排序和移动仍要求管理员。分组只是展示元数据，不参与请求鉴权。
 func (s *Server) handleListProviderGroups(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireAdmin(w, r); !ok {
 		return
@@ -158,14 +159,25 @@ func (s *Server) providerGroupExists(groupID string) bool {
 	return err == nil
 }
 
-// stripProviderGroupsForUser 去掉普通用户不应感知的管理员分组信息。
-// 这里只影响展示状态，不参与任何权限判断。
-func stripProviderGroupsForUser(state *domain.GatewayState) {
+// retainVisibleProviderGroupsForUser keeps the display label for groups that
+// contain at least one Provider visible to this user, and drops every other
+// group. Group management remains admin-only, but the labels are useful in the
+// key Provider picker so users can browse and select a shared group.
+func retainVisibleProviderGroupsForUser(state *domain.GatewayState) {
 	if state == nil {
 		return
 	}
-	state.ProviderGroups = []domain.ProviderGroup{}
-	for index := range state.Providers {
-		state.Providers[index].GroupID = ""
+	visible := make(map[string]bool, len(state.Providers))
+	for _, provider := range state.Providers {
+		if groupID := strings.TrimSpace(provider.GroupID); groupID != "" {
+			visible[groupID] = true
+		}
 	}
+	groups := make([]domain.ProviderGroup, 0, len(state.ProviderGroups))
+	for _, group := range state.ProviderGroups {
+		if visible[group.ID] {
+			groups = append(groups, group)
+		}
+	}
+	state.ProviderGroups = groups
 }

@@ -18,7 +18,7 @@ func TestPeerProviderCardCarriesWorkBuddyCredits(t *testing.T) {
 		BaseURL: "https://copilot.tencent.com/v2", AuthType: domain.AuthTypeWorkBuddy,
 		APIKeySource: "literal:secret",
 		WorkBuddy: &domain.WorkBuddyCredential{
-			AccessToken: "access", RefreshToken: "refresh", AccountLabel: "陌", UserID: "user-123456789", Connected: true,
+			AccessToken: "access", RefreshToken: "refresh", AccountLabel: "陌", Phone: "180****3664", UserID: "user-123456789", Connected: true,
 		},
 		Models: []domain.Model{{ID: "deepseek-v4.1-flash", ProviderID: "wb-main", InMenu: true}},
 	}
@@ -55,7 +55,7 @@ func TestPeerProviderCardCarriesWorkBuddyCredits(t *testing.T) {
 		t.Fatalf("peer provider card missing: %+v", granted)
 	}
 	card := granted[0].Card
-	if card.AuthType != domain.AuthTypeWorkBuddy || card.Vendor != "workbuddy" || card.AccountLabel != "陌" || !card.Connected {
+	if card.AuthType != domain.AuthTypeWorkBuddy || card.Vendor != "workbuddy" || card.AccountLabel != "陌" || card.Phone != "180****3664" || !card.Connected {
 		t.Fatalf("card metadata = %+v", card)
 	}
 	if card.TodayTokens == nil || *card.TodayTokens != 175 {

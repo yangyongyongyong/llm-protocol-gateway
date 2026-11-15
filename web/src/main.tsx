@@ -112,6 +112,7 @@ import {
     protocolLabel,
     protocolTone,
     PROVIDER_CONNECT_FILTERS,
+    providerAccountDetail,
     providerAccountLabel,
     providerAuthTypeParam,
     providerConnectKind,
@@ -176,7 +177,7 @@ import {
 import {SubscriptionConnect} from './components/subscription';
 import {providerIcon, ProviderLabel} from './components/provider_label';
 import {MonitoringPage} from './monitoring/MonitoringPage';
-import {groupProvidersByBrand, providerSelectOptions} from './components/provider_select';
+import {groupProvidersByBrand, providerKeySelectOptions, providerSelectOptions} from './components/provider_select';
 import {ChatTestDialog, type ChatTestTab} from './components/chat_test';
 import {QuotaKeeperPanel} from './components/quota_keeper';
 import {ReplayPanel, ScheduleTracePanel, trafficLogRowKey, TrafficLogTable} from './components/traffic_log';
@@ -1211,9 +1212,7 @@ function App() {
         providerDisabled={!!provider.disabled}
         onToggleEnabled={!isNormalUser && canDo('providers.toggle') ? () => void toggleProviderEnabled(provider) : undefined}
         onToggleRTK={!isNormalUser && canDo('providers.toggle') ? () => void toggleProviderRTK(provider) : undefined}
-        subtitle={peer
-          ? (provider.peerGrants?.card?.accountLabel?.trim() || undefined)
-          : (providerAccountLabel(provider) || undefined)}
+        subtitle={providerAccountDetail(provider) || (peer ? provider.peerGrants?.card?.accountLabel?.trim() : providerAccountLabel(provider)) || undefined}
         icon={resolveProviderIcon(provider)}
         isClaudeOAuth={provider.authType === 'claude_oauth'}
         claudeOAuthConnected={provider.claudeOAuth?.connected}
@@ -5745,6 +5744,7 @@ function App() {
                   <ApiKeyDetailWorkspace
                     keyItem={selectedApiKey}
                     providers={state.providers}
+                    providerGroups={state.providerGroups}
                     models={state.models}
                     routes={state.routes}
                     endpoints={state.endpoints}
@@ -5807,6 +5807,7 @@ function App() {
                 <ApiKeyDetailWorkspace
                   keyItem={selectedApiKey}
                   providers={state.providers}
+                  providerGroups={state.providerGroups}
                   models={state.models}
                   routes={state.routes}
                   endpoints={state.endpoints}
@@ -8531,7 +8532,7 @@ function App() {
                 if (connected) {
                   return (
                     <>
-                      <div className="hint-text">{`已连接${editingProvider?.workbuddyOAuth?.accountLabel ? ` · ${editingProvider.workbuddyOAuth.accountLabel}` : ''}${editingProvider?.workbuddyOAuth?.expiresAt ? ` · 令牌到期：${formatClaudeUsageResetAt(editingProvider.workbuddyOAuth.expiresAt)}（到期自动续）` : ''} · 模型 ${editingProvider?.models?.length ?? 0} 个`}</div>
+                      <div className="hint-text">{`已连接${editingProvider ? (providerAccountDetail(editingProvider) ? ` · ${providerAccountDetail(editingProvider)}` : '') : ''}${editingProvider?.workbuddyOAuth?.expiresAt ? ` · 令牌到期：${formatClaudeUsageResetAt(editingProvider.workbuddyOAuth.expiresAt)}（到期自动续）` : ''} · 模型 ${editingProvider?.models?.length ?? 0} 个`}</div>
                       <WorkBuddyUsagePanel providerId={editingProviderID} accountKey={`provider:${editingProviderID}`} connected />
                       <div className="actions" style={{ gap: 8 }}>
                         <button className="btn" disabled={testingProviderID === editingProviderID} onClick={() => void fetchProviderModels(editingProviderID, editingProvider?.name || '', true)}>{testingProviderID === editingProviderID ? '同步中…' : '同步模型'}</button>
@@ -9025,7 +9026,7 @@ function App() {
                 label="输入 Provider"
                 hint="这条 Key 默认转发到的上游；请求落到它时，网关按「输出协议」决定透传还是转换。"
                 value={apiKeyDraft.providerId}
-                options={providerSelectOptions(state.providers)}
+                options={providerKeySelectOptions(state.providers, state.providerGroups)}
                 onChange={(value) => setApiKeyDraft((current) => ({ ...current, providerId: value, modelOverride: '' }))}
               />
               <IconSelect

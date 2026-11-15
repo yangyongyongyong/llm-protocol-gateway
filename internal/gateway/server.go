@@ -907,10 +907,6 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, s.stateForUser(identity, state))
 		return
 	}
-	if !p.IsAdmin {
-		// Provider 分组只属于管理员控制台；ScopeAll 的自定义角色也不能看到。
-		stripProviderGroupsForUser(&state)
-	}
 	state.RequestLogRetentionDays = s.RequestLogRetentionDays()
 	state.Log2xxBodies = s.Log2xxBodies()
 	// Send the effective values, not the raw 0-means-default ones: both fields
@@ -1040,6 +1036,7 @@ func redactProviderForClient(provider domain.Provider) domain.Provider {
 		provider.WorkBuddy = &domain.WorkBuddyCredential{
 			ExpiresAt:    original.ExpiresAt,
 			AccountLabel: original.AccountLabel,
+			Phone:        workBuddyHidablePhone(original.Phone),
 			// The account id and domain are identifiers, not secrets, and the
 			// console shows them so an operator can tell two WorkBuddy accounts
 			// apart.

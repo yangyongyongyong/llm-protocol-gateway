@@ -221,7 +221,8 @@ type TunnelRuntime struct {
 }
 
 // ProviderGroup 是管理员侧的 Provider 归类维度，不参与任何权限判定。
-// 普通用户看不到分组，管理员想把 Provider 授权给用户仍然走用户管理里的
+// 创建、改名、排序和移动仍只允许管理员；普通用户只看到自己可见 Provider
+// 使用到的组名，用于密钥选择器按组浏览和批量勾选。授权仍然走用户管理里的
 // user_resource_grants 直接授权。
 type ProviderGroup struct {
 	ID       string `json:"id"`
@@ -253,8 +254,10 @@ type Provider struct {
 	// admin-created. A normal user owns the providers they create and may
 	// edit/clone/delete/test them; admins have full access to every provider.
 	OwnerUserID string `json:"ownerUserId,omitempty"`
-	// GroupID is the administrator-only Provider 分组。它只用于控制台归类、
-	// 筛选与批量操作，不参与可见性、路由或 API Key 授权；空值表示未分组。
+	// GroupID is the administrator-managed Provider 分组。管理员用它归类、
+	// 筛选与批量操作；普通用户只会在自己可见的 Provider 上看到这个标签，
+	// 用于在密钥的 Provider 选择器里按组浏览和批量勾选。分组不参与可见性、
+	// 路由或 API Key 授权；空值表示未分组。
 	GroupID string `json:"groupId,omitempty"`
 	// Disabled is the admin-only kill switch. Zero value (false) means enabled,
 	// so newly created providers and legacy rows/exports default to enabled.
@@ -482,11 +485,15 @@ type PeerGrantedProvider struct {
 // PeerProviderCard 是沿网关互联链路透传的 Provider 卡片展示信息。
 // 它只描述“长什么样、当前额度大约是多少”，绝不携带连接凭据或真实端点。
 type PeerProviderCard struct {
-	AuthType     string             `json:"authType,omitempty"`
-	Vendor       string             `json:"vendor,omitempty"`
-	AccountLabel string             `json:"accountLabel,omitempty"`
-	Connected    bool               `json:"connected,omitempty"`
-	Usage        *PeerProviderUsage `json:"usage,omitempty"`
+	AuthType     string `json:"authType,omitempty"`
+	Vendor       string `json:"vendor,omitempty"`
+	AccountLabel string `json:"accountLabel,omitempty"`
+	// Phone is the already-masked WorkBuddy sign-in phone (for example
+	// 180****3664). It is a display identifier, never a full phone number or a
+	// credential.
+	Phone     string             `json:"phone,omitempty"`
+	Connected bool               `json:"connected,omitempty"`
+	Usage     *PeerProviderUsage `json:"usage,omitempty"`
 	// TodayTokens 是父网关今天在这个 Provider 上的全量 Token（输入 + 输出），
 	// 包含父端所有用户与下游流量。指针用于区分“上游没下发/旧版未知”(nil) 和
 	// “上游明确统计为 0”；子网关绝不拿本机转发量冒充这个总量。
@@ -689,6 +696,11 @@ type WorkBuddyCredential struct {
 	RefreshToken string `json:"refreshToken,omitempty"`
 	ExpiresAt    string `json:"expiresAt,omitempty"` // RFC3339
 	AccountLabel string `json:"accountLabel,omitempty"`
+	// Phone is the masked sign-in phone shown below the provider name. Nicknames
+	// are not unique (several WorkBuddy accounts can all be named the same), so
+	// the phone is the operator's reliable visual discriminator. Store only the
+	// masked form, never the full number.
+	Phone string `json:"phone,omitempty"`
 	// UserID is the plan account's id, sent as X-User-Id on every request.
 	// It is an account identifier rather than a secret, so it may be shown to
 	// the console.

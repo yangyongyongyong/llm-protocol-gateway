@@ -231,15 +231,17 @@ func sanitizeImportedWorkBuddy(cred *domain.WorkBuddyCredential) *domain.WorkBud
 	refresh := strings.TrimSpace(cred.RefreshToken)
 	expires := strings.TrimSpace(cred.ExpiresAt)
 	label := strings.TrimSpace(cred.AccountLabel)
+	phone := workBuddyHidablePhone(strings.TrimSpace(cred.Phone))
 	userID := strings.TrimSpace(cred.UserID)
 	domainName := strings.TrimSpace(cred.Domain)
 	if access == "" && refresh == "" {
-		if expires == "" && label == "" && userID == "" && !cred.Connected {
+		if expires == "" && label == "" && phone == "" && userID == "" && !cred.Connected {
 			return nil
 		}
 		return &domain.WorkBuddyCredential{
 			ExpiresAt:    expires,
 			AccountLabel: label,
+			Phone:        phone,
 			UserID:       userID,
 			Domain:       domainName,
 			Connected:    false,
@@ -250,6 +252,7 @@ func sanitizeImportedWorkBuddy(cred *domain.WorkBuddyCredential) *domain.WorkBud
 		RefreshToken: refresh,
 		ExpiresAt:    expires,
 		AccountLabel: label,
+		Phone:        phone,
 		UserID:       userID,
 		Domain:       domainName,
 		DeviceToken:  strings.TrimSpace(cred.DeviceToken),
@@ -417,7 +420,20 @@ func mergeWorkBuddyImport(existing, incoming *domain.WorkBuddyCredential) *domai
 	if existing == nil {
 		return nil
 	}
-	return cloneWorkBuddy(existing)
+	merged := *existing
+	if incoming.Phone != "" {
+		merged.Phone = incoming.Phone
+	}
+	if incoming.AccountLabel != "" {
+		merged.AccountLabel = incoming.AccountLabel
+	}
+	if incoming.UserID != "" {
+		merged.UserID = incoming.UserID
+	}
+	if incoming.Domain != "" {
+		merged.Domain = incoming.Domain
+	}
+	return cloneWorkBuddy(&merged)
 }
 
 func cloneWorkBuddy(cred *domain.WorkBuddyCredential) *domain.WorkBuddyCredential {
@@ -546,6 +562,9 @@ func cloneProviderForExport(provider domain.Provider) domain.Provider {
 	cloned.CursorOAuth = cloneCursorOAuth(provider.CursorOAuth)
 	cloned.QoderPAT = cloneQoderPAT(provider.QoderPAT)
 	cloned.WorkBuddy = cloneWorkBuddy(provider.WorkBuddy)
+	if cloned.WorkBuddy != nil {
+		cloned.WorkBuddy.Phone = workBuddyHidablePhone(cloned.WorkBuddy.Phone)
+	}
 	if cloned.RequestAdapter != nil {
 		cloned.RequestAdapter.CurlExample = ""
 	}

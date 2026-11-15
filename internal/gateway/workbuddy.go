@@ -412,7 +412,7 @@ func (p workBuddyCredentialPayload) toCredential(account domain.WorkBuddyCredent
 }
 
 // workBuddyAccountLabel names a signed-in account for the console: its
-// nickname, its phone number, or its id.
+// nickname, its masked phone number, or its id.
 func workBuddyAccountLabel(nickname, phone, uid string) string {
 	for _, candidate := range []string{nickname, phone, uid} {
 		if trimmed := strings.TrimSpace(candidate); trimmed != "" {
@@ -422,25 +422,38 @@ func workBuddyAccountLabel(nickname, phone, uid string) string {
 	return "WorkBuddy"
 }
 
-// workBuddyHidablePhone keeps only the first four and last four digits of a
-// phone number. The label is what tells one WorkBuddy account from the next in
-// every picker, so it has to stay unique; what it must not do is put a whole
-// phone number on screen (a screenshot of the console is a shared artifact),
-// which is why the account is stored as 1815****4947 rather than 181512344947.
+// workBuddyHidablePhone keeps a phone number useful as a visual discriminator
+// without putting the whole number on screen. Mainland mobile numbers use the
+// familiar 3+4 form (180****3664); other lengths keep four leading digits.
+// The console is frequently screenshotted, so storing or returning the full
+// number would be an unnecessary disclosure.
 func workBuddyHidablePhone(label string) string {
-	if !workBuddyAllDigits(label) || len(label) < 7 {
-		return label
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return ""
 	}
-	return label[:4] + "****" + label[len(label)-4:]
-}
-
-func workBuddyAllDigits(value string) bool {
-	for _, char := range value {
+	phone := strings.NewReplacer(" ", "", "-", "", "+", "", "(", "", ")", "").Replace(label)
+	for _, char := range phone {
 		if char < '0' || char > '9' {
-			return false
+			// Nicknames may contain digits; they are not phone numbers and must
+			// remain exactly as WorkBuddy spells them.
+			return label
 		}
 	}
-	return true
+	if len(phone) < 7 {
+		return label
+	}
+	text := phone
+	// Accept the common +86-prefixed form while showing the same 3+4 mask as an
+	// 11-digit domestic number.
+	if len(text) == 13 && strings.HasPrefix(text, "86") {
+		text = text[2:]
+	}
+	prefix := 4
+	if len(text) == 11 {
+		prefix = 3
+	}
+	return text[:prefix] + "****" + text[len(text)-4:]
 }
 
 // ---- the plan's JSON API ---------------------------------------------------
@@ -647,6 +660,8 @@ func (s *Server) pollWorkBuddyOAuthInBackground(
 		UID         string `json:"uid"`
 		Nickname    string `json:"nickname"`
 		PhoneNumber string `json:"phoneNumber"`
+		Mobile      string `json:"mobile"`
+		Phone       string `json:"phone"`
 	}
 	accountEndpoint := site.api() + workBuddyAccountPath + "?state=" + url.QueryEscape(state)
 	if err := s.pollWorkBuddyJSON(ctx, site, accountEndpoint, headers, workBuddyRetryAccountCode, func(payload json.RawMessage) error {
@@ -660,7 +675,9 @@ func (s *Server) pollWorkBuddyOAuthInBackground(
 		return
 	}
 	credential.UserID = strings.TrimSpace(who.UID)
-	credential.AccountLabel = workBuddyAccountLabel(who.Nickname, who.PhoneNumber, who.UID)
+	phone := firstNonEmptyString(who.PhoneNumber, who.Mobile, who.Phone)
+	credential.AccountLabel = workBuddyAccountLabel(who.Nickname, phone, who.UID)
+	credential.Phone = workBuddyHidablePhone(phone)
 
 	updated, err := s.router.SetProviderWorkBuddy(providerID, site.authType, credential)
 	if err != nil {

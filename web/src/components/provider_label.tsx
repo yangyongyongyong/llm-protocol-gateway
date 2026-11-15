@@ -1,4 +1,4 @@
-import {peerProviderMemberName, peerUpstreamName, providerAccountLabel, providerConnectKind, providerOptionLabel, shortenAccountLabel} from '../lib';
+import {peerProviderMemberName, peerUpstreamName, providerAccountDetail, providerAccountLabel, providerConnectKind, providerOptionLabel, shortenAccountLabel} from '../lib';
 import {resolveProviderIcon} from '../provider_presets';
 import type {Provider} from '../types';
 import {BrandIcon} from './ui';
@@ -27,7 +27,9 @@ export function ProviderLabel({ provider, size = 16, protocol, account = true, s
   // 上游网关成员行：名字那格写成员名，第二格写它属于哪条上游（与账号同位置）。
   const peer = providerConnectKind(provider) === 'peer';
   const accountLabel = account
-    ? (peer ? peerUpstreamName(provider) : providerAccountLabel(provider))
+    ? (peer
+      ? [providerAccountDetail(provider), peerUpstreamName(provider)].filter(Boolean).join(' · ')
+      : (providerAccountDetail(provider) || providerAccountLabel(provider)))
     : '';
   const showAccount = Boolean(accountLabel) && accountLabel !== provider.name;
   const name = peer ? peerProviderMemberName(provider) : provider.name;

@@ -2037,6 +2037,28 @@ html[data-theme="dark"] .models-search-input { background-image: url("data:image
 }
 .fpp-link:disabled { color: var(--subtle); cursor: default; }
 .fpp-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 4px; display: grid; align-content: start; gap: 2px; }
+.fpp-group { display: grid; align-content: start; gap: 2px; min-width: 0; }
+.fpp-group + .fpp-group { margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--border); }
+.provider-group-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 5px 7px;
+  border-radius: var(--r-sm);
+  background: var(--surface-sunken);
+  color: var(--muted);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+}
+.provider-group-check:hover { background: var(--hover); color: var(--text); }
+.provider-group-check.all, .provider-group-check.some { background: var(--accent-soft); color: var(--accent-strong); }
+.provider-group-check input { flex: 0 0 auto; width: 13px; height: 13px; margin: 0; accent-color: var(--accent); cursor: pointer; }
+.provider-group-check-title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.provider-group-check-count { flex: 0 0 auto; color: var(--subtle); font-family: var(--mono); font-size: var(--fs-xs); font-weight: 500; }
+.provider-group-check.all .provider-group-check-count, .provider-group-check.some .provider-group-check-count { color: inherit; }
 .fpp-empty { padding: 28px 12px; color: var(--muted); font-size: var(--fs-base); text-align: center; line-height: 1.5; }
 .fpp-row {
   display: flex; align-items: center; gap: 6px;

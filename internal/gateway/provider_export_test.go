@@ -38,6 +38,33 @@ func TestExportProvidersAllAndByIDs(t *testing.T) {
 	}
 }
 
+func TestWorkBuddyRoundTripKeepsMaskedPhone(t *testing.T) {
+	stored := domain.WorkBuddyCredential{
+		AccessToken: "at", RefreshToken: "rt", AccountLabel: "herui",
+		Phone: "18012343664", UserID: "uid-wb", Connected: true,
+	}
+	router := NewRouter(domain.GatewayState{Providers: []domain.Provider{{
+		ID: "wb", Name: "WorkBuddy 订阅-herui", Protocol: domain.ProtocolOpenAIChat,
+		AuthType: domain.AuthTypeWorkBuddy, WorkBuddy: &stored,
+	}}})
+	bundle, errs := router.ExportProviders([]string{"wb"})
+	if len(errs) != 0 || len(bundle.Providers) != 1 || bundle.Providers[0].WorkBuddy == nil {
+		t.Fatalf("export = %+v errs=%v", bundle, errs)
+	}
+	if bundle.Providers[0].WorkBuddy.Phone != "180****3664" {
+		t.Fatalf("exported phone = %q", bundle.Providers[0].WorkBuddy.Phone)
+	}
+	fresh := NewRouter(domain.GatewayState{})
+	result := fresh.ImportProviders(bundle)
+	if len(result.Errors) != 0 || len(result.Created) != 1 {
+		t.Fatalf("import result = %+v", result)
+	}
+	imported, err := fresh.ProviderByID("wb")
+	if err != nil || imported.WorkBuddy == nil || imported.WorkBuddy.Phone != "180****3664" {
+		t.Fatalf("imported = %+v err=%v", imported.WorkBuddy, err)
+	}
+}
+
 func TestImportProvidersCreateUpdateByIDAndName(t *testing.T) {
 	router := NewRouter(domain.GatewayState{
 		Providers: []domain.Provider{

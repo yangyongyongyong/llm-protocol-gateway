@@ -19,10 +19,21 @@ func (s *Server) peerProviderCardFor(provider domain.Provider, todayTokens *int6
 		AuthType:     authType,
 		Vendor:       providerVendorKey(provider),
 		AccountLabel: peerProviderAccountLabel(provider),
+		Phone:        peerProviderAccountPhone(provider),
 		Connected:    peerProviderConnected(provider),
 		Usage:        s.peerProviderUsageFor(provider),
 		TodayTokens:  todayTokens,
 	}
+}
+
+// peerProviderAccountPhone carries the display-safe masked phone separately
+// from AccountLabel. WorkBuddy nicknames are often identical across accounts,
+// so downstream pickers need the phone even when the nickname is present.
+func peerProviderAccountPhone(provider domain.Provider) string {
+	if provider.WorkBuddy == nil {
+		return ""
+	}
+	return workBuddyHidablePhone(provider.WorkBuddy.Phone)
 }
 
 // peerProviderAccountLabel 返回上游卡片的账号标识。只挑非秘密字段，

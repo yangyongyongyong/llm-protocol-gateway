@@ -5,29 +5,33 @@ import {
   fallbackRemove,
   peerProviderMemberName,
   peerUpstreamName,
+  providerAccountDetail,
   providerAccountLabel,
   providerConnectKind,
   providerGroupLabel,
   providerMatchesQuery,
   providerOptionLabel,
+  providerSelectionGroup,
+  selectionToggleGroup,
 } from '../lib';
 import {providerIcon} from './provider_label';
 import {BrandIcon} from './ui';
 import {groupProvidersByBrand} from './provider_select';
-import type {Provider} from '../types';
+import {ProviderGroupHeader, type GroupPickState} from './provider_group_header';
+import type {Provider, ProviderGroup} from '../types';
 
 /**
- * BrandFilterChips 是一条「全部 / 品牌…」的筛选胶囊。两侧列表共用它，胶囊上带
- * 该品牌在当前搜索结果里的条数，没有命中的品牌不出现，免得点进去全是空的。
+ * ProviderGroupChips 是一条「全部 / 分组…」的筛选胶囊。管理员分组优先，
+ * 没分组的 Provider 仍按品牌聚合。两侧列表共用它。
  */
-function BrandFilterChips({groups, value, onChange}: {
+function ProviderGroupChips({groups, value, onChange}: {
   groups: Array<{key: string; title: string; icon: string; count: number}>;
   value: string;
   onChange: (key: string) => void;
 }) {
   if (groups.length < 2) return null;
   return (
-    <div className="fpp-chips" role="group" aria-label="按 Provider 品牌筛选">
+    <div className="fpp-chips" role="group" aria-label="按 Provider 分组筛选">
       <button
         type="button"
         className={`fpp-chip${value === '' ? ' active' : ''}`}
@@ -64,7 +68,9 @@ function BrandFilterChips({groups, value, onChange}: {
 function ProviderRowFace({provider}: {provider: Provider}) {
   const peer = providerConnectKind(provider) === 'peer';
   const name = peer ? peerProviderMemberName(provider) : provider.name;
-  const account = peer ? peerUpstreamName(provider) : providerAccountLabel(provider);
+  const account = peer
+    ? [providerAccountDetail(provider), peerUpstreamName(provider)].filter(Boolean).join(' · ')
+    : (providerAccountDetail(provider) || providerAccountLabel(provider));
   const showAccount = Boolean(account) && account !== provider.name && account !== name;
   return (
     <span className="fpp-face">
@@ -88,8 +94,10 @@ function ProviderRowFace({provider}: {provider: Provider}) {
  * 排序用指针拖拽（与备选流水线同一套手感：按下后移动超过 4px 才算拖），另外
  * 保留 ↑/↓ 键盘路径——拖动对触屏和键盘都不友好。
  */
-export function FallbackProviderPicker({providers, selectedIds, sameProtocol, onChange, thirdColumn}: {
+export function FallbackProviderPicker({providers, providerGroups = [], selectedIds, sameProtocol, onChange, thirdColumn}: {
   providers: Provider[];
+  /** 管理员分组的显示元数据；有 groupId 的 Provider 优先按它收组。 */
+  providerGroups?: ProviderGroup[];
   selectedIds: string[];
   /** 判断备选与首选是否同协议；跨协议由网关自动转换，不强制锁定模型。 */
   sameProtocol: (provider: Provider) => boolean;
@@ -101,7 +109,7 @@ export function FallbackProviderPicker({providers, selectedIds, sameProtocol, on
   thirdColumn?: React.ReactNode;
 }) {
   const [query, setQuery] = React.useState('');
-  const [brand, setBrand] = React.useState('');
+  const [groupKey, setGroupKey] = React.useState('');
   const [pickedLeft, setPickedLeft] = React.useState<string[]>([]);
   const [pickedRight, setPickedRight] = React.useState<string[]>([]);
   // 刚变化的行：加个短暂的入场动画提示「它刚挪过来」，避免视线在两侧跳。
@@ -118,18 +126,24 @@ export function FallbackProviderPicker({providers, selectedIds, sameProtocol, on
     [providers, selectedSet],
   );
 
-  // 两侧各自按搜索词过滤，再按品牌收窄；品牌胶囊的条数按过滤后的结果算。
+  // 两侧各自按搜索词过滤，再按管理员分组/品牌收窄；胶囊条数按过滤后的结果算。
   const narrow = React.useCallback((list: Provider[]) => {
-    const matched = list.filter((item) => providerMatchesQuery(item, query));
-    const groups = groupProvidersByBrand(matched).map((group) => ({
+    const allGroups = groupProvidersByBrand(list, providerGroups);
+    const groupTitleByKey = new Map(allGroups.map((group) => [group.key, group.title]));
+    const matched = list.filter((item) => {
+      const key = providerSelectionGroup(item, providerGroups)?.key || providerGroupLabel(item);
+      return providerMatchesQuery(item, query, groupTitleByKey.get(key) || '');
+    });
+    const groups = groupProvidersByBrand(matched, providerGroups).map((group) => ({
       key: group.key,
       title: group.title,
       icon: group.icon,
       count: group.items.length,
     }));
-    const shown = brand ? matched.filter((item) => providerGroupLabel(item) === brand) : matched;
-    return {matched, shown, groups};
-  }, [query, brand]);
+    const sections = groupProvidersByBrand(matched, providerGroups).filter((group) => !groupKey || group.key === groupKey);
+    const shown = sections.flatMap((group) => group.items);
+    return {matched, shown, groups, sections};
+  }, [query, groupKey, providerGroups]);
   const left = narrow(available);
   const right = narrow(selected);
 
@@ -235,6 +249,16 @@ export function FallbackProviderPicker({providers, selectedIds, sameProtocol, on
 
   const allLeftShownPicked = left.shown.length > 0 && left.shown.every((item) => pickedLeft.includes(item.id));
   const allRightShownPicked = right.shown.length > 0 && right.shown.every((item) => pickedRight.includes(item.id));
+  const allGroups = left.groups.concat(right.groups.filter((group) => !left.groups.some((item) => item.key === group.key)));
+  const groupPickState = (items: Provider[], picked: string[]): GroupPickState => {
+    if (items.length === 0) return 'none';
+    const count = items.filter((item) => picked.includes(item.id)).length;
+    return count === 0 ? 'none' : count === items.length ? 'all' : 'some';
+  };
+
+  React.useEffect(() => {
+    if (groupKey && !allGroups.some((group) => group.key === groupKey)) setGroupKey('');
+  }, [groupKey, allGroups]);
 
   return (
     <div className="fpp">
@@ -250,7 +274,7 @@ export function FallbackProviderPicker({providers, selectedIds, sameProtocol, on
           data-1p-ignore
           data-lpignore="true"
           name="fallbackProviderQuery"
-          placeholder="搜索名称、账号或 ID（空格分词）"
+          placeholder="搜索名称、手机号、分组或 ID（空格分词）"
           aria-label="搜索 Provider"
           onChange={(event) => setQuery(event.target.value)}
         />
@@ -258,7 +282,7 @@ export function FallbackProviderPicker({providers, selectedIds, sameProtocol, on
           <button type="button" className="fpp-search-clear" title="清空搜索词" onClick={() => setQuery('')}>×</button>
         ) : null}
       </div>
-      <BrandFilterChips groups={left.groups.concat(right.groups.filter((group) => !left.groups.some((item) => item.key === group.key)))} value={brand} onChange={setBrand} />
+      <ProviderGroupChips groups={allGroups} value={groupKey} onChange={setGroupKey} />
 
       <div className="fpp-cols">
         <section className="fpp-col" aria-label="可选 Provider">
@@ -277,32 +301,47 @@ export function FallbackProviderPicker({providers, selectedIds, sameProtocol, on
           <div className="fpp-list" role="listbox" aria-multiselectable="true">
             {left.shown.length === 0 ? (
               <div className="fpp-empty">{available.length === 0 ? '全部 Provider 都已在备选链上' : '无匹配项'}</div>
-            ) : left.shown.map((provider) => {
-              const picked = pickedLeft.includes(provider.id);
+            ) : left.sections.map((group) => {
+              const groupIds = group.items.map((item) => item.id);
               return (
-                <div
-                  key={provider.id}
-                  className={`fpp-row${picked ? ' picked' : ''}${justMoved[provider.id] ? ' arrived' : ''}`}
-                  data-provider-id={provider.id}
-                >
-                  <input
-                    type="checkbox"
-                    className="fpp-check"
-                    checked={picked}
-                    aria-label={`勾选 ${provider.name}`}
-                    onChange={() => setPickedLeft((current) => (picked ? current.filter((id) => id !== provider.id) : [...current, provider.id]))}
+                <div className="fpp-group" key={group.key}>
+                  <ProviderGroupHeader
+                    title={group.title}
+                    count={group.items.length}
+                    icon={group.icon}
+                    picked={groupPickState(group.items, pickedLeft)}
+                    hint="勾选整组后，再点下方「加入备选」"
+                    onToggle={(checked) => setPickedLeft((current) => selectionToggleGroup(current, groupIds, checked))}
                   />
-                  <button type="button" className="fpp-row-main" onClick={() => add([provider.id])}>
-                    <ProviderRowFace provider={provider} />
-                  </button>
-                  <button type="button" className="fpp-row-act add" title="加入备选链末尾" onClick={() => add([provider.id])}>›</button>
+                  {group.items.map((provider) => {
+                    const picked = pickedLeft.includes(provider.id);
+                    return (
+                      <div
+                        key={provider.id}
+                        className={`fpp-row${picked ? ' picked' : ''}${justMoved[provider.id] ? ' arrived' : ''}`}
+                        data-provider-id={provider.id}
+                      >
+                        <input
+                          type="checkbox"
+                          className="fpp-check"
+                          checked={picked}
+                          aria-label={`勾选 ${provider.name}${providerAccountDetail(provider) ? ` ${providerAccountDetail(provider)}` : ''}`}
+                          onChange={() => setPickedLeft((current) => (picked ? current.filter((id) => id !== provider.id) : [...current, provider.id]))}
+                        />
+                        <button type="button" className="fpp-row-main" onClick={() => add([provider.id])}>
+                          <ProviderRowFace provider={provider} />
+                        </button>
+                        <button type="button" className="fpp-row-act add" title="加入备选链末尾" onClick={() => add([provider.id])}>›</button>
+                      </div>
+                    );
+                  })}
                 </div>
               );
             })}
           </div>
           <footer className="fpp-col-foot">
             <span className="fpp-hint">
-              {pickedLeft.length > 0 ? `已勾选 ${pickedLeft.length} 项` : '单击加入备选；勾选后批量加入'}
+              {pickedLeft.length > 0 ? `已勾选 ${pickedLeft.length} 项` : '单击加入；勾选整组后批量加入'}
             </span>
             <button
               type="button"
@@ -331,7 +370,22 @@ export function FallbackProviderPicker({providers, selectedIds, sameProtocol, on
           <div className="fpp-list" role="listbox" aria-multiselectable="true">
             {right.shown.length === 0 ? (
               <div className="fpp-empty">{selected.length === 0 ? '还没有备选：首选额度耗尽后不会自动换到别的 Provider' : '无匹配项'}</div>
-            ) : right.shown.map((provider) => {
+            ) : <>
+              {right.sections.length === 1 ? (() => {
+                const group = right.sections[0];
+                const groupIds = group.items.map((item) => item.id);
+                return (
+                  <ProviderGroupHeader
+                    title={group.title}
+                    count={group.items.length}
+                    icon={group.icon}
+                    picked={groupPickState(group.items, pickedRight)}
+                    hint="勾选整组后，再点下方「移出」"
+                    onToggle={(checked) => setPickedRight((current) => selectionToggleGroup(current, groupIds, checked))}
+                  />
+                );
+              })() : null}
+              {right.shown.map((provider) => {
               const picked = pickedRight.includes(provider.id);
               const position = selected.findIndex((item) => item.id === provider.id);
               const crossProtocol = !sameProtocol(provider);
@@ -343,7 +397,7 @@ export function FallbackProviderPicker({providers, selectedIds, sameProtocol, on
                   className={[
                     'fpp-row',
                     'chain',
-                    picked ? 'picked' : '',
+                    picked ? ' picked' : '',
                     justMoved[provider.id] ? ' arrived' : '',
                     crossProtocol ? ' cross' : '',
                     dragging ? ' dragging' : '',
@@ -356,7 +410,7 @@ export function FallbackProviderPicker({providers, selectedIds, sameProtocol, on
                     type="checkbox"
                     className="fpp-check"
                     checked={picked}
-                    aria-label={`勾选 ${provider.name}`}
+                    aria-label={`勾选 ${provider.name}${providerAccountDetail(provider) ? ` ${providerAccountDetail(provider)}` : ''}`}
                     onChange={() => setPickedRight((current) => (picked ? current.filter((id) => id !== provider.id) : [...current, provider.id]))}
                   />
                   <span className="fpp-rank" title="降级顺序：数字越小越先试">#{position + 1}</span>
@@ -371,7 +425,8 @@ export function FallbackProviderPicker({providers, selectedIds, sameProtocol, on
                   </span>
                 </div>
               );
-            })}
+              })}
+            </>}
           </div>
           <footer className="fpp-col-foot">
             <span className="fpp-hint">

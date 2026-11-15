@@ -4,17 +4,19 @@ import {
     protocolLabel,
     peerProviderMemberName,
     peerUpstreamName,
+    providerAccountDetail,
     providerAccountLabel,
     providerConnectKind,
     providerGroupLabel,
     providerOptionLabel,
+    providerSelectionGroup,
     reportIfLooksLikeAutofill,
     shortenAccountLabel,
 } from '../lib';
 import {providerIcon} from './provider_label';
 import {BrandIcon} from './ui';
 import type {IconSelectOption} from './selects';
-import type {Provider, ProviderConnectKind, ProviderPresetSection} from '../types';
+import type {Provider, ProviderConnectKind, ProviderGroup, ProviderPresetSection} from '../types';
 
 /**
  * 每个 Provider 在下拉里给人看的名字：品牌名 + 脱敏账号
@@ -46,7 +48,7 @@ function providerAccountFaceTail(provider: Provider): string {
   // 上游网关没有「账号」：成员行自己的名字里已经带着上游名（vps1 · DeepSeek
   // Chat），再补一段只会把名字挤掉。上游名由分组标题说，这里留空。
   if (providerConnectKind(provider) === 'peer') return '';
-  const account = providerAccountLabel(provider);
+  const account = providerAccountDetail(provider) || providerAccountLabel(provider);
   if (!account || account === provider.name) return '';
   return maskAccountLabel(account);
 }
@@ -88,6 +90,8 @@ export type ProviderBrandGroup = {
   icon: string;
   kind: ProviderConnectKind;
   items: Provider[];
+  /** 管理员 Provider 分组；为空表示这仍是按品牌聚合出来的兜底分组。 */
+  adminGroupId?: string;
 };
 
 /**
@@ -101,10 +105,11 @@ export type ProviderBrandGroup = {
  * 品牌顺序按目录磁贴的排法（订阅登录 → 模型厂商 → 中转 → 本机/自建），目录里
  * 没有的落到「自定义」（排最后）；同段内保持 Provider 出现的顺序。
  */
-export function groupProvidersByBrand(providers: Provider[]): ProviderBrandGroup[] {
+export function groupProvidersByBrand(providers: Provider[], providerGroups: ProviderGroup[] = []): ProviderBrandGroup[] {
   const groups = new Map<string, ProviderBrandGroup>();
   providers.forEach((provider) => {
-    const key = providerGroupLabel(provider);
+    const managed = providerSelectionGroup(provider, providerGroups);
+    const key = managed?.key || providerGroupLabel(provider);
     const peer = providerConnectKind(provider) === 'peer';
     const group = groups.get(key);
     if (group) {
@@ -113,22 +118,28 @@ export function groupProvidersByBrand(providers: Provider[]): ProviderBrandGroup
     }
     groups.set(key, {
       key,
-      title: (peer ? peerUpstreamName(provider) : providerBrandName(provider)) || key,
+      title: managed?.title || ((peer ? peerUpstreamName(provider) : providerBrandName(provider)) || key),
       icon: providerIcon(provider),
       kind: providerConnectKind(provider),
       items: [provider],
+      adminGroupId: managed?.id,
     });
   });
   return [...groups.values()].sort((left, right) => {
+    if (left.adminGroupId || right.adminGroupId) {
+      const leftPosition = left.adminGroupId ? providerGroups.findIndex((group) => group.id === left.adminGroupId) : Number.MAX_SAFE_INTEGER;
+      const rightPosition = right.adminGroupId ? providerGroups.findIndex((group) => group.id === right.adminGroupId) : Number.MAX_SAFE_INTEGER;
+      if (leftPosition !== rightPosition) return leftPosition - rightPosition;
+    }
     const delta = sectionRank(left.kind) - sectionRank(right.kind);
     if (delta !== 0) return delta;
     return providers.indexOf(left.items[0]) - providers.indexOf(right.items[0]);
   });
 }
 
-export function providerSelectOptions(providers: Provider[], options: { withProtocol?: boolean } = {}): IconSelectOption[] {
+export function providerSelectOptions(providers: Provider[], options: { withProtocol?: boolean; groups?: ProviderGroup[] } = {}): IconSelectOption[] {
   const withProtocol = options.withProtocol ?? true;
-  return groupProvidersByBrand(providers).flatMap((group) => {
+  return groupProvidersByBrand(providers, options.groups || []).flatMap((group) => {
     const faces = group.items.map((provider) => providerMenuLabel(provider));
     const duplicated = group.items.length > 1 && new Set(faces).size !== faces.length;
     const indices = group.items.map((_, index) => index);
@@ -147,6 +158,39 @@ export function providerSelectOptions(providers: Provider[], options: { withProt
         description: account ? undefined : provider.id,
         meta: withProtocol ? protocolLabel(provider.protocol) : undefined,
         keywords: `${providerOptionLabel(provider)} ${provider.name} ${account} ${provider.id}`,
+        group: group.title,
+        groupKey: group.key,
+      };
+    });
+  });
+}
+
+/**
+ * API Key 配置专用的 Provider 选项：左侧优先使用管理员分组（例如「共享组」），
+ * 没分组的才退回品牌；右侧第一行始终是完整 Provider 名称，第二行给脱敏手机号/
+ * 账号。这样多个同名的「WorkBuddy 订阅-herui」可以靠 180****3664 直接区分。
+ */
+export function providerKeySelectOptions(providers: Provider[], groups: ProviderGroup[] = [], options: { withProtocol?: boolean } = {}): IconSelectOption[] {
+  const withProtocol = options.withProtocol ?? true;
+  return groupProvidersByBrand(providers, groups).flatMap((group) => {
+    const details = group.items.map((provider) => providerAccountDetail(provider));
+    const names = group.items.map((provider) => provider.name.trim());
+    const duplicateNames = group.items.length > 1 && new Set(names).size !== names.length;
+    const combinedFaces = group.items.map((provider, index) => `${names[index]}\u0000${details[index]}`);
+    const duplicateFaces = combinedFaces.length > 1 && new Set(combinedFaces).size !== combinedFaces.length;
+    return group.items.map((provider, index) => {
+      const account = providerAccountLabel(provider);
+      const idTail = `#${provider.id.replace(/-/g, '').slice(0, 8)}`;
+      const detail = duplicateFaces
+        ? [details[index], idTail].filter(Boolean).join(' · ')
+        : (details[index] || (duplicateNames ? idTail : ''));
+      return {
+        value: provider.id,
+        label: provider.name.trim(),
+        icon: group.icon,
+        description: detail || undefined,
+        meta: withProtocol ? protocolLabel(provider.protocol) : undefined,
+        keywords: `${providerOptionLabel(provider)} ${provider.name} ${account} ${providerAccountDetail(provider)} ${provider.id} ${group.title}`,
         group: group.title,
         groupKey: group.key,
       };
@@ -250,11 +294,15 @@ function sectionRank(kind: ProviderConnectKind): number {
 
 const PROVIDER_SECTION_ORDER: ProviderPresetSection[] = ['subscription', 'vendor', 'relay', 'local'];
 
-/** 手机号只留前 4 后 4（1815****4947）；邮箱砍掉域名；其余原样。 */
+/** 手机号：11 位按 3+4（180****3664），其他长度按 4+4；邮箱砍掉域名。 */
 function maskAccountLabel(label: string): string {
   const phone = label.replace(/[\s-]/g, '');
   if (/^\+?\d{7,15}$/.test(phone)) {
-    return phone.length <= 8 ? phone : `${phone.slice(0, 4)}****${phone.slice(-4)}`;
+    if (phone.length <= 8) return phone;
+    const digits = phone.replace(/^\+/, '');
+    const normalized = digits.length === 13 && digits.startsWith('86') ? digits.slice(2) : digits;
+    const prefix = normalized.length === 11 ? 3 : 4;
+    return `${normalized.slice(0, prefix)}****${normalized.slice(-4)}`;
   }
   return shortenAccountLabel(label);
 }

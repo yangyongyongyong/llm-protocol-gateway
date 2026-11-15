@@ -13,7 +13,7 @@ import {
   ApiKeyModelMappingModal,
   ApiKeyQuotaSection,
 } from './apikeys';
-import {providerSelectOptions} from './provider_select';
+import {providerKeySelectOptions, providerSelectOptions} from './provider_select';
 import {FilterPopoverSelect, type PopoverFilterOption} from './filter_popover';
 import {IconSelect, SearchableModelSelect} from './selects';
 import {Badge, BrandIcon, InfoTip, Switch} from './ui';
@@ -46,6 +46,7 @@ import {
   OutputEndpoint,
   Protocol,
   Provider,
+  ProviderGroup,
   Route,
   RouteTestResult,
 } from '../types';
@@ -636,6 +637,7 @@ export type ApiKeyDetailTab = 'routing' | 'params' | 'client' | 'quota';
 export type ApiKeyWorkspaceProps = {
   keyItem: APIKey;
   providers: Provider[];
+  providerGroups: ProviderGroup[];
   models: Model[];
   routes: Route[];
   endpoints: OutputEndpoint[];
@@ -679,7 +681,7 @@ function isLocalConsoleHost() {
 
 export function ApiKeyDetailWorkspace(props: ApiKeyWorkspaceProps) {
   const {
-    keyItem, providers, models, routes, endpoints, owners, saving, canWriteQuota,
+    keyItem, providers, providerGroups, models, routes, endpoints, owners, saving, canWriteQuota,
     testingProviderID, livePublicURL, fixedOutputLabels, panel, onToast,
   } = props;
   const canDelete = props.canDelete !== false;
@@ -884,6 +886,7 @@ export function ApiKeyDetailWorkspace(props: ApiKeyWorkspaceProps) {
           <ParamsTab
             keyItem={keyItem}
             providers={providers}
+            providerGroups={providerGroups}
             models={models}
             owners={owners}
             saving={saving}
@@ -943,6 +946,7 @@ export function ApiKeyDetailWorkspace(props: ApiKeyWorkspaceProps) {
         <ApiKeyFallbackProvidersModal
           preferredProviderId={route?.providerId || ''}
           providers={providers}
+          providerGroups={providerGroups}
           models={models}
           selectedIds={validFallbackIds}
           modelOverrides={keyItem.fallbackModelOverrides || {}}
@@ -1512,6 +1516,7 @@ function SchemeActions({
 function ParamsTab({
   keyItem,
   providers,
+  providerGroups,
   models,
   owners,
   saving,
@@ -1527,6 +1532,7 @@ function ParamsTab({
 }: {
   keyItem: APIKey;
   providers: Provider[];
+  providerGroups: ProviderGroup[];
   models: Model[];
   owners?: ConsoleUser[];
   saving: boolean;
@@ -1563,7 +1569,7 @@ function ParamsTab({
             label="输入 Provider（首选）"
             value={primaryProviderId}
             disabled={saving}
-            options={providerSelectOptions(providers)}
+            options={providerKeySelectOptions(providers, providerGroups)}
             onChange={(providerId) => void panel.onUpdateBinding(keyItem, providerId, bindingOutputProtocol)}
           />
           {owners ? (

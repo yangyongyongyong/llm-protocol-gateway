@@ -54,6 +54,15 @@ export type GrantTarget = {
   id: string;
   name: string;
   ownerName: string;
+  ownerId?: string;
+  protocol?: string;
+  disabled?: boolean;
+  /** 管理员 Provider 分组；用于在授权选择器里按组浏览/勾选。 */
+  groupId?: string;
+  groupName?: string;
+  /** 非敏感账号标识与已脱敏手机号。 */
+  accountLabel?: string;
+  phone?: string;
 };
 
 /** 编辑角色的表单：新建与编辑共用。 */

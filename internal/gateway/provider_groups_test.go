@@ -71,18 +71,31 @@ func TestProviderGroupHandlersRequireAdmin(t *testing.T) {
 	}
 }
 
-// 普通用户状态必须完全去掉管理员分组和 groupId，避免在控制台或 API 泄漏内部归类。
-func TestStateForUserStripsProviderGroups(t *testing.T) {
+// 普通用户能看到自己可见 Provider 上使用的组名，用于密钥选择器按组勾选；
+// 不可见 Provider 的组不能跟着泄漏。
+func TestStateForUserKeepsOnlyVisibleProviderGroups(t *testing.T) {
 	router := NewRouter(domain.GatewayState{
-		ProviderGroups: []domain.ProviderGroup{{ID: "private-tag", Name: "内部", Position: 0}},
-		Providers: []domain.Provider{{
-			ID: "p1", Name: "p1", Protocol: domain.ProtocolOpenAIChat,
-			BaseURL: "https://p1.example/v1", OwnerUserID: "u1", GroupID: "private-tag",
-		}},
+		ProviderGroups: []domain.ProviderGroup{
+			{ID: "shared", Name: "共享组", Position: 0},
+			{ID: "private-tag", Name: "内部", Position: 1},
+		},
+		Providers: []domain.Provider{
+			{
+				ID: "p1", Name: "p1", Protocol: domain.ProtocolOpenAIChat,
+				BaseURL: "https://p1.example/v1", OwnerUserID: "u1", GroupID: "shared",
+			},
+			{
+				ID: "p2", Name: "p2", Protocol: domain.ProtocolOpenAIChat,
+				BaseURL: "https://p2.example/v1", OwnerUserID: "other", GroupID: "private-tag",
+			},
+		},
 	})
 	server := &Server{router: router}
 	out := server.stateForUser(sessionIdentity{UserID: "u1", Username: "u1", Role: domain.UserRoleUser}, router.State())
-	if len(out.ProviderGroups) != 0 || len(out.Providers) != 1 || out.Providers[0].GroupID != "" {
-		t.Fatalf("普通用户状态泄漏了分组: %+v %+v", out.ProviderGroups, out.Providers)
+	if len(out.ProviderGroups) != 1 || out.ProviderGroups[0].ID != "shared" || out.ProviderGroups[0].Name != "共享组" {
+		t.Fatalf("visible groups = %+v, want only shared", out.ProviderGroups)
+	}
+	if len(out.Providers) != 1 || out.Providers[0].GroupID != "shared" {
+		t.Fatalf("visible providers/groups = %+v", out.Providers)
 	}
 }

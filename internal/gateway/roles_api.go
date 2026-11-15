@@ -58,12 +58,16 @@ func (s *Server) handleRoleCatalog(w http.ResponseWriter, r *http.Request) {
 // from the users page.
 func (s *Server) handleGrantTargets(w http.ResponseWriter, r *http.Request) {
 	type target struct {
-		ID        string `json:"id"`
-		Name      string `json:"name"`
-		OwnerID   string `json:"ownerId"`
-		OwnerName string `json:"ownerName"`
-		Protocol  string `json:"protocol"`
-		Disabled  bool   `json:"disabled"`
+		ID           string `json:"id"`
+		Name         string `json:"name"`
+		OwnerID      string `json:"ownerId"`
+		OwnerName    string `json:"ownerName"`
+		Protocol     string `json:"protocol"`
+		Disabled     bool   `json:"disabled"`
+		GroupID      string `json:"groupId,omitempty"`
+		GroupName    string `json:"groupName,omitempty"`
+		AccountLabel string `json:"accountLabel,omitempty"`
+		Phone        string `json:"phone,omitempty"`
 	}
 	out := []target{}
 	if s.router == nil {
@@ -71,10 +75,16 @@ func (s *Server) handleGrantTargets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	names := map[string]string{}
-	for _, provider := range s.router.State().Providers {
+	state := s.router.State()
+	groupNames := make(map[string]string, len(state.ProviderGroups))
+	for _, group := range state.ProviderGroups {
+		groupNames[group.ID] = group.Name
+	}
+	for _, provider := range state.Providers {
 		if provider.Deleted {
 			continue
 		}
+		groupID := strings.TrimSpace(provider.GroupID)
 		ownerID := strings.TrimSpace(provider.OwnerUserID)
 		ownerName, ok := names[ownerID]
 		if !ok {
@@ -84,6 +94,8 @@ func (s *Server) handleGrantTargets(w http.ResponseWriter, r *http.Request) {
 		out = append(out, target{
 			ID: provider.ID, Name: provider.Name, OwnerID: ownerID, OwnerName: ownerName,
 			Protocol: string(provider.Protocol), Disabled: provider.Disabled,
+			GroupID: groupID, GroupName: groupNames[groupID],
+			AccountLabel: peerProviderAccountLabel(provider), Phone: peerProviderAccountPhone(provider),
 		})
 	}
 	writeJSON(w, http.StatusOK, out)

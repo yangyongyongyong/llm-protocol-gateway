@@ -576,8 +576,9 @@ func (s *Server) stateForUser(identity sessionIdentity, state domain.GatewayStat
 	state.Routes = routes
 	state.Models = models
 	state.APIKeys = keysVisibleTo(p, state.APIKeys)
-	// Provider 分组只服务于管理员侧归类，普通用户不应感知。
-	stripProviderGroupsForUser(&state)
+	// 分组管理仍是管理员操作；这里只保留当前用户可见 Provider 使用到的组名，
+	// 让密钥的 Provider 选择器仍能按「共享组」等标签浏览和批量勾选。
+	retainVisibleProviderGroupsForUser(&state)
 	// 普通用户看不到未授权的 Provider：把「在服务」里指向它们的那一项按未设置处理，
 	// 否则界面会拿着一个不存在的 id 去画绿点。
 	for index := range state.APIKeys {

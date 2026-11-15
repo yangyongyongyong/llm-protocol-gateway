@@ -603,6 +603,34 @@ test('providerMatchesQuery：空格分词按 AND 收窄，账号也能搜到', (
   assert.equal(lib.providerMatchesQuery(provider, 'qoder workbuddy'), false, '任一词不命中就过滤掉');
 });
 
+test('WorkBuddy 同名账号用手机号区分，选择器第二行优先展示手机号', () => {
+  const base = {
+    protocol: 'openai_chat', authType: 'workbuddy', baseUrl: 'https://copilot.tencent.com/v2',
+    workbuddyOAuth: {connected: true, accountLabel: 'herui', phone: '180****3664'},
+  };
+  const first = {...base, id: 'wb-1', name: 'WorkBuddy 订阅-herui'};
+  const second = {...base, id: 'wb-2', name: 'WorkBuddy 订阅-herui', workbuddyOAuth: {...base.workbuddyOAuth, phone: '139****1111'}};
+  assert.equal(lib.providerAccountPhone(first), '180****3664');
+  assert.equal(lib.providerAccountDetail(first), '180****3664');
+  assert.equal(lib.providerAccountPhone({...first, workbuddyOAuth: {...base.workbuddyOAuth, phone: '18012343664'}}), '180****3664');
+  assert.notEqual(lib.providerDisplayLabel(first), lib.providerDisplayLabel(second));
+  assert.equal(lib.providerMatchesQuery(first, '180****3664'), true);
+  assert.equal(lib.providerMatchesQuery(first, '共享组', '共享组'), true);
+  // 父网关下发的继承卡片同样保留手机号，子端不用重新登录才能认出账号。
+  const peer = {id: 'peer-wb', name: 'vps1 · WorkBuddy 订阅-herui', authType: 'peer', protocol: 'openai_chat', peerGrants: {upstreamName: 'vps1', card: {accountLabel: 'herui', phone: '137****2222'}}};
+  assert.equal(lib.providerAccountDetail(peer), '137****2222');
+  assert.equal(lib.providerDisplayLabel(peer), 'vps1 · WorkBuddy 订阅-herui · 137****2222');
+});
+
+test('管理员 Provider 分组优先于品牌，分组勾选保持原选择顺序', () => {
+  const groups = [{id: 'shared', name: '共享组', position: 0}];
+  const provider = {id: 'wb-1', name: 'WorkBuddy 订阅-herui', groupId: 'shared', authType: 'workbuddy', protocol: 'openai_chat'};
+  assert.deepEqual(lib.providerSelectionGroup(provider, groups), {id: 'shared', key: 'provider-group:shared', title: '共享组'});
+  assert.equal(lib.providerSelectionGroup(provider, []), null);
+  assert.deepEqual(lib.selectionToggleGroup(['b'], ['a', 'b', 'c'], true), ['b', 'a', 'c']);
+  assert.deepEqual(lib.selectionToggleGroup(['b', 'a', 'c'], ['a', 'c'], false), ['b']);
+});
+
 test('上游网关成员行：按所属上游分组，行内只写成员自己的名字', () => {
   const deepseek = {
     id: 'sub-gw-ds', name: 'vps1 · DeepSeek Chat', protocol: 'openai_chat', authType: 'peer',

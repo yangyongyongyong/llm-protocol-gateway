@@ -971,7 +971,7 @@ func workBuddySignInServer(t *testing.T, tokenAttempts int) *httptest.Server {
 		if r.Header.Get("Authorization") != "Bearer at-1" {
 			t.Errorf("account request authorization = %q", r.Header.Get("Authorization"))
 		}
-		fmt.Fprint(w, `{"code":0,"data":{"uid":"uid-9","nickname":"郭庆"}}`)
+		fmt.Fprint(w, `{"code":0,"data":{"uid":"uid-9","nickname":"郭庆","phoneNumber":"18012343664"}}`)
 	})
 	mux.HandleFunc("GET /v3/config", func(w http.ResponseWriter, r *http.Request) {
 		// The flow syncs the plan's models right after signing in.
@@ -1041,6 +1041,9 @@ func TestWorkBuddySignInStoresAccountSession(t *testing.T) {
 	if provider.WorkBuddy.UserID != "uid-9" || provider.WorkBuddy.AccountLabel != "郭庆" {
 		t.Fatalf("account = %q / %q, want uid-9 / 郭庆", provider.WorkBuddy.UserID, provider.WorkBuddy.AccountLabel)
 	}
+	if provider.WorkBuddy.Phone != "180****3664" {
+		t.Fatalf("phone = %q, want masked 180****3664", provider.WorkBuddy.Phone)
+	}
 	if provider.BaseURL != server.URL+"/v2" {
 		t.Fatalf("baseUrl = %q, want the test server's /v2", provider.BaseURL)
 	}
@@ -1054,6 +1057,9 @@ func TestWorkBuddySignInStoresAccountSession(t *testing.T) {
 	}
 	if !redacted.WorkBuddy.Connected {
 		t.Fatal("redacted credential should report connected")
+	}
+	if redacted.WorkBuddy.Phone != "180****3664" {
+		t.Fatalf("redacted phone = %q", redacted.WorkBuddy.Phone)
 	}
 }
 
@@ -1386,7 +1392,7 @@ func TestWorkBuddyQuotaReadsCreditPackages(t *testing.T) {
 // The account label is the only thing that tells two WorkBuddy sign-ins apart in
 // every picker, so it must stay unique — but it must not put a whole phone
 // number on screen either. A sign-in with no nickname falls back to the phone,
-// kept as 1815****4947; a nickname is left exactly as the account spells it.
+// kept as 181****4947; a nickname is left exactly as the account spells it.
 func TestWorkBuddyAccountLabelMasksThePhoneItFallsBackTo(t *testing.T) {
 	cases := []struct {
 		nickname, phone, uid string
@@ -1394,7 +1400,9 @@ func TestWorkBuddyAccountLabelMasksThePhoneItFallsBackTo(t *testing.T) {
 	}{
 		{"郭庆", "181512344947", "uid-9", "郭庆"},
 		{"", "181512344947", "uid-9", "1815****4947"},
-		{"   ", "13900001111", "uid-9", "1390****1111"},
+		{"   ", "13900001111", "uid-9", "139****1111"},
+		{"郭庆", "+8618012343664", "uid-9", "郭庆"},
+		{"herui-2026", "18012343664", "uid-9", "herui-2026"},
 		{"", "", "uid-9", "uid-9"},
 		{"", "12345", "uid-9", "12345"},
 		{"", "", "", "WorkBuddy"},

@@ -10,6 +10,29 @@
 // 勾选可批量、栏头显示计数、两栏各自滚动（长短不一时互不拖累）。
 import React, {useCallback, useMemo, useState} from 'react';
 import type {GrantTarget} from './rbac_types';
+import {selectionToggleGroup} from '../lib';
+import {ProviderGroupHeader, type GroupPickState} from './provider_group_header';
+
+type GrantSection = {key: string; groupKey: string; title: string; items: GrantTarget[]};
+
+function grantSections(targets: GrantTarget[]): GrantSection[] {
+  const sections: GrantSection[] = [];
+  for (const target of targets) {
+    const id = (target.groupId || '').trim();
+    const key = id ? `provider-group:${id}` : 'provider-group:ungrouped';
+    const title = (target.groupName || '').trim() || '未分组';
+    const last = sections[sections.length - 1];
+    if (last && last.groupKey === key) last.items.push(target);
+    else sections.push({key: `${key}:${sections.length}`, groupKey: key, title, items: [target]});
+  }
+  return sections;
+}
+
+function pickedState(items: GrantTarget[], picked: string[]): GroupPickState {
+  if (items.length === 0) return 'none';
+  const count = items.filter((item) => picked.includes(item.id)).length;
+  return count === 0 ? 'none' : count === items.length ? 'all' : 'some';
+}
 
 export function ProviderGrantPicker({
   targets,
@@ -43,7 +66,7 @@ export function ProviderGrantPicker({
     // 空格分词、全部命中：与备选选择器同一套搜索口径，避免两处手感不同。
     const words = needle.split(/\s+/).filter(Boolean);
     return list.filter((target) => {
-      const haystack = `${target.name} ${target.ownerName || ''}`.toLowerCase();
+      const haystack = `${target.name} ${target.ownerName || ''} ${target.groupName || ''} ${target.accountLabel || ''} ${target.phone || ''}`.toLowerCase();
       return words.every((word) => haystack.includes(word));
     });
   }, [targets, query, deniedSet]);
@@ -57,6 +80,8 @@ export function ProviderGrantPicker({
       .map((id) => byId.get(id))
       .filter((target): target is GrantTarget => Boolean(target));
   }, [visible, granted]);
+  const leftSections = useMemo(() => grantSections(left), [left]);
+  const rightSections = useMemo(() => grantSections(right), [right]);
 
   const add = useCallback((ids: string[]) => {
     if (ids.length === 0) return;
@@ -82,6 +107,10 @@ export function ProviderGrantPicker({
   const row = (target: GrantTarget, picked: boolean, side: 'left' | 'right') => {
     const setPicked = side === 'left' ? setPickedLeft : setPickedRight;
     const act = side === 'left' ? () => add([target.id]) : () => remove([target.id]);
+    const detail = [target.phone, target.accountLabel && target.accountLabel !== target.name ? target.accountLabel : '', target.ownerName ? `归属 ${target.ownerName}` : '']
+      .filter(Boolean)
+      .filter((value, index, list) => list.indexOf(value) === index)
+      .join(' · ');
     return (
       <div key={target.id} className={`fpp-row${picked ? ' picked' : ''}`} data-provider-id={target.id}>
         <input
@@ -95,7 +124,7 @@ export function ProviderGrantPicker({
           <span className="fpp-face">
             <span className="fpp-face-text">
               <span className="fpp-face-name" title={target.name}>{target.name}</span>
-              {target.ownerName ? <span className="fpp-face-account" title={`归属：${target.ownerName}`}>归属 {target.ownerName}</span> : null}
+              {detail ? <span className="fpp-face-account" title={detail}>{detail}</span> : null}
             </span>
           </span>
         </button>
@@ -126,7 +155,7 @@ export function ProviderGrantPicker({
           data-1p-ignore
           data-lpignore="true"
           name="grantProviderQuery"
-          placeholder="搜索名称或归属账号（空格分词）"
+          placeholder="搜索名称、手机号、分组或归属账号（空格分词）"
           aria-label="搜索可授权的输入 Provider"
           onChange={(event) => setQuery(event.target.value)}
         />
@@ -152,7 +181,21 @@ export function ProviderGrantPicker({
           <div className="fpp-list" role="listbox" aria-multiselectable="true">
             {left.length === 0 ? (
               <div className="fpp-empty">{query.trim() ? '无匹配项' : '全部 Provider 都已授权'}</div>
-            ) : left.map((target) => row(target, pickedLeft.includes(target.id), 'left'))}
+            ) : leftSections.map((section) => {
+              const ids = section.items.map((item) => item.id);
+              return (
+                <div className="fpp-group" key={section.key}>
+                  <ProviderGroupHeader
+                    title={section.title}
+                    count={section.items.length}
+                    picked={pickedState(section.items, pickedLeft)}
+                    hint="勾选整组后，再点下方「授权」"
+                    onToggle={(checked) => setPickedLeft((current) => selectionToggleGroup(current, ids, checked))}
+                  />
+                  {section.items.map((target) => row(target, pickedLeft.includes(target.id), 'left'))}
+                </div>
+              );
+            })}
           </div>
           <footer className="fpp-col-foot">
             <span className="fpp-hint">{pickedLeft.length > 0 ? `已勾选 ${pickedLeft.length} 项` : '单击即可授权；勾选后批量授权'}</span>
@@ -178,7 +221,21 @@ export function ProviderGrantPicker({
           <div className="fpp-list" role="listbox" aria-multiselectable="true">
             {right.length === 0 ? (
               <div className="fpp-empty">还没有授权任何 Provider</div>
-            ) : right.map((target) => row(target, pickedRight.includes(target.id), 'right'))}
+            ) : rightSections.map((section) => {
+              const ids = section.items.map((item) => item.id);
+              return (
+                <div className="fpp-group" key={section.key}>
+                  <ProviderGroupHeader
+                    title={section.title}
+                    count={section.items.length}
+                    picked={pickedState(section.items, pickedRight)}
+                    hint="勾选整组后，再点下方「收回」"
+                    onToggle={(checked) => setPickedRight((current) => selectionToggleGroup(current, ids, checked))}
+                  />
+                  {section.items.map((target) => row(target, pickedRight.includes(target.id), 'right'))}
+                </div>
+              );
+            })}
           </div>
           <footer className="fpp-col-foot">
             <span className="fpp-hint">{pickedRight.length > 0 ? `已勾选 ${pickedRight.length} 项` : '单击即可收回；勾选后批量收回'}</span>
