@@ -50,6 +50,7 @@ const (
 	StateReady       = "ready"
 	StateInstalling  = "installing"
 	StateRestarting  = "restarting"
+	StateRollingBack = "rolling-back"
 	StateError       = "error"
 )
 
@@ -69,24 +70,33 @@ var SignaturePublicKey = strings.TrimSpace(updatePublicKeyFile)
 // Settings are local to the desktop app and are never written into GatewayState:
 // they describe the App's own update behaviour, not the gateway's routing state.
 type Settings struct {
-	AutoCheck          bool `json:"autoCheck"`
-	AutoDownload       bool `json:"autoDownload"`
-	AutoInstall        bool `json:"autoInstall"`
-	CheckIntervalHours int  `json:"checkIntervalHours"`
+	AutoCheck            bool `json:"autoCheck"`
+	AutoDownload         bool `json:"autoDownload"`
+	AutoInstall          bool `json:"autoInstall"`
+	AutoRollback         bool `json:"autoRollback"`
+	CheckIntervalHours   int  `json:"checkIntervalHours"`
+	RollbackGraceMinutes int  `json:"rollbackGraceMinutes"`
 }
 
 func DefaultSettings() Settings {
 	return Settings{
-		AutoCheck:          true,
-		AutoDownload:       true,
-		AutoInstall:        true,
-		CheckIntervalHours: defaultCheckIntervalHours,
+		AutoCheck:            true,
+		AutoDownload:         true,
+		AutoInstall:          true,
+		AutoRollback:         true,
+		CheckIntervalHours:   defaultCheckIntervalHours,
+		RollbackGraceMinutes: 5,
 	}
 }
 
 func (s Settings) normalized() Settings {
 	if s.CheckIntervalHours != 1 && s.CheckIntervalHours != 6 && s.CheckIntervalHours != 24 {
 		s.CheckIntervalHours = defaultCheckIntervalHours
+	}
+	switch s.RollbackGraceMinutes {
+	case 2, 5, 10, 30:
+	default:
+		s.RollbackGraceMinutes = 5
 	}
 	return s
 }
@@ -129,6 +139,15 @@ type Status struct {
 	SignatureRequired bool     `json:"signatureRequired,omitempty"`
 	SignatureVerified bool     `json:"signatureVerified,omitempty"`
 	Settings          Settings `json:"settings"`
+
+	RollbackPending         bool   `json:"rollbackPending,omitempty"`
+	RollbackPreviousVersion string `json:"rollbackPreviousVersion,omitempty"`
+	RollbackNewVersion      string `json:"rollbackNewVersion,omitempty"`
+	RollbackDeadline        string `json:"rollbackDeadline,omitempty"`
+	LastRollbackFrom        string `json:"lastRollbackFrom,omitempty"`
+	LastRollbackTo          string `json:"lastRollbackTo,omitempty"`
+	LastRollbackAt          string `json:"lastRollbackAt,omitempty"`
+	LastRollbackReason      string `json:"lastRollbackReason,omitempty"`
 }
 
 // Options are explicit for tests and for the desktop shell.
@@ -155,16 +174,19 @@ type Manager struct {
 	settingsPath string
 	client       *http.Client
 
-	settings  Settings
-	state     string
-	latest    *Release
-	assetKey  string
-	stagePath string
-	progress  int64
-	total     int64
-	err       string
-	message   string
-	checkedAt time.Time
+	settings     Settings
+	state        string
+	rollbacks    rollbackArtifacts
+	rollback     *rollbackJournal
+	lastRollback *rollbackEvent
+	latest       *Release
+	assetKey     string
+	stagePath    string
+	progress     int64
+	total        int64
+	err          string
+	message      string
+	checkedAt    time.Time
 
 	available         bool
 	started           bool
@@ -178,6 +200,7 @@ type Manager struct {
 
 	restartHook func() error
 	idleCheck   func() bool
+	healthCheck func() error
 	idleSince   time.Time
 }
 
@@ -221,8 +244,15 @@ func New(opts Options) *Manager {
 	if m.settingsPath == "" {
 		m.settingsPath = defaultSettingsPath()
 	}
+	m.rollbacks = rollbackArtifactsFor(m.settingsPath)
 	if s, err := loadSettings(m.settingsPath); err == nil {
 		m.settings = s.normalized()
+	}
+	if journal, err := loadRollbackJournal(m.rollbacks.Journal); err == nil && journal != nil && filepath.Clean(journal.BundlePath) == filepath.Clean(m.bundle) {
+		m.rollback = journal
+	}
+	if event, err := loadLatestRollbackEvent(m.rollbacks.History); err == nil {
+		m.lastRollback = event
 	}
 	m.available = runtime.GOOS == "darwin" && m.bundle != ""
 	if !m.available {
@@ -258,16 +288,23 @@ func (m *Manager) Start(ctx context.Context) {
 	}
 	m.started = true
 	m.ctx = ctx
-	bundle := m.bundle
+	journal := m.rollback
+	autoRollback := m.settings.AutoRollback
 	m.mu.Unlock()
-	go func() {
-		// The previous process is normally gone by the time this starts; wait a
-		// moment so an in-place relaunch can finish first.
-		time.Sleep(2 * time.Second)
-		if bundle != "" {
-			cleanupOldBundles(bundle)
+	if journal != nil {
+		if autoRollback {
+			// A previous watchdog normally still owns the process handoff. If it
+			// died, re-arm it now; its PID file makes duplicate launches harmless.
+			_ = m.launchWatchdog(ctx, journal, 0)
+			go m.monitorRollback(ctx)
+		} else {
+			_ = os.RemoveAll(journal.BackupPath)
+			_ = os.Remove(m.rollbacks.Journal)
+			m.mu.Lock()
+			m.rollback = nil
+			m.mu.Unlock()
 		}
-	}()
+	}
 	go m.loop(ctx)
 }
 
@@ -284,6 +321,14 @@ func (m *Manager) SetRestartHook(fn func() error) {
 func (m *Manager) SetIdleCheck(fn func() bool) {
 	m.mu.Lock()
 	m.idleCheck = fn
+	m.mu.Unlock()
+}
+
+// SetHealthCheck is used after an update to decide whether the new build is
+// stable enough to keep. A nil hook means the app cannot verify the update.
+func (m *Manager) SetHealthCheck(fn func() error) {
+	m.mu.Lock()
+	m.healthCheck = fn
 	m.mu.Unlock()
 }
 
@@ -377,6 +422,12 @@ func (m *Manager) Settings() Settings {
 // SetSettings validates, persists, and applies desktop update preferences.
 func (m *Manager) SetSettings(s Settings) (Status, error) {
 	s = s.normalized()
+	m.mu.Lock()
+	pendingRollback := m.rollback != nil
+	m.mu.Unlock()
+	if pendingRollback && !s.AutoRollback {
+		return m.Status(), errors.New("更新回退观察期内不能关闭自动回退")
+	}
 	if err := saveSettings(m.settingsPath, s); err != nil {
 		return m.Status(), err
 	}
@@ -414,6 +465,18 @@ func (m *Manager) Status() Status {
 		out.Latest = m.latest.Version
 		out.ReleaseURL = m.latest.ReleaseURL
 	}
+	if m.rollback != nil {
+		out.RollbackPending = true
+		out.RollbackPreviousVersion = m.rollback.PreviousVersion
+		out.RollbackNewVersion = m.rollback.NewVersion
+		out.RollbackDeadline = m.rollback.Deadline
+	}
+	if m.lastRollback != nil {
+		out.LastRollbackFrom = m.lastRollback.FromVersion
+		out.LastRollbackTo = m.lastRollback.ToVersion
+		out.LastRollbackAt = m.lastRollback.At
+		out.LastRollbackReason = m.lastRollback.Reason
+	}
 	return out
 }
 
@@ -421,7 +484,7 @@ func (m *Manager) Status() Status {
 // operation is already running or this build cannot update itself.
 func (m *Manager) CheckNow() bool {
 	m.mu.Lock()
-	if !m.available || m.closed || m.state == StateChecking || m.state == StateDownloading || m.state == StateInstalling || m.state == StateRestarting || m.state == StateReady {
+	if !m.available || m.closed || m.rollback != nil || m.state == StateChecking || m.state == StateDownloading || m.state == StateInstalling || m.state == StateRestarting || m.state == StateReady {
 		m.mu.Unlock()
 		return false
 	}
@@ -438,7 +501,7 @@ func (m *Manager) CheckNow() bool {
 // DownloadNow starts the asset download selected by CheckNow.
 func (m *Manager) DownloadNow() bool {
 	m.mu.Lock()
-	if !m.available || m.closed || m.latest == nil || m.state == StateDownloading || m.state == StateInstalling || m.state == StateRestarting {
+	if !m.available || m.closed || m.rollback != nil || m.latest == nil || m.state == StateDownloading || m.state == StateInstalling || m.state == StateRestarting {
 		m.mu.Unlock()
 		return false
 	}
@@ -465,22 +528,66 @@ func (m *Manager) DownloadNow() bool {
 // restart hook is supplied by the desktop shell because only it knows Wails.
 func (m *Manager) InstallNow() bool {
 	m.mu.Lock()
-	if m.closed || m.state != StateReady || m.stagePath == "" || m.restartHook == nil || m.bundle == "" {
+	if m.closed || m.rollback != nil || m.state != StateReady || m.stagePath == "" || m.restartHook == nil || m.bundle == "" || m.latest == nil {
 		m.mu.Unlock()
 		return false
 	}
 	m.state = StateInstalling
 	m.err = ""
 	stagePath, bundle, restart := m.stagePath, m.bundle, m.restartHook
+	newVersion := m.latest.Version
+	autoRollback := m.settings.AutoRollback
+	graceMinutes := m.settings.RollbackGraceMinutes
 	m.mu.Unlock()
 
-	if err := installBundleFn(stagePath, bundle); err != nil {
+	// Never let markers from a previous update influence this handoff.
+	_ = os.Remove(m.rollbacks.Commit)
+	_ = os.Remove(m.rollbacks.Request)
+
+	backup, err := installBundleFn(stagePath, bundle)
+	if err != nil {
 		m.mu.Lock()
 		m.state = StateReady
 		m.err = "安装更新失败：" + err.Error()
 		m.mu.Unlock()
 		return false
 	}
+
+	if autoRollback {
+		now := time.Now()
+		journal := rollbackJournal{
+			BundlePath:      bundle,
+			BackupPath:      backup,
+			PreviousVersion: m.version,
+			NewVersion:      newVersion,
+			StartedAt:       now.UTC().Format(time.RFC3339),
+			Deadline:        now.Add(time.Duration(graceMinutes) * time.Minute).UTC().Format(time.RFC3339),
+		}
+		if err := saveRollbackJournal(m.rollbacks.Journal, journal); err != nil {
+			_ = restoreRollbackBundleFn(backup, bundle)
+			m.mu.Lock()
+			m.state = StateReady
+			m.err = "更新已取消：无法写入异常回退日志：" + err.Error()
+			m.mu.Unlock()
+			return false
+		}
+		m.mu.Lock()
+		m.rollback = &journal
+		m.mu.Unlock()
+		if err := m.launchWatchdog(m.contextLocked(), &journal, os.Getpid()); err != nil {
+			_ = restoreRollbackBundleFn(backup, bundle)
+			_ = os.Remove(m.rollbacks.Journal)
+			m.mu.Lock()
+			m.rollback = nil
+			m.state = StateReady
+			m.err = "更新已取消：异常回退守护进程启动失败：" + err.Error()
+			m.mu.Unlock()
+			return false
+		}
+	} else {
+		_ = os.RemoveAll(backup)
+	}
+
 	m.mu.Lock()
 	m.state = StateRestarting
 	m.stagePath = ""
@@ -488,6 +595,9 @@ func (m *Manager) InstallNow() bool {
 	go func() {
 		time.Sleep(350 * time.Millisecond)
 		if err := restart(); err != nil {
+			if autoRollback {
+				m.requestRollback("新版本重启失败：" + err.Error())
+			}
 			m.mu.Lock()
 			m.state = StateError
 			m.err = "更新已安装，但重新打开 App 失败：" + err.Error()
@@ -552,8 +662,10 @@ func relSignatureFlag(rel *Release) bool {
 }
 
 var (
-	stageDownloadFn = stageDownload
-	installBundleFn = installBundle
+	stageDownloadFn          = stageDownload
+	installBundleFn          = installBundle
+	restoreRollbackBundleFn  = restoreRollbackBundle
+	launchRollbackWatchdogFn = launchRollbackWatchdog
 )
 
 func (m *Manager) download(ctx context.Context, version string, asset Asset) {
@@ -900,9 +1012,37 @@ func loadSettings(path string) (Settings, error) {
 		}
 		return DefaultSettings(), err
 	}
-	var s Settings
-	if err := json.Unmarshal(b, &s); err != nil {
+	// Old settings files do not contain the rollback fields. Preserve their old
+	// on/off choices while defaulting the newly introduced rollback switch to on.
+	var raw struct {
+		AutoCheck            *bool `json:"autoCheck"`
+		AutoDownload         *bool `json:"autoDownload"`
+		AutoInstall          *bool `json:"autoInstall"`
+		AutoRollback         *bool `json:"autoRollback"`
+		CheckIntervalHours   *int  `json:"checkIntervalHours"`
+		RollbackGraceMinutes *int  `json:"rollbackGraceMinutes"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
 		return DefaultSettings(), err
+	}
+	s := DefaultSettings()
+	if raw.AutoCheck != nil {
+		s.AutoCheck = *raw.AutoCheck
+	}
+	if raw.AutoDownload != nil {
+		s.AutoDownload = *raw.AutoDownload
+	}
+	if raw.AutoInstall != nil {
+		s.AutoInstall = *raw.AutoInstall
+	}
+	if raw.AutoRollback != nil {
+		s.AutoRollback = *raw.AutoRollback
+	}
+	if raw.CheckIntervalHours != nil {
+		s.CheckIntervalHours = *raw.CheckIntervalHours
+	}
+	if raw.RollbackGraceMinutes != nil {
+		s.RollbackGraceMinutes = *raw.RollbackGraceMinutes
 	}
 	return s.normalized(), nil
 }

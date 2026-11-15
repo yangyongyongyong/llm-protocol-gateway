@@ -17,6 +17,7 @@ type fakeDesktopUpdater struct {
 	check    int
 	download int
 	install  int
+	rollback int
 	settings desktopupdate.Settings
 }
 
@@ -34,6 +35,11 @@ func (f *fakeDesktopUpdater) DownloadNow() bool {
 func (f *fakeDesktopUpdater) InstallNow() bool {
 	f.install++
 	f.status.State = desktopupdate.StateInstalling
+	return true
+}
+func (f *fakeDesktopUpdater) RollbackNow() bool {
+	f.rollback++
+	f.status.State = desktopupdate.StateRollingBack
 	return true
 }
 func (f *fakeDesktopUpdater) SetSettings(s desktopupdate.Settings) (desktopupdate.Status, error) {
@@ -96,9 +102,21 @@ func TestDesktopUpdateAPIReadsAndStartsActions(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	server.handleDesktopUpdateSettings(rec, localDesktopUpdateRequest(http.MethodPatch, "/__desktop/update/settings", `{"autoCheck":false,"autoDownload":true,"autoInstall":true,"checkIntervalHours":24}`))
-	if rec.Code != http.StatusOK || !fake.settings.AutoInstall || fake.settings.CheckIntervalHours != 24 {
+	server.handleDesktopUpdateRollback(rec, localDesktopUpdateRequest(http.MethodPost, "/__desktop/update/rollback", ""))
+	if rec.Code != http.StatusAccepted || fake.rollback != 1 {
+		t.Fatalf("rollback = %d %s calls=%d", rec.Code, rec.Body.String(), fake.rollback)
+	}
+
+	rec = httptest.NewRecorder()
+	server.handleDesktopUpdateSettings(rec, localDesktopUpdateRequest(http.MethodPatch, "/__desktop/update/settings", `{"autoCheck":false,"autoDownload":true,"autoInstall":true,"autoRollback":true,"checkIntervalHours":24,"rollbackGraceMinutes":10}`))
+	if rec.Code != http.StatusOK || !fake.settings.AutoInstall || !fake.settings.AutoRollback || fake.settings.CheckIntervalHours != 24 || fake.settings.RollbackGraceMinutes != 10 {
 		t.Fatalf("settings = %d %s settings=%+v", rec.Code, rec.Body.String(), fake.settings)
+	}
+
+	rec = httptest.NewRecorder()
+	server.handleDesktopUpdateSettings(rec, localDesktopUpdateRequest(http.MethodPatch, "/__desktop/update/settings", `{"autoCheck":false}`))
+	if rec.Code != http.StatusOK || !fake.settings.AutoRollback || !fake.settings.AutoInstall || fake.settings.CheckIntervalHours != 24 {
+		t.Fatalf("partial settings lost fields = %d %s settings=%+v", rec.Code, rec.Body.String(), fake.settings)
 	}
 
 	fake.status.ReleaseURL = "https://github.com/yangyongyongyong/llm-protocol-gateway/releases/tag/v1.0.20"

@@ -40,7 +40,7 @@ func TestBundledUpdatePublicKeyIsValid(t *testing.T) {
 
 func TestDefaultSettingsEnableHourlyHandsFreeUpdates(t *testing.T) {
 	got := DefaultSettings()
-	want := Settings{AutoCheck: true, AutoDownload: true, AutoInstall: true, CheckIntervalHours: 1}
+	want := Settings{AutoCheck: true, AutoDownload: true, AutoInstall: true, AutoRollback: true, CheckIntervalHours: 1, RollbackGraceMinutes: 5}
 	if got != want {
 		t.Fatalf("DefaultSettings() = %+v, want %+v", got, want)
 	}
@@ -94,7 +94,7 @@ func TestCheckAndDownloadUseTheSelectedAsset(t *testing.T) {
 		}
 		return filepath.Join(dir, "payload"), nil
 	}
-	installBundleFn = func(string, string) error { return nil }
+	installBundleFn = func(string, string) (string, error) { return filepath.Join(root, ".previous.app"), nil }
 	t.Cleanup(func() { stageDownloadFn, installBundleFn = oldStage, oldInstall })
 
 	m := New(Options{
@@ -129,8 +129,14 @@ func TestCheckAndDownloadUseTheSelectedAsset(t *testing.T) {
 func TestInstallUsesTheRestartHookOnlyAfterStaging(t *testing.T) {
 	root := t.TempDir()
 	oldInstall := installBundleFn
-	installBundleFn = func(string, string) error { return nil }
-	t.Cleanup(func() { installBundleFn = oldInstall })
+	oldRestore := restoreRollbackBundleFn
+	oldWatchdog := launchRollbackWatchdogFn
+	installBundleFn = func(string, string) (string, error) { return filepath.Join(root, ".previous.app"), nil }
+	restoreRollbackBundleFn = func(string, string) error { return nil }
+	launchRollbackWatchdogFn = func(context.Context, rollbackArtifacts, rollbackJournal, int, time.Duration) error { return nil }
+	t.Cleanup(func() {
+		installBundleFn, restoreRollbackBundleFn, launchRollbackWatchdogFn = oldInstall, oldRestore, oldWatchdog
+	})
 
 	m := New(Options{
 		Version:      "1.0.0",
@@ -141,6 +147,7 @@ func TestInstallUsesTheRestartHookOnlyAfterStaging(t *testing.T) {
 	m.available = true
 	m.state = StateReady
 	m.stagePath = filepath.Join(root, "payload")
+	m.latest = &Release{Version: "1.1.0"}
 	var restarted atomic.Int32
 	m.SetRestartHook(func() error {
 		restarted.Add(1)
@@ -178,7 +185,7 @@ func TestManifestSignature(t *testing.T) {
 func TestSettingsRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "nested", "desktop-update.json")
-	want := Settings{AutoCheck: false, AutoDownload: true, AutoInstall: true, CheckIntervalHours: 24}
+	want := Settings{AutoCheck: false, AutoDownload: true, AutoInstall: true, AutoRollback: true, CheckIntervalHours: 24, RollbackGraceMinutes: 10}
 	if err := saveSettings(path, want); err != nil {
 		t.Fatal(err)
 	}
@@ -280,4 +287,235 @@ func TestUnsignedNewerGitHubFallbackIsRejectedWhenSignatureIsRequired(t *testing
 	if err == nil || !strings.Contains(err.Error(), "update.json/update.json.sig") {
 		t.Fatalf("unsigned newer fallback must be rejected, got %v", err)
 	}
+}
+
+func TestLegacySettingsEnableRollbackByDefault(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "desktop-update.json")
+	if err := os.WriteFile(path, []byte(`{"autoCheck":false,"autoDownload":true,"autoInstall":false,"checkIntervalHours":24}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadSettings(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.AutoRollback || got.RollbackGraceMinutes != 5 {
+		t.Fatalf("legacy settings did not get safe rollback defaults: %+v", got)
+	}
+	if got.AutoCheck || got.AutoInstall || got.CheckIntervalHours != 24 {
+		t.Fatalf("legacy choices were not preserved: %+v", got)
+	}
+}
+
+func TestInstallKeepsRollbackJournalAndArmsWatchdog(t *testing.T) {
+	root := t.TempDir()
+	backup := filepath.Join(root, ".previous.app")
+	bundle := filepath.Join(root, "LLM Protocol Gateway.app")
+	if err := os.Mkdir(backup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldInstall := installBundleFn
+	oldWatchdog := launchRollbackWatchdogFn
+	t.Cleanup(func() { installBundleFn, launchRollbackWatchdogFn = oldInstall, oldWatchdog })
+	installBundleFn = func(string, string) (string, error) { return backup, nil }
+	var gotJournal rollbackJournal
+	watchdogCalls := 0
+	launchRollbackWatchdogFn = func(_ context.Context, _ rollbackArtifacts, journal rollbackJournal, oldPID int, timeout time.Duration) error {
+		watchdogCalls++
+		gotJournal = journal
+		if oldPID <= 0 || timeout < time.Minute {
+			t.Fatalf("watchdog oldPID=%d timeout=%s", oldPID, timeout)
+		}
+		return nil
+	}
+
+	m := New(Options{
+		Version:      "1.0.0",
+		BundlePath:   bundle,
+		SettingsPath: filepath.Join(root, "settings.json"),
+		StageRoot:    filepath.Join(root, "stage"),
+	})
+	m.available = true
+	m.state = StateReady
+	m.stagePath = filepath.Join(root, "payload")
+	m.latest = &Release{Version: "1.1.0"}
+	m.SetRestartHook(func() error { return nil })
+	if !m.InstallNow() {
+		t.Fatal("InstallNow returned false")
+	}
+	if watchdogCalls != 1 {
+		t.Fatalf("watchdog calls = %d", watchdogCalls)
+	}
+	if gotJournal.BackupPath != backup || gotJournal.PreviousVersion != "1.0.0" || gotJournal.NewVersion != "1.1.0" {
+		t.Fatalf("journal = %+v", gotJournal)
+	}
+	if _, err := os.Stat(m.rollbacks.Journal); err != nil {
+		t.Fatalf("rollback journal missing: %v", err)
+	}
+	if !m.Status().RollbackPending {
+		t.Fatal("status should report pending rollback")
+	}
+}
+
+func TestRollbackNowWritesRequestMarker(t *testing.T) {
+	root := t.TempDir()
+	backup := filepath.Join(root, ".previous.app")
+	if err := os.Mkdir(backup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldWatchdog := launchRollbackWatchdogFn
+	launchRollbackWatchdogFn = func(context.Context, rollbackArtifacts, rollbackJournal, int, time.Duration) error { return nil }
+	t.Cleanup(func() { launchRollbackWatchdogFn = oldWatchdog })
+	m := New(Options{
+		Version:      "1.1.0",
+		BundlePath:   filepath.Join(root, "LLM Protocol Gateway.app"),
+		SettingsPath: filepath.Join(root, "settings.json"),
+	})
+	m.rollback = &rollbackJournal{
+		BundlePath:      filepath.Join(root, "LLM Protocol Gateway.app"),
+		BackupPath:      backup,
+		PreviousVersion: "1.0.0",
+		NewVersion:      "1.1.0",
+		StartedAt:       time.Now().UTC().Format(time.RFC3339),
+		Deadline:        time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339),
+	}
+	if !m.RollbackNow() {
+		t.Fatal("RollbackNow returned false")
+	}
+	if _, err := os.Stat(m.rollbacks.Request); err != nil {
+		t.Fatalf("request marker missing: %v", err)
+	}
+	if got := m.Status().State; got != StateRollingBack {
+		t.Fatalf("state = %q, want %q", got, StateRollingBack)
+	}
+}
+
+func TestMonitorHealthFailuresRequestRollback(t *testing.T) {
+	root := t.TempDir()
+	backup := filepath.Join(root, ".previous.app")
+	if err := os.Mkdir(backup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldDelay, oldInterval, oldThreshold := rollbackMonitorStartDelay, rollbackMonitorInterval, rollbackFailureThreshold
+	oldWatchdog := launchRollbackWatchdogFn
+	rollbackMonitorStartDelay = time.Millisecond
+	rollbackMonitorInterval = time.Millisecond
+	rollbackFailureThreshold = 2
+	launchRollbackWatchdogFn = func(context.Context, rollbackArtifacts, rollbackJournal, int, time.Duration) error { return nil }
+	t.Cleanup(func() {
+		rollbackMonitorStartDelay, rollbackMonitorInterval, rollbackFailureThreshold = oldDelay, oldInterval, oldThreshold
+		launchRollbackWatchdogFn = oldWatchdog
+	})
+	m := New(Options{
+		Version:      "1.1.0",
+		BundlePath:   filepath.Join(root, "LLM Protocol Gateway.app"),
+		SettingsPath: filepath.Join(root, "settings.json"),
+	})
+	m.rollback = &rollbackJournal{
+		BundlePath:      filepath.Join(root, "LLM Protocol Gateway.app"),
+		BackupPath:      backup,
+		PreviousVersion: "1.0.0",
+		NewVersion:      "1.1.0",
+		StartedAt:       time.Now().UTC().Format(time.RFC3339),
+		Deadline:        time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339),
+	}
+	m.SetHealthCheck(func() error { return fmt.Errorf("gateway unhealthy") })
+	if err := saveRollbackJournal(m.rollbacks.Journal, *m.rollback); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); m.monitorRollback(ctx) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(m.rollbacks.Request); err == nil {
+			<-done
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	t.Fatal("health failures did not request rollback")
+}
+
+func TestCommitRollbackRemovesBackupAndJournal(t *testing.T) {
+	root := t.TempDir()
+	backup := filepath.Join(root, ".previous.app")
+	if err := os.Mkdir(backup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m := New(Options{
+		Version:      "1.1.0",
+		BundlePath:   filepath.Join(root, "LLM Protocol Gateway.app"),
+		SettingsPath: filepath.Join(root, "settings.json"),
+	})
+	m.rollback = &rollbackJournal{
+		BundlePath:      filepath.Join(root, "LLM Protocol Gateway.app"),
+		BackupPath:      backup,
+		PreviousVersion: "1.0.0",
+		NewVersion:      "1.1.0",
+		StartedAt:       time.Now().Add(-5 * time.Minute).UTC().Format(time.RFC3339),
+		Deadline:        time.Now().UTC().Format(time.RFC3339),
+	}
+	if err := saveRollbackJournal(m.rollbacks.Journal, *m.rollback); err != nil {
+		t.Fatal(err)
+	}
+	m.commitRollback()
+	if _, err := os.Stat(backup); !os.IsNotExist(err) {
+		t.Fatalf("backup still exists: %v", err)
+	}
+	if _, err := os.Stat(m.rollbacks.Journal); !os.IsNotExist(err) {
+		t.Fatalf("journal still exists: %v", err)
+	}
+	if m.Status().RollbackPending {
+		t.Fatal("status still reports pending rollback")
+	}
+}
+
+func TestMonitorHealthyPastDeadlineCommitsUpdate(t *testing.T) {
+	root := t.TempDir()
+	backup := filepath.Join(root, ".previous.app")
+	if err := os.Mkdir(backup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldDelay, oldInterval := rollbackMonitorStartDelay, rollbackMonitorInterval
+	rollbackMonitorStartDelay = time.Millisecond
+	rollbackMonitorInterval = time.Millisecond
+	t.Cleanup(func() { rollbackMonitorStartDelay, rollbackMonitorInterval = oldDelay, oldInterval })
+	m := New(Options{
+		Version:      "1.1.0",
+		BundlePath:   filepath.Join(root, "LLM Protocol Gateway.app"),
+		SettingsPath: filepath.Join(root, "settings.json"),
+	})
+	m.rollback = &rollbackJournal{
+		BundlePath:      filepath.Join(root, "LLM Protocol Gateway.app"),
+		BackupPath:      backup,
+		PreviousVersion: "1.0.0",
+		NewVersion:      "1.1.0",
+		StartedAt:       time.Now().Add(-5 * time.Minute).UTC().Format(time.RFC3339),
+		Deadline:        time.Now().Add(-time.Second).UTC().Format(time.RFC3339),
+	}
+	if err := saveRollbackJournal(m.rollbacks.Journal, *m.rollback); err != nil {
+		t.Fatal(err)
+	}
+	m.SetHealthCheck(func() error { return nil })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); m.monitorRollback(ctx) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !m.Status().RollbackPending {
+			<-done
+			if _, err := os.Stat(backup); !os.IsNotExist(err) {
+				t.Fatalf("backup still exists: %v", err)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	t.Fatal("healthy update was not committed")
 }

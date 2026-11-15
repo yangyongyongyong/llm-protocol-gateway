@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -17,6 +18,7 @@ type desktopUpdater interface {
 	CheckNow() bool
 	DownloadNow() bool
 	InstallNow() bool
+	RollbackNow() bool
 	SetSettings(desktopupdate.Settings) (desktopupdate.Status, error)
 }
 
@@ -91,6 +93,20 @@ func (s *Server) handleDesktopUpdateInstall(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusAccepted, s.desktopUpdateStatus())
 }
 
+func (s *Server) handleDesktopUpdateRollback(w http.ResponseWriter, r *http.Request) {
+	if !s.requireLocalDesktopUpdate(w, r) {
+		return
+	}
+	if !s.desktopUpdater.RollbackNow() {
+		writeOpenAIError(w, http.StatusConflict, "当前没有可回退的上一版本")
+		return
+	}
+	if s.logs != nil {
+		s.logs.AddApp("warn", "desktop update rollback requested", "restoring the previous app bundle")
+	}
+	writeJSON(w, http.StatusAccepted, s.desktopUpdateStatus())
+}
+
 // handleDesktopUpdateOpenRelease opens the current release page in the system
 // browser. It deliberately accepts no URL from the caller: the URL comes from
 // the updater's own status and must belong to this repository's GitHub Releases.
@@ -124,11 +140,38 @@ func (s *Server) handleDesktopUpdateSettings(w http.ResponseWriter, r *http.Requ
 	if !s.requireLocalDesktopUpdate(w, r) {
 		return
 	}
-	var settings desktopupdate.Settings
-	if err := json.NewDecoder(r.Body).Decode(&settings); err != nil {
+	current := s.desktopUpdater.Status().Settings
+	var patch struct {
+		AutoCheck            *bool `json:"autoCheck"`
+		AutoDownload         *bool `json:"autoDownload"`
+		AutoInstall          *bool `json:"autoInstall"`
+		AutoRollback         *bool `json:"autoRollback"`
+		CheckIntervalHours   *int  `json:"checkIntervalHours"`
+		RollbackGraceMinutes *int  `json:"rollbackGraceMinutes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid update settings: "+err.Error())
 		return
 	}
+	if patch.AutoCheck != nil {
+		current.AutoCheck = *patch.AutoCheck
+	}
+	if patch.AutoDownload != nil {
+		current.AutoDownload = *patch.AutoDownload
+	}
+	if patch.AutoInstall != nil {
+		current.AutoInstall = *patch.AutoInstall
+	}
+	if patch.AutoRollback != nil {
+		current.AutoRollback = *patch.AutoRollback
+	}
+	if patch.CheckIntervalHours != nil {
+		current.CheckIntervalHours = *patch.CheckIntervalHours
+	}
+	if patch.RollbackGraceMinutes != nil {
+		current.RollbackGraceMinutes = *patch.RollbackGraceMinutes
+	}
+	settings := current
 	status, err := s.desktopUpdater.SetSettings(settings)
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, err.Error())
@@ -139,6 +182,8 @@ func (s *Server) handleDesktopUpdateSettings(w http.ResponseWriter, r *http.Requ
 			"autoCheck=" + boolString(settings.AutoCheck),
 			"autoDownload=" + boolString(settings.AutoDownload),
 			"autoInstall=" + boolString(settings.AutoInstall),
+			"autoRollback=" + boolString(settings.AutoRollback),
+			"rollbackGraceMinutes=" + fmt.Sprintf("%d", settings.RollbackGraceMinutes),
 		}, " "))
 	}
 	writeJSON(w, http.StatusOK, status)

@@ -117,7 +117,7 @@ GATEWAY_ADDR=0.0.0.0:18093 ./.cache/gateway-dev
 桌面 App 内置原生更新器（`internal/desktopupdate`），窗口关闭后仍随 App 进程检查：
 
 - 启动约 5 秒后检查一次，之后按设置每 1 / 6 / 24 小时检查；
-- 默认自动检查、自动下载、空闲时自动重启安装；
+- 默认自动检查、自动下载、空闲时自动重启安装，并开启异常自动回退；
 - 自动安装会等待网关没有模型请求；手动点击安装则立即重启；
 - macOS 只替换完整 `.app`，不会覆盖正在运行的可执行文件；
 - 更新地址：`https://github.com/yangyongyongyong/llm-protocol-gateway/releases/latest/download/update.json`；

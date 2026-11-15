@@ -45,3 +45,6 @@
   .desktop-update-toast { top: 12px; }
   .desktop-update-checked { width: 100%; margin-left: 0; }
 }
+
+.desktop-update-interval-row { display: flex; flex-wrap: wrap; gap: 12px; }
+.desktop-update-interval-row .desktop-update-interval { flex: 1 1 180px; }

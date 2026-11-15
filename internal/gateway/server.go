@@ -545,6 +545,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /__desktop/update/check", s.handleDesktopUpdateCheck)
 	mux.HandleFunc("POST /__desktop/update/download", s.handleDesktopUpdateDownload)
 	mux.HandleFunc("POST /__desktop/update/install", s.handleDesktopUpdateInstall)
+	mux.HandleFunc("POST /__desktop/update/rollback", s.handleDesktopUpdateRollback)
 	mux.HandleFunc("POST /__desktop/update/open-release", s.handleDesktopUpdateOpenRelease)
 	mux.HandleFunc("PATCH /__desktop/update/settings", s.handleDesktopUpdateSettings)
 	mux.HandleFunc("GET /__logs", s.handleLogs)

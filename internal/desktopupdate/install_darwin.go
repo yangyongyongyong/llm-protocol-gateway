@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -106,38 +107,25 @@ func validateApp(app string, wantVersion string) error {
 	return nil
 }
 
-func installBundle(staged, bundle string) error {
+func installBundle(staged, bundle string) (string, error) {
 	if _, err := os.Stat(staged); err != nil {
-		return fmt.Errorf("更新目录不存在：%w", err)
+		return "", fmt.Errorf("更新目录不存在：%w", err)
 	}
 	if _, err := os.Stat(bundle); err != nil {
-		return fmt.Errorf("当前 App 目录不存在：%w", err)
+		return "", fmt.Errorf("当前 App 目录不存在：%w", err)
 	}
 	parent := filepath.Dir(bundle)
-	old := filepath.Join(parent, fmt.Sprintf(".llm-protocol-gateway-old-%d", time.Now().UnixNano()))
+	old := filepath.Join(parent, fmt.Sprintf(".llm-protocol-gateway-previous-%d.app", time.Now().UnixNano()))
 	if err := os.Rename(bundle, old); err != nil {
-		return fmt.Errorf("移动旧 App 失败：%w", err)
+		return "", fmt.Errorf("移动旧 App 失败：%w", err)
 	}
 	if err := os.Rename(staged, bundle); err != nil {
 		_ = os.Rename(old, bundle)
-		return fmt.Errorf("放入新 App 失败：%w", err)
+		return "", fmt.Errorf("放入新 App 失败：%w", err)
 	}
-	// Keep the previous bundle until the new process starts. If macOS refuses to
-	// launch the new one, the hidden backup is still on disk and can be restored.
-	return nil
-}
-
-func cleanupOldBundles(bundle string) {
-	parent := filepath.Dir(bundle)
-	entries, err := os.ReadDir(parent)
-	if err != nil {
-		return
-	}
-	for _, entry := range entries {
-		if entry.IsDir() && strings.HasPrefix(entry.Name(), ".llm-protocol-gateway-old-") {
-			_ = os.RemoveAll(filepath.Join(parent, entry.Name()))
-		}
-	}
+	// The detached watchdog keeps this bundle until the new build has passed its
+	// health window. It is the actual rollback source, not just a startup spare.
+	return old, nil
 }
 
 // Relaunch arranges for open -n to run after this process has exited. Doing it
@@ -156,4 +144,157 @@ func Relaunch(bundle string) error {
 
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+const rollbackWatchdogScript = `
+new_bundle=$1
+old_bundle=$2
+prev_version=$3
+new_version=$4
+commit_marker=$5
+request_marker=$6
+pid_file=$7
+history_file=$8
+journal_file=$9
+log_file=${10}
+old_pid=${11}
+timeout_seconds=${12}
+
+umask 077
+exec >>"$log_file" 2>&1
+echo "[rollback-watchdog] start $(date -u +%Y-%m-%dT%H:%M:%SZ) old_pid=$old_pid timeout=${timeout_seconds}s"
+
+if [ -f "$pid_file" ]; then
+  other_pid=$(cat "$pid_file" 2>/dev/null || true)
+  if [ -n "$other_pid" ] && kill -0 "$other_pid" 2>/dev/null; then
+    echo "[rollback-watchdog] another watchdog is alive: $other_pid"
+    exit 0
+  fi
+fi
+printf '%s\n' "$$" >"$pid_file"
+cleanup() { rm -f "$pid_file" 2>/dev/null || true; }
+trap cleanup EXIT
+trap 'exit 143' HUP INT TERM
+
+if [ "$old_pid" -gt 0 ] 2>/dev/null; then
+  while kill -0 "$old_pid" 2>/dev/null; do sleep 0.2; done
+fi
+
+started=$(date +%s)
+seen_new=0
+gone_seconds=0
+reason=""
+while :; do
+  if [ -f "$commit_marker" ]; then
+    echo "[rollback-watchdog] health window committed"
+    exit 0
+  fi
+  if [ -f "$request_marker" ]; then
+    reason=$(tr '\t\r\n' '   ' <"$request_marker" | cut -c1-500)
+    [ -n "$reason" ] || reason="App requested rollback"
+    break
+  fi
+  now=$(date +%s)
+  elapsed=$((now - started))
+  if pgrep -f "^${new_bundle}/Contents/MacOS/LLM Protocol Gateway" >/dev/null 2>&1; then
+    seen_new=1
+    gone_seconds=0
+  elif [ "$seen_new" -eq 1 ]; then
+    gone_seconds=$((gone_seconds + 1))
+    if [ "$gone_seconds" -ge 20 ]; then
+      reason="New App exited during rollback health window"
+      break
+    fi
+  fi
+  if [ "$seen_new" -eq 0 ] && [ "$elapsed" -ge 45 ]; then
+    reason="New App did not start within 45s"
+    break
+  fi
+  if [ "$elapsed" -ge "$timeout_seconds" ]; then
+    reason="New App health window timed out"
+    break
+  fi
+  sleep 1
+done
+
+echo "[rollback-watchdog] rollback requested: $reason"
+for pid in $(pgrep -f "^${new_bundle}/Contents/MacOS/LLM Protocol Gateway" 2>/dev/null || true); do
+  kill "$pid" 2>/dev/null || true
+done
+sleep 1
+
+if [ ! -d "$old_bundle" ]; then
+  echo "[rollback-watchdog] previous bundle missing: $old_bundle"
+  rm -f "$request_marker" "$commit_marker" "$journal_file" 2>/dev/null || true
+  exit 1
+fi
+
+failed_bundle="${new_bundle}.failed-$(date +%s)"
+if [ -e "$new_bundle" ]; then
+  mv "$new_bundle" "$failed_bundle" || exit 1
+fi
+if ! mv "$old_bundle" "$new_bundle"; then
+  echo "[rollback-watchdog] failed to restore previous bundle"
+  [ -e "$failed_bundle" ] && mv "$failed_bundle" "$new_bundle" 2>/dev/null || true
+  exit 1
+fi
+
+safe_reason=$(printf '%s' "$reason" | tr '\t\r\n' '   ' | cut -c1-500)
+printf '%s\t%s\t%s\t%s\n' "$new_version" "$prev_version" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$safe_reason" >>"$history_file"
+rm -rf "$failed_bundle" 2>/dev/null || true
+rm -f "$request_marker" "$commit_marker" "$journal_file" 2>/dev/null || true
+echo "[rollback-watchdog] restored $prev_version and relaunching"
+open -n "$new_bundle"
+`
+
+func launchRollbackWatchdog(_ context.Context, artifacts rollbackArtifacts, journal rollbackJournal, oldPID int, timeout time.Duration) error {
+	if timeout < 5*time.Second {
+		timeout = 5 * time.Second
+	}
+	logFile, err := os.OpenFile(artifacts.WatchdogLog, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(
+		"/bin/sh", "-c", rollbackWatchdogScript, "wt-rollback",
+		journal.BundlePath,
+		journal.BackupPath,
+		journal.PreviousVersion,
+		journal.NewVersion,
+		artifacts.Commit,
+		artifacts.Request,
+		artifacts.PID,
+		artifacts.History,
+		artifacts.Journal,
+		artifacts.WatchdogLog,
+		strconv.Itoa(oldPID),
+		strconv.Itoa(int(timeout.Seconds())),
+	)
+	cmd.Stdin = nil
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
+		return err
+	}
+	return logFile.Close()
+}
+
+func restoreRollbackBundle(backup, bundle string) error {
+	if _, err := os.Stat(backup); err != nil {
+		return fmt.Errorf("上一版本不存在：%w", err)
+	}
+	failed := filepath.Join(filepath.Dir(bundle), fmt.Sprintf(".llm-protocol-gateway-failed-%d.app", time.Now().UnixNano()))
+	if _, err := os.Stat(bundle); err == nil {
+		if err := os.Rename(bundle, failed); err != nil {
+			return fmt.Errorf("移走异常版本失败：%w", err)
+		}
+	}
+	if err := os.Rename(backup, bundle); err != nil {
+		_ = os.Rename(failed, bundle)
+		return fmt.Errorf("恢复上一版本失败：%w", err)
+	}
+	_ = os.RemoveAll(failed)
+	return nil
 }

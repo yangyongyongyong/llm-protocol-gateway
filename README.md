@@ -259,7 +259,7 @@ curl -s http://127.0.0.1:18093/__health
 ### 桌面 App
 
 Wails 打包的桌面应用覆盖 macOS / Windows / Linux，内置同一套核心与 `web/dist`，关闭窗口后继续在后台运行；
-macOS 版内置 `cloudflared`，可直接开启 Cloudflare 公网访问。预编译包见上方的「下载与安装」，
+macOS 版内置 `cloudflared`，可直接开启 Cloudflare 公网访问；桌面 App 可从 GitHub Release 自动更新，并在新版本启动失败或健康检查异常时自动回退上一版。预编译包见上方的「下载与安装」，
 macOS 本地构建与使用细节见 **[macOS App](docs/macos-app.md)**。
 
 ```bash

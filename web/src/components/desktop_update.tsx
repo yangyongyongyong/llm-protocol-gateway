@@ -9,7 +9,9 @@ type UpdateSettings = {
     autoCheck: boolean;
     autoDownload: boolean;
     autoInstall: boolean;
+    autoRollback: boolean;
     checkIntervalHours: number;
+    rollbackGraceMinutes: number;
 };
 
 type UpdateStatus = {
@@ -29,6 +31,14 @@ type UpdateStatus = {
     signatureRequired?: boolean;
     signatureVerified?: boolean;
     settings: UpdateSettings;
+    rollbackPending?: boolean;
+    rollbackPreviousVersion?: string;
+    rollbackNewVersion?: string;
+    rollbackDeadline?: string;
+    lastRollbackFrom?: string;
+    lastRollbackTo?: string;
+    lastRollbackAt?: string;
+    lastRollbackReason?: string;
 };
 
 const ENDPOINT = `${API_BASE}/__desktop/update`;
@@ -43,6 +53,7 @@ const stateLabels: Record<string, string> = {
     ready: '等待安装',
     installing: '正在安装',
     restarting: '正在重启',
+    'rolling-back': '正在回退',
     error: '更新失败',
 };
 
@@ -59,6 +70,7 @@ function stateTone(state: string): 'green' | 'blue' | 'amber' | 'red' | 'slate' 
         case 'restarting':
             return 'amber';
         case 'error':
+        case 'rolling-back':
             return 'red';
         default:
             return 'slate';
@@ -143,15 +155,15 @@ export function DesktopUpdateCard({onToast}: {onToast: (message: string) => void
         }
     };
 
-    const run = async (action: 'check' | 'download' | 'install') => {
+    const run = async (action: 'check' | 'download' | 'install' | 'rollback') => {
         if (busy) return;
         setBusy(action);
         try {
             await requestStatus(`/${action}`, {method: 'POST'});
             await refresh();
-            onToast(action === 'check' ? '已开始检查更新' : action === 'download' ? '已开始下载更新' : '更新已安装，App 正在重启');
+            onToast(action === 'check' ? '已开始检查更新' : action === 'download' ? '已开始下载更新' : action === 'rollback' ? '正在恢复上一版本' : '更新已安装，App 正在重启');
         } catch (error) {
-            onToast(`${action === 'check' ? '检查' : action === 'download' ? '下载' : '安装'}更新失败：${String(error)}`);
+            onToast(`${action === 'check' ? '检查' : action === 'download' ? '下载' : action === 'rollback' ? '回退' : '安装'}更新失败：${String(error)}`);
             await refresh();
         } finally {
             setBusy('');
@@ -186,19 +198,36 @@ export function DesktopUpdateCard({onToast}: {onToast: (message: string) => void
                 <Switch checked={settings?.autoCheck ?? true} label="自动检查更新" disabled={Boolean(busy) || !settings} onChange={(v) => void updateSettings({autoCheck: v})} />
                 <Switch checked={settings?.autoDownload ?? true} label="发现更新后自动下载" disabled={Boolean(busy) || !settings} onChange={(v) => void updateSettings({autoDownload: v})} />
                 <Switch checked={settings?.autoInstall ?? true} label="网关空闲时自动重启安装" disabled={Boolean(busy) || !settings} onChange={(v) => void updateSettings({autoInstall: v})} />
+                <Switch checked={settings?.autoRollback ?? true} label="更新异常时自动回退上一版" disabled={Boolean(busy) || !settings || Boolean(status.rollbackPending)} onChange={(v) => void updateSettings({autoRollback: v})} />
             </div>
-            <label className="field desktop-update-interval">
-                <span>检查间隔</span>
-                <select
-                    value={settings?.checkIntervalHours ?? 1}
-                    disabled={Boolean(busy) || !settings}
-                    onChange={(event) => void updateSettings({checkIntervalHours: Number(event.target.value)})}
-                >
-                    <option value={1}>每 1 小时</option>
-                    <option value={6}>每 6 小时</option>
-                    <option value={24}>每天</option>
-                </select>
-            </label>
+            <div className="desktop-update-interval-row">
+                <label className="field desktop-update-interval">
+                    <span>检查间隔</span>
+                    <select
+                        value={settings?.checkIntervalHours ?? 1}
+                        disabled={Boolean(busy) || !settings}
+                        onChange={(event) => void updateSettings({checkIntervalHours: Number(event.target.value)})}
+                    >
+                        <option value={1}>每 1 小时</option>
+                        <option value={6}>每 6 小时</option>
+                        <option value={24}>每天</option>
+                    </select>
+                </label>
+                <label className="field desktop-update-interval">
+                    <span>异常观察期</span>
+                    <select
+                        value={settings?.rollbackGraceMinutes ?? 5}
+                        disabled={Boolean(busy) || !settings || !settings?.autoRollback}
+                        onChange={(event) => void updateSettings({rollbackGraceMinutes: Number(event.target.value)})}
+                    >
+                        <option value={2}>2 分钟</option>
+                        <option value={5}>5 分钟</option>
+                        <option value={10}>10 分钟</option>
+                        <option value={30}>30 分钟</option>
+                    </select>
+                </label>
+            </div>
+            <div className="hint-text">自动回退会保留上一版 App，更新后连续检查本机网关 /__health；启动失败、进程退出或连续健康检查失败时自动恢复上一版并重新打开。观察期内健康才确认并清理旧版。</div>
 
             {status.state === 'downloading' ? (
                 <div className="desktop-update-progress-wrap">
@@ -209,8 +238,22 @@ export function DesktopUpdateCard({onToast}: {onToast: (message: string) => void
                 </div>
             ) : null}
 
+            {status.rollbackPending ? (
+                <div className="mon-set-notice">
+                    <span className="mon-set-notice-label">回退观察中</span>
+                    <span className="mon-set-notice-text">
+                        {`新版本 ${status.rollbackNewVersion || status.latest || '—'} 正在观察，健康前保留上一版 ${status.rollbackPreviousVersion || '—'}${status.rollbackDeadline ? `，截止 ${new Date(status.rollbackDeadline).toLocaleString()}` : ''}。`}
+                    </span>
+                    <button className="btn btn-sm mon-set-notice-btn" type="button" disabled={Boolean(busy)} onClick={() => void run('rollback')}>立即回退</button>
+                </div>
+            ) : null}
             {status.error ? <div className="desktop-update-error">{status.error}</div> : null}
             {status.message ? <div className="hint-text">{status.message}</div> : null}
+            {status.lastRollbackAt ? (
+                <div className="hint-text">
+                    {`已于 ${new Date(status.lastRollbackAt).toLocaleString()} 从 ${status.lastRollbackFrom || '—'} 回退到 ${status.lastRollbackTo || '—'}：${status.lastRollbackReason || '健康检查异常'}`}
+                </div>
+            ) : null}
 
             <div className="desktop-update-actions">
                 <button className="btn" type="button" disabled={Boolean(busy)} onClick={() => void run('check')}>检查更新</button>

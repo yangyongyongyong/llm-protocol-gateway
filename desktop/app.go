@@ -315,6 +315,7 @@ func (a *App) startDesktopUpdater() {
 		server := a.rt.Server()
 		return server == nil || server.CurrentInFlight() == 0
 	})
+	updater.SetHealthCheck(a.localHealthCheck)
 	updater.SetRestartHook(func() error {
 		bundle := updater.AppBundle()
 		if err := desktopupdate.Relaunch(bundle); err != nil {
@@ -329,6 +330,30 @@ func (a *App) startDesktopUpdater() {
 	updater.Start(ctx)
 	a.updater = updater
 	a.updaterCancel = cancel
+}
+
+// localHealthCheck is the post-update stability probe. /__health alone is not
+// enough: an update with a missing web-dist still serves 200 there but leaves
+// the Wails window on a 404 page, which should roll back.
+func (a *App) localHealthCheck() error {
+	if a.rt == nil {
+		return fmt.Errorf("gateway runtime is not ready")
+	}
+	if err := a.rt.WaitHealthy(3 * time.Second); err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Get(a.rt.LocalURL() + "/")
+	if err != nil {
+		return fmt.Errorf("管理页请求失败：%w", err)
+	}
+	defer resp.Body.Close()
+	buf := make([]byte, 512)
+	n, _ := io.ReadFull(resp.Body, buf)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(strings.ToLower(string(buf[:n])), "<!doctype html") {
+		return fmt.Errorf("管理页没有正常加载：HTTP %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // LocalURL returns the loopback management URL.
