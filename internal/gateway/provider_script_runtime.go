@@ -443,12 +443,42 @@ func (r *ProviderScriptRuntime) waitHealthy(ctx context.Context, provider domain
 		} else {
 			last = err
 		}
+		// 进程已经退出时不必等满超时：把 adapter.log 末尾带上。否则调用方
+		// （以及 CI）只能看到一个没有上下文的 "context deadline exceeded"，
+		// 既不知道脚本是崩了、解释器找不到，还是根本没监听。
+		if !r.running(provider.ID) {
+			if tail := r.logTail(provider.ID); tail != "" {
+				return fmt.Errorf("provider script exited before becoming healthy: %w; adapter.log:\n%s", last, tail)
+			}
+			return fmt.Errorf("provider script exited before becoming healthy: %w", last)
+		}
 		time.Sleep(200 * time.Millisecond)
 	}
 	if last == nil {
 		last = errors.New("health check timed out")
 	}
 	return last
+}
+
+// running 报告这个 provider 的脚本进程是否还活着。进程退出后 goroutine 会把
+// 条目从 processes 里删掉，所以这里同时覆盖「从没启动」和「已经退出」。
+func (r *ProviderScriptRuntime) running(providerID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return providerScriptProcessRunning(r.processes[providerID])
+}
+
+// logTail 取 adapter.log 的末尾一段，供健康检查失败时定位原因。
+func (r *ProviderScriptRuntime) logTail(providerID string) string {
+	data, err := os.ReadFile(filepath.Join(r.providerDir(providerID), "adapter.log"))
+	if err != nil || len(data) == 0 {
+		return ""
+	}
+	const maxTail = 2000
+	if len(data) > maxTail {
+		data = data[len(data)-maxTail:]
+	}
+	return strings.TrimSpace(string(data))
 }
 
 func probeProviderScriptHealth(ctx context.Context, baseURL, healthPath string) error {

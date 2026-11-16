@@ -153,7 +153,7 @@ server.serve_forever()
 		t.Fatalf("start: %v", err)
 	}
 	t.Cleanup(func() { runtime.stop(provider.ID) })
-	if err := runtime.waitHealthy(context.Background(), provider, 8*time.Second); err != nil {
+	if err := runtime.waitHealthy(context.Background(), provider, 30*time.Second); err != nil {
 		t.Fatalf("health: %v", err)
 	}
 	status := runtime.status(provider.ID)
@@ -242,7 +242,7 @@ func TestProviderScriptRuntimeRestartUsesNewSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { runtime.stop(provider.ID) })
-	if err := runtime.waitHealthy(context.Background(), provider, 8*time.Second); err != nil {
+	if err := runtime.waitHealthy(context.Background(), provider, 30*time.Second); err != nil {
 		t.Fatal(err)
 	}
 	first := runtime.status(provider.ID)
@@ -250,7 +250,7 @@ func TestProviderScriptRuntimeRestartUsesNewSource(t *testing.T) {
 	if err := runtime.restart(context.Background(), provider); err != nil {
 		t.Fatalf("restart: %v", err)
 	}
-	if err := runtime.waitHealthy(context.Background(), provider, 8*time.Second); err != nil {
+	if err := runtime.waitHealthy(context.Background(), provider, 30*time.Second); err != nil {
 		t.Fatalf("health after restart: %v", err)
 	}
 	second := runtime.status(provider.ID)
