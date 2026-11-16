@@ -69,7 +69,10 @@ apiKeySource = "env:MY_UPSTREAM_KEY"
 （`deriveModelsURL`，`internal/gateway/server.go`）：
 
 - host 含 `anthropic.com` → `/v1/models`
-- Azure `/deployments/.../chat/completions` → 取 deployments 前缀 + `/models`
+- Azure `/deployments/.../chat/completions` → 先尝试 deployments 前缀 + `/v1/models`，
+  再尝试前缀 + `/models`；全部失败时才回退到 Provider 已配置目录
+- Azure deployment 模板在 Responses 模式下 → 使用同一前缀的统一入口
+  `/openai/v1/responses`，模型名放在请求体里（例如 `gpt-5.4-pro`）
 - path 含 `/chat/completions` | `/responses` | `/messages` → 就地替换为 `/models`
 - 其余情况 → 在 path 末尾追加 `/models`
 
@@ -81,6 +84,19 @@ https://api.example.com/v1                     → 探测 https://api.example.co
 ```
 
 ---
+
+### 严格 Chat 上游的兼容处理
+
+Responses 客户端（Codex）转 OpenAI Chat 时，网关会对两类常见 400 做兼容：
+
+- `reasoning_effort=max` 但目标模型只支持到 `xhigh` 时，按模型能力降级到最近合法档位。
+- 函数工具 `parameters` 顶层是 `oneOf/anyOf/allOf`，或直接带 `enum/const/not` 时，
+  会归并为普通 `object` schema；嵌套结构保留。
+- Chat 的 `tool_calls[].id` 超过 64 字符时，用原值哈希生成稳定短 ID，调用与结果共用同一 ID。
+- Codex namespace 展开后的工具数超过 128 时，按声明顺序保留前 128 个；若固定 `tool_choice`
+  指向被裁掉的工具，会退化为自动选择，避免严格 Chat 上游报 `array_above_max_length`。
+
+这些处理只影响发往严格 Chat 上游的转换请求，不改变客户端原始请求日志里的工具定义。
 
 ## 5. 健康探测与"异常"状态（重要）
 

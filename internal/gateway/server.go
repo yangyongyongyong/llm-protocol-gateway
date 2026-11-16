@@ -532,6 +532,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /__auth/logout", s.handleAuthLogout)
 	mux.HandleFunc("POST /__auth/password", s.handleAuthPassword)
 	mux.HandleFunc("GET /__state", s.handleState)
+	mux.HandleFunc("GET /__gateway-name", s.handleGatewayName)
+	mux.HandleFunc("PATCH /__gateway-name", s.handleSetGatewayName)
 	mux.HandleFunc("GET /__settings/paths", s.handleSettingsPaths)
 	mux.HandleFunc("GET /__desktop/autostart", s.handleDesktopAutostart)
 	mux.HandleFunc("PATCH /__desktop/autostart", s.handleSetDesktopAutostart)
@@ -614,6 +616,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /__provider-groups/assign", s.handleAssignProviderGroup)
 	mux.HandleFunc("PATCH /__provider-groups/{id}", s.handleUpdateProviderGroup)
 	mux.HandleFunc("DELETE /__provider-groups/{id}", s.handleDeleteProviderGroup)
+	mux.HandleFunc("GET /__custom-providers", s.handleListCustomProviders)
+	mux.HandleFunc("GET /__custom-providers/ai-prompt", s.handleCustomProviderAIPrompt)
+	mux.HandleFunc("POST /__custom-providers", s.handleCreateCustomProvider)
+	mux.HandleFunc("PATCH /__custom-providers/{id}", s.handleUpdateCustomProvider)
+	mux.HandleFunc("DELETE /__custom-providers/{id}", s.handleDeleteCustomProvider)
 	mux.HandleFunc("POST /__providers", s.handleCreateProvider)
 	mux.HandleFunc("PATCH /__providers/{id}", s.handleUpdateProvider)
 	mux.HandleFunc("GET /__providers/export", s.handleExportProviders)
@@ -710,6 +717,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /__routes/{id}", s.handleUpdateRoute)
 	mux.HandleFunc("DELETE /__routes/{id}", s.handleDeleteRoute)
 	mux.HandleFunc("POST /__routes/{id}/test", s.handleTestRoute)
+	mux.HandleFunc("POST /__connectors/lab", s.handleConnectorLab)
+	// 自定义协议 Provider：脚本 ABI、生命周期与日志。Provider 本身仍用普通
+	// CRUD；这些接口只管理随 Provider 保存的 providerScript。
+	mux.HandleFunc("GET /__provider-script/abi", s.handleProviderScriptABI)
+	mux.HandleFunc("POST /__provider-script/validate", s.handleProviderScriptValidate)
+	mux.HandleFunc("POST /__providers/{id}/script/start", s.handleProviderScriptStart)
+	mux.HandleFunc("POST /__providers/{id}/script/restart", s.handleProviderScriptRestart)
+	mux.HandleFunc("POST /__providers/{id}/script/stop", s.handleProviderScriptStop)
+	mux.HandleFunc("GET /__providers/{id}/script/status", s.handleProviderScriptStatus)
+	mux.HandleFunc("GET /__providers/{id}/script/logs", s.handleProviderScriptLogs)
+	mux.HandleFunc("POST /__providers/{id}/script/test", s.handleProviderScriptTest)
 	mux.HandleFunc("GET /__apikeys", s.handleListAPIKeys)
 	mux.HandleFunc("POST /__apikeys", s.handleCreateAPIKey)
 	mux.HandleFunc("PATCH /__apikeys/{id}", s.handleUpdateAPIKey)
@@ -762,6 +780,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /__peer-upstreams", s.handleRegisterPeerUpstream)
 	mux.HandleFunc("POST /__peer-upstreams/{id}/refresh", s.handleRefreshPeerUpstream)
 	mux.HandleFunc("POST /__peer-upstreams/{id}/reconnect", s.handleReconnectPeerUpstream)
+	mux.HandleFunc("PATCH /__peer-upstreams/{id}", s.handleRenamePeerUpstream)
 	// 断开一条上游＝删掉它这一组的全部成员行（见 handleDisconnectPeerUpstream）。
 	mux.HandleFunc("DELETE /__peer-upstreams/{id}", s.handleDisconnectPeerUpstream)
 	// RBAC: roles, the permission catalog, resource grant targets, and the
@@ -884,6 +903,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		state.APIKeys[index].ServingProviderIDs = s.servingProvidersFor(state.APIKeys[index])
 	}
 	state.Providers = redactProvidersForClient(state.Providers)
+	state.CustomProviders = decorateCustomProvidersForClient(state.CustomProviders)
 	for index := range state.Providers {
 		enrichProviderAdapterCurl(&state.Providers[index])
 		s.applyProviderAvailability(&state.Providers[index])
@@ -1076,6 +1096,14 @@ func redactProviderForClient(provider domain.Provider) domain.Provider {
 			Connected:    strings.TrimSpace(original.AccessToken) != "" && !original.Disconnected,
 			Disconnected: original.Disconnected,
 		}
+	}
+	if provider.CustomProviderID != "" && provider.ProviderScript != nil {
+		// 自定义类型实例只需要客户端拿到上游 URL 等运行参数；脚本正文属于类型
+		// 模板，不在每个实例的响应里重复下发，也避免误以为实例可单独改脚本。
+		script := *provider.ProviderScript
+		script.Source = ""
+		script.Requirements = ""
+		provider.ProviderScript = &script
 	}
 	// Regenerate curl against the real BaseURL for UI display.
 	enrichProviderAdapterCurl(&provider)
@@ -1850,7 +1878,7 @@ func (s *Server) recordRequestLogEx(r *http.Request, started time.Time, matchedK
 		scheduleTraceOf(r.Context()).applyTo(&entry.Analysis)
 		// 父子透传的位置标记：纯本地请求是零值，applyPeerTrace 直接返回，
 		// 所以这一段不会改变既有日志的任何一个字段。
-		applyPeerTrace(&entry, peerTraceFor(r, timing))
+		applyPeerTrace(&entry, peerTraceFor(r, timing, providerID))
 	}
 	if gatewayKeyMatched {
 		entry.APIKeyID = matchedKey.ID
@@ -2446,7 +2474,10 @@ func (s *Server) ensureSplitCustomDomains(ctx context.Context) domain.PublicAcce
 	if !setup.IsAuthorized() {
 		return settings
 	}
-	provisioned, err := setup.Provision(ctx, apiDomain, uiDomain, settings.TunnelName, s.localGatewayPort())
+	// A legacy install may still store the old shared default in SQLite. The
+	// tunnel package migrates that sentinel to this machine's derived name; the
+	// persisted copy is updated below through ProvisionResult.
+	provisioned, err := setup.Provision(ctx, apiDomain, uiDomain, settings.TunnelName, s.GatewayID(), s.localGatewayPort())
 	if err != nil {
 		s.logs.AddApp("warn", "custom-domain reprovision skipped", err.Error())
 		return settings
@@ -2701,7 +2732,7 @@ func (s *Server) handleCloudflareBind(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "cloudflare is not authorized yet; complete browser login first")
 		return
 	}
-	provisioned, err := setup.Provision(r.Context(), customDomain, uiDomain, strings.TrimSpace(payload.TunnelName), s.localGatewayPort())
+	provisioned, err := setup.Provision(r.Context(), customDomain, uiDomain, strings.TrimSpace(payload.TunnelName), s.GatewayID(), s.localGatewayPort())
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, err.Error())
 		return
@@ -2799,6 +2830,20 @@ func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "authType=peer 不能手工创建：请在「网关互联」页注册到上游网关，网关会自动生成这条记录")
 		return
 	}
+	// 自定义 Provider 实例只提交模板 ID、上游 URL 和 Key；协议、鉴权头与脚本
+	// 全部从管理员定义的模板解析，实例永远不需要重复携带脚本正文。
+	if customID := strings.TrimSpace(provider.CustomProviderID); customID != "" {
+		template, err := s.router.CustomProviderByID(customID)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		provider, err = s.hydrateProviderFromCustomProvider(provider, template, provider.BaseURL)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 	if p := s.requestPrincipal(r); p.scopeOf() != domain.ScopeAll {
 		// Restricted users own the providers they create (including clones),
 		// while every other account's provider is labelled with its own
@@ -2826,6 +2871,13 @@ func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if provider.ProviderScript != nil {
+		v := validateProviderScript(*provider.ProviderScript, provider.Protocol)
+		if !v.Valid {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid providerScript: "+strings.Join(v.Errors, "; "))
+			return
+		}
+	}
 	if provider.RTKCompress {
 		if available, _ := s.rtk.status(); !available {
 			writeOpenAIError(w, http.StatusConflict, "rtk CLI not found on the gateway host; install rtk or set GATEWAY_RTK_PATH, then retry")
@@ -2841,9 +2893,25 @@ func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
 		return
 	}
+	if created.ProviderScript != nil {
+		// 创建脚本 Provider 时先落盘脚本并启动；启动失败不回滚 Provider，
+		// 用户可以在编辑弹窗看到日志并修正脚本。
+		refreshed, discovery, startErr := s.startAndDiscoverProviderScript(r.Context(), created, false)
+		if startErr != nil {
+			s.logs.AddApp("warn", "provider script created but not started", fmt.Sprintf("provider=%s: %v", created.ID, startErr))
+		} else {
+			created = refreshed
+			s.logs.AddApp("info", "provider script started", fmt.Sprintf("provider=%s models=%d defaultModel=%s", created.ID, len(discovery.Models), created.DefaultModel))
+		}
+	}
 	s.logs.AddApp("info", "provider created", created.ID)
 	// 新建之后立刻在后台探一遍它支持哪些协议。人不用点按钮——建完就有了结论，
 	// 控制台上直接看到"这台上游支持 Claude / OpenAI 两套"。
+	// 模型发现可能已经改了内存里的 DefaultModel/Models，返回前重新取一份，
+	// 让创建响应直接带上脚本实际发现的模型。
+	if refreshed, err := s.router.ProviderByID(created.ID); err == nil {
+		created = refreshed
+	}
 	s.autoDetectProviderProtocols(created)
 	writeJSON(w, http.StatusCreated, redactProviderForClient(created))
 }
@@ -2893,6 +2961,13 @@ func (s *Server) handleImportProviders(w http.ResponseWriter, r *http.Request) {
 		if !s.providerGroupExists(bundle.Providers[index].GroupID) {
 			bundle.Providers[index].GroupID = ""
 		}
+		// 导入到没有同名自定义类型的网关时，保留脚本快照仍可运行，但不能留下
+		// 一个指向不存在类型的编辑入口；清空引用后退化成普通脚本 Provider。
+		if customID := strings.TrimSpace(bundle.Providers[index].CustomProviderID); customID != "" {
+			if _, err := s.router.CustomProviderByID(customID); err != nil {
+				bundle.Providers[index].CustomProviderID = ""
+			}
+		}
 	}
 	result := s.router.ImportProviders(bundle)
 	if len(result.Created) == 0 && len(result.Updated) == 0 && len(result.Errors) > 0 {
@@ -2903,6 +2978,19 @@ func (s *Server) handleImportProviders(w http.ResponseWriter, r *http.Request) {
 		if err := s.saveState(); err != nil {
 			writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
 			return
+		}
+	}
+	// 导入的脚本 Provider 与新建一样，需要立刻启动并发现模型。失败不回滚导入，
+	// 用户仍能在卡片上查看日志并修复脚本。
+	for _, ids := range [][]string{result.Created, result.Updated} {
+		for _, providerID := range ids {
+			provider, err := s.router.ProviderByID(providerID)
+			if err != nil || provider.ProviderScript == nil {
+				continue
+			}
+			if _, _, startErr := s.startAndDiscoverProviderScript(r.Context(), provider, true); startErr != nil {
+				s.logs.AddApp("warn", "imported provider script not started", fmt.Sprintf("provider=%s: %v", providerID, startErr))
+			}
 		}
 	}
 	s.logs.AddApp("info", "providers imported", fmt.Sprintf("created=%d updated=%d skipped=%d errors=%d", len(result.Created), len(result.Updated), len(result.Skipped), len(result.Errors)))
@@ -2923,9 +3011,88 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid provider json: "+err.Error())
 		return
 	}
+	existing, err := s.router.ProviderByID(r.PathValue("id"))
+	if err != nil {
+		writeOpenAIError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	providerScriptSet, scriptPatch, err := decodeProviderScriptField(body)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// 自定义 Provider 实例的脚本来自类型模板，PATCH 里即使没有 providerScript
+	// 也必须按模板重新解析；否则修改 URL/Key 后实例仍会运行旧脚本旧鉴权头。
+	customID := strings.TrimSpace(existing.CustomProviderID)
+	if requested := strings.TrimSpace(provider.CustomProviderID); requested != "" {
+		customID = requested
+	}
+	if customID != "" {
+		template, err := s.router.CustomProviderByID(customID)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		upstream := ""
+		if existing.ProviderScript != nil {
+			upstream = existing.ProviderScript.UpstreamBaseURL
+		}
+		// 新界面提交的 baseUrl 是私有上游地址；旧本地脚本地址不能当成上游。
+		requestedBase := strings.TrimSpace(provider.BaseURL)
+		oldScriptBase := providerScriptRuntimes.apiBaseURL(existing)
+		if requestedBase != "" && strings.TrimRight(requestedBase, "/") != strings.TrimRight(oldScriptBase, "/") {
+			upstream = requestedBase
+		}
+		hydrated, err := s.hydrateProviderFromCustomProvider(existing, template, upstream)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		provider.CustomProviderID = hydrated.CustomProviderID
+		provider.Protocol = hydrated.Protocol
+		provider.AuthType = hydrated.AuthType
+		provider.AuthHeader = hydrated.AuthHeader
+		provider.ProviderScript = hydrated.ProviderScript
+		providerScriptSet = true
+		scriptPatch = hydrated.ProviderScript
+	}
+	targetScript := existing.ProviderScript
+	if providerScriptSet {
+		targetScript = scriptPatch
+	}
+	targetProtocol := provider.Protocol
+	if strings.TrimSpace(string(targetProtocol)) == "" {
+		targetProtocol = existing.Protocol
+	}
 	// GroupID 用指针单独解一次：字段缺省表示“这次不改分组”，空字符串才是
 	// “移到未分组”。直接看 domain.Provider.GroupID 会把老客户端没传的字段
 	// 当成清空操作。
+	if targetScript != nil {
+		v := validateProviderScript(*targetScript, targetProtocol)
+		if !v.Valid {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid providerScript: "+strings.Join(v.Errors, "; "))
+			return
+		}
+	}
+	if providerScriptSet {
+		if scriptPatch == nil {
+			// 清空脚本后 Provider 必须重新指向真正的上游，不能继续保留
+			// 127.0.0.1 的脚本地址，否则路由看起来正常、请求必然连不上。
+			oldScriptBase := providerScriptRuntimes.apiBaseURL(existing)
+			base := strings.TrimSpace(provider.BaseURL)
+			if base == "" || strings.TrimRight(base, "/") == strings.TrimRight(oldScriptBase, "/") {
+				writeOpenAIError(w, http.StatusBadRequest, "清空 providerScript 时必须同时提交普通上游 baseUrl")
+				return
+			}
+			provider.ProviderScript = nil
+		} else {
+			provider.ProviderScript = scriptPatch
+			candidate := existing
+			candidate.Protocol = targetProtocol
+			candidate.ProviderScript = scriptPatch
+			provider.BaseURL = providerScriptRuntimes.apiBaseURL(candidate)
+		}
+	}
 	var groupPatch struct {
 		GroupID *string `json:"groupId"`
 	}
@@ -2938,8 +3105,7 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 	// 所以这里不能一刀切拒绝；真正要拦的是「把一条普通 provider 改成 peer」，
 	// 那会得到一条手工伪造的对端门，凭据与地址都对不上。
 	if provider.AuthType == domain.AuthTypePeer {
-		existing, err := s.router.ProviderByID(r.PathValue("id"))
-		if err != nil || existing.AuthType != domain.AuthTypePeer {
+		if existing.AuthType != domain.AuthTypePeer {
 			writeOpenAIError(w, http.StatusBadRequest, "只有「网关互联」注册生成的对端记录才能是 authType=peer；请到该页面重新注册，不要手改连接方式")
 			return
 		}
@@ -2955,7 +3121,7 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	updated, err := s.router.UpdateProvider(r.PathValue("id"), provider)
+	updated, err := s.router.updateProviderWithScript(r.PathValue("id"), provider, providerScriptSet)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error())
 		return
@@ -2971,9 +3137,27 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
 		return
 	}
+	// 脚本正文、上游地址、Key 或协议变化后，旧进程里的环境变量已经过期，
+	// 必须替换进程；只改名称/分组则不打断正在飞行的请求。
+	if providerScriptRuntimeConfigChanged(existing, updated) {
+		if updated.ProviderScript == nil {
+			providerScriptRuntimes.stop(updated.ID)
+		} else {
+			providerScriptRuntimes.stop(updated.ID)
+			refreshed, discovery, startErr := s.startAndDiscoverProviderScript(r.Context(), updated, false)
+			if startErr != nil {
+				s.logs.AddApp("warn", "provider script updated but not restarted", fmt.Sprintf("provider=%s: %v", updated.ID, startErr))
+			} else {
+				updated = refreshed
+				s.logs.AddApp("info", "provider script restarted after update", fmt.Sprintf("provider=%s models=%d", updated.ID, len(discovery.Models)))
+			}
+		}
+	}
 	s.logs.AddApp("info", "provider updated", updated.ID)
 	// baseUrl 或协议变了，之前那份探测结论就不再成立：后台重探一遍。
-	s.autoDetectProviderProtocols(updated)
+	if updated.ProviderScript == nil || providerScriptRuntimes.status(updated.ID)["running"] == true {
+		s.autoDetectProviderProtocols(updated)
+	}
 	writeJSON(w, http.StatusOK, redactProviderForClient(updated))
 }
 
@@ -3002,10 +3186,21 @@ func (s *Server) handleSetProviderEnabled(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if *payload.Enabled {
+		if updated.ProviderScript != nil {
+			refreshed, _, startErr := s.startAndDiscoverProviderScript(r.Context(), updated, false)
+			if startErr != nil {
+				s.logs.AddApp("warn", "provider enabled but script not started", fmt.Sprintf("provider=%s: %v", updated.ID, startErr))
+			} else {
+				updated = refreshed
+			}
+		}
 		s.logs.AddApp("info", "provider enabled", updated.ID)
 	} else {
 		// 禁用即停止可用性重探：清掉内存里的 unavailable 标记，避免后台继续打 /models。
 		s.markProviderAvailable(updated.ID)
+		if updated.ProviderScript != nil {
+			providerScriptRuntimes.stop(updated.ID)
+		}
 		s.logs.AddApp("info", "provider disabled", updated.ID)
 	}
 	writeJSON(w, http.StatusOK, redactProviderForClient(updated))
@@ -4239,6 +4434,7 @@ func (s *Server) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusConflict, err.Error())
 		return
 	}
+	providerScriptRuntimes.stop(providerID)
 	if err := s.saveState(); err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
 		return
@@ -4272,6 +4468,15 @@ func (s *Server) handleRestoreProvider(w http.ResponseWriter, r *http.Request) {
 	if err := s.saveState(); err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
 		return
+	}
+	if updated.ProviderScript != nil {
+		refreshed, _, startErr := s.startAndDiscoverProviderScript(r.Context(), updated, false)
+		if startErr != nil {
+			s.logs.AddApp("warn", "provider script restored but not started", fmt.Sprintf("provider=%s: %v", updated.ID, startErr))
+		} else {
+			updated = refreshed
+			s.autoDetectProviderProtocols(updated)
+		}
 	}
 	s.logs.AddApp("info", "provider restored", providerID)
 	writeJSON(w, http.StatusOK, redactProviderForClient(updated))
@@ -5773,11 +5978,10 @@ func (s *Server) fetchProviderModels(r *http.Request, provider domain.Provider, 
 		// 正常的 provider 标成"异常"、清空它可用的模型清单。
 		return s.fetchPeerUpstreamModels(r, provider, started)
 	}
-	// {model} 模板（Azure OpenAI deployment 最典型）不是可枚举的模型目录：
-	// deployment 已经写在路径里，请求 /models 要么 400，要么返回的不是这个
-	// deployment。此时“获取模型”应沿用 Provider 上已经配置的模型目录，不能把
-	// 一个对话完全正常的 Provider 标成 degraded。
-	if provider.AuthType == domain.AuthTypeAPIKey && strings.Contains(provider.BaseURL, "{model}") {
+	// Azure deployment 模板本身不能枚举模型；Ocean Dev 这类中转另有统一的
+	// /openai/v1/models 目录。只有确认是 Ocean Dev 时才探测这些候选地址，
+	// 其他 deployment 上游继续沿用已配置模型，避免改变通用行为。
+	if provider.AuthType == domain.AuthTypeAPIKey && strings.Contains(provider.BaseURL, "{model}") && !isOceanDevProvider(provider) {
 		if models := declaredProviderModels(provider); len(models) > 0 {
 			return providerTestResult{
 				Success:   true,
@@ -5788,6 +5992,39 @@ func (s *Server) fetchProviderModels(r *http.Request, provider domain.Provider, 
 				Models:    models,
 				Preview:   "Base URL 使用 {model} 模板，沿用已配置的模型目录",
 			}
+		}
+	}
+	if isOceanDevProvider(provider) && provider.AuthType == domain.AuthTypeAPIKey && strings.Contains(provider.BaseURL, "{model}") {
+		var lastFailure providerTestResult
+		for _, baseURL := range templateModelBaseCandidates(provider.BaseURL) {
+			candidate := provider
+			candidate.BaseURL = baseURL
+			result := s.fetchProviderModels(r, candidate, started)
+			result.Provider = provider.ID
+			if result.Success && len(result.Models) > 0 {
+				return result
+			}
+			if !result.Success {
+				lastFailure = result
+			}
+		}
+		if models := declaredProviderModels(provider); len(models) > 0 {
+			preview := "Base URL 使用 {model} 模板，候选模型目录不可用，沿用已配置的模型目录"
+			if lastFailure.Error != "" {
+				preview += "；" + lastFailure.Error
+			}
+			return providerTestResult{
+				Success:   true,
+				Provider:  provider.ID,
+				ModelsURL: provider.BaseURL,
+				Status:    http.StatusOK,
+				LatencyMs: time.Since(started).Milliseconds(),
+				Models:    models,
+				Preview:   preview,
+			}
+		}
+		if lastFailure.Error != "" {
+			return lastFailure
 		}
 	}
 	if provider.AuthType == domain.AuthTypeCursorOAuth {
@@ -6038,6 +6275,38 @@ func declaredProviderModels(provider domain.Provider) []domain.Model {
 		}}
 	}
 	return nil
+}
+
+// templateModelBaseCandidates 给带 {model} 的 deployment URL 推导可枚举模型的
+// 基础地址。按从现代 OpenAI 兼容代理到旧路径的顺序尝试；调用方仍可回退到
+// Provider 已声明的模型，因此探测失败不会影响正常转发。
+func templateModelBaseCandidates(baseURL string) []string {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return nil
+	}
+	path := parsed.Path
+	deploymentIndex := strings.Index(strings.ToLower(path), "/deployments/")
+	if deploymentIndex < 0 {
+		return nil
+	}
+	prefix := strings.TrimRight(path[:deploymentIndex], "/")
+	origin := parsed.Scheme + "://" + parsed.Host
+	candidates := []string{origin + prefix + "/v1"}
+	if prefix != "" {
+		candidates = append(candidates, origin+prefix)
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		candidate = strings.TrimRight(candidate, "/")
+		if candidate == "" || seen[candidate] {
+			continue
+		}
+		seen[candidate] = true
+		out = append(out, candidate)
+	}
+	return out
 }
 
 func deriveModelsURL(provider domain.Provider) (string, error) {
@@ -6444,12 +6713,14 @@ func (s *Server) proxyOpenAIToClaudeMessages(w http.ResponseWriter, r *http.Requ
 	if forcedStream {
 		openAIReq["stream"] = true
 	}
+	model = applyProviderModelMapping(provider, model)
+	if isOceanDevProvider(provider) {
+		applyOceanDevChatCompat(openAIReq, model)
+	}
 	upstreamBody, err := json.Marshal(openAIReq)
 	if err != nil {
 		return 0, TokenUsage{}, nil, err
 	}
-
-	model = applyProviderModelMapping(provider, model)
 	upstreamBody, bodyErr := applyRequestAdapterBody(provider, model, upstreamBody)
 	if bodyErr != nil {
 		return 0, TokenUsage{}, nil, bodyErr

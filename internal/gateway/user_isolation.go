@@ -576,6 +576,16 @@ func (s *Server) stateForUser(identity sessionIdentity, state domain.GatewayStat
 	state.Routes = routes
 	state.Models = models
 	state.APIKeys = keysVisibleTo(p, state.APIKeys)
+	customProviders := append([]domain.CustomProvider(nil), state.CustomProviders...)
+	state.CustomProviders = customProviders
+	if !identity.isAdmin() {
+		// 普通用户只需要在目录里看到自定义类型并实例化；脚本正文和依赖属于
+		// 管理员维护的模板，不下发给普通账号。
+		for index := range state.CustomProviders {
+			state.CustomProviders[index].Script.Source = ""
+			state.CustomProviders[index].Script.Requirements = ""
+		}
+	}
 	// Provider 分组只服务于管理员侧归类，普通用户不应感知。
 	stripProviderGroupsForUser(&state)
 	// 普通用户看不到未授权的 Provider：把「在服务」里指向它们的那一项按未设置处理，

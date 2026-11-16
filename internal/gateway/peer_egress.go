@@ -36,9 +36,9 @@ func (s *Server) sendPeerDoor(ctx context.Context, r *http.Request, provider dom
 	// arrives. It is overwritten by the response header below when that arrives;
 	// this is only a fallback for interrupted requests, never a substitute for
 	// verifying the live peer.
-	notePeerEgressAttempt(ctx)
+	notePeerEgressAttempt(ctx, provider.ID)
 	if grants := provider.PeerGrants; grants != nil && strings.TrimSpace(grants.ParentGatewayID) != "" {
-		notePeerEgressFallback(ctx, grants.ParentGatewayID)
+		notePeerEgressFallback(ctx, provider.ID, grants.ParentGatewayID)
 	}
 	wrapped, err := buildPeerForwardBody(peerGrantedProviderID(provider), provider.Protocol, body)
 	if err != nil {
@@ -93,7 +93,7 @@ func (s *Server) sendPeerDoor(ctx context.Context, r *http.Request, provider dom
 	// 读完就摘掉：这个头是给网关看的，不该沿着响应继续传给最终客户端——那等于
 	// 把父网关的身份公开给每一个用这个下游的人。
 	if gatewayID := strings.TrimSpace(response.Header.Get(peerIdentityHeader)); gatewayID != "" {
-		notePeerEgress(ctx, gatewayID)
+		notePeerEgress(ctx, provider.ID, gatewayID)
 		response.Header.Del(peerIdentityHeader)
 	}
 	return response, err
@@ -105,26 +105,27 @@ func (s *Server) sendPeerDoor(ctx context.Context, r *http.Request, provider dom
 // 的地方（每个协议各有一个 send 闭包），而写日志用的是最外层那个 r，换出去的
 // 请求传不回来。requestTiming 在 handler 入口就挂好、写日志时再读一次，正是
 // 这种「路上才知道、最后才用」的值该待的地方（schedule trace 同理）。
-func notePeerEgress(ctx context.Context, gatewayID string) {
+func notePeerEgress(ctx context.Context, providerID, gatewayID string) {
 	if t := requestTimingFrom(ctx); t != nil {
-		t.notePeerEgress(gatewayID)
+		t.notePeerEgress(providerID, gatewayID)
 	}
 }
 
-// notePeerEgressAttempt 标记这次请求正在走对端网关，但还不能确定对方身份。
+// notePeerEgressAttempt 标记这个具体 Provider 正在走对端网关，但还不能确定
+// 对方身份。providerID 用来确保最终日志只接受“最终服务 Provider”的 egress。
 // 取消/超时会让 sendPeerDoor 在响应头到达前返回；若没有这个标记，日志会把
 // 一次真实的 egress 误写成“直连”。
-func notePeerEgressAttempt(ctx context.Context) {
+func notePeerEgressAttempt(ctx context.Context, providerID string) {
 	if t := requestTimingFrom(ctx); t != nil {
-		t.notePeerEgressAttempt()
+		t.beginPeerEgressAttempt(providerID)
 	}
 }
 
 // notePeerEgressFallback records the registered parent identity as a fallback
 // for interrupted egress attempts. It is separate from notePeerEgress so the
 // live X-Gateway-Id header always wins when it arrives.
-func notePeerEgressFallback(ctx context.Context, gatewayID string) {
+func notePeerEgressFallback(ctx context.Context, providerID, gatewayID string) {
 	if t := requestTimingFrom(ctx); t != nil {
-		t.notePeerEgressFallback(gatewayID)
+		t.notePeerEgressFallback(providerID, gatewayID)
 	}
 }

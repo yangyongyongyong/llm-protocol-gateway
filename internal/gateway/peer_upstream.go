@@ -102,6 +102,9 @@ func peerProtocolChoices() []domain.Protocol {
 // 空值取 OpenAI Chat：它是绝大多数上游和客户端说的那种，作为默认不会让人
 // 一上手就撞到一个不匹配的协议。
 func normalizePeerProtocol(raw string) (domain.Protocol, error) {
+	// Registration no longer asks for a protocol. The protocol comes from the
+	// parent's granted providers; this empty default only keeps legacy callers
+	// and the placeholder row for an empty grant list working.
 	value := strings.ToLower(strings.TrimSpace(raw))
 	if value == "" {
 		return domain.ProtocolOpenAIChat, nil
@@ -370,8 +373,14 @@ func (s *Server) registerWithParent(r *http.Request, parentURL, name, username, 
 	if err != nil {
 		return peerRegistration{}, nil, err
 	}
+	// The local gateway name is the identity shown on the parent's downstream
+	// row and is remembered independently of the per-upstream provider label.
+	registeredName := strings.TrimSpace(s.GatewayName())
+	if registeredName == "" {
+		registeredName = name
+	}
 	client := newPeerClient()
-	registration, err := client.register(r.Context(), root, s.GatewayID(), name, username, password, requested)
+	registration, err := client.register(r.Context(), root, s.GatewayID(), registeredName, username, password, requested)
 	if err != nil {
 		return peerRegistration{}, nil, err
 	}
@@ -1372,4 +1381,85 @@ func (s *Server) peerUpstreamByID(w http.ResponseWriter, r *http.Request) (domai
 		return domain.Provider{}, false
 	}
 	return provider, true
+}
+
+// peerUpstreamRenameRequest changes only the local display label of an existing
+// upstream group. Credentials, provider authorization and the parent's records
+// stay untouched.
+type peerUpstreamRenameRequest struct {
+	Name string `json:"name"`
+}
+
+func (s *Server) handleRenamePeerUpstream(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePermission(w, r, domain.PermPeersManage) {
+		return
+	}
+	provider, ok := s.peerUpstreamByID(w, r)
+	if !ok {
+		return
+	}
+	var payload peerUpstreamRenameRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&payload); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	name := strings.TrimSpace(payload.Name)
+	if name == "" {
+		writeOpenAIError(w, http.StatusBadRequest, "上游名称不能为空")
+		return
+	}
+	if len([]rune(name)) > 80 {
+		writeOpenAIError(w, http.StatusBadRequest, "上游名称不能超过 80 个字符")
+		return
+	}
+	upstreamKey := peerGroupKeyForProvider(provider)
+	oldName := strings.TrimSpace(provider.Name)
+	if provider.PeerGrants != nil && strings.TrimSpace(provider.PeerGrants.UpstreamName) != "" {
+		oldName = strings.TrimSpace(provider.PeerGrants.UpstreamName)
+	}
+	members := s.peerUpstreamMembers(upstreamKey)
+	if len(members) == 0 {
+		members = []domain.Provider{provider}
+	}
+	for _, member := range members {
+		memberName := renamePeerMemberLabel(member.Name, oldName, name)
+		// Router.UpdateProvider writes APIKeySource verbatim even when the patch
+		// omits it. Rename through the narrow setter so the peer credential is
+		// never blanked by a label-only operation.
+		if _, err := s.router.RenameProvider(member.ID, memberName); err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if member.PeerGrants == nil {
+			continue
+		}
+		snapshot := member.PeerGrants.Clone()
+		snapshot.UpstreamName = name
+		if _, err := s.router.SetPeerGrants(member.ID, snapshot); err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	if err := s.saveState(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+		return
+	}
+	s.logs.AddApp("info", "peer upstream renamed", fmt.Sprintf("upstream=%s old=%q new=%q members=%d", upstreamKey, oldName, name, len(members)))
+	writeJSON(w, http.StatusOK, map[string]any{"upstream": s.peerUpstreamSummaryOf(provider.ID)})
+}
+
+// renamePeerMemberLabel preserves the upstream-provider suffix while replacing
+// the group label: "vps1 · GPT-4o" -> "vps2 · GPT-4o". A member that is exactly
+// the old group label (placeholder/legacy row) becomes the new label.
+func renamePeerMemberLabel(current, oldName, newName string) string {
+	current = strings.TrimSpace(current)
+	oldName = strings.TrimSpace(oldName)
+	newName = strings.TrimSpace(newName)
+	if current == "" || current == oldName {
+		return newName
+	}
+	if oldName != "" && strings.HasPrefix(current, oldName+" · ") {
+		return newName + strings.TrimPrefix(current, oldName)
+	}
+	return current
 }

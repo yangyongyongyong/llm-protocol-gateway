@@ -262,6 +262,14 @@ func routePermission(method, path string) *domain.Permission {
 		return perm(domain.PermProvidersCreate)
 	case "/__routes":
 		return perm(domain.PermRoutesWrite)
+	case "/__connectors/lab":
+		// Lab 会临时创建 Provider/Route/Key 并真实打上游，天然属于测试动作。
+		return perm(domain.PermProvidersTest)
+	case "/__provider-script/abi":
+		// 脚本 ABI 是公开给有建 Provider 权限的用户的说明文本。
+		return perm(domain.PermProvidersCreate)
+	case "/__provider-script/validate":
+		return perm(domain.PermProvidersCreate)
 	case "/__quota-tasks":
 		// Reading the list is the page itself; creating needs manage. Before
 		// this split a read-only role could not even open 额度保活.
@@ -360,6 +368,12 @@ func providerRoutePermission(method, path string) *domain.Permission {
 		{"/purge", domain.PermProvidersDelete},
 		{"/auth-preview", domain.PermProvidersSecret},
 		{"/chat-test", domain.PermProvidersTest},
+		{"/script/start", domain.PermProvidersTest},
+		{"/script/restart", domain.PermProvidersTest},
+		{"/script/stop", domain.PermProvidersTest},
+		{"/script/status", domain.PermProvidersTest},
+		{"/script/logs", domain.PermProvidersTest},
+		{"/script/test", domain.PermProvidersTest},
 		{"/detect-protocols", domain.PermProvidersTest},
 		{"/cache-test", domain.PermProvidersTest},
 		{"/thinking-test", domain.PermProvidersTest},

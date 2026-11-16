@@ -620,6 +620,14 @@ func providerConcurrencyConfig(provider domain.Provider) (max int, wait time.Dur
 // providerConcurrentCap is the concurrency knob alone, guards applied.
 func providerConcurrentCap(provider domain.Provider) int {
 	max := provider.MaxConcurrentRequests
+	// 自定义脚本自己也声明了并发上限时，Provider 调度层取两者较小值：脚本
+	// 进程无法凭空扩容，网关先挡住超额请求，才能让脚本里的信号量和队列生效。
+	if provider.ProviderScript != nil {
+		scriptMax := provider.ProviderScript.MaxConcurrentRequests
+		if scriptMax > 0 && (max <= 0 || scriptMax < max) {
+			max = scriptMax
+		}
+	}
 	if max < 0 {
 		return 0
 	}

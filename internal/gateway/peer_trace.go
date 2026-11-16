@@ -104,7 +104,7 @@ func withIngressPeer(r *http.Request, peerGatewayID string) *http.Request {
 	return r.WithContext(withPeerTrace(r.Context(), trace))
 }
 
-// peerTraceFor 汇总一条请求的全部链路标记。
+// peerTraceFor 汇总一条请求最终实际使用的链路标记。
 //
 // Ingress 来自请求本身（校验过的对端凭据，见 withIngressPeer）；Egress 来自
 // requestTiming，因为它是「路上才知道」的：父网关的身份要到它的响应头回来时
@@ -112,24 +112,28 @@ func withIngressPeer(r *http.Request, peerGatewayID string) *http.Request {
 // 的 *http.Request 传不回最外层的写日志处。requestTiming 在 handler 入口挂好、
 // 写日志时再读，正是这种值该待的地方。两个来源都空就是纯本地请求。
 //
+// providerID 是最终落库的 Provider。故障转移里可能先试上游客服网关、失败后
+// 落到本地 Provider；此时定时器上仍留着前一个候选的 egress 尝试，但最终链路
+// 必须跟随最终服务方，不能把失败候选写成出口。候选过程保留在 analysis.attempts。
+//
 // Path 直接从请求头解析而不是走 context：链路头随请求到达，写日志时 r 还在
 // 手边，没必要再多一层传递。但它只在确认是透传流量（有校验过的 ingress 或
 // egress）时才记——链路头是外部可写的，本地请求随手带一个同名头（浏览器插件
 // 就干得出来）不能凭空造出一条链路日志。两级链路里 Ingress/Origin 已经足够，
 // Path 是给三级及以上的排障看的。
-func peerTraceFor(r *http.Request, timing *requestTiming) peerTrace {
+func peerTraceFor(r *http.Request, timing *requestTiming, providerID string) peerTrace {
 	var trace peerTrace
 	if r != nil {
 		trace = peerTraceFrom(r.Context())
 	}
-	if id := timing.peerEgressFrom(); id != "" {
+	if id, attempted := timing.peerEgressSnapshotForProvider(providerID); attempted {
+		trace.EgressAttempted = true
 		trace.Egress = id
+	}
+	if id := strings.TrimSpace(trace.Egress); id != "" {
 		if trace.Origin == "" && r != nil {
 			trace.Origin = strings.TrimSpace(r.Header.Get(headerGatewayOrigin))
 		}
-	}
-	if timing.peerEgressAttempted() {
-		trace.EgressAttempted = true
 	}
 	if r != nil && (trace.Ingress != "" || trace.Egress != "" || trace.EgressAttempted) && len(trace.Path) == 0 {
 		trace.Path = parseGatewayHop(r).Path

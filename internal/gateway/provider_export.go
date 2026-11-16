@@ -143,7 +143,14 @@ func prepareProviderForImport(provider domain.Provider) (domain.Provider, error)
 			return domain.Provider{}, fmt.Errorf("unsupported protocol %q", provider.Protocol)
 		}
 	}
+	if provider.ProviderScript != nil {
+		valid := validateProviderScript(*provider.ProviderScript, provider.Protocol)
+		if !valid.Valid {
+			return domain.Provider{}, fmt.Errorf("invalid providerScript: %s", strings.Join(valid.Errors, "; "))
+		}
+	}
 	if provider.BaseURL == "" &&
+		provider.ProviderScript == nil &&
 		provider.AuthType != domain.AuthTypeClaudeOAuth &&
 		provider.AuthType != domain.AuthTypeCursorOAuth &&
 		provider.AuthType != domain.AuthTypeChatGPTOAuth &&
@@ -345,6 +352,11 @@ func (r *Router) upsertProviderImport(incoming domain.Provider) (action string, 
 	if targetIndex >= 0 {
 		updated := mergeProviderImport(r.state.Providers[targetIndex], incoming)
 		normalizeProvider(&updated)
+		if updated.ProviderScript != nil {
+			// 导出包里的 baseUrl 是本机旧端口；导入到另一台机器后必须按新
+			// Provider ID 重新派生脚本端口，否则会指向别人的配置或空端口。
+			updated.BaseURL = providerScriptRuntimes.apiBaseURL(updated)
+		}
 		r.state.Providers[targetIndex] = updated
 		r.rebuildModelsLocked()
 		return "updated", updated.ID, nil
@@ -368,6 +380,9 @@ func (r *Router) upsertProviderImport(incoming domain.Provider) (action string, 
 		}
 	}
 	normalizeProvider(&created)
+	if created.ProviderScript != nil {
+		created.BaseURL = providerScriptRuntimes.apiBaseURL(created)
+	}
 	r.state.Providers = append(r.state.Providers, created)
 	r.rebuildModelsLocked()
 	return "created", created.ID, nil
@@ -399,12 +414,24 @@ func mergeProviderImport(existing, incoming domain.Provider) domain.Provider {
 		updated.Models = carryModelContextOverrides(cloneModels(incoming.Models), existing.Models)
 	}
 	updated.RequestAdapter = cloneRequestAdapter(incoming.RequestAdapter)
+	updated.ProviderScript = cloneProviderScript(incoming.ProviderScript)
+	updated.CustomProviderID = incoming.CustomProviderID
 	updated.ClaudeOAuth = mergeClaudeOAuthImport(existing.ClaudeOAuth, incoming.ClaudeOAuth)
 	updated.CursorOAuth = mergeCursorOAuthImport(existing.CursorOAuth, incoming.CursorOAuth)
 	updated.ChatGPTOAuth = mergeChatGPTOAuthImport(existing.ChatGPTOAuth, incoming.ChatGPTOAuth)
 	updated.QoderPAT = mergeQoderPATImport(existing.QoderPAT, incoming.QoderPAT)
 	updated.WorkBuddy = mergeWorkBuddyImport(existing.WorkBuddy, incoming.WorkBuddy)
 	return updated
+}
+
+// cloneProviderScript 复制脚本配置，避免应用导入包里的指针后被后续修改
+// 反向污染调用方持有的对象。脚本正文和依赖都按值保存。
+func cloneProviderScript(script *domain.ProviderScript) *domain.ProviderScript {
+	if script == nil {
+		return nil
+	}
+	copy := *script
+	return &copy
 }
 
 func mergeWorkBuddyImport(existing, incoming *domain.WorkBuddyCredential) *domain.WorkBuddyCredential {
@@ -542,6 +569,10 @@ func cloneProviderForExport(provider domain.Provider) domain.Provider {
 	cloned := provider
 	cloned.Models = cloneModels(provider.Models)
 	cloned.RequestAdapter = cloneRequestAdapter(provider.RequestAdapter)
+	if provider.ProviderScript != nil {
+		copy := *provider.ProviderScript
+		cloned.ProviderScript = &copy
+	}
 	cloned.ClaudeOAuth = cloneClaudeOAuth(provider.ClaudeOAuth)
 	cloned.CursorOAuth = cloneCursorOAuth(provider.CursorOAuth)
 	cloned.QoderPAT = cloneQoderPAT(provider.QoderPAT)

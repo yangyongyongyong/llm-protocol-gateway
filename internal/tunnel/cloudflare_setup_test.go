@@ -50,39 +50,25 @@ func TestFindTunnelByNameFromList(t *testing.T) {
 	}
 }
 
-func TestEnsureTunnelRecreatesWhenCredentialsMissing(t *testing.T) {
+func TestEnsureTunnelRejectsTunnelOwnedByAnotherMachine(t *testing.T) {
 	tmp := t.TempDir()
-	newCred := filepath.Join(tmp, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.json")
 	var calls []string
 	setup := NewCloudflareSetup()
 	setup.homeDir = func() (string, error) { return tmp, nil }
 	setup.run = func(ctx context.Context, args ...string) (string, error) {
 		joined := strings.Join(args, " ")
 		calls = append(calls, joined)
-		switch {
-		case joined == "tunnel list":
+		if joined == "tunnel list" {
 			return "ID                                   NAME                 CREATED\n" +
 				"ff2f197e-d383-40f7-9fc8-50772d7e9c26 llm-protocol-gateway 2026-07-08T08:55:14Z\n", nil
-		case joined == "tunnel delete -f ff2f197e-d383-40f7-9fc8-50772d7e9c26":
-			return "deleted", nil
-		case joined == "tunnel create llm-protocol-gateway":
-			return "Tunnel credentials written to " + newCred + "\nCreated tunnel llm-protocol-gateway with id aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\n", nil
-		default:
-			return "", fmt.Errorf("unexpected args: %v", args)
 		}
+		return "", fmt.Errorf("unexpected args: %v", args)
 	}
-	id, cred, err := setup.ensureTunnel(ctxBackground(), "llm-protocol-gateway")
-	if err != nil {
-		t.Fatal(err)
+	if _, _, err := setup.ensureTunnel(ctxBackground(), "llm-protocol-gateway"); err == nil || !strings.Contains(err.Error(), "不会自动删除远端隧道") {
+		t.Fatalf("expected an ownership conflict, got %v", err)
 	}
-	if id != "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" {
-		t.Fatalf("id=%q", id)
-	}
-	if cred != newCred {
-		t.Fatalf("cred=%q", cred)
-	}
-	if len(calls) != 3 {
-		t.Fatalf("calls=%v", calls)
+	if len(calls) != 1 || calls[0] != "tunnel list" {
+		t.Fatalf("must not delete/recreate another machine's tunnel, calls=%v", calls)
 	}
 }
 
@@ -161,7 +147,7 @@ func TestDNSRecordConflict(t *testing.T) {
 	}
 }
 
-func TestRouteDNSOverwritesExisting(t *testing.T) {
+func TestRouteDNSRefusesForeignExistingRecord(t *testing.T) {
 	tmp := t.TempDir()
 	cert := []byte(`-----BEGIN ARGO TUNNEL TOKEN-----
 eyJ6b25lSUQiOiJ6b25lLTEiLCJhY2NvdW50SUQiOiJhY2MtMSIsImFwaVRva2Vu
@@ -212,18 +198,18 @@ IjoiY2Z1dF90ZXN0In0=
 			return jsonHTTPResponse(404, map[string]any{"success": false}), nil
 		}
 	}
-	if err := setup.routeDNS(ctxBackground(), "llm-protocol-gateway", wantID, "gateway.lucadesign.uk"); err != nil {
-		t.Fatal(err)
+	if err := setup.routeDNS(ctxBackground(), "llm-protocol-gateway", wantID, "gateway.lucadesign.uk"); err == nil {
+		t.Fatal("expected a foreign DNS target to be refused")
 	}
-	if calls != 2 {
-		t.Fatalf("calls=%d want 2 (create then overwrite)", calls)
+	if calls != 1 {
+		t.Fatalf("calls=%d want 1 (route conflict only; never overwrite another tunnel), got %v", calls, calls)
 	}
-	if putCalls != 1 {
-		t.Fatalf("putCalls=%d want 1", putCalls)
+	if putCalls != 0 {
+		t.Fatalf("must not overwrite another tunnel's DNS, putCalls=%d", putCalls)
 	}
 }
 
-func TestRouteDNSFixesStaleAlreadyConfigured(t *testing.T) {
+func TestRouteDNSRefusesStaleAlreadyConfiguredTarget(t *testing.T) {
 	tmp := t.TempDir()
 	cert := []byte(`-----BEGIN ARGO TUNNEL TOKEN-----
 eyJ6b25lSUQiOiJ6b25lLTEiLCJhY2NvdW50SUQiOiJhY2MtMSIsImFwaVRva2Vu
@@ -272,18 +258,14 @@ IjoiY2Z1dF90ZXN0In0=
 			return jsonHTTPResponse(404, map[string]any{"success": false}), nil
 		}
 	}
-	if err := setup.routeDNS(ctxBackground(), "llm-protocol-gateway", wantID, "gateway.lucadesign.uk"); err != nil {
-		t.Fatal(err)
+	if err := setup.routeDNS(ctxBackground(), "llm-protocol-gateway", wantID, "gateway.lucadesign.uk"); err == nil {
+		t.Fatal("expected stale target to be refused instead of overwritten")
 	}
-	if cliCalls < 2 {
-		t.Fatalf("cliCalls=%d want >=2 (route + overwrite after stale id)", cliCalls)
+	if cliCalls != 1 {
+		t.Fatalf("cliCalls=%d want 1 (route reported foreign target; no overwrite), got %v", cliCalls, cliCalls)
 	}
-	if putCalls != 1 {
-		t.Fatalf("putCalls=%d want 1", putCalls)
-	}
-	id, ok := parseAlreadyRoutedTunnelID("INF gateway.lucadesign.uk is already configured to route to your tunnel tunnelID=" + staleID)
-	if !ok || id != staleID {
-		t.Fatalf("parseAlreadyRoutedTunnelID=%q ok=%v", id, ok)
+	if putCalls != 0 {
+		t.Fatalf("must not overwrite another tunnel's DNS, putCalls=%d", putCalls)
 	}
 }
 
@@ -409,7 +391,7 @@ IjoiY2Z1dF90ZXN0In0=
 		}
 	}
 
-	result, err := setup.Provision(ctxBackground(), "gateway.lucadesign.uk", "console.lucadesign.uk", "llm-protocol-gateway", 18093)
+	result, err := setup.Provision(ctxBackground(), "gateway.lucadesign.uk", "console.lucadesign.uk", "llm-protocol-gateway", "gw_test", 18093)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -435,7 +417,7 @@ func TestProvisionRejectsSameHost(t *testing.T) {
 		t.Fatalf("should not run cloudflared: %v", args)
 		return "", nil
 	}
-	if _, err := setup.Provision(ctxBackground(), "gateway.lucadesign.uk", "gateway.lucadesign.uk", "llm-protocol-gateway", 18093); err == nil {
+	if _, err := setup.Provision(ctxBackground(), "gateway.lucadesign.uk", "gateway.lucadesign.uk", "llm-protocol-gateway", "gw_test", 18093); err == nil {
 		t.Fatal("expected same-host rejection")
 	}
 }
@@ -485,7 +467,7 @@ IjoiY2Z1dF90ZXN0In0=
 		}
 		return jsonHTTPResponse(404, map[string]any{"success": false}), nil
 	}
-	result, err := setup.Provision(ctxBackground(), "", "console.lucadesign.uk", "llm-protocol-gateway", 18093)
+	result, err := setup.Provision(ctxBackground(), "", "console.lucadesign.uk", "llm-protocol-gateway", "gw_test", 18093)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -508,5 +490,47 @@ func jsonHTTPResponse(status int, body any) *http.Response {
 		StatusCode: status,
 		Body:       io.NopCloser(strings.NewReader(string(payload))),
 		Header:     make(http.Header),
+	}
+}
+
+func TestRouteDNSRepairsSameTunnelRecord(t *testing.T) {
+	tmp := t.TempDir()
+	cert := []byte(`-----BEGIN ARGO TUNNEL TOKEN-----
+eyJ6b25lSUQiOiJ6b25lLTEiLCJhY2NvdW50SUQiOiJhY2MtMSIsImFwaVRva2Vu
+IjoiY2Z1dF90ZXN0In0=
+-----END ARGO TUNNEL TOKEN-----
+`)
+	if err := os.WriteFile(filepath.Join(tmp, "cert.pem"), cert, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tunnelID := "ff2f197e-d383-40f7-9fc8-50772d7e9c26"
+	overwrote := false
+	setup := NewCloudflareSetup()
+	setup.homeDir = func() (string, error) { return tmp, nil }
+	setup.run = func(ctx context.Context, args ...string) (string, error) {
+		joined := strings.Join(args, " ")
+		if strings.Contains(joined, "--overwrite-dns") {
+			overwrote = true
+			return "added route", nil
+		}
+		return "Failed to add route: code: 1003, reason: An A, AAAA, or CNAME record with that host already exists.", fmt.Errorf("exit status 1")
+	}
+	setup.httpDo = func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodGet && strings.Contains(req.URL.Path, "/dns_records") {
+			return jsonHTTPResponse(200, map[string]any{
+				"success": true,
+				"result": []map[string]any{{
+					"id": "rec-1", "type": "CNAME", "name": "gateway.lucadesign.uk",
+					"content": tunnelID + ".cfargotunnel.com", "proxied": true,
+				}},
+			}), nil
+		}
+		return jsonHTTPResponse(404, map[string]any{"success": false}), nil
+	}
+	if err := setup.routeDNS(ctxBackground(), "llm-protocol-gateway", tunnelID, "gateway.lucadesign.uk"); err != nil {
+		t.Fatal(err)
+	}
+	if !overwrote {
+		t.Fatal("a record already pointing at this same tunnel should be repairable")
 	}
 }

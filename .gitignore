@@ -54,6 +54,7 @@ desktop/frontend/.history/
 **/.cloudflared/
 **/cert.pem
 **/tunnel-config.yml
+**/tunnel-*.yml
 !internal/tunnel/quick_tunnel_config.yml
 # 本地 agent 工作目录（截图、探针、临时构建产物），不进库
 .workbuddy/

@@ -71,6 +71,8 @@ open "desktop/build/bin/LLM Protocol Gateway.app"
 
 外部 DNS 是网关级全局配置，所有用户和 API Key 共用同一组 API / 管理页域名，不按用户或 Key 拆分。该模式仍使用 Host 分离：API 域名只提供模型协议和 `/__health`，管理页域名只提供控制台。`PATCH /__public-access` 保存时 `mode=external_dns`，`provider=external`。
 
+同一个 Cloudflare 账号可以供多台电脑使用。每台电脑的具名隧道名按本机稳定网关身份派生为 `llm-protocol-gateway-<12 位哈希>`，本地配置也写在该身份专属的 `tunnel-<哈希>.yml` 中；两台电脑仍应使用各自的 API/管理页子域名。若远端已存在同名隧道但本机没有其凭据，网关会拒绝自动删除；若 DNS 已指向另一条隧道，网关会拒绝静默覆盖，避免两台电脑互相顶掉。
+
 页面底部的「公网开关自动化令牌」只允许本机/局域网脚本调用 `POST /__public/control` 开关公网入口，不是模型 API Key，也不能管理 Provider、密钥或用户。
 
 ## 防止系统休眠
@@ -119,11 +121,14 @@ GATEWAY_ADDR=0.0.0.0:18093 ./.cache/gateway-dev
 - 自动安装会等待网关没有模型请求；手动点击安装则立即重启；
 - macOS 只替换完整 `.app`，不会覆盖正在运行的可执行文件；
 - 更新地址：`https://github.com/yangyongyongyong/llm-protocol-gateway/releases/latest/download/update.json`；
-- 如果最新 Release 暂时没有 `update.json`，会回退到 GitHub Releases API；
-- 每份安装包必须匹配清单中的 SHA-256；
+- 稳定清单地址读取失败时，会向 GitHub Releases API 查询固定版本的 `update.json` 与
+  `update.json.sig`，重新读取并验证签名；不会只凭 API 的版本号/哈希下载安装包；
+- 内置公钥的普通构建必须先通过 Ed25519 清单签名验证，每份安装包还必须匹配
+  已验证清单中的 SHA-256；签名损坏、版本错配或缺失时都拒绝更新；
 - 设置页「App 自动更新」可以打开/关闭自动检查、自动下载和空闲自动安装。
 
-发布工作流会为每个 Release 生成 `update.json`。如果仓库配置了更新签名：
+发布工作流会为每个 Release 生成 `update.json`。仓库已内置验签公钥，正常发布
+必须配置匹配的更新私钥并提供签名：
 
 1. `UPDATE_PUBLIC_KEY`：Repository variable，放 Ed25519 raw public key 的 base64；
 2. `UPDATE_SIGNING_KEY`：Repository secret，放 Ed25519 private key 的 PEM 文本。
@@ -139,6 +144,19 @@ openssl pkey -in update-signing-key.pem -pubout -outform DER \
 ```
 
 `update-public-key.txt` 的内容提交到 `internal/desktopupdate/update_public_key.txt`（如有轮换，同时更新 `UPDATE_PUBLIC_KEY`）；`update-signing-key.pem` 的内容只放到 `UPDATE_SIGNING_KEY`。私钥不要提交到仓库。
+
+### 检查更新报错的区别
+
+- **附件确实缺失**：GitHub API 返回的附件列表没有 `update.json` 或 `update.json.sig`。
+  应补齐该 Release 的签名发布产物，不能关闭校验规避。
+- **附件存在但读不到**：会提示「Release 已发布更新清单，但读取 update.json 失败」
+  并保留 `EOF`、TLS 断连或超时等真实原因；不再把网络故障误报为缺签名文件。
+- **签名校验失败 / 清单版本不一致**：停止更新，不回退到未验证的安装包。
+
+GitHub 的页面/API 和 Release 附件下载属于不同域名。页面可访问不代表
+`release-assets.githubusercontent.com` 可访问；这个域名若经 VPN/代理转发失败，会在
+TLS 握手阶段出现 EOF。应检查当前网络对 GitHub 附件域名的路由，更新器不会擅自改
+系统代理、VPN 或关闭 TLS/Ed25519 校验。
 
 ## 版本号唯一来源
 

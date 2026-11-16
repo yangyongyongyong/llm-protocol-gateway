@@ -326,6 +326,14 @@ type Provider struct {
 	// account identifiers, not secrets, so they may be sent to the frontend.
 	TeamOrganizationID string `json:"teamOrganizationId,omitempty"`
 	TeamProjectID      string `json:"teamProjectId,omitempty"`
+	// ProviderScript 是该 Provider 自带的自定义协议转换脚本。非空表示这条
+	// Provider 是由“自定义协议”创建：网关启动脚本后，仍按 Provider.Protocol
+	// 的三大标准协议之一转发，脚本负责把标准请求转成厂商私有协议。
+	ProviderScript *ProviderScript `json:"providerScript,omitempty"`
+	// CustomProviderID 指向管理员预定义的自定义 Provider 类型模板。实例仍然
+	// 保存一份解析后的 ProviderScript 快照供运行时使用，但用户在编辑实例时
+	// 只需要改上游 URL 和 Key；脚本统一在 CustomProvider 类型里维护。
+	CustomProviderID string `json:"customProviderId,omitempty"`
 	// SelfRegistration lets the provider owner's own automation script keep
 	// BaseURL/APIKeySource in sync (e.g. a self-hosted backend behind a
 	// rotating reverse-tunnel URL) by calling
@@ -1164,15 +1172,18 @@ type DataPaths struct {
 }
 
 type GatewayState struct {
-	ProviderGroups []ProviderGroup      `json:"providerGroups"`
-	Providers      []Provider           `json:"providers"`
-	Endpoints      []OutputEndpoint     `json:"endpoints"`
-	Routes         []Route              `json:"routes"`
-	Models         []Model              `json:"models"`
-	APIKeys        []APIKey             `json:"apiKeys"`
-	Metrics        MetricsSnapshot      `json:"metrics"`
-	PublicAccess   PublicAccessSettings `json:"publicAccess"`
-	LogLevel       string               `json:"logLevel,omitempty"`
+	ProviderGroups []ProviderGroup `json:"providerGroups"`
+	// CustomProviders 是可复用的自定义协议类型模板（例如 ocean）。它们不是
+	// 可路由的 Provider 实例，只给“添加输入 Provider”目录和实例化逻辑使用。
+	CustomProviders []CustomProvider     `json:"customProviders"`
+	Providers       []Provider           `json:"providers"`
+	Endpoints       []OutputEndpoint     `json:"endpoints"`
+	Routes          []Route              `json:"routes"`
+	Models          []Model              `json:"models"`
+	APIKeys         []APIKey             `json:"apiKeys"`
+	Metrics         MetricsSnapshot      `json:"metrics"`
+	PublicAccess    PublicAccessSettings `json:"publicAccess"`
+	LogLevel        string               `json:"logLevel,omitempty"`
 	// RequestLogRetentionDays controls how long request_logs are kept (default 7).
 	RequestLogRetentionDays int `json:"requestLogRetentionDays,omitempty"`
 	// Log2xxBodies controls whether successful (2xx) requests store their request

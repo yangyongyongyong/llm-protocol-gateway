@@ -21,7 +21,6 @@ import {
   ProviderPreset,
   ProviderThinkingTestResult,
   PublicAccessSettings,
-  RequestAdapter,
   RequestStatsSnapshot,
   Route,
   RouteTestResult,
@@ -29,102 +28,6 @@ import {
   SubscriptionConnectKind,
   TimeHint
 } from './types';
-
-export const REQUEST_ADAPTER_PRESETS: Array<{ id: string; label: string; hint: string; json: string }> = [
-  {
-    id: 'tuya-azure-deployment',
-    label: '涂鸦 / Azure Deployment',
-    hint: 'BaseURL 含 {model} 部署路径；Claude 客户端模型名映射到上游部署名。',
-    json: `{
-  "modelMapping": {
-    "claude-sonnet-5": "gpt-5.5",
-    "claude-opus-4-8": "gpt-5.5",
-    "sonnet": "gpt-5.5",
-    "opus": "gpt-5.5",
-    "haiku": "gpt-5.5"
-  }
-}`,
-  },
-  {
-    id: 'url-template',
-    label: '自定义 URL 模板',
-    hint: '用 urlTemplate 覆盖最终上游地址，占位符 {baseUrl}/{model}。',
-    json: `{
-  "urlTemplate": "{baseUrl}/deployments/{model}/chat/completions?api-version=2024-02-01",
-  "modelMapping": {
-    "claude-sonnet-5": "gpt-5.5"
-  },
-  "headers": {}
-}`,
-  },
-  {
-    id: 'body-wrap',
-    label: 'Body 包装模板',
-    hint: '用 {body} 嵌入网关转换后的 JSON，再包一层自定义字段。',
-    json: `{
-  "bodyTemplate": "{\\"scene\\":\\"gateway\\",\\"payload\\":{body}}",
-  "modelMapping": {}
-}`,
-  },
-];
-
-export function compactRequestAdapterJSON(raw: string): string {
-  const trimmed = raw.trim();
-  if (!trimmed) return '';
-  try {
-    const parsed = JSON.parse(trimmed) as RequestAdapter;
-    const compact: RequestAdapter = {};
-    if (parsed.urlTemplate?.trim()) compact.urlTemplate = parsed.urlTemplate.trim();
-    if (parsed.bodyTemplate?.trim()) compact.bodyTemplate = parsed.bodyTemplate.trim();
-    if (parsed.headers && Object.keys(parsed.headers).length > 0) compact.headers = parsed.headers;
-    if (parsed.modelMapping && Object.keys(parsed.modelMapping).length > 0) compact.modelMapping = parsed.modelMapping;
-    return Object.keys(compact).length ? JSON.stringify(compact, null, 2) : '';
-  } catch {
-    return trimmed;
-  }
-}
-
-export function previewRequestAdapterCurl(baseUrl: string, defaultModel: string, adapterJSON: string): string {
-  const trimmed = adapterJSON.trim();
-  if (!trimmed) return '';
-  let adapter: RequestAdapter;
-  try {
-    adapter = JSON.parse(trimmed) as RequestAdapter;
-  } catch {
-    return 'JSON 无效，保存前请修正语法。';
-  }
-  const clientModel = Object.keys(adapter.modelMapping || {})[0] || defaultModel || 'gpt-5.5';
-  const mappedModel = adapter.modelMapping?.[clientModel] || clientModel;
-  let url = (adapter.urlTemplate || '').trim();
-  if (!url) {
-    url = baseUrl.includes('{model}') ? baseUrl : `${baseUrl.replace(/\/$/, '')}/chat/completions`;
-  }
-  url = url
-    .replaceAll('{model}', mappedModel)
-    .replaceAll('{baseUrl}', baseUrl.replace(/\/$/, ''))
-    .replaceAll('{baseURL}', baseUrl.replace(/\/$/, ''));
-  const sampleBody = JSON.stringify({
-    model: mappedModel,
-    messages: [{ role: 'user', content: 'hi' }],
-    max_completion_tokens: 64,
-  });
-  let body = sampleBody;
-  if (adapter.bodyTemplate?.trim()) {
-    body = adapter.bodyTemplate
-      .replaceAll('{model}', mappedModel)
-      .replaceAll('{baseUrl}', baseUrl.replace(/\/$/, ''))
-      .replaceAll('{baseURL}', baseUrl.replace(/\/$/, ''))
-      .replaceAll('{body}', sampleBody);
-  }
-  const headerLines = Object.entries(adapter.headers || {}).map(([key, value]) => {
-    const rendered = String(value)
-      .replaceAll('{model}', mappedModel)
-      .replaceAll('{baseUrl}', baseUrl.replace(/\/$/, ''))
-      .replaceAll('{baseURL}', baseUrl.replace(/\/$/, ''));
-    return ` \\\n  -H '${key}: ${rendered.replace(/'/g, `'\\''`)}'`;
-  }).join('');
-  return `curl -sS -X POST '${url.replace(/'/g, `'\\''`)}' \\\n  -H 'Content-Type: application/json'${headerLines} \\\n  -d '${body.replace(/'/g, `'\\''`)}'`;
-}
 
 export const PROVIDER_CACHE_ROUND2_USER = '继续';
 
@@ -633,6 +536,7 @@ export const defaultPublicAccess: PublicAccessSettings = {
 
 export const fallbackState: GatewayState = {
   providerGroups: [],
+  customProviders: [],
   providers: [],
   endpoints: [],
   routes: [],
@@ -650,6 +554,7 @@ export function normalizeGatewayState(data: Partial<GatewayState> | null | undef
     ...base,
     ...data,
     providerGroups: data?.providerGroups ?? [],
+    customProviders: data?.customProviders ?? [],
     providers: data?.providers ?? [],
     endpoints: data?.endpoints ?? [],
     routes: data?.routes ?? [],
@@ -2233,6 +2138,9 @@ function trimNumber(value: number): string {
 // 的「已添加」标记与计数。订阅类按连接方式归组（同一账号族可以有多个 Provider）；
 // API Key 类按端点主机归组，因为同一个厂商的多个 Provider 通常指向同一主机。
 export function presetMatchesProvider(preset: ProviderPreset, provider: Provider): boolean {
+  if (preset.customProviderId) {
+    return provider.customProviderId === preset.customProviderId;
+  }
   if (preset.authType === 'api_key') {
     if (providerConnectKind(provider) !== 'api_key') return false;
     const presetHost = urlHost(preset.baseUrl);
@@ -4396,3 +4304,4 @@ export function cloudflareAuthPollOutcome(input: { authorized: boolean; elapsedM
   if (input.elapsedMs > input.timeoutMs) return 'timeout'
   return 'wait'
 }
+

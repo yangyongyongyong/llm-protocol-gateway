@@ -437,6 +437,9 @@ func (s *Server) testProviderChat(r *http.Request, providerID string, req provid
 			payload["max_output_tokens"] = req.MaxTokens
 		} else {
 			payload["max_tokens"] = req.MaxTokens
+			// gpt-5.5 / o-series 这类模型拒绝旧的 max_tokens；provider 对话测试
+			// 和真实转换路径使用同一个字段归一化函数，避免“测试报错、实际请求正常”。
+			normalizeOpenAIChatMaxTokensField(payload, model)
 		}
 	}
 	// Claude 协议走它自己那条真实路径：sendClaudeMessagesUpstream 会做

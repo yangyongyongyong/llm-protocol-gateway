@@ -50,7 +50,6 @@ import {
     routeTestResultFromBody,
     clearUICache,
     clientGatewayRoot,
-    compactRequestAdapterJSON,
     composeCustomDomain,
     copyToClipboard,
     defaultProviderChatTestOptions,
@@ -105,7 +104,6 @@ import {
     normalizeRequestStats,
     parseSSEStreamContent,
     pickCustomDomainRoot,
-    previewRequestAdapterCurl,
     promoteApiKeyProvider,
     protocolFromLabel,
     protocolIcon,
@@ -134,7 +132,6 @@ import {
     readStoredSidebarCollapsed,
     readUICache,
     reportIfLooksLikeAutofill,
-    REQUEST_ADAPTER_PRESETS,
     resolveProviderChatURL,
     resolveProviderTestModel,
     routeGatewayTestURL,
@@ -192,6 +189,7 @@ import {
     ChatTestContext,
     CloudflareZoneOption,
     ConsoleUser,
+    CustomProvider,
     DesktopAutostartStatus,
     GatewayState,
     KeyProfile,
@@ -214,7 +212,6 @@ import {
     PublicAccessMode,
     PublicAccessSettings,
     SleepPreventionStatus,
-    RequestAdapter,
     RequestStatsSnapshot,
     Route,
     RouteTestResult,
@@ -689,6 +686,7 @@ function App() {
   const [providerGroupFilter, setProviderGroupFilter] = useState('all');
   const [batchProviderGroupID, setBatchProviderGroupID] = useState('');
   const [editingProviderID, setEditingProviderID] = useState('');
+  const [customProviderModalOpen, setCustomProviderModalOpen] = useState(false);
   const [routeModalOpen, setRouteModalOpen] = useState(false);
   const [editingRouteID, setEditingRouteID] = useState('');
   const [apiKeyModalOpen, setApiKeyModalOpen] = useState(false);
@@ -757,10 +755,43 @@ function App() {
     defaultThinkingDepth: '',
     authType: 'api_key' as ProviderAuthType,
     groupId: '',
-    requestAdapterJSON: '',
     teamOrganizationId: '',
     teamProjectId: '',
+    customProviderId: '',
+    customProviderName: '',
+    customProviderProtocol: 'openai_chat' as Protocol,
+    scriptMode: false,
+    scriptSource: '',
+    scriptUpstreamBaseUrl: '',
+    scriptRequirements: '',
+    scriptMaxConcurrentRequests: '',
+    scriptRequestTimeoutSec: '',
+    scriptBusy: false,
+    scriptStatus: '',
+    scriptLogs: '',
   });
+  const [customProviderAIPrompt, setCustomProviderAIPrompt] = useState({prompt: '', loading: false, error: ''});
+  useEffect(() => {
+    if (!customProviderModalOpen || customProviderAIPrompt.prompt || customProviderAIPrompt.loading || customProviderAIPrompt.error) return;
+    let cancelled = false;
+    setCustomProviderAIPrompt((current) => ({...current, loading: true, error: ''}));
+    void fetchWithTimeout(`${API_BASE}/__custom-providers/ai-prompt`, {credentials: 'same-origin'})
+      .then(async (response) => {
+        if (!response.ok) throw new Error(await response.text());
+        return await response.json() as {prompt?: string};
+      })
+      .then((data) => {
+        if (cancelled) return;
+        setCustomProviderAIPrompt({prompt: data.prompt || '', loading: false, error: ''});
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setCustomProviderAIPrompt({prompt: '', loading: false, error: String(error)});
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [customProviderModalOpen, customProviderAIPrompt.prompt, customProviderAIPrompt.loading, customProviderAIPrompt.error]);
   // 首包超时是 Provider 的调度旋钮，走专用接口保存：Provider 的 PATCH 是增量的，
   // 数字 0 分不清「没传」和「关掉限制」。输入框非受控，切到别的 Provider 时靠 key 重置。
   const providerFirstPacketRef = useRef<HTMLInputElement>(null);
@@ -3528,9 +3559,20 @@ function App() {
       defaultThinkingDepth: '',
       authType: 'api_key',
       groupId: '',
-      requestAdapterJSON: '',
       teamOrganizationId: '',
       teamProjectId: '',
+      customProviderId: '',
+      customProviderName: '',
+      customProviderProtocol: 'openai_chat' as Protocol,
+      scriptMode: false,
+      scriptSource: '',
+      scriptUpstreamBaseUrl: '',
+      scriptRequirements: '',
+      scriptMaxConcurrentRequests: '',
+      scriptRequestTimeoutSec: '',
+      scriptBusy: false,
+      scriptStatus: '',
+      scriptLogs: '',
     });
     resetClaudeOAuthFlowState();
     resetCursorOAuthFlowState();
@@ -3548,11 +3590,14 @@ function App() {
   function openProviderDraftForPreset(preset: ProviderPreset) {
     setProviderSheetOpen(false);
     setEditingProviderID('');
-    const protocol = (preset.protocol || 'openai_chat') as Protocol;
+    const custom = preset.customProviderId ? state.customProviders.find((item) => item.id === preset.customProviderId) : undefined;
+    const protocol = (custom?.protocol || preset.protocol || 'openai_chat') as Protocol;
     setProviderDraft({
       name: preset.name,
       protocol,
-      baseUrl: preset.authType === 'self_register'
+      baseUrl: custom
+        ? ''
+        : preset.authType === 'self_register'
         ? selfRegisterPlaceholderBaseURL(protocol)
         : preset.authType === 'api_key' ? (preset.baseUrl || 'https://example.com/v1/chat/completions') : (preset.baseUrl || ''),
       apiKeySource: '',
@@ -3560,13 +3605,20 @@ function App() {
       defaultThinkingDepth: '',
       authType: preset.authType,
       groupId: '',
-      // 预置自带的必需请求头（OpenCode Go 的 x-opencode-session 这类）直接落进
-      // 「请求适配器」，仍然可见可改——但用户不必自己知道还缺什么。
-      requestAdapterJSON: preset.headers && Object.keys(preset.headers).length > 0
-        ? JSON.stringify({headers: preset.headers}, null, 2)
-        : '',
       teamOrganizationId: '',
       teamProjectId: '',
+      customProviderId: custom?.id || '',
+      customProviderName: custom?.name || '',
+      customProviderProtocol: custom?.protocol || protocol,
+      scriptMode: false,
+      scriptSource: '',
+      scriptUpstreamBaseUrl: '',
+      scriptRequirements: '',
+      scriptMaxConcurrentRequests: '',
+      scriptRequestTimeoutSec: '',
+      scriptBusy: false,
+      scriptStatus: '',
+      scriptLogs: '',
     });
     resetClaudeOAuthFlowState();
     resetCursorOAuthFlowState();
@@ -3582,24 +3634,32 @@ function App() {
   }
 
   function openEditProviderModal(provider: Provider) {
+    const custom = provider.customProviderId ? state.customProviders.find((item) => item.id === provider.customProviderId) : undefined;
+    const legacyScript = !!provider.providerScript && !provider.customProviderId;
     setEditingProviderID(provider.id);
     setProviderDraft({
       name: provider.name,
       protocol: provider.protocol,
-      baseUrl: provider.baseUrl,
+      baseUrl: custom || legacyScript ? (provider.providerScript?.upstreamBaseUrl || '') : provider.baseUrl,
       apiKeySource: provider.apiKeySource,
       defaultModel: provider.defaultModel || '',
       defaultThinkingDepth: provider.defaultThinkingDepth || '',
       authType: resolveProviderAuthType(provider),
       groupId: provider.groupId || '',
-      requestAdapterJSON: provider.requestAdapter ? JSON.stringify({
-        urlTemplate: provider.requestAdapter.urlTemplate || '',
-        headers: provider.requestAdapter.headers || {},
-        bodyTemplate: provider.requestAdapter.bodyTemplate || '',
-        modelMapping: provider.requestAdapter.modelMapping || {},
-      }, null, 2) : '',
       teamOrganizationId: provider.teamOrganizationId || '',
       teamProjectId: provider.teamProjectId || '',
+      customProviderId: provider.customProviderId || '',
+      customProviderName: custom?.name || '',
+      customProviderProtocol: custom?.protocol || provider.protocol,
+      scriptMode: legacyScript,
+      scriptSource: provider.providerScript?.source || '',
+      scriptUpstreamBaseUrl: provider.providerScript?.upstreamBaseUrl || '',
+      scriptRequirements: provider.providerScript?.requirements || '',
+      scriptMaxConcurrentRequests: provider.providerScript?.maxConcurrentRequests ? String(provider.providerScript.maxConcurrentRequests) : '',
+      scriptRequestTimeoutSec: provider.providerScript?.requestTimeoutSec ? String(provider.providerScript.requestTimeoutSec) : '',
+      scriptBusy: false,
+      scriptStatus: '',
+      scriptLogs: '',
     });
     resetClaudeOAuthFlowState();
     resetCursorOAuthFlowState();
@@ -3616,25 +3676,35 @@ function App() {
     // existing provider so the user can tweak and save it as a new provider.
     setEditingProviderID('');
     const cloneAuthType = resolveProviderAuthType(provider);
+    const custom = provider.customProviderId ? state.customProviders.find((item) => item.id === provider.customProviderId) : undefined;
+    const legacyScript = !!provider.providerScript && !provider.customProviderId;
     setProviderDraft({
       name: `${provider.name} Copy`,
       protocol: provider.protocol,
       // 自助注册类原本的 baseUrl 可能是脚本回填的真实地址（或尚未回填时的空值），
       // 克隆出来的是一张全新的卡、还没有令牌，所以统一放占位值，等新脚本注册。
-      baseUrl: cloneAuthType === 'self_register' ? selfRegisterPlaceholderBaseURL(provider.protocol) : provider.baseUrl,
+      baseUrl: cloneAuthType === 'self_register'
+        ? selfRegisterPlaceholderBaseURL(provider.protocol)
+        : custom || legacyScript ? (provider.providerScript?.upstreamBaseUrl || '') : provider.baseUrl,
       apiKeySource: provider.apiKeySource,
       defaultModel: provider.defaultModel || '',
       defaultThinkingDepth: provider.defaultThinkingDepth || '',
       authType: cloneAuthType,
       groupId: provider.groupId || '',
-      requestAdapterJSON: provider.requestAdapter ? JSON.stringify({
-        urlTemplate: provider.requestAdapter.urlTemplate || '',
-        headers: provider.requestAdapter.headers || {},
-        bodyTemplate: provider.requestAdapter.bodyTemplate || '',
-        modelMapping: provider.requestAdapter.modelMapping || {},
-      }, null, 2) : '',
       teamOrganizationId: provider.teamOrganizationId || '',
       teamProjectId: provider.teamProjectId || '',
+      customProviderId: provider.customProviderId || '',
+      customProviderName: custom?.name || '',
+      customProviderProtocol: custom?.protocol || provider.protocol,
+      scriptMode: legacyScript,
+      scriptSource: provider.providerScript?.source || '',
+      scriptUpstreamBaseUrl: provider.providerScript?.upstreamBaseUrl || '',
+      scriptRequirements: provider.providerScript?.requirements || '',
+      scriptMaxConcurrentRequests: provider.providerScript?.maxConcurrentRequests ? String(provider.providerScript.maxConcurrentRequests) : '',
+      scriptRequestTimeoutSec: provider.providerScript?.requestTimeoutSec ? String(provider.providerScript.requestTimeoutSec) : '',
+      scriptBusy: false,
+      scriptStatus: '',
+      scriptLogs: '',
     });
     resetClaudeOAuthFlowState();
     resetCursorOAuthFlowState();
@@ -3732,43 +3802,69 @@ function App() {
     return created;
   }
 
+  function openCreateCustomProvider() {
+    setCustomProviderAIPrompt({prompt: '', loading: false, error: ''});
+    setCustomProviderModalOpen(true);
+  }
+
+  async function deleteCustomProviderType(provider: CustomProvider) {
+    const ok = await confirmDialog(
+      `删除自定义 Provider「${provider.name}」？\n只有没有实例引用它时才能删除。已创建的 Provider 不会被隐式删除。`,
+      {confirmLabel: '删除', danger: true},
+    );
+    if (!ok) return;
+    try {
+      const response = await fetch(`${API_BASE}/__custom-providers/${encodeURIComponent(provider.id)}`, {method: 'DELETE'});
+      if (!response.ok) throw new Error(await response.text());
+      await refreshState(false);
+      showToast(`已删除自定义 Provider：${provider.name}`);
+    } catch (error) {
+      showToast(`删除失败：${String(error)}`);
+    }
+  }
+
   async function createProvider() {
     setSaving(true);
     try {
-      const isClaudeOAuth = providerDraft.protocol === 'claude' && providerDraft.authType === 'claude_oauth';
-      const isCursorOAuth = providerDraft.protocol === 'openai_chat' && providerDraft.authType === 'cursor_oauth';
-      const isChatGPTOAuth = providerDraft.protocol === 'openai_responses' && providerDraft.authType === 'chatgpt_oauth';
-      const isQoder = providerDraft.protocol === 'openai_chat' && isQoderConnectKind(providerDraft.authType);
+      const customProviderMode = !!providerDraft.customProviderId;
+      const effectiveProtocol = customProviderMode ? providerDraft.customProviderProtocol : providerDraft.protocol;
+      const isClaudeOAuth = effectiveProtocol === 'claude' && providerDraft.authType === 'claude_oauth';
+      const isCursorOAuth = effectiveProtocol === 'openai_chat' && providerDraft.authType === 'cursor_oauth';
+      const isChatGPTOAuth = effectiveProtocol === 'openai_responses' && providerDraft.authType === 'chatgpt_oauth';
+      const isQoder = effectiveProtocol === 'openai_chat' && isQoderConnectKind(providerDraft.authType);
       const isWorkBuddy = isWorkBuddyConnectKind(providerDraft.authType);
       const isSelfRegister = providerDraft.authType === 'self_register';
-      let requestAdapter: RequestAdapter | null = null;
-      const adapterRaw = providerDraft.requestAdapterJSON.trim();
-      if (adapterRaw) {
-        try {
-          requestAdapter = JSON.parse(adapterRaw) as RequestAdapter;
-        } catch {
-          throw new Error('自定义适配 JSON 无效');
-        }
-      }
+      // 自定义私有协议由 Connector 负责，Provider 表单不再维护 requestAdapter。
+      // 后端仍兼容已有 requestAdapter 数据，避免升级时破坏存量 Provider。
       const payload = {
         name: providerDraft.name,
-        protocol: providerDraft.protocol,
+        protocol: effectiveProtocol,
         baseUrl: providerDraft.baseUrl,
         apiKeySource: providerDraft.apiKeySource,
-        defaultModel: providerDraft.defaultModel,
+        defaultModel: customProviderMode ? '' : providerDraft.defaultModel,
         defaultThinkingDepth: providerDraft.defaultThinkingDepth,
-        authHeader: providerDraft.protocol === 'claude' ? 'x-api-key' : 'Authorization',
+        authHeader: effectiveProtocol === 'claude' ? 'x-api-key' : 'Authorization',
+        customProviderId: customProviderMode ? providerDraft.customProviderId : '',
         // 管理员编辑/创建时可带分组；后端仍会再次校验管理员身份和分组存在性。
         groupId: providerDraft.groupId || '',
         // Qoder 两个站点是两种连接方式，直接把草稿里选定的那种交回去，
         // 不能让「选了 Qoder CN、存成 qoder_pat」把账号签到错的站点上。
-        authType: isClaudeOAuth ? 'claude_oauth' : isCursorOAuth ? 'cursor_oauth' : isChatGPTOAuth ? 'chatgpt_oauth' : isQoder ? providerDraft.authType
+        authType: customProviderMode ? 'api_key' : isClaudeOAuth ? 'claude_oauth' : isCursorOAuth ? 'cursor_oauth' : isChatGPTOAuth ? 'chatgpt_oauth' : isQoder ? providerDraft.authType
           : providerAuthTypeParam(providerDraft.authType),
-        requestAdapter,
         // 智谱团队版：两者都填才发送并触发团队端点；否则清空（走个人版）。
         teamOrganizationId: providerDraft.teamOrganizationId.trim(),
         teamProjectId: providerDraft.teamProjectId.trim(),
         codingPlanProvider: providerDraft.teamOrganizationId.trim() && providerDraft.teamProjectId.trim() ? 'zhipu_team' : '',
+        providerScript: !customProviderMode && providerDraft.scriptMode ? {
+          language: 'python',
+          entrypoint: 'adapter.py',
+          source: providerDraft.scriptSource,
+          upstreamBaseUrl: providerDraft.scriptUpstreamBaseUrl.trim(),
+          requirements: providerDraft.scriptRequirements,
+          healthPath: '/health',
+          maxConcurrentRequests: Number(providerDraft.scriptMaxConcurrentRequests) || 0,
+          requestTimeoutSec: Number(providerDraft.scriptRequestTimeoutSec) || 0,
+        } : null,
       };
       const response = await fetch(editingProviderID ? `${API_BASE}/__providers/${encodeURIComponent(editingProviderID)}` : `${API_BASE}/__providers`, {
         method: editingProviderID ? 'PATCH' : 'POST',
@@ -6176,9 +6272,15 @@ function App() {
               <ProviderCatalogDialog
                 open={providerSheetOpen}
                 providers={state.providers}
+                customProviders={state.customProviders}
                 hasProviders={sortedProviders.length > 0}
                 onClose={() => setProviderSheetOpen(false)}
                 onPick={openProviderDraftForPreset}
+                onManageCustomProviders={isAdminUser && canDo('providers.create') ? () => {
+                  setProviderSheetOpen(false);
+                  openCreateCustomProvider();
+                } : undefined}
+                onDeleteCustomProvider={isAdminUser ? (provider) => void deleteCustomProviderType(provider) : undefined}
               />
             </div>
           </section>
@@ -8251,6 +8353,35 @@ function App() {
         onMove={moveProviderGroup}
       />
 
+      {customProviderModalOpen && (() => {
+        const prompt = customProviderAIPrompt.prompt
+          ? `API Base: ${API_BASE}\n\n${customProviderAIPrompt.prompt}`
+          : '';
+        return (
+          <Modal
+            title="添加自定义 Provider 类型"
+            description="此页面只提供 AI Prompt，不提供手动配置。把 Prompt 复制给 AI，由它通过 API 完成新建、编辑、删除、实例化和验收。"
+            size="wide"
+            onClose={() => setCustomProviderModalOpen(false)}
+          >
+            <div className="provider-script-panel">
+              <div className="hint-text">
+                自定义类型由 AI 调用 API 管理；脚本由服务端落盘到 App 数据目录。类型磁贴右侧只保留删除菜单。
+              </div>
+              <pre className="json-preview" style={{whiteSpace: 'pre-wrap', userSelect: 'text'}}>
+                {prompt || (customProviderAIPrompt.loading ? '正在加载 AI Prompt…' : customProviderAIPrompt.error || '暂无 Prompt')}
+              </pre>
+              <div className="actions" style={{gap: 8, flexWrap: 'wrap'}}>
+                <button type="button" className="mini-btn" onClick={() => void refreshState(false)}>刷新类型目录</button>
+                <button type="button" className="btn primary" disabled={!prompt} onClick={() => void copyToClipboard(prompt).then((ok) => showToast(ok ? '自定义 Provider API Prompt 已复制' : '复制失败，请手动选中文本'))}>
+                  复制给 AI
+                </button>
+              </div>
+            </div>
+          </Modal>
+        );
+      })()}
+
       {providerModalOpen && (
         <Modal title={editingProviderID ? '编辑输入 Provider' : '创建输入 Provider'} description={editingProviderID ? '修改后保存即生效。' : '选好连接方式与接入地址即可；订阅类保存后在下方登录一次。'} onClose={() => { setProviderModalOpen(false); setEditingProviderID(''); resetClaudeOAuthFlowState(); resetCursorOAuthFlowState(); resetChatGPTOAuthFlowState(); resetQoderPATFlowState(); resetWorkBuddyOAuthFlowState(); resetSelfRegistrationState(); }}>
           <div className="form-grid modal-form provider-form">
@@ -8264,7 +8395,17 @@ function App() {
                 </select>
               </div>
             ) : null}
-            {(() => {
+            {providerDraft.customProviderId ? (
+              <div className="provider-script-panel field field-full">
+                <div className="hint-text">
+                  自定义 Provider 类型：<b>{providerDraft.customProviderName || providerDraft.customProviderId}</b>
+                  {' · '}{protocolLabel(providerDraft.customProviderProtocol)}
+                </div>
+                <div className="hint-text">
+                  协议、鉴权头和转换脚本由该类型统一维护。这里只填写这个实例自己的上游 URL 和 API Key。
+                </div>
+              </div>
+            ) : (() => {
               // 连接方式与它的展示文案都取自 lib 里的那一张表：目录磁贴、筛选条与
               // 这个下拉框共用同一份标签，新增一种订阅不用再改这里。
               const connectChoices = PROVIDER_CONNECT_CHOICES;
@@ -8386,13 +8527,30 @@ function App() {
             )}
             {providerDraft.authType === 'api_key' && (
               <>
-                <Field fullWidth label="Base URL" value={providerDraft.baseUrl} onChange={(value) => setProviderDraft((current) => ({ ...current, baseUrl: value }))} />
-                <Field fullWidth label="API Key Source（可选）" hint="留空时透传客户端 Authorization；也可直接填 sk-xxx，或填 env:VAR_NAME / literal:sk-xxx。" value={providerDraft.apiKeySource} onChange={(value) => setProviderDraft((current) => ({ ...current, apiKeySource: value }))} />
-                {/(?:bigmodel\.cn|z\.ai)/i.test(providerDraft.baseUrl) && (
+                {providerDraft.customProviderId ? (
                   <>
-                    <Field label="智谱组织 ID（团队版填，个人版留空）" value={providerDraft.teamOrganizationId} onChange={(value) => setProviderDraft((current) => ({ ...current, teamOrganizationId: value }))} />
-                    <Field label="智谱项目 ID（团队版填，个人版留空）" value={providerDraft.teamProjectId} onChange={(value) => setProviderDraft((current) => ({ ...current, teamProjectId: value }))} />
+                    <Field fullWidth label="上游 Base URL" hint="只填这个实例对应的私有上游根地址；脚本地址由网关自动生成。" value={providerDraft.baseUrl} onChange={(value) => setProviderDraft((current) => ({ ...current, baseUrl: value }))} />
+                    <Field fullWidth label="上游 API Key" hint="通过 UPSTREAM_API_KEY 注入该类型的脚本；不会回显到脚本正文。" value={providerDraft.apiKeySource} onChange={(value) => setProviderDraft((current) => ({ ...current, apiKeySource: value }))} />
                   </>
+                ) : !providerDraft.scriptMode ? (
+                  <>
+                    <Field fullWidth label="Base URL" value={providerDraft.baseUrl} onChange={(value) => setProviderDraft((current) => ({ ...current, baseUrl: value }))} />
+                    <Field fullWidth label="API Key Source（可选）" hint="留空时透传客户端 Authorization；也可直接填 sk-xxx，或填 env:VAR_NAME / literal:sk-xxx。" value={providerDraft.apiKeySource} onChange={(value) => setProviderDraft((current) => ({ ...current, apiKeySource: value }))} />
+                    {/(?:bigmodel\.cn|z\.ai)/i.test(providerDraft.baseUrl) && (
+                      <>
+                        <Field label="智谱组织 ID（团队版填，个人版留空）" value={providerDraft.teamOrganizationId} onChange={(value) => setProviderDraft((current) => ({ ...current, teamOrganizationId: value }))} />
+                        <Field label="智谱项目 ID（团队版填，个人版留空）" value={providerDraft.teamProjectId} onChange={(value) => setProviderDraft((current) => ({ ...current, teamProjectId: value }))} />
+                      </>
+                    )}
+                  </>
+                ) : (
+                  <div className="provider-script-panel">
+                    <div className="hint-text">
+                      这是旧版内联脚本 Provider。脚本正文已改为在「自定义 Provider」类型中统一维护；这里只保留该实例的上游 URL 和 Key。
+                    </div>
+                    <Field fullWidth label="上游 Base URL" value={providerDraft.scriptUpstreamBaseUrl} onChange={(value) => setProviderDraft((current) => ({ ...current, scriptUpstreamBaseUrl: value }))} />
+                    <Field fullWidth label="上游 API Key" value={providerDraft.apiKeySource} onChange={(value) => setProviderDraft((current) => ({ ...current, apiKeySource: value }))} />
+                  </div>
                 )}
               </>
             )}
@@ -8685,63 +8843,6 @@ function App() {
               </div>
             );
           })()}
-                    <details className="adapter-editor" open={!!providerDraft.requestAdapterJSON.trim() || providerDraft.baseUrl.includes('{model}') || providerDraft.baseUrl.includes('deployments/')}>
-            <summary>自定义适配（非标准上游）</summary>
-            <div className="hint-text">{'用于 tuyadev / Azure deployment 等非标准上游。字段：urlTemplate、headers、bodyTemplate、modelMapping。占位符：{model}、{baseUrl}、{body}。运行时会把请求体里的 model 改写成映射后的上游模型名。'}</div>
-            <div className="models-filter-group" style={{ margin: '10px 0' }}>
-              {REQUEST_ADAPTER_PRESETS.map((preset) => (
-                <button
-                  key={preset.id}
-                  type="button"
-                  className="models-filter-chip"
-                  title={preset.hint}
-                  onClick={() => setProviderDraft((current) => ({ ...current, requestAdapterJSON: preset.json }))}
-                >
-                  填入：{preset.label}
-                </button>
-              ))}
-              <button
-                type="button"
-                className="models-filter-chip"
-                onClick={() => setProviderDraft((current) => ({ ...current, requestAdapterJSON: compactRequestAdapterJSON(current.requestAdapterJSON) }))}
-              >
-                格式化 JSON
-              </button>
-              {providerDraft.requestAdapterJSON.trim() ? (
-                <button
-                  type="button"
-                  className="models-filter-chip"
-                  onClick={() => setProviderDraft((current) => ({ ...current, requestAdapterJSON: '' }))}
-                >
-                  清空适配
-                </button>
-              ) : null}
-            </div>
-            <textarea
-              className="json-preview"
-              rows={12}
-              placeholder={REQUEST_ADAPTER_PRESETS[0].json}
-              value={providerDraft.requestAdapterJSON}
-              onChange={(event) => setProviderDraft((current) => ({ ...current, requestAdapterJSON: event.target.value }))}
-            />
-            {(() => {
-              const liveCurl = previewRequestAdapterCurl(providerDraft.baseUrl, providerDraft.defaultModel, providerDraft.requestAdapterJSON);
-              const savedCurl = editingProviderID
-                ? state.providers.find((item) => item.id === editingProviderID)?.requestAdapter?.curlExample
-                : '';
-              const curl = liveCurl || savedCurl || '';
-              if (!curl) return null;
-              return (
-                <div className="field" style={{ marginTop: 10 }}>
-                  <div className="field-label-row">
-                    <label>curl 样例（按当前编辑内容实时生成）</label>
-                    <CopyButton value={curl} label="复制" />
-                  </div>
-                  <pre className="json-preview">{curl}</pre>
-                </div>
-              );
-            })()}
-          </details>
           {editingProviderID && canDo('providers.edit') && (() => {
             const editingProvider = state.providers.find((item) => item.id === editingProviderID);
             if (!editingProvider) return null;

@@ -58,7 +58,9 @@ type RequestLog struct {
 	//
 	// Ingress 是把这次请求送进来的对端网关 ID（空 = 客户端直连本机）。
 	Ingress string `json:"ingress,omitempty"`
-	// Egress 是本机把这次请求转发出去的对端网关 ID（空 = 本机直连 provider）。
+	// Egress 是最终实际服务这次请求的对端网关 ID（空 = 最终由本机直连
+	// provider）。故障转移里失败候选尝试过的上游不能写进这里；候选过程由
+	// Analysis.Attempts 保留，避免 ProviderID 与链路指向不同对象。
 	Egress string `json:"egress,omitempty"`
 	// PeerGatewayID 是这次请求要对账的那个对端网关：有 Ingress 取 Ingress，
 	// 否则取 Egress。单独存一列是为了让"某个子网关上个月调了多少"是一条

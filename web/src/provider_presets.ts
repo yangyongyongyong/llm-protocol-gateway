@@ -1,4 +1,4 @@
-import type {Provider, ProviderConnectKind, ProviderPreset, ProviderPresetSection} from './types';
+import type {CustomProvider, Provider, ProviderConnectKind, ProviderPreset, ProviderPresetSection} from './types';
 import {presetMatchesProvider, providerConnectLabel} from './lib';
 
 // 添加 Provider 的可选目录：点一个磁贴即填好连接方式、协议与接入地址，
@@ -66,7 +66,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
   { id: 'yylx', name: '鱼鱼连线', section: 'relay', authType: 'api_key', protocol: 'openai_chat', baseUrl: 'https://app.yylx.io/v1', website: 'https://yylx.io', icon: 'yylx' },
   { id: 'commandcode', name: 'Command Code', section: 'relay', authType: 'api_key', protocol: 'openai_chat', baseUrl: 'https://api.commandcode.ai/provider/v1', website: 'https://commandcode.ai/docs/provider', icon: 'commandcode' },
   { id: 'opencode-zen', name: 'OpenCode Zen', section: 'relay', authType: 'api_key', protocol: 'openai_chat', baseUrl: 'https://opencode.ai/zen/v1', website: 'https://opencode.ai/zen', note: '部分模型无需密钥', icon: 'opencode' },
-  { id: 'opencode-go', name: 'OpenCode Go', section: 'relay', authType: 'api_key', protocol: 'openai_chat', baseUrl: 'https://opencode.ai/zen/go/v1', website: 'https://opencode.ai/docs/go', icon: 'opencode', headers: {'x-opencode-session': 'lpg-gateway-session'}, note: '需填密钥；卡片展示 5 小时 / 周 / 月额度，并自动带上 x-opencode-session 头' },
+  { id: 'opencode-go', name: 'OpenCode Go', section: 'relay', authType: 'api_key', protocol: 'openai_chat', baseUrl: 'https://opencode.ai/zen/go/v1', website: 'https://opencode.ai/docs/go', icon: 'opencode', note: '需填密钥；卡片展示 5 小时 / 周 / 月额度，并自动带上 x-opencode-session 头' },
   { id: 'kilo', name: 'Kilo Gateway', section: 'relay', authType: 'api_key', protocol: 'openai_chat', baseUrl: 'https://api.kilo.ai/api/openrouter', note: '部分模型无需密钥', icon: 'kilo' },
   { id: 'clinepass', name: 'ClinePass', section: 'relay', authType: 'api_key', protocol: 'openai_chat', baseUrl: 'https://api.cline.bot/api/v1', website: 'https://docs.cline.bot/getting-started/clinepass', icon: 'cline' },
   { id: 'pipellm', name: 'PipeLLM', section: 'relay', authType: 'api_key', protocol: 'openai_chat', baseUrl: 'https://api.pipellm.ai/openai/v1', website: 'https://www.pipellm.ai', icon: 'pipellm-color' },
@@ -160,19 +160,34 @@ export const PROVIDER_CONNECT_CHOICES: ProviderConnectChoice[] = [
 ];
 
 const SECTION_META: Array<{ id: ProviderPresetSection; title: string; desc: string }> = [
+  { id: 'custom', title: '自定义 Provider', desc: '管理员先定义协议脚本，新建实例时只填上游 URL 和 Key' },
   { id: 'subscription', title: '订阅账号', desc: '登录一次即可，无需粘贴密钥' },
   { id: 'vendor', title: '模型厂商', desc: '厂商自己的 API 与密钥' },
   { id: 'relay', title: '中转服务', desc: '一把密钥访问多家模型' },
   { id: 'local', title: '本机与自定义', desc: '本地推理服务、任意兼容端点、脚本自注册' },
 ];
 
+/** 把管理员定义的自定义类型投影成目录磁贴。 */
+export function customProviderPresets(customProviders: CustomProvider[] = []): ProviderPreset[] {
+  return customProviders.map((custom) => ({
+    id: `custom:${custom.id}`,
+    name: custom.name,
+    section: 'custom',
+    authType: 'api_key',
+    protocol: custom.protocol,
+    note: custom.description || `${custom.protocol} 私有协议转换`,
+    customProviderId: custom.id,
+  }));
+}
+
 /** 目录分区 + 关键字过滤（名称 / id / 端点主机 / 备注），保持分区顺序。 */
-export function groupProviderPresets(query: string): ProviderPresetGroup[] {
+export function groupProviderPresets(query: string, customProviders: CustomProvider[] = []): ProviderPresetGroup[] {
   const needle = query.trim().toLowerCase();
+  const allPresets = [...customProviderPresets(customProviders), ...PROVIDER_PRESETS];
   const matched = needle
-    ? PROVIDER_PRESETS.filter((preset) => [preset.name, preset.id, preset.baseUrl, preset.note, preset.website, preset.keysUrl]
+    ? allPresets.filter((preset) => [preset.name, preset.id, preset.baseUrl, preset.note, preset.website, preset.keysUrl]
         .some((field) => (field || '').toLowerCase().includes(needle)))
-    : PROVIDER_PRESETS;
+    : allPresets;
   return SECTION_META
     .map((section) => ({
       ...section,

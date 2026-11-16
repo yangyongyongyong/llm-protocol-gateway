@@ -67,23 +67,45 @@ type requestTiming struct {
 	// peerEgressKnown distinguishes "no peer attempt" from "egress attempted but
 	// identity unavailable": both have an empty Egress string, but only the
 	// latter should render as an unknown chain rather than as a direct one.
-	peerEgressMu    sync.Mutex
-	peerEgress      string
-	peerEgressKnown bool
+	peerEgressMu sync.Mutex
+	peerEgress   string
+	// peerEgressProviderID 是发起这次 egress 尝试的本地 Provider。请求日志记录
+	// 的是“最终实际服务的 Provider”，所以只有它与落库的 ProviderID 一致时，
+	// Egress 才是有效链路；前面失败候选留下的上游客服网关不能冒充最终出口。
+	peerEgressProviderID string
+	peerEgressKnown      bool
 	// peerEgressFallback is the registered parent identity. It is used only
 	// when the response header never arrives (cancellation/timeout), and never
 	// overrides an identity learned from the live response.
 	peerEgressFallback string
 }
 
+// beginPeerEgressAttempt 标记一个具体 Provider 即将走对端网关，并清掉上一个
+// 候选留下的出口信息。故障转移可能先试上游客服网关、再落到本地 Provider；
+// 最终日志必须只描述最后真正服务的那一跳，历史候选由 schedule.attempts 保留。
+func (t *requestTiming) beginPeerEgressAttempt(providerID string) {
+	if t == nil {
+		return
+	}
+	t.peerEgressMu.Lock()
+	t.peerEgressKnown = true
+	t.peerEgressProviderID = strings.TrimSpace(providerID)
+	t.peerEgress = ""
+	t.peerEgressFallback = ""
+	t.peerEgressMu.Unlock()
+}
+
 // notePeerEgress records the parent gateway a forwarded request reached.
-func (t *requestTiming) notePeerEgress(gatewayID string) {
+func (t *requestTiming) notePeerEgress(providerID, gatewayID string) {
 	gatewayID = strings.TrimSpace(gatewayID)
 	if t == nil {
 		return
 	}
 	t.peerEgressMu.Lock()
 	t.peerEgressKnown = true
+	if providerID = strings.TrimSpace(providerID); providerID != "" {
+		t.peerEgressProviderID = providerID
+	}
 	if gatewayID != "" {
 		t.peerEgress = gatewayID
 	}
@@ -94,52 +116,38 @@ func (t *requestTiming) notePeerEgress(gatewayID string) {
 // snapshot. It is deliberately weaker than the live response header: a
 // cancelled or timed-out request can still name the peer it was addressed to,
 // while a successful response keeps the authoritative header value.
-func (t *requestTiming) notePeerEgressFallback(gatewayID string) {
+func (t *requestTiming) notePeerEgressFallback(providerID, gatewayID string) {
 	gatewayID = strings.TrimSpace(gatewayID)
 	if t == nil || gatewayID == "" {
 		return
 	}
 	t.peerEgressMu.Lock()
+	if providerID = strings.TrimSpace(providerID); providerID != "" {
+		t.peerEgressProviderID = providerID
+	}
 	if t.peerEgressFallback == "" {
 		t.peerEgressFallback = gatewayID
 	}
 	t.peerEgressMu.Unlock()
 }
 
-// notePeerEgressAttempt marks that this request is leaving through a peer
-// gateway even when its identity is not known yet. It is called before the
-// upstream round trip; the response header refines the value later.
-func (t *requestTiming) notePeerEgressAttempt() {
+// peerEgressSnapshotForProvider 只在最终服务方就是发起过 egress 的那个
+// Provider 时返回链路信息。前面的候选即使已经拿到过父网关身份，也不能写进
+// 最终请求日志，否则会出现“Provider 列是本地 OpenCode，链路却指向上游网关”。
+func (t *requestTiming) peerEgressSnapshotForProvider(providerID string) (string, bool) {
 	if t == nil {
-		return
-	}
-	t.peerEgressMu.Lock()
-	t.peerEgressKnown = true
-	t.peerEgressMu.Unlock()
-}
-
-// peerEgressFrom returns the parent gateway recorded for this request, if any.
-func (t *requestTiming) peerEgressFrom() string {
-	if t == nil {
-		return ""
+		return "", false
 	}
 	t.peerEgressMu.Lock()
 	defer t.peerEgressMu.Unlock()
-	if t.peerEgress != "" {
-		return t.peerEgress
+	providerID = strings.TrimSpace(providerID)
+	if !t.peerEgressKnown || providerID == "" || providerID != t.peerEgressProviderID {
+		return "", false
 	}
-	return t.peerEgressFallback
-}
-
-// peerEgressAttempted reports whether this request tried to leave through a
-// peer gateway, regardless of whether its identity was learned.
-func (t *requestTiming) peerEgressAttempted() bool {
-	if t == nil {
-		return false
+	if gatewayID := strings.TrimSpace(t.peerEgress); gatewayID != "" {
+		return gatewayID, true
 	}
-	t.peerEgressMu.Lock()
-	defer t.peerEgressMu.Unlock()
-	return t.peerEgressKnown
+	return strings.TrimSpace(t.peerEgressFallback), true
 }
 
 func newRequestTiming(started time.Time) *requestTiming {

@@ -40,7 +40,7 @@ func TestSendPeerDoorRecordsEgressWhenCancelledBeforeResponse(t *testing.T) {
 		t.Fatal("a cancelled peer request must return an error")
 	}
 
-	trace := peerTraceFor(request, timing)
+	trace := peerTraceFor(request, timing, provider.ID)
 	if trace.Egress != otherID {
 		t.Fatalf("Egress = %q, want the registered parent %q", trace.Egress, otherID)
 	}

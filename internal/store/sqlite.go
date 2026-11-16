@@ -647,6 +647,26 @@ func (s *Store) Load(defaultState domain.GatewayState) (domain.GatewayState, err
 	// 链路授权快照（见 domain.PeerUpstreamGrants）。和 adapter 一样按 provider id
 	// 存在 settings 里，而不是给 providers 表加一列：它是一小块只读的展示状态，
 	// 结构以后可能还得带上游的名字/额度，不值得每改一次就迁移一次表结构。
+	if raw := s.setting("providerScripts"); raw != "" {
+		var scripts map[string]*domain.ProviderScript
+		if err := json.Unmarshal([]byte(raw), &scripts); err == nil {
+			for index := range state.Providers {
+				if script, ok := scripts[state.Providers[index].ID]; ok {
+					state.Providers[index].ProviderScript = script
+				}
+			}
+		}
+	}
+	if raw := s.setting("providerCustomTypes"); raw != "" {
+		var customTypes map[string]string
+		if err := json.Unmarshal([]byte(raw), &customTypes); err == nil {
+			for index := range state.Providers {
+				if customID := strings.TrimSpace(customTypes[state.Providers[index].ID]); customID != "" {
+					state.Providers[index].CustomProviderID = customID
+				}
+			}
+		}
+	}
 	if raw := s.setting("peerUpstreamGrants"); raw != "" {
 		var grants map[string]*domain.PeerUpstreamGrants
 		if err := json.Unmarshal([]byte(raw), &grants); err == nil {
@@ -667,6 +687,17 @@ func (s *Store) Load(defaultState domain.GatewayState) (domain.GatewayState, err
 	}
 	if state.ProviderGroups == nil {
 		state.ProviderGroups = []domain.ProviderGroup{}
+	}
+	// 自定义 Provider 类型是 Provider 实例之上的可复用模板；存成 settings JSON，
+	// 避免为一个很小的管理表反复迁移 providers 主表。
+	if raw := s.setting("customProviders"); raw != "" {
+		var customProviders []domain.CustomProvider
+		if err := json.Unmarshal([]byte(raw), &customProviders); err == nil {
+			state.CustomProviders = customProviders
+		}
+	}
+	if state.CustomProviders == nil {
+		state.CustomProviders = []domain.CustomProvider{}
 	}
 	validGroups := make(map[string]bool, len(state.ProviderGroups))
 	for _, group := range state.ProviderGroups {
@@ -954,6 +985,39 @@ func (s *Store) Save(state domain.GatewayState) error {
 		return err
 	}
 	if err := setSetting(tx, "providerRequestAdapters", string(adapterRaw)); err != nil {
+		return err
+	}
+	scripts := make(map[string]*domain.ProviderScript, len(state.Providers))
+	for _, provider := range state.Providers {
+		if provider.ProviderScript != nil {
+			scripts[provider.ID] = provider.ProviderScript
+		}
+	}
+	scriptRaw, err := json.Marshal(scripts)
+	if err != nil {
+		return err
+	}
+	if err := setSetting(tx, "providerScripts", string(scriptRaw)); err != nil {
+		return err
+	}
+	customTypes := make(map[string]string, len(state.Providers))
+	for _, provider := range state.Providers {
+		if customID := strings.TrimSpace(provider.CustomProviderID); customID != "" {
+			customTypes[provider.ID] = customID
+		}
+	}
+	customTypesRaw, err := json.Marshal(customTypes)
+	if err != nil {
+		return err
+	}
+	if err := setSetting(tx, "providerCustomTypes", string(customTypesRaw)); err != nil {
+		return err
+	}
+	customProvidersRaw, err := json.Marshal(state.CustomProviders)
+	if err != nil {
+		return err
+	}
+	if err := setSetting(tx, "customProviders", string(customProvidersRaw)); err != nil {
 		return err
 	}
 	grants := make(map[string]*domain.PeerUpstreamGrants, len(state.Providers))

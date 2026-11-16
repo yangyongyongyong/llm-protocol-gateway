@@ -1,11 +1,10 @@
-import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
-import {API_BASE, protocolLabel} from '../lib';
+import React, {useCallback, useEffect, useRef, useState} from 'react';
+import {API_BASE} from '../lib';
 import {Badge, Field, Modal} from './ui';
 import {confirmDialog} from '../dialogs';
-import {IconSelect, IconSelectOption} from './selects';
 import type {GrantTarget} from './rbac_types';
 import {ProviderGrantPicker} from './provider_grant_picker';
-import type {PeerGateway, PeerOwnerOption, PeerUpstream, PeerUpstreamsResponse, PeersResponse, Protocol} from '../types';
+import type {PeerGateway, PeerOwnerOption, PeerUpstream, PeerUpstreamsResponse, PeersResponse} from '../types';
 
 async function errorTextFrom(response: Response): Promise<string> {
   try {
@@ -68,12 +67,6 @@ function GatewayIdChip({ gatewayId }: { gatewayId: string }) {
   );
 }
 
-const PROTOCOL_OPTIONS: Array<{value: Protocol; label: string}> = [
-  { value: 'openai_chat', label: 'OpenAI Chat' },
-  { value: 'openai_responses', label: 'OpenAI Responses' },
-  { value: 'claude', label: 'Claude' },
-];
-
 type UpstreamDraft = {
   /** 已有上游的 provider ID；null = 新建。 */
   providerId: string | null;
@@ -81,7 +74,6 @@ type UpstreamDraft = {
   username: string;
   password: string;
   name: string;
-  protocol: Protocol;
   requestedProviderIds: string[];
 };
 
@@ -91,7 +83,6 @@ const emptyUpstreamDraft: UpstreamDraft = {
   username: '',
   password: '',
   name: '',
-  protocol: 'openai_chat',
   requestedProviderIds: [],
 };
 
@@ -118,6 +109,9 @@ export function PeersPage({
 }) {
   const [upstreams, setUpstreams] = useState<PeerUpstream[]>([]);
   const [upstreamGatewayId, setUpstreamGatewayId] = useState('');
+  const [localGatewayName, setLocalGatewayName] = useState('');
+  const [localNameDraft, setLocalNameDraft] = useState('');
+  const [localNameSaving, setLocalNameSaving] = useState(false);
   const [upstreamsLoading, setUpstreamsLoading] = useState(true);
   const [upstreamsError, setUpstreamsError] = useState('');
 
@@ -138,6 +132,9 @@ export function PeersPage({
   const [draftError, setDraftError] = useState('');
   const [draftSaving, setDraftSaving] = useState(false);
   const [busyId, setBusyId] = useState('');
+  const [renameTarget, setRenameTarget] = useState<PeerUpstream | null>(null);
+  const [renameValue, setRenameValue] = useState('');
+  const [renameBusy, setRenameBusy] = useState(false);
   // 「测试连接」的结果：按上游 providerId 记，成功也留一条——运维点完按钮要的
   // 是「连上了、同步到了什么」，只有失败才冒出来会让人反复点。
   const [testResults, setTestResults] = useState<Record<string, { ok: boolean; text: string }>>({});
@@ -149,6 +146,14 @@ export function PeersPage({
       setUpstreams(payload.upstreams || []);
       setUpstreamGatewayId(payload.gatewayId || '');
       setUpstreamsError('');
+      try {
+        const namePayload = await jsonRequest<{name?: string}>(`${API_BASE}/__gateway-name`);
+        const name = namePayload.name || '';
+        setLocalGatewayName(name);
+        setLocalNameDraft((current) => current || name);
+      } catch {
+        // 名称只是展示与默认值，读取失败不阻断上游列表。
+      }
     } catch (error) {
       setUpstreamsError((error as Error).message);
     } finally {
@@ -233,7 +238,6 @@ export function PeersPage({
             username: draft.username.trim(),
             password: draft.password,
             name: draft.name.trim(),
-            protocol: draft.protocol,
             requestedProviderIds: draft.requestedProviderIds,
           }),
         });
@@ -336,6 +340,51 @@ export function PeersPage({
     }
   };
 
+  const openRenameUpstream = (upstream: PeerUpstream) => {
+    setRenameTarget(upstream);
+    setRenameValue(upstream.name);
+  };
+
+  const submitRenameUpstream = async () => {
+    if (!renameTarget) return;
+    const next = renameValue.trim();
+    if (!next || next === renameTarget.name) return;
+    setRenameBusy(true);
+    try {
+      await jsonRequest(`${API_BASE}/__peer-upstreams/${encodeURIComponent(renameTarget.providerId)}`, {
+        method: 'PATCH',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name: next}),
+      });
+      setRenameTarget(null);
+      await refreshAll();
+    } catch (error) {
+      setUpstreamsError((error as Error).message);
+    } finally {
+      setRenameBusy(false);
+    }
+  };
+
+  const saveLocalGatewayName = async () => {
+    const next = localNameDraft.trim();
+    if (!next || next === localGatewayName) return;
+    setLocalNameSaving(true);
+    try {
+      const payload = await jsonRequest<{name: string}>(`${API_BASE}/__gateway-name`, {
+        method: 'PATCH',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name: next}),
+      });
+      setLocalGatewayName(payload.name || next);
+      setLocalNameDraft(payload.name || next);
+      setUpstreamsError('');
+    } catch (error) {
+      setUpstreamsError((error as Error).message);
+    } finally {
+      setLocalNameSaving(false);
+    }
+  };
+
   const saveCidrs = async (value: string) => {    try {
       const payload = await jsonRequest<{ cidrs: string }>(`${API_BASE}/__settings/peer-registration-cidrs`, {
         method: 'PATCH',
@@ -391,7 +440,7 @@ export function PeersPage({
           </div>
           <div className="panel-header-actions">
             {canManage ? (
-              <button className="btn primary" type="button" onClick={() => { setDraftError(''); setDraft({ ...emptyUpstreamDraft }); }}>
+              <button className="btn primary" type="button" onClick={() => { setDraftError(''); setDraft({ ...emptyUpstreamDraft, name: localGatewayName }); }}>
                 连接到上游网关
               </button>
             ) : null}
@@ -399,8 +448,23 @@ export function PeersPage({
         </div>
         <div className="peers-gateway-id-row">
           <GatewayIdChip gatewayId={localGatewayId || upstreamGatewayId} />
+          {canManage ? (
+            <span className="peer-local-name-editor">
+              <span className="hint-text">本机名称</span>
+              <input
+                value={localNameDraft}
+                placeholder="例如 Luca-Mac-mini"
+                maxLength={80}
+                onChange={(event) => setLocalNameDraft(event.target.value)}
+                onBlur={() => void saveLocalGatewayName()}
+                onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }}
+                aria-label="本机名称"
+              />
+              {localNameSaving ? <span className="hint-text">保存中…</span> : null}
+            </span>
+          ) : null}
           <span className="hint-text">
-            同一台机器上重装 app 身份不变，所以上游那边认的还是同一个下游。
+            同一台机器上重装 app 身份不变；这个名称会显示在上游的下游列表里，并作为后续注册上游的默认名称。
           </span>
         </div>
 
@@ -416,7 +480,6 @@ export function PeersPage({
           <div className="peer-upstream-list">
             <div className="peer-upstream-row peer-upstream-row-head">
               <span>上游</span>
-              <span>协议</span>
               <span>可用模型</span>
               <span>最近状态</span>
               <span />
@@ -445,7 +508,6 @@ export function PeersPage({
                     {upstream.grantsSyncedAt ? <span>同步于 {formatTime(upstream.grantsSyncedAt)}</span> : null}
                   </div>
                 </div>
-                <div><Badge tone="blue">{protocolLabel(upstream.protocol)}</Badge></div>
                 <div className="peer-upstream-models">
                   {upstream.models.length === 0 ? (
                     <span className="hint-text">
@@ -453,7 +515,7 @@ export function PeersPage({
                         ? '还没同步到上游的授权清单'
                         : upstream.grantCount > 0
                           // 授权了、但都不是这条链路的协议：说清楚，否则"没模型"看起来像故障。
-                          ? `上游授权了 ${upstream.grantCount} 个 Provider，但其中没有 ${protocolLabel(upstream.protocol)} 的模型`
+                          ? `上游授权了 ${upstream.grantCount} 个 Provider，但没有可用模型`
                           : '上游还没授权任何模型'}
                     </span>
                   ) : (
@@ -475,6 +537,14 @@ export function PeersPage({
                         className="mini-btn"
                         type="button"
                         disabled={busy(upstream.providerId)}
+                        onClick={() => openRenameUpstream(upstream)}
+                      >
+                        重命名
+                      </button>
+                      <button
+                        className="mini-btn"
+                        type="button"
+                        disabled={busy(upstream.providerId)}
                         onClick={() => void refreshUpstream(upstream)}
                       >
                         {busy(upstream.providerId) ? '测试中…' : '测试连接'}
@@ -490,7 +560,6 @@ export function PeersPage({
                             username: '',
                             password: '',
                             name: upstream.name,
-                            protocol: upstream.protocol,
                             requestedProviderIds: [],
                           });
                         }}
@@ -681,6 +750,33 @@ export function PeersPage({
         />
       ) : null}
 
+      {renameTarget ? (
+        <Modal
+          title="重命名上游网关"
+          description="只改本机显示名与成员 Provider 的前缀；凭据、授权清单和上游那边的注册记录都不受影响。"
+          onClose={() => { if (!renameBusy) setRenameTarget(null); }}
+        >
+          <form onSubmit={(event) => { event.preventDefault(); void submitRenameUpstream(); }}>
+            <div className="form-grid modal-form">
+              <Field
+                fullWidth
+                label="上游名称"
+                hint={`当前：${renameTarget.name}`}
+                value={renameValue}
+                onChange={setRenameValue}
+                placeholder="例如 vps2"
+              />
+            </div>
+            <div className="modal-actions">
+              <button className="btn" type="button" disabled={renameBusy} onClick={() => setRenameTarget(null)}>取消</button>
+              <button className="btn primary" type="submit" disabled={renameBusy || !renameValue.trim() || renameValue.trim() === renameTarget.name}>
+                {renameBusy ? '保存中…' : '保存名称'}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      ) : null}
+
       {draft ? (
         <UpstreamDraftModal
           draft={draft}
@@ -710,9 +806,6 @@ function UpstreamDraftModal({
   onClose: () => void;
   onSubmit: () => void;
 }) {
-  const [protocolChoices] = useState(() =>
-    PROTOCOL_OPTIONS.map((option): IconSelectOption => ({ value: option.value, label: option.label })));
-  const protocolValue = useMemo(() => draft.protocol, [draft.protocol]);
   const editing = Boolean(draft.providerId);
   // 「测试连接」：只问上游能不能连通、允不允许本机注册，不建账号、不换凭据。
   const [probing, setProbing] = useState(false);
@@ -825,13 +918,6 @@ function UpstreamDraftModal({
               value={draft.name}
               placeholder="vps1-远端"
               onChange={(value) => onChange({ ...draft, name: value })}
-            />
-            <IconSelect
-              label="协议"
-              value={protocolValue}
-              options={protocolChoices}
-              onChange={(value) => onChange({ ...draft, protocol: value as Protocol })}
-              hint="一条 Provider 只能说一种协议。想同时用上游的 OpenAI 和 Claude，就按两个协议各连一次。"
             />
           </>
         )}

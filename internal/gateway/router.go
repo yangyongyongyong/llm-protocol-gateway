@@ -24,6 +24,9 @@ type Router struct {
 func NewRouter(state domain.GatewayState) *Router {
 	mergeDefaultEndpoints(&state)
 	normalizePublicAccess(&state)
+	if state.CustomProviders == nil {
+		state.CustomProviders = []domain.CustomProvider{}
+	}
 	rebuildModels(&state)
 	return &Router{state: state}
 }
@@ -628,6 +631,7 @@ func (r *Router) AddProvider(provider domain.Provider) (domain.Provider, error) 
 	// (there's nothing else for the user to configure), so skip the manual
 	// requirement for those modes only.
 	if provider.BaseURL == "" &&
+		provider.ProviderScript == nil &&
 		provider.AuthType != domain.AuthTypeClaudeOAuth &&
 		provider.AuthType != domain.AuthTypeCursorOAuth &&
 		provider.AuthType != domain.AuthTypeChatGPTOAuth &&
@@ -652,6 +656,11 @@ func (r *Router) AddProvider(provider domain.Provider) (domain.Provider, error) 
 			return false
 		})
 	}
+	if provider.ProviderScript != nil {
+		// ID 生成后才能稳定推导脚本端口；脚本 Provider 的 BaseURL 永远
+		// 指向本机脚本，而不是厂商私有协议地址。
+		provider.BaseURL = providerScriptRuntimes.apiBaseURL(provider)
+	}
 	normalizeProvider(&provider)
 
 	r.state.Providers = append(r.state.Providers, provider)
@@ -659,7 +668,36 @@ func (r *Router) AddProvider(provider domain.Provider) (domain.Provider, error) 
 	return provider, nil
 }
 
+// RenameProvider changes only the display label. Unlike UpdateProvider it
+// never touches credentials, models, protocols, or routing metadata.
+func (r *Router) RenameProvider(providerID, name string) (domain.Provider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return domain.Provider{}, fmt.Errorf("provider name is required")
+	}
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID != providerID {
+			continue
+		}
+		r.state.Providers[index].Name = name
+		return r.state.Providers[index], nil
+	}
+	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+}
+
 func (r *Router) UpdateProvider(providerID string, patch domain.Provider) (domain.Provider, error) {
+	// 内部增量更新（模型刷新、OAuth 刷新等）通常不带 ProviderScript；nil 表示
+	// 保留旧脚本，非 nil 表示显式替换。控制台 PATCH 需要表达“显式清空”，会走
+	// updateProviderWithScript 并把 providerScriptSet 设为 true。
+	return r.updateProviderWithScript(providerID, patch, patch.ProviderScript != nil)
+}
+
+// updateProviderWithScript 是 Provider PATCH 的原子实现。providerScriptSet 用来
+// 区分 JSON 字段缺省和显式 null：前者保留旧脚本，后者清空脚本。这个区分不能
+// 放进 domain.Provider 的普通字段里，否则所有内部增量更新都会误清脚本。
+func (r *Router) updateProviderWithScript(providerID string, patch domain.Provider, providerScriptSet bool) (domain.Provider, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -673,6 +711,9 @@ func (r *Router) UpdateProvider(providerID string, patch domain.Provider) (domai
 		}
 		if patch.Protocol != "" {
 			updated.Protocol = patch.Protocol
+		}
+		if customID := strings.TrimSpace(patch.CustomProviderID); customID != "" {
+			updated.CustomProviderID = customID
 		}
 		if strings.TrimSpace(patch.BaseURL) != "" {
 			updated.BaseURL = strings.TrimSpace(patch.BaseURL)
@@ -692,8 +733,17 @@ func (r *Router) UpdateProvider(providerID string, patch domain.Provider) (domai
 		if strings.TrimSpace(patch.AuthType) != "" {
 			updated.AuthType = strings.TrimSpace(patch.AuthType)
 		}
-		// Explicitly allow clearing requestAdapter by sending null/empty object.
-		updated.RequestAdapter = patch.RequestAdapter
+		// RequestAdapter 字段缺省表示“这次不改”，显式 null / {} 才清空。
+		// 控制台已不再展示自定义适配，但存量 Provider 仍需要保留旧配置，
+		// 不能被一次普通编辑静默清掉。
+		if patch.RequestAdapter != nil {
+			updated.RequestAdapter = patch.RequestAdapter
+		}
+		// ProviderScript：字段缺省表示不改，显式 null 才清空，显式对象才替换。
+		// 这样普通编辑不会把用户脚本静默删掉，同时 API 也能完整管理脚本生命周期。
+		if providerScriptSet {
+			updated.ProviderScript = patch.ProviderScript
+		}
 		// Zhipu coding-plan quota-query config (non-secret). Sent verbatim from
 		// the editor; trim so blank inputs clear the fields.
 		updated.CodingPlanProvider = strings.TrimSpace(patch.CodingPlanProvider)
@@ -835,6 +885,17 @@ func normalizeProvider(provider *domain.Provider) {
 	}
 	if provider.HealthStatus == "" {
 		provider.HealthStatus = "unchecked"
+	}
+	if provider.ProviderScript != nil {
+		if strings.TrimSpace(provider.ProviderScript.Entrypoint) == "" {
+			provider.ProviderScript.Entrypoint = "adapter.py"
+		}
+		if strings.TrimSpace(provider.ProviderScript.Language) == "" {
+			provider.ProviderScript.Language = "python"
+		}
+		if strings.TrimSpace(provider.ProviderScript.HealthPath) == "" {
+			provider.ProviderScript.HealthPath = "/health"
+		}
 	}
 	if provider.AuthHeader == "" {
 		provider.AuthHeader = "Authorization"
@@ -2510,6 +2571,26 @@ func (r *Router) UpdateProviderModels(providerID string, models []domain.Model, 
 			r.state.Providers[index].HealthStatus = strings.TrimSpace(healthStatus)
 		}
 		r.rebuildModelsLocked()
+		return r.state.Providers[index], nil
+	}
+	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)
+}
+
+// SetProviderDefaultModel 只更新默认模型，供脚本 Provider 在模型目录刷新后修正
+// 已经失效的旧默认值。普通 Provider 仍遵守「运维选过就不覆盖」的规则，不能把
+// 这段逻辑塞进 UpdateProviderModels 全局生效。
+func (r *Router) SetProviderDefaultModel(providerID, modelID string) (domain.Provider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return domain.Provider{}, fmt.Errorf("default model is required")
+	}
+	for index := range r.state.Providers {
+		if r.state.Providers[index].ID != providerID {
+			continue
+		}
+		r.state.Providers[index].DefaultModel = modelID
 		return r.state.Providers[index], nil
 	}
 	return domain.Provider{}, fmt.Errorf("provider %q not found", providerID)

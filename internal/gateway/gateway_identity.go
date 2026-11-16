@@ -3,6 +3,8 @@ package gateway
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
+	"os"
 	"strings"
 
 	"github.com/luca/llm-protocol-gateway/internal/domain"
@@ -16,6 +18,7 @@ import (
 // 换，界面上会把这件事说出来（见 GatewayIdentity.MachineIDReadable）。
 const settingGatewayID = "gatewayId"
 const settingGatewayIDSource = "gatewayIdSource"
+const settingGatewayName = "gatewayName"
 
 // GatewayIdentity 是 /__state 里给界面看的那部分身份信息。
 type GatewayIdentity struct {
@@ -97,6 +100,7 @@ func resolveGatewayIdentity(machineID string, store AdminAuthStore, salt string)
 	if derived.MachineIDReadable {
 		return GatewayIdentity{
 			ID:                derived.Value,
+			Name:              storedGatewayName(store),
 			Source:            string(derived.Source),
 			MachineIDReadable: true,
 		}
@@ -117,9 +121,57 @@ func resolveGatewayIdentity(machineID string, store AdminAuthStore, salt string)
 	}
 	return GatewayIdentity{
 		ID:                gatewayid.Derive(persisted, salt).Value,
+		Name:              storedGatewayName(store),
 		Source:            string(gatewayid.SourcePersisted),
 		MachineIDReadable: false,
 	}
+}
+
+func storedGatewayName(store AdminAuthStore) string {
+	if store == nil {
+		return ""
+	}
+	if name := strings.TrimSpace(store.Setting(settingGatewayName)); name != "" {
+		return name
+	}
+	host, _ := os.Hostname()
+	return strings.TrimSpace(host)
+}
+
+// SetGatewayName persists the user-visible name. The stable gateway ID does not
+// change: peer registration and loop detection continue to use the ID, while
+// the name is a mutable label shown on both sides.
+func (s *Server) SetGatewayName(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("本机名称不能为空")
+	}
+	if len([]rune(name)) > 80 {
+		return fmt.Errorf("本机名称不能超过 80 个字符")
+	}
+	if s.gatewayIdentity != nil {
+		s.gatewayIdentity.Name = name
+	}
+	if auth, ok := s.stateSaver.(AdminAuthStore); ok && auth != nil {
+		if err := auth.SetSetting(settingGatewayName, name); err != nil {
+			return err
+		}
+	}
+	if s.adminAuth != nil {
+		if err := s.adminAuth.SetSetting(settingGatewayName, name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// GatewayName is the current display label used by local users and by the
+// registration request sent to parent gateways.
+func (s *Server) GatewayName() string {
+	if s != nil && s.gatewayIdentity != nil {
+		return strings.TrimSpace(s.gatewayIdentity.Name)
+	}
+	return ""
 }
 
 // newRandomGatewaySeed 生成一个 128 bit 的随机种子，只在退化路径上用。

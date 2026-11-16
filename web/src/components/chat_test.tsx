@@ -19,6 +19,7 @@ import type {
     RouteTestResult,
 } from '../types';
 import {Badge, CopyButton, Field, Modal} from './ui';
+import {SearchableModelSelect} from './selects';
 
 /** 一种协议下可选的 thinking 字段与其枚举值。 */
 export type ThinkingFieldPreset = ReturnType<typeof thinkingPresetsForProtocol>['fields'][number];
@@ -88,10 +89,12 @@ export function ChatTestDialog(props: ChatTestDialogProps) {
           <div className="field">
             <label>测试模型</label>
             <div className="field-inline">
-              <select value={props.model} onChange={(event) => props.onModelChange(event.target.value)}>
-                <option value="">（使用 Provider 兜底模型）</option>
-                {props.models.map((model) => <option key={model.id} value={model.id}>{model.id}</option>)}
-              </select>
+              <SearchableModelSelect
+                value={props.model}
+                models={props.models}
+                emptyLabel="（使用 Provider 兜底模型）"
+                onChange={props.onModelChange}
+              />
               <button className="mini-btn" type="button" disabled={props.refreshingModels} onClick={() => void props.onRefreshModels()}>
                 {props.refreshingModels ? '刷新中…' : '刷新模型'}
               </button>
