@@ -116,7 +116,7 @@ func TestProviderScriptRuntimeStartsAndStops(t *testing.T) {
 	runtime := newProviderScriptRuntime()
 	runtime.rootDir = t.TempDir()
 	script := `from http.server import BaseHTTPRequestHandler, HTTPServer
-import json, os
+import json, os, socketserver
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *args):
@@ -137,7 +137,15 @@ class H(BaseHTTPRequestHandler):
         self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
         self.wfile.write(json.dumps(payload).encode())
 
-server = HTTPServer(("127.0.0.1", int(os.environ["PROVIDER_SCRIPT_PORT"])), H)
+class S(HTTPServer):
+    def server_bind(self):
+        # 跳过 socket.getfqdn()：它在 bind 之后、serve_forever 之前执行，
+        # macOS 上反向解析可能卡住几十秒，端口已 listen 却永远不 accept。
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = self.server_address[0]
+        self.server_port = self.server_address[1]
+
+server = S(("127.0.0.1", int(os.environ["PROVIDER_SCRIPT_PORT"])), H)
 server.serve_forever()
 `
 	provider := domain.Provider{
@@ -189,7 +197,7 @@ server.serve_forever()
 // Chat 入口都有，POST 一律返回成功，足以验证网关的启动/重启/模型发现链路。
 func testProviderScriptSource(model string) string {
 	script := `from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import json, os
+import json, os, socketserver
 MODEL = "__MODEL__"
 class H(BaseHTTPRequestHandler):
     def log_message(self, *args):
@@ -211,7 +219,14 @@ class H(BaseHTTPRequestHandler):
             body = {"ok": True}
         self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
         self.wfile.write(json.dumps(body).encode())
-server = ThreadingHTTPServer(("127.0.0.1", int(os.environ["PROVIDER_SCRIPT_PORT"])), H)
+class S(ThreadingHTTPServer):
+    def server_bind(self):
+        # 跳过 socket.getfqdn()：它在 bind 之后、serve_forever 之前执行，
+        # macOS 上反向解析可能卡住几十秒，端口已 listen 却永远不 accept。
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = self.server_address[0]
+        self.server_port = self.server_address[1]
+server = S(("127.0.0.1", int(os.environ["PROVIDER_SCRIPT_PORT"])), H)
 server.daemon_threads = True
 server.serve_forever()
 `

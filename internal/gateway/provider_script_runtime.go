@@ -457,6 +457,9 @@ func (r *ProviderScriptRuntime) waitHealthy(ctx context.Context, provider domain
 	if last == nil {
 		last = errors.New("health check timed out")
 	}
+	if tail := r.logTail(provider.ID); tail != "" {
+		return fmt.Errorf("%w; adapter.log:\n%s", last, tail)
+	}
 	return last
 }
 
@@ -489,7 +492,12 @@ func probeProviderScriptHealth(ctx context.Context, baseURL, healthPath string) 
 	if err != nil {
 		return err
 	}
-	client := &http.Client{Timeout: 2 * time.Second}
+	// 脚本永远在 127.0.0.1 上：绝不能走环境里的 HTTP 代理（CI 与内网常见）。
+	// 否则请求被代理接走，本地脚本的健康检查永远等不到响应。
+	client := &http.Client{
+		Timeout:   2 * time.Second,
+		Transport: &http.Transport{Proxy: nil},
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err

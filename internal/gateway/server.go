@@ -6038,6 +6038,11 @@ func (s *Server) fetchProviderModels(r *http.Request, provider domain.Provider, 
 		}
 		request.Header.Set("Accept", "application/json")
 		client := &http.Client{Timeout: 30 * time.Second}
+		if provider.ProviderScript != nil {
+			// 脚本 Provider 的 baseURL 永远是本机回环，不能走环境里的 HTTP 代理：
+			// 否则 /v1/models 被代理接走，模型发现永远失败。
+			client.Transport = &http.Transport{Proxy: nil}
+		}
 		response, err := client.Do(request)
 		if err != nil {
 			return providerTestResult{Success: false, Provider: provider.ID, ModelsURL: modelsURL, LatencyMs: time.Since(started).Milliseconds(), Error: err.Error(), Models: []domain.Model{}}
