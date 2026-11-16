@@ -505,6 +505,14 @@ func (m *Manager) DownloadNow() bool {
 		m.mu.Unlock()
 		return false
 	}
+	// 版本号与 SHA-256 元数据不能代替发布签名。即使 API 回退只为确认
+	// “没有更新”保留了一份未验签快照，也不能经手动下载接口绕过校验。
+	if m.signatureRequired && !m.latest.signatureVerified {
+		m.state = StateError
+		m.err = "更新清单尚未通过签名验证，拒绝下载未经验证的安装包"
+		m.mu.Unlock()
+		return false
+	}
 	assetKey := platformKey()
 	asset, ok := m.latest.Assets[assetKey]
 	if !ok || strings.TrimSpace(asset.URL) == "" || strings.TrimSpace(asset.SHA256) == "" {
@@ -793,37 +801,62 @@ func fileSHA256(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// fetchManifest 优先读取稳定清单；下载失败时才向 GitHub API 查询同一
+// Release 的附件。解析或验签失败一律终止，不能降级为未签名安装包。
 func (m *Manager) fetchManifest(ctx context.Context) (*Release, error) {
 	if m.publicKeyErr != nil {
 		return nil, m.publicKeyErr
 	}
-	body, err := getBytes(ctx, m.client, m.feedURL)
-	if err == nil {
-		var rel Release
-		if err := json.Unmarshal(body, &rel); err != nil {
-			return nil, fmt.Errorf("解析更新清单失败：%w", err)
-		}
+	body, feedErr := getBytes(ctx, m.client, m.feedURL)
+	if feedErr == nil {
+		var sig []byte
 		if m.signatureRequired {
-			sig, sigErr := getBytes(ctx, m.client, m.feedURL+".sig")
+			var sigErr error
+			sig, sigErr = getBytes(ctx, m.client, m.feedURL+".sig")
 			if sigErr != nil {
 				return nil, fmt.Errorf("读取更新签名失败：%w", sigErr)
 			}
-			if err := verifySignature(body, sig, m.publicKey); err != nil {
-				return nil, err
-			}
-			rel.signatureVerified = true
 		}
-		if strings.TrimSpace(rel.Version) == "" || len(rel.Assets) == 0 {
-			return nil, errors.New("更新清单缺少版本号或安装包")
-		}
-		return &rel, nil
+		return m.parseManifest(body, sig, "")
 	}
-	if !m.githubFallback {
-		return nil, err
+	if !m.githubFallback || ctx.Err() != nil {
+		return nil, feedErr
 	}
-	return m.fetchGitHubLatest(ctx)
+	rel, fallbackErr := m.fetchGitHubLatest(ctx)
+	if fallbackErr != nil {
+		// 保留最初的网络错误与回退原因，避免把 EOF/TLS 失败说成“发布缺文件”。
+		return nil, fmt.Errorf("读取更新清单失败：%w", errors.Join(feedErr, fallbackErr))
+	}
+	return rel, nil
 }
 
+// parseManifest 对原始清单字节验签后解析；API 回退必须匹配其查询到的
+// Release 版本，避免把旧版签名文件与新版安装包信息拼成一份可信更新。
+func (m *Manager) parseManifest(body, sig []byte, expectedVersion string) (*Release, error) {
+	if m.publicKeyErr != nil {
+		return nil, m.publicKeyErr
+	}
+	var rel Release
+	if err := json.Unmarshal(body, &rel); err != nil {
+		return nil, fmt.Errorf("解析更新清单失败：%w", err)
+	}
+	if m.signatureRequired {
+		if err := verifySignature(body, sig, m.publicKey); err != nil {
+			return nil, err
+		}
+		rel.signatureVerified = true
+	}
+	if strings.TrimSpace(rel.Version) == "" || len(rel.Assets) == 0 {
+		return nil, errors.New("更新清单缺少版本号或安装包")
+	}
+	if expectedVersion != "" && cleanVersion(rel.Version) != cleanVersion(expectedVersion) {
+		return nil, fmt.Errorf("GitHub Release 版本 %s 与更新清单版本 %s 不一致，拒绝更新", expectedVersion, rel.Version)
+	}
+	return &rel, nil
+}
+
+// fetchGitHubLatest 从官方 API 找到固定版本的清单与签名附件，并重新验签。
+// 只有 API 明确没提供附件时才报告缺文件；读取失败必须保留真实网络原因。
 func (m *Manager) fetchGitHubLatest(ctx context.Context) (*Release, error) {
 	api := githubAPIBase + "/repos/" + m.repo + "/releases/latest"
 	body, err := getBytes(ctx, m.client, api)
@@ -860,6 +893,36 @@ func (m *Manager) fetchGitHubLatest(ctx context.Context) (*Release, error) {
 			sha  string
 		}{a.Size, a.URL, strings.TrimPrefix(a.Digest, "sha256:")}
 	}
+	manifest, hasManifest := byName["update.json"]
+	signature, hasSignature := byName["update.json.sig"]
+	hasManifest = hasManifest && strings.TrimSpace(manifest.url) != ""
+	hasSignature = hasSignature && strings.TrimSpace(signature.url) != ""
+	if hasManifest && (hasSignature || !m.signatureRequired) {
+		// 使用 API 这一份 Release 给出的固定附件地址，不再读会随发版变化的
+		// /latest/download；清单和签名必须来自同一版本，且仍用内置公钥验签。
+		manifestBody, err := getBytes(ctx, m.client, manifest.url)
+		if err != nil {
+			return nil, fmt.Errorf("GitHub Release %s 已发布更新清单，但读取 update.json 失败：%w", raw.TagName, err)
+		}
+		var signatureBody []byte
+		if m.signatureRequired {
+			signatureBody, err = getBytes(ctx, m.client, signature.url)
+			if err != nil {
+				return nil, fmt.Errorf("GitHub Release %s 已发布签名，但读取 update.json.sig 失败：%w", raw.TagName, err)
+			}
+		}
+		return m.parseManifest(manifestBody, signatureBody, raw.TagName)
+	}
+	if m.signatureRequired && Newer(rel.Version, m.version) {
+		missing := make([]string, 0, 2)
+		if !hasManifest {
+			missing = append(missing, "update.json")
+		}
+		if !hasSignature {
+			missing = append(missing, "update.json.sig")
+		}
+		return nil, fmt.Errorf("GitHub Release %s 缺少经过签名的 update.json/update.json.sig（缺少 %s），拒绝未验证的新版本", raw.TagName, strings.Join(missing, "、"))
+	}
 	var sumBody []byte
 	for _, key := range []string{"darwin-arm64", "darwin-amd64", "windows-amd64", "linux-amd64"} {
 		name := platformAssetName(key)
@@ -884,12 +947,11 @@ func (m *Manager) fetchGitHubLatest(ctx context.Context) (*Release, error) {
 	if len(rel.Assets) == 0 {
 		return nil, errors.New("GitHub Release 中没有可用于当前平台的 App 安装包")
 	}
-	if m.signatureRequired && Newer(rel.Version, m.version) {
-		return nil, errors.New("GitHub Release 缺少经过签名的 update.json/update.json.sig，拒绝未验证的新版本")
-	}
 	return rel, nil
 }
 
+// getBytes 读取更新元数据，网络错误只显示出错主机和根因，不回显
+// GitHub CDN 跳转 URL 中的临时签名参数；原始错误链保留供诊断。
 func getBytes(ctx context.Context, client *http.Client, rawURL string) ([]byte, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Scheme == "" || u.Host == "" {
@@ -903,7 +965,15 @@ func getBytes(ctx context.Context, client *http.Client, rawURL string) ([]byte, 
 	req.Header.Set("User-Agent", "llm-protocol-gateway-updater/1")
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		failedHost := u.Hostname()
+		var requestErr *url.Error
+		if errors.As(err, &requestErr) {
+			if failedURL, parseErr := url.Parse(requestErr.URL); parseErr == nil && failedURL.Hostname() != "" {
+				failedHost = failedURL.Hostname()
+			}
+			err = requestErr.Err
+		}
+		return nil, fmt.Errorf("连接更新服务器 %s 失败（请检查网络或代理）：%w", failedHost, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

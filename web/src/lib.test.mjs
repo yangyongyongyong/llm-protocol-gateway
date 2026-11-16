@@ -71,6 +71,7 @@ test('新建 API 密钥默认思考深度为 max', () => {
 test('GatewayState 归一化：Provider 分组缺省为空数组', () => {
   const state = lib.normalizeGatewayState({providers: [{id: 'p1', name: 'p1', groupId: 'g1'}]});
   assert.deepEqual(state.providerGroups, []);
+  assert.deepEqual(state.customProviders, []);
   assert.equal(state.providers[0].groupId, 'g1');
   assert.deepEqual(lib.normalizeGatewayState({providerGroups: [{id: 'g1', name: 'G', position: 0}], providers: []}).providerGroups, [{id: 'g1', name: 'G', position: 0}]);
 });

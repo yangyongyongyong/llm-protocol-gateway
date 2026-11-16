@@ -217,6 +217,17 @@ func isUserAllowedPath(method, path string) bool {
 	if method == http.MethodPost && (path == "/__providers" || path == "/__routes") {
 		return true
 	}
+	// Connector Lab 是 Provider 创建与真实协议测试的组合动作。作用域内的
+	// Provider 仍由 Lab 自己创建，不存在借用别人 Provider 的路径。
+	if method == http.MethodPost && path == "/__connectors/lab" {
+		return true
+	}
+	if method == http.MethodPost && path == "/__provider-script/validate" {
+		return true
+	}
+	if method == http.MethodGet && path == "/__provider-script/abi" {
+		return true
+	}
 	// A user's own routes: edit / delete / test, with the same per-route
 	// ownership check the other provider-scoped handlers carry
 	// (requireRouteAccessForUser). Routes of providers they were not granted
@@ -322,6 +333,12 @@ func isUserProviderManagementPath(method, path string) bool {
 			return method == http.MethodGet
 		default:
 			return false
+		}
+	}
+	if len(parts) == 3 && parts[1] == "script" {
+		switch parts[2] {
+		case "start", "restart", "stop", "status", "logs", "test":
+			return true
 		}
 	}
 	if len(parts) == 3 {

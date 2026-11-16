@@ -100,6 +100,8 @@ OpenAI Chat、OpenAI Responses、Claude、Gemini 四个端点集中展示，附�
 | **Gemini** | 直转 | 直转 | 直转 | 透传 |
 
 - 协议相同直接透传，不同则点对点转换，**不经过有损中间层**；工具调用、图像输入、thinking 块与 prompt cache 断点在各条路径上都有测试覆盖。
+- Responses → Chat 转换会兼容严格 OpenAI/Azure 校验：`gpt-5.5` 等不认 `max` 的模型自动降到 `xhigh`，函数工具顶层 `oneOf/anyOf/allOf` 会归并为普通 object schema，避免 Codex 的 MCP 工具导致整条会话 400。
+- 超长 Codex 工具调用 id 会稳定缩短到 64 字符内；namespace 展开超过 Azure 的 128 个工具上限时按声明顺序裁剪，避免整条 Responses 会话被 400 拒绝。
 - 流式响应支持**心跳保活**（长思考静默时不至于被客户端判定超时）、空响应重试、仅思考无正文时重试/切换。
 - Claude 方向自动在工具尾块、system 尾块与倒数第二条 user 消息注入 `cache_control` 断点，保持上游 prompt 缓存命中。
 - 除对话外，还透传 `/v1/embeddings`、`/v1/audio/transcriptions|translations`、`/v1/images/generations`。
@@ -124,8 +126,10 @@ OpenAI Chat、OpenAI Responses、Claude、Gemini 四个端点集中展示，附�
 添加 Provider 时提供 60 个预设（24 个厂商、16 个中转、12 个订阅、4 个本地），也可选「自定义」手填 Base URL。**密钥与 OAuth 令牌只留在网关进程里，任何页面都不会下发。**
 
 Base URL 支持 `{model}` 占位符（例如 Azure OpenAI 的
-`/openai/deployments/{model}/chat/completions?api-version=...`）。这类 deployment
-端点不能通过 `/models` 枚举，控制台的「获取模型」会沿用 Provider 已配置的模型目录，不会误把账号标成异常。
+`/openai/deployments/{model}/chat/completions?api-version=...`）。deployment 路径本身
+不能直接枚举，网关会继续探测同主机的 `/v1/models`、前缀 `/models` 等候选目录；
+只有这些目录都不可用时才沿用 Provider 已配置的模型目录，不会误把账号标成异常。
+新版 Codex 的 Responses 请求会改走同主机的 `/openai/v1/responses`（model 放 body），不会错误拼成 `/deployments/{model}/responses`。
 
 ### 3. 调度与容灾
 

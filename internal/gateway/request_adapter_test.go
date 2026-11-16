@@ -101,3 +101,30 @@ func TestGenerateRequestAdapterCurlUsesBaseURLModelPlaceholder(t *testing.T) {
 		t.Fatalf("expected rewritten body model, got %s", curl)
 	}
 }
+
+// 控制台不再展示自定义适配后，普通 Provider PATCH 不会携带 requestAdapter。
+// 这种“字段缺省”的更新必须保留存量配置；只有显式 null / 空对象才清空。
+func TestUpdateProviderOmitsRequestAdapterKeepsExisting(t *testing.T) {
+	router := NewRouter(domain.GatewayState{Providers: []domain.Provider{{
+		ID: "legacy", Name: "Legacy", Protocol: domain.ProtocolOpenAIChat,
+		BaseURL: "https://example.com/v1/chat/completions",
+		RequestAdapter: &domain.RequestAdapter{
+			URLTemplate:  "https://example.com/v1/chat/completions",
+			ModelMapping: map[string]string{"claude-sonnet-5": "gpt-5.5"},
+		},
+	}}})
+	if _, err := router.UpdateProvider("legacy", domain.Provider{Name: "Renamed"}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	got, _ := router.ProviderByID("legacy")
+	if got.RequestAdapter == nil || got.RequestAdapter.ModelMapping["claude-sonnet-5"] != "gpt-5.5" {
+		t.Fatalf("requestAdapter lost on partial update: %#v", got.RequestAdapter)
+	}
+	if _, err := router.UpdateProvider("legacy", domain.Provider{RequestAdapter: &domain.RequestAdapter{}}); err != nil {
+		t.Fatalf("clear update: %v", err)
+	}
+	got, _ = router.ProviderByID("legacy")
+	if got.RequestAdapter != nil {
+		t.Fatalf("requestAdapter not cleared by explicit empty object: %#v", got.RequestAdapter)
+	}
+}

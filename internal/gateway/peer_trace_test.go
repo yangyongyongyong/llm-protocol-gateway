@@ -9,13 +9,20 @@ import (
 	"github.com/luca/llm-protocol-gateway/internal/monitor"
 )
 
+const (
+	peerTraceProviderID  = "peer-provider"
+	localProviderID      = "local-provider"
+	peerTraceParentID    = otherID
+	peerTraceSecondaryID = "gw_2222222222222222"
+)
+
 // 纯本地请求：三个字段都必须留空。这不只是"没数据"，而是界面判断要不要画
 // 链路的依据——一旦本地请求被写上任何链路标记，日志里就会出现一条假的
 // "来自某网关"的记录，运维会去查一个不存在的对端。
 func TestPeerTraceLeavesLocalRequestsClean(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 	entry := monitor.RequestLog{}
-	applyPeerTrace(&entry, peerTraceFor(request, newRequestTiming(time.Now())))
+	applyPeerTrace(&entry, peerTraceFor(request, newRequestTiming(time.Now()), localProviderID))
 	if entry.Ingress != "" || entry.Egress != "" || entry.PeerGatewayID != "" ||
 		entry.PeerDirection != "" || entry.PeerOrigin != "" || entry.PeerPath != "" {
 		t.Fatalf("a local request must stay clean, got %+v", entry)
@@ -29,7 +36,7 @@ func TestPeerTraceIgnoresSpoofedPathOnLocalTraffic(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 	request.Header.Set(headerGatewayPath, otherID+",gw_9999999999999999")
 	entry := monitor.RequestLog{}
-	applyPeerTrace(&entry, peerTraceFor(request, newRequestTiming(time.Now())))
+	applyPeerTrace(&entry, peerTraceFor(request, newRequestTiming(time.Now()), localProviderID))
 	if entry.PeerPath != "" {
 		t.Fatalf("a spoofed path on local traffic must not be logged, got %q", entry.PeerPath)
 	}
@@ -64,10 +71,11 @@ func TestPeerTraceMarksIngress(t *testing.T) {
 func TestPeerTraceMarksEgress(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 	timing := newRequestTiming(time.Now())
-	timing.notePeerEgress(otherID)
+	timing.beginPeerEgressAttempt(peerTraceProviderID)
+	timing.notePeerEgress(peerTraceProviderID, otherID)
 
 	entry := monitor.RequestLog{}
-	applyPeerTrace(&entry, peerTraceFor(request, timing))
+	applyPeerTrace(&entry, peerTraceFor(request, timing, peerTraceProviderID))
 	if entry.Egress != otherID || entry.Ingress != "" {
 		t.Fatalf("Ingress/Egress = %q/%q", entry.Ingress, entry.Egress)
 	}
@@ -87,11 +95,12 @@ func TestPeerTracePrefersIngressForAccounting(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 	request = withIngressPeer(request, "gw_1111111111111111")
 	timing := newRequestTiming(time.Now())
-	timing.notePeerEgress("gw_2222222222222222")
+	timing.beginPeerEgressAttempt(peerTraceProviderID)
+	timing.notePeerEgress(peerTraceProviderID, peerTraceSecondaryID)
 
 	entry := monitor.RequestLog{}
-	applyPeerTrace(&entry, peerTraceFor(request, timing))
-	if entry.Ingress != "gw_1111111111111111" || entry.Egress != "gw_2222222222222222" {
+	applyPeerTrace(&entry, peerTraceFor(request, timing, peerTraceProviderID))
+	if entry.Ingress != "gw_1111111111111111" || entry.Egress != peerTraceSecondaryID {
 		t.Fatalf("both sides must be kept, got %+v", entry)
 	}
 	if entry.PeerGatewayID != "gw_1111111111111111" || entry.PeerDirection != "ingress" {
@@ -109,7 +118,7 @@ func TestPeerTraceRecordsFullPath(t *testing.T) {
 	in.Header.Set(headerGatewayOrigin, otherID)
 	in = withIngressPeer(in, gwID)
 	entry := monitor.RequestLog{}
-	applyPeerTrace(&entry, peerTraceFor(in, newRequestTiming(time.Now())))
+	applyPeerTrace(&entry, peerTraceFor(in, newRequestTiming(time.Now()), localProviderID))
 	if entry.PeerPath != otherID+",gw_mmmmmmmmmmmmmmmm" {
 		t.Fatalf("ingress PeerPath = %q, want the full chain", entry.PeerPath)
 	}
@@ -118,9 +127,10 @@ func TestPeerTraceRecordsFullPath(t *testing.T) {
 	out := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 	out.Header.Set(headerGatewayPath, gwID)
 	timing := newRequestTiming(time.Now())
-	timing.notePeerEgress(otherID)
+	timing.beginPeerEgressAttempt(peerTraceProviderID)
+	timing.notePeerEgress(peerTraceProviderID, otherID)
 	entry = monitor.RequestLog{}
-	applyPeerTrace(&entry, peerTraceFor(out, timing))
+	applyPeerTrace(&entry, peerTraceFor(out, timing, peerTraceProviderID))
 	if entry.PeerPath != gwID {
 		t.Fatalf("egress PeerPath = %q, want the self path", entry.PeerPath)
 	}
@@ -135,13 +145,13 @@ func TestPeerTraceHelpersTolerateNil(t *testing.T) {
 	if got := peerTraceFrom(nil); !got.isEmpty() {
 		t.Fatalf("peerTraceFrom(nil) = %+v", got)
 	}
-	if got := peerTraceFor(nil, nil); !got.isEmpty() {
-		t.Fatalf("peerTraceFor(nil, nil) = %+v", got)
+	if got := peerTraceFor(nil, nil, ""); !got.isEmpty() {
+		t.Fatalf("peerTraceFor(nil, nil, \"\") = %+v", got)
 	}
 	// timing 为 nil 时不能 panic：有些合成日志路径根本没有计时器。
 	var noTiming *requestTiming
-	noTiming.notePeerEgress(gwID)
-	if noTiming.peerEgressFrom() != "" {
+	noTiming.notePeerEgress(peerTraceProviderID, gwID)
+	if got, attempted := noTiming.peerEgressSnapshotForProvider(peerTraceProviderID); got != "" || attempted {
 		t.Fatal("a nil timing must report no egress peer")
 	}
 }
@@ -151,10 +161,10 @@ func TestPeerTraceHelpersTolerateNil(t *testing.T) {
 func TestPeerTraceKeepsEgressAttemptWhenIdentityUnknown(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	timing := newRequestTiming(time.Now())
-	timing.notePeerEgressAttempt()
+	timing.beginPeerEgressAttempt(peerTraceProviderID)
 
 	entry := monitor.RequestLog{}
-	applyPeerTrace(&entry, peerTraceFor(request, timing))
+	applyPeerTrace(&entry, peerTraceFor(request, timing, peerTraceProviderID))
 	if entry.Egress != "" {
 		t.Fatalf("Egress must stay empty until the parent id is known, got %q", entry.Egress)
 	}
@@ -168,11 +178,11 @@ func TestPeerTraceKeepsEgressAttemptWhenIdentityUnknown(t *testing.T) {
 func TestPeerTraceUsesRememberedParentWhenEgressIdentityMissing(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	timing := newRequestTiming(time.Now())
-	timing.notePeerEgressAttempt()
-	timing.notePeerEgress(otherID)
+	timing.beginPeerEgressAttempt(peerTraceProviderID)
+	timing.notePeerEgressFallback(peerTraceProviderID, otherID)
 
 	entry := monitor.RequestLog{}
-	applyPeerTrace(&entry, peerTraceFor(request, timing))
+	applyPeerTrace(&entry, peerTraceFor(request, timing, peerTraceProviderID))
 	if entry.Egress != otherID || entry.PeerDirection != "egress" {
 		t.Fatalf("Egress/Direction = %q/%q, want %q/egress", entry.Egress, entry.PeerDirection, otherID)
 	}
@@ -182,14 +192,30 @@ func TestPeerTraceUsesRememberedParentWhenEgressIdentityMissing(t *testing.T) {
 // a live response header.
 func TestPeerTraceLiveEgressHeaderBeatsRegistrationFallback(t *testing.T) {
 	timing := newRequestTiming(time.Now())
-	timing.notePeerEgressAttempt()
-	timing.notePeerEgressFallback("gw_aaaaaaaaaaaaaaaa")
-	timing.notePeerEgress("gw_bbbbbbbbbbbbbbbb")
+	timing.beginPeerEgressAttempt(peerTraceProviderID)
+	timing.notePeerEgressFallback(peerTraceProviderID, "gw_aaaaaaaaaaaaaaaa")
+	timing.notePeerEgress(peerTraceProviderID, "gw_bbbbbbbbbbbbbbbb")
 
 	entry := monitor.RequestLog{}
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	applyPeerTrace(&entry, peerTraceFor(request, timing))
+	applyPeerTrace(&entry, peerTraceFor(request, timing, peerTraceProviderID))
 	if entry.Egress != "gw_bbbbbbbbbbbbbbbb" {
 		t.Fatalf("Egress = %q, want the live header value", entry.Egress)
+	}
+}
+
+// 故障转移先试上游客服网关、失败后落到本地 Provider 时，最终日志的链路
+// 必须跟随最终服务方：Provider 列是本地 Provider，就不能再显示上游 egress。
+// 被淘汰的对端候选仍留在 analysis.attempts 里，排障信息不丢。
+func TestPeerTraceIgnoresFailedPeerCandidateWhenFinalProviderIsLocal(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	timing := newRequestTiming(time.Now())
+	timing.beginPeerEgressAttempt(peerTraceProviderID)
+	timing.notePeerEgress(peerTraceProviderID, peerTraceParentID)
+
+	entry := monitor.RequestLog{ProviderID: localProviderID}
+	applyPeerTrace(&entry, peerTraceFor(request, timing, localProviderID))
+	if entry.Egress != "" || entry.PeerGatewayID != "" || entry.PeerDirection != "" || entry.PeerOrigin != "" || entry.PeerPath != "" {
+		t.Fatalf("final local provider must not inherit a failed peer egress chain: %+v", entry)
 	}
 }

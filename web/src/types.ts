@@ -632,19 +632,39 @@ export type ChatGPTOAuthUsageReport = {
   resetCredits?: ChatGPTResetCredits;
 };
 
-export type RequestAdapter = {
-  urlTemplate?: string;
-  headers?: Record<string, string>;
-  bodyTemplate?: string;
-  modelMapping?: Record<string, string>;
-  curlExample?: string;
-};
-
 /** 管理员维护的 Provider 分组；组名会随可见 Provider 下发给用户用于选择，不参与权限判定。 */
 export type ProviderGroup = {
   id: string;
   name: string;
   position: number;
+};
+
+/** 自定义协议 Provider 的转换脚本；脚本对外仍只提供三大标准协议之一。 */
+export type ProviderScript = {
+  language?: 'python';
+  entrypoint?: string;
+  source: string;
+  upstreamBaseUrl?: string;
+  requirements?: string;
+  listenPort?: number;
+  startCommand?: string;
+  healthPath?: string;
+  maxConcurrentRequests?: number;
+  requestTimeoutSec?: number;
+};
+
+/** 可复用的自定义协议类型模板；实例化时只填写 URL 和 Key。 */
+export type CustomProvider = {
+  id: string;
+  name: string;
+  description?: string;
+  protocol: Protocol;
+  authHeader?: string;
+  defaultModel?: string;
+  script: ProviderScript;
+  scriptDir?: string;
+  createdAt?: string;
+  updatedAt?: string;
 };
 
 export type Provider = {
@@ -725,7 +745,9 @@ export type Provider = {
   workbuddyOAuth?: WorkBuddyOAuthInfo;
   zcodeOAuth?: ZCodeOAuthInfo;
   traeOAuth?: TraeOAuthInfo;
-  requestAdapter?: RequestAdapter;
+  providerScript?: ProviderScript;
+  /** 非空表示这是某个“自定义 Provider”类型的实例。 */
+  customProviderId?: string;
 };
 
 export type ProviderModelAvailability = {
@@ -1037,6 +1059,7 @@ export type DesktopAutostartStatus = {
 
 export type GatewayState = {
   providerGroups: ProviderGroup[];
+  customProviders: CustomProvider[];
   providers: Provider[];
   endpoints: OutputEndpoint[];
   routes: Route[];
@@ -1151,7 +1174,7 @@ export type LogEntry = {
   // 请求也可能没有这些字段，界面必须区分“已知直连”和“链路未知”。
   /** 把这次请求送进来的下游网关 ID（空 = 客户端直连本机）。 */
   ingress?: string;
-  /** 本机把这次请求转发出去的上游网关 ID（可能因取消/超时为空）。 */
+  /** 最终实际服务请求的上游网关 ID；失败候选的 egress 尝试不会写到这里。 */
   egress?: string;
   /** 这次透传要对账的对端网关 ID：有 ingress 取 ingress，否则取 egress。 */
   peerGatewayId?: string;
@@ -1543,7 +1566,7 @@ export type SubscriptionConnectKind = 'workbuddy' | 'workbuddy_ai' | 'zcode' | '
 export type ProviderAuthType = ProviderConnectKind;
 
 /** 添加 Provider 目录：一个可点选的接入预设（订阅登录、厂商、中转、本机服务）。 */
-export type ProviderPresetSection = 'subscription' | 'vendor' | 'relay' | 'local';
+export type ProviderPresetSection = 'custom' | 'subscription' | 'vendor' | 'relay' | 'local';
 
 export type ProviderPreset = {
   id: string;
@@ -1564,16 +1587,8 @@ export type ProviderPreset = {
    * <img> 渲染；否则是 currentColor 单色版，必须用 CSS mask 才能跟着主题着色。
    */
   icon?: string;
-  /**
-   * 这条上游要求、但表单里没有专门输入框的额外请求头。
-   *
-   * 存在的原因很实际：有些上游不给默认可用，少一个头就整条不能用，而用户从预置
-   * 建 provider 时并不知道自己还缺什么。OpenCode Go 要求每个请求带
-   * x-opencode-session，缺了直接 400 MissingSessionID —— 填了 key 也没用。
-   *
-   * 点选预置时它会落进表单的「请求适配器」里，用户仍然看得见、改得动。
-   */
-  headers?: Record<string, string>;
+  /** 动态自定义类型：目录磁贴直接指向这个模板 ID。 */
+  customProviderId?: string;
 };
 
 export type LegacyRequestStatsSnapshot = {

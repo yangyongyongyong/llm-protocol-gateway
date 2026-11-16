@@ -273,6 +273,12 @@ func nativeProtocolForProvider(provider domain.Provider, clientProtocol domain.P
 	if clientProtocol == "" || provider.Protocol == clientProtocol {
 		return "", false
 	}
+	// Ocean Dev 的 deployment 地址只支持 Chat。它的探测会看到 /v1/responses
+	// 或 /messages 路由存在，但那些入口会启用不同的参数集；这里固定回退到
+	// 平台 Chat 转换，避免一次注定失败的 native 尝试和随之而来的 max effort 400。
+	if isOceanDevProvider(provider) {
+		return "", false
+	}
 	// 对端网关同样适用：上游把多协议能力透传下来后，下游也应该优先按客户端
 	// 协议把请求送进父网关，由父网关挑它自己那台同协议的真实上游。
 	if provider.AuthType != domain.AuthTypeAPIKey && provider.AuthType != domain.AuthTypePeer {

@@ -4781,16 +4781,6 @@ details:not([open]) > *:not(summary) { display: none !important; }
    24. 杂项
    ---------------------------------------------------------------- */
 .toggle-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.adapter-editor {
-  margin-top: 14px;
-  padding: 14px;
-  border-radius: var(--r-md);
-  border: 1px solid var(--border);
-  background: var(--surface-soft);
-}
-.adapter-editor summary { cursor: pointer; font-weight: 600; margin-bottom: 8px; }
-.adapter-editor textarea.json-preview { width: 100%; min-height: 160px; resize: vertical; }
-
 /* ----------------------------------------------------------------
    25. 响应式
    ---------------------------------------------------------------- */
@@ -7737,6 +7727,34 @@ html[data-theme="dark"] .pivot-entity-card:hover {
 }
 .provider-tile:hover .brand-icon.mask { background-color: var(--accent-strong); }
 .provider-tile.have { border-color: var(--accent-border); }
+
+/* 自定义类型磁贴右侧三点菜单：类型编辑由 AI/API 完成，这里只保留删除。 */
+.provider-custom-tile { position: relative; min-width: 0; }
+.provider-custom-tile > .provider-tile { width: 100%; padding-right: 36px; }
+.provider-custom-menu-trigger {
+  position: absolute; right: 5px; top: 50%; transform: translateY(-50%);
+  display: grid; place-items: center; width: 26px; height: 26px;
+  border: 0; border-radius: 6px; background: transparent;
+  color: var(--muted); font-size: 18px; line-height: 1; cursor: pointer;
+}
+.provider-custom-menu-trigger:hover,
+.provider-custom-menu-trigger[aria-expanded="true"] {
+  background: var(--hover); color: var(--text-strong);
+}
+.provider-custom-menu-trigger:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--accent-ring); }
+.provider-custom-menu-popover {
+  position: absolute; right: 4px; top: calc(100% + 4px); z-index: 30;
+  display: grid; min-width: 116px; padding: 4px;
+  border: 1px solid var(--border); border-radius: var(--r-md);
+  background: var(--surface); box-shadow: var(--shadow-pop);
+}
+.provider-custom-menu-popover > button {
+  height: 30px; padding: 0 10px; border: 0; border-radius: 6px;
+  background: transparent; color: var(--text); text-align: left;
+  font-size: var(--fs-base); cursor: pointer;
+}
+.provider-custom-menu-popover > button.danger { color: var(--red-text); }
+.provider-custom-menu-popover > button.danger:hover { background: var(--red-soft); }
 
 /* ----------------------------------------------------------------
    37. 额度保活 (Quota Keeper)
