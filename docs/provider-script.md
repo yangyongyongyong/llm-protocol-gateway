@@ -1,8 +1,8 @@
 # 自定义协议 Provider 脚本
 
-Provider 页面支持两层自定义 Provider：
+Provider 页面支持两层自定义连接器：
 
-1. **自定义 Provider 类型**（例如 `ocean`）：管理员定义一次标准协议、鉴权头、
+1. **自定义连接器**（例如 `ocean`）：管理员定义一次标准协议、鉴权头、
    并发/超时和转换脚本；
 2. **Provider 实例**：在“添加输入 Provider”目录里选择 `ocean`，只填写该实例的
    上游 URL 和 Key。
@@ -11,14 +11,28 @@ Provider 页面支持两层自定义 Provider：
 `openai_chat` / `openai_responses` / `claude` 工作。这样 Ocean、WorkBuddy 或
 其他私有协议不会持续污染主协议转换流程。
 
+边界必须保持清晰：主 Go 代码只负责通用协议转换、Provider 调度和脚本进程
+生命周期，不识别任何厂商域名，也不实现某一家私有参数。以下逻辑都属于
+`adapter.py`：
+
+- 厂商路径、Azure deployment、鉴权头和模型名展开；
+- 私有字段与三家标准协议的字段映射；
+- `tool_choice`、`tools`、`tool_calls`、`tool` 消息的厂商级校验与修补；
+- reasoning 档位、最大 token、工具 schema 等厂商特有约束；
+- 厂商错误码到标准 HTTP/JSON 错误的映射。
+
+新增私有协议时不应修改 `internal/gateway` 的协议转换主流程。主流程只需要
+通过自定义连接器调用脚本，脚本对外返回 OpenAI Chat / OpenAI
+Responses / Claude 之一。
+
 ## 使用流程
 
 1. 在 Provider 页面点击“添加输入 Provider”。
-2. 在目录的“自定义 Provider”分区点击“＋ 添加自定义类型”。
+2. 在目录的“自定义连接器”分区点击“＋ 添加自定义连接器”。
 3. 弹窗只提供一段完整的 AI Prompt，不提供手填表单；点击“复制给 AI”。
-4. AI 通过 `GET/POST/PATCH/DELETE /__custom-providers` 查询、新建、编辑、删除类型，并调用脚本校验、实例创建和测试 API 完成验收。
-5. 类型创建完成后，目录会自动出现对应磁贴；选择磁贴只填写该实例的上游 URL 和 Key。
-6. 类型磁贴右侧三点菜单只保留“删除类型”；编辑类型统一交给 AI/API。
+4. AI 通过 `GET/POST/PATCH/DELETE /__custom-providers` 查询、新建、编辑、删除连接器，并调用脚本校验、实例创建和测试 API 完成验收。
+5. 连接器创建完成后，目录会自动出现对应磁贴；选择磁贴只填写该实例的上游 URL 和 Key。
+6. 连接器磁贴右侧三点菜单提供“导出连接器”和“删除连接器”；编辑连接器统一交给 AI/API。
 7. 保存实例后网关会启动脚本、做健康检查，并自动请求 `/v1/models` 回填模型目录。
 
 Provider 实例对客户端暴露的 Base URL 自动设为：
@@ -28,11 +42,23 @@ http://127.0.0.1:<derived-port>/v1
 ```
 
 私有厂商地址只通过 `UPSTREAM_BASE_URL` 注入脚本，不写进实例的公开 Base URL。
-类型更新后会同步刷新所有引用它的实例，并重启对应脚本进程。
+连接器更新后会同步刷新所有引用它的实例，并重启对应脚本进程；不需要重启主网关。
+脚本进程的启动、停止和重启用下面的 Provider 实例接口完成：
+
+```text
+POST /__providers/{id}/script/start
+POST /__providers/{id}/script/restart
+POST /__providers/{id}/script/stop
+GET  /__providers/{id}/script/status
+GET  /__providers/{id}/script/logs
+```
+
+因此升级某个厂商适配器时，只更新自定义连接器脚本并重启对应实例，正在运行的
+网关和其他 Provider 不受影响。
 
 ## 脚本落盘位置
 
-类型脚本不只保存在数据库里，还会写入 App 的用户数据目录：
+连接器脚本不只保存在数据库里，还会写入 App 的用户数据目录：
 
 ```text
 ~/Library/Application Support/llm-protocol-gateway/custom-providers/<type-id>/adapter.py
@@ -163,22 +189,26 @@ POST /v1/messages             Provider.Protocol=claude
 如果 `/v1/models` 不可枚举，可在 Provider 表单里手动填写默认模型；测试接口
 会使用该模型，不会用空 model 发请求。
 
-## 类型与实例更新语义
+## 连接器与实例更新语义
 
-自定义 Provider 类型使用：
+自定义连接器使用：
 
 ```text
 GET    /__custom-providers
 GET    /__custom-providers/ai-prompt
 POST   /__custom-providers
+GET    /__custom-providers/{id}/export
+POST   /__custom-providers/import
 PATCH  /__custom-providers/{id}
 DELETE /__custom-providers/{id}
 ```
 
-- 类型更新会同步所有引用实例，保留各实例自己的 URL、Key、模型和分组；
-- 仍有实例引用时禁止删除类型；
-- 普通用户可以在目录中看到类型并创建实例，但只有管理员能查看/修改脚本正文。
-- “添加自定义类型”弹窗只展示 AI Prompt；类型的新增和编辑通过 API 完成。
+- 连接器更新会同步所有引用实例，保留各实例自己的 URL、Key、模型和分组；
+- 仍有实例引用时禁止删除连接器；
+- 导出连接器只包含模板和脚本，不包含任何实例 URL、Key、OAuth token 或用量数据；
+- 导入连接器默认不覆盖同 ID 连接器；需要覆盖时调用 `POST /__custom-providers/import?replace=true`；
+- 普通用户可以在目录中看到连接器并创建实例，但只有管理员能查看/修改脚本正文。
+- “添加自定义连接器”弹窗只展示 AI Prompt；连接器的新增和编辑通过 API 完成。
 - AI Prompt 包含临时测试密钥和至少一种标准协议真实验收要求：
   - 创建临时 Provider、Route、API Key；
   - 通过 Chat / Responses / Claude 中至少一种真实入口返回 2xx 有效响应；
@@ -187,9 +217,9 @@ DELETE /__custom-providers/{id}
 
 `PATCH /__providers/{id}`：
 
-- 自定义类型实例提交 `customProviderId` + `baseUrl` + `apiKeySource`，协议和
-  脚本由类型模板解析；
-- 上游 URL、Key 或类型模板变化时，网关会停止旧进程、启动新进程并重新发现模型；
+- 自定义连接器实例提交 `customProviderId` + `baseUrl` + `apiKeySource`，协议和
+  脚本由连接器模板解析；
+- 上游 URL、Key 或连接器模板变化时，网关会停止旧进程、启动新进程并重新发现模型；
 - `providerScript: null`：停止脚本并清空脚本配置；同一 PATCH 必须带一个真实的
   普通上游 `baseUrl`，否则返回 400，避免留下指向 `127.0.0.1` 的死 Provider。
 
@@ -223,7 +253,7 @@ DELETE /__providers/{id}/purge
 `GET /__provider-script/abi` 同时返回 `version`、`abi`、`examplePrompt`、
 `requiredEnv` 和 `protocols`，外部 AI/自动化应以它为唯一契约来源。
 
-创建自定义类型：
+创建自定义连接器：
 
 ```json
 {
@@ -263,7 +293,7 @@ curl -sS -X POST http://127.0.0.1:18093/__provider-script/validate \
   -d '{"protocol":"openai_chat","script":{"language":"python","entrypoint":"adapter.py","source":"print(1)","upstreamBaseUrl":"https://vendor.example","maxConcurrentRequests":4,"requestTimeoutSec":120}}'
 ```
 
-创建自定义类型 `ocean`：
+创建自定义连接器 `ocean`：
 
 ```bash
 curl -sS -X POST http://127.0.0.1:18093/__custom-providers \

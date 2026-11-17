@@ -206,13 +206,6 @@ func (rt *Runtime) Start(cfg Config) error {
 		_ = db.Close()
 		return err
 	}
-	// Ocean Dev 的 deployment 入口只按 Chat 使用；若旧版本曾把 Responses/
-	// Claude 能力写进库，启动时顺手收敛，避免界面和调度继续显示多协议。
-	if gateway.NormalizeOceanDevProtocolSupport(&state) {
-		if err := db.Save(state); err != nil {
-			slog.Warn("normalize Ocean Dev protocol support failed", "error", err)
-		}
-	}
 	slog.Info("config loaded", "path", db.Path(), "providers", len(state.Providers), "routes", len(state.Routes), "models", len(state.Models), "apiKeys", len(state.APIKeys))
 
 	logs := monitor.NewStore()

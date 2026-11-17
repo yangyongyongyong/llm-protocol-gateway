@@ -6,9 +6,19 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/luca/llm-protocol-gateway/internal/domain"
 )
+
+const customConnectorBundleKind = "llm-protocol-gateway/custom-connector"
+
+type customConnectorBundle struct {
+	Kind           string                `json:"kind"`
+	Version        int                   `json:"version"`
+	ExportedAt     string                `json:"exportedAt,omitempty"`
+	CustomProvider domain.CustomProvider `json:"customProvider"`
+}
 
 func (s *Server) handleListCustomProviders(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireAdmin(w, r); !ok {
@@ -26,6 +36,99 @@ func (s *Server) handleCustomProviderAIPrompt(w http.ResponseWriter, r *http.Req
 		"prompt":  customProviderAIPrompt(),
 		"abi":     providerScriptABI,
 	})
+}
+
+func (s *Server) handleExportCustomProvider(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	provider, err := s.router.CustomProviderByID(r.PathValue("id"))
+	if err != nil {
+		writeOpenAIError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	provider.ScriptDir = ""
+	provider.Script.UpstreamBaseURL = ""
+	bundle := customConnectorBundle{
+		Kind:           customConnectorBundleKind,
+		Version:        1,
+		ExportedAt:     time.Now().UTC().Format(time.RFC3339),
+		CustomProvider: provider,
+	}
+	filename := safeScriptDirName(firstNonEmpty(provider.ID, provider.Name)) + ".custom-connector.json"
+	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+	writeJSON(w, http.StatusOK, bundle)
+}
+
+func (s *Server) handleImportCustomProvider(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	var raw json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid connector json: "+err.Error())
+		return
+	}
+	provider, err := decodeCustomProviderImport(raw)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validateCustomProviderDefinition(provider); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	replace := strings.EqualFold(r.URL.Query().Get("replace"), "true") || r.URL.Query().Get("replace") == "1"
+	var imported domain.CustomProvider
+	if existing, lookupErr := s.router.CustomProviderByID(provider.ID); lookupErr == nil {
+		if !replace {
+			writeOpenAIError(w, http.StatusConflict, fmt.Sprintf("custom connector %q already exists; retry with ?replace=true to overwrite", existing.ID))
+			return
+		}
+		imported, err = s.router.UpdateCustomProvider(existing.ID, provider)
+	} else {
+		imported, err = s.router.AddCustomProvider(provider)
+	}
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	scriptDir, err := writeCustomProviderScriptFiles(imported)
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to write custom connector script: "+err.Error())
+		return
+	}
+	imported.ScriptDir = scriptDir
+	if err := s.saveState(); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
+		return
+	}
+	if replace {
+		if err := s.syncCustomProviderInstances(r, imported); err != nil {
+			writeOpenAIError(w, http.StatusBadGateway, "custom connector imported but instances not fully refreshed: "+err.Error())
+			return
+		}
+	}
+	s.logs.AddApp("info", "custom connector imported", imported.ID)
+	writeJSON(w, http.StatusOK, customConnectorBundle{Kind: customConnectorBundleKind, Version: 1, CustomProvider: imported})
+}
+
+func decodeCustomProviderImport(raw json.RawMessage) (domain.CustomProvider, error) {
+	var bundle customConnectorBundle
+	if err := json.Unmarshal(raw, &bundle); err == nil && (bundle.CustomProvider.ID != "" || bundle.CustomProvider.Name != "") {
+		if bundle.Kind != "" && bundle.Kind != customConnectorBundleKind {
+			return domain.CustomProvider{}, fmt.Errorf("unsupported connector bundle kind %q", bundle.Kind)
+		}
+		if bundle.Version > 1 {
+			return domain.CustomProvider{}, fmt.Errorf("unsupported connector bundle version %d", bundle.Version)
+		}
+		return bundle.CustomProvider, nil
+	}
+	var provider domain.CustomProvider
+	if err := json.Unmarshal(raw, &provider); err != nil {
+		return domain.CustomProvider{}, fmt.Errorf("invalid connector json: %w", err)
+	}
+	return provider, nil
 }
 
 func (s *Server) handleCreateCustomProvider(w http.ResponseWriter, r *http.Request) {

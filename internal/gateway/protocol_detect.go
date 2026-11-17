@@ -155,15 +155,6 @@ func classifyProtocolProbe(status int) bool {
 // detectProviderProtocols 探一遍这条上游支持的协议。
 func (s *Server) detectProviderProtocols(ctx context.Context, provider domain.Provider) []protocolDetection {
 	candidates := protocolProbeCandidates(provider.BaseURL, provider.Protocol)
-	if isOceanDevProvider(provider) {
-		// Ocean Dev 是 Chat-only 场景：它的 deployment URL 只接受 Chat，平台
-		// 会负责 Responses/Claude -> Chat 的转换。不要再向界面承诺原生 Responses
-		// 或 Claude 能力，否则调度会先做一次无效的 native pass-through。
-		// 探测打真实的 deployment Chat 端点，模型占位符由 probeOneProtocol 展开。
-		model := firstNonEmpty(provider.DefaultModel, "probe")
-		chatURL := resolveProviderChatURL(provider, model)
-		candidates = []protocolProbe{{Protocol: domain.ProtocolOpenAIChat, Root: strings.TrimRight(chatURL, "/"), URL: chatURL}}
-	}
 	// 同一个协议可能有多条候选路径（例如 Claude 同根 /messages 与 /anthropic
 	// 兄弟路径）。按协议分组后只要任意一条成立就算支持，避免后一条 404 把前一条
 	// 已经探到的结论覆盖掉。
@@ -230,11 +221,6 @@ func (s *Server) probeOneProtocol(ctx context.Context, provider domain.Provider,
 		body = []byte(`{"model":"` + firstNonEmpty(provider.DefaultModel, "probe") + `","input":"hi","max_output_tokens":1}`)
 	default:
 		body = []byte(`{"model":"` + firstNonEmpty(provider.DefaultModel, "probe") + `","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":1}`)
-		if isOceanDevProvider(provider) {
-			// Ocean Dev 的 gpt-5.4-pro 只接受 medium/high/xhigh，默认空思考
-			// 也会在严格校验层被拒；探测只需要路由存在，给一个它支持的档位。
-			body = []byte(`{"model":"` + firstNonEmpty(provider.DefaultModel, "probe") + `","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":1,"reasoning_effort":"medium"}`)
-		}
 	}
 
 	// 探测超时给足：这条请求会真的把一个「注定失败」的请求送到上游，而不少上游

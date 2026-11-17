@@ -620,6 +620,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /__custom-providers", s.handleListCustomProviders)
 	mux.HandleFunc("GET /__custom-providers/ai-prompt", s.handleCustomProviderAIPrompt)
 	mux.HandleFunc("POST /__custom-providers", s.handleCreateCustomProvider)
+	mux.HandleFunc("POST /__custom-providers/import", s.handleImportCustomProvider)
+	mux.HandleFunc("GET /__custom-providers/{id}/export", s.handleExportCustomProvider)
 	mux.HandleFunc("PATCH /__custom-providers/{id}", s.handleUpdateCustomProvider)
 	mux.HandleFunc("DELETE /__custom-providers/{id}", s.handleDeleteCustomProvider)
 	mux.HandleFunc("POST /__providers", s.handleCreateProvider)
@@ -2918,7 +2920,8 @@ func (s *Server) handleExportProviders(w http.ResponseWriter, r *http.Request) {
 	ids := ParseProviderExportIDs(r.URL.Query().Get("ids"))
 	if r.Method == http.MethodPost {
 		var payload struct {
-			IDs []string `json:"ids"`
+			IDs         []string `json:"ids"`
+			ProviderIDs []string `json:"providerIds"`
 		}
 		if r.Body != nil {
 			decoder := json.NewDecoder(r.Body)
@@ -2929,6 +2932,8 @@ func (s *Server) handleExportProviders(w http.ResponseWriter, r *http.Request) {
 				}
 			} else if payload.IDs != nil {
 				ids = payload.IDs
+			} else if payload.ProviderIDs != nil {
+				ids = payload.ProviderIDs
 			}
 		}
 	}
@@ -2939,10 +2944,11 @@ func (s *Server) handleExportProviders(w http.ResponseWriter, r *http.Request) {
 	}
 	s.logs.AddApp("info", "providers exported", fmt.Sprintf("count=%d errors=%d", len(bundle.Providers), len(exportErrors)))
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version":    bundle.Version,
-		"exportedAt": bundle.ExportedAt,
-		"providers":  bundle.Providers,
-		"errors":     exportErrors,
+		"version":         bundle.Version,
+		"exportedAt":      bundle.ExportedAt,
+		"providers":       bundle.Providers,
+		"customProviders": bundle.CustomProviders,
+		"errors":          exportErrors,
 	})
 }
 
@@ -2953,6 +2959,12 @@ func (s *Server) handleImportProviders(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid import json: "+err.Error())
 		return
 	}
+	importedCustomIDs := make(map[string]bool, len(bundle.CustomProviders))
+	for _, custom := range bundle.CustomProviders {
+		if id := strings.TrimSpace(custom.ID); id != "" {
+			importedCustomIDs[id] = true
+		}
+	}
 	// 分组不随 Provider 导出；导入到不同网关时，未知 groupId 必须回落到未分组，
 	// 不能留下一个筛选栏里永远选不到的幽灵 ID。
 	for index := range bundle.Providers {
@@ -2962,7 +2974,7 @@ func (s *Server) handleImportProviders(w http.ResponseWriter, r *http.Request) {
 		// 导入到没有同名自定义类型的网关时，保留脚本快照仍可运行，但不能留下
 		// 一个指向不存在类型的编辑入口；清空引用后退化成普通脚本 Provider。
 		if customID := strings.TrimSpace(bundle.Providers[index].CustomProviderID); customID != "" {
-			if _, err := s.router.CustomProviderByID(customID); err != nil {
+			if _, err := s.router.CustomProviderByID(customID); err != nil && !importedCustomIDs[customID] {
 				bundle.Providers[index].CustomProviderID = ""
 			}
 		}
@@ -2973,6 +2985,15 @@ func (s *Server) handleImportProviders(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(result.Created) > 0 || len(result.Updated) > 0 {
+		for _, custom := range s.router.CustomProviders() {
+			if !importedCustomIDs[custom.ID] {
+				continue
+			}
+			if _, err := writeCustomProviderScriptFiles(custom); err != nil {
+				writeOpenAIError(w, http.StatusInternalServerError, "failed to write imported custom connector script: "+err.Error())
+				return
+			}
+		}
 		if err := s.saveState(); err != nil {
 			writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
 			return
@@ -5976,10 +5997,9 @@ func (s *Server) fetchProviderModels(r *http.Request, provider domain.Provider, 
 		// 正常的 provider 标成"异常"、清空它可用的模型清单。
 		return s.fetchPeerUpstreamModels(r, provider, started)
 	}
-	// Azure deployment 模板本身不能枚举模型；Ocean Dev 这类中转另有统一的
-	// /openai/v1/models 目录。只有确认是 Ocean Dev 时才探测这些候选地址，
-	// 其他 deployment 上游继续沿用已配置模型，避免改变通用行为。
-	if provider.AuthType == domain.AuthTypeAPIKey && strings.Contains(provider.BaseURL, "{model}") && !isOceanDevProvider(provider) {
+	// Azure deployment 模板本身不能枚举模型；带 {model} 的 Provider 继续沿用
+	// 已配置模型，避免把一条正常对话账号误标成 degraded。
+	if provider.AuthType == domain.AuthTypeAPIKey && strings.Contains(provider.BaseURL, "{model}") {
 		if models := declaredProviderModels(provider); len(models) > 0 {
 			return providerTestResult{
 				Success:   true,
@@ -5990,39 +6010,6 @@ func (s *Server) fetchProviderModels(r *http.Request, provider domain.Provider, 
 				Models:    models,
 				Preview:   "Base URL 使用 {model} 模板，沿用已配置的模型目录",
 			}
-		}
-	}
-	if isOceanDevProvider(provider) && provider.AuthType == domain.AuthTypeAPIKey && strings.Contains(provider.BaseURL, "{model}") {
-		var lastFailure providerTestResult
-		for _, baseURL := range templateModelBaseCandidates(provider.BaseURL) {
-			candidate := provider
-			candidate.BaseURL = baseURL
-			result := s.fetchProviderModels(r, candidate, started)
-			result.Provider = provider.ID
-			if result.Success && len(result.Models) > 0 {
-				return result
-			}
-			if !result.Success {
-				lastFailure = result
-			}
-		}
-		if models := declaredProviderModels(provider); len(models) > 0 {
-			preview := "Base URL 使用 {model} 模板，候选模型目录不可用，沿用已配置的模型目录"
-			if lastFailure.Error != "" {
-				preview += "；" + lastFailure.Error
-			}
-			return providerTestResult{
-				Success:   true,
-				Provider:  provider.ID,
-				ModelsURL: provider.BaseURL,
-				Status:    http.StatusOK,
-				LatencyMs: time.Since(started).Milliseconds(),
-				Models:    models,
-				Preview:   preview,
-			}
-		}
-		if lastFailure.Error != "" {
-			return lastFailure
 		}
 	}
 	if provider.AuthType == domain.AuthTypeCursorOAuth {
@@ -6278,38 +6265,6 @@ func declaredProviderModels(provider domain.Provider) []domain.Model {
 		}}
 	}
 	return nil
-}
-
-// templateModelBaseCandidates 给带 {model} 的 deployment URL 推导可枚举模型的
-// 基础地址。按从现代 OpenAI 兼容代理到旧路径的顺序尝试；调用方仍可回退到
-// Provider 已声明的模型，因此探测失败不会影响正常转发。
-func templateModelBaseCandidates(baseURL string) []string {
-	parsed, err := url.Parse(strings.TrimSpace(baseURL))
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return nil
-	}
-	path := parsed.Path
-	deploymentIndex := strings.Index(strings.ToLower(path), "/deployments/")
-	if deploymentIndex < 0 {
-		return nil
-	}
-	prefix := strings.TrimRight(path[:deploymentIndex], "/")
-	origin := parsed.Scheme + "://" + parsed.Host
-	candidates := []string{origin + prefix + "/v1"}
-	if prefix != "" {
-		candidates = append(candidates, origin+prefix)
-	}
-	seen := map[string]bool{}
-	out := make([]string, 0, len(candidates))
-	for _, candidate := range candidates {
-		candidate = strings.TrimRight(candidate, "/")
-		if candidate == "" || seen[candidate] {
-			continue
-		}
-		seen[candidate] = true
-		out = append(out, candidate)
-	}
-	return out
 }
 
 func deriveModelsURL(provider domain.Provider) (string, error) {
@@ -6717,9 +6672,6 @@ func (s *Server) proxyOpenAIToClaudeMessages(w http.ResponseWriter, r *http.Requ
 		openAIReq["stream"] = true
 	}
 	model = applyProviderModelMapping(provider, model)
-	if isOceanDevProvider(provider) {
-		applyOceanDevChatCompat(openAIReq, model)
-	}
 	upstreamBody, err := json.Marshal(openAIReq)
 	if err != nil {
 		return 0, TokenUsage{}, nil, err

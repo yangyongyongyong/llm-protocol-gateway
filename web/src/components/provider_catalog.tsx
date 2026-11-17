@@ -17,6 +17,8 @@ export function ProviderCatalogDialog({
   onClose,
   onPick,
   onManageCustomProviders,
+  onImportCustomProvider,
+  onExportCustomProvider,
   onDeleteCustomProvider,
 }: {
   open: boolean;
@@ -26,6 +28,8 @@ export function ProviderCatalogDialog({
   onClose: () => void;
   onPick: (preset: ProviderPreset) => void;
   onManageCustomProviders?: () => void;
+  onImportCustomProvider?: () => void;
+  onExportCustomProvider?: (provider: CustomProvider) => void;
   onDeleteCustomProvider?: (provider: CustomProvider) => void;
 }) {
   const [query, setQuery] = useState('');
@@ -105,7 +109,8 @@ export function ProviderCatalogDialog({
         ) : null}
         {menuOpen ? (
           <div className="provider-custom-menu-popover" role="menu">
-            {onDeleteCustomProvider ? <button type="button" role="menuitem" className="danger" onClick={() => { setOpenCustomMenuID(''); onDeleteCustomProvider(custom); }}>删除类型</button> : null}
+            {onExportCustomProvider ? <button type="button" role="menuitem" onClick={() => { setOpenCustomMenuID(''); onExportCustomProvider(custom); }}>导出连接器</button> : null}
+            {onDeleteCustomProvider ? <button type="button" role="menuitem" className="danger" onClick={() => { setOpenCustomMenuID(''); onDeleteCustomProvider(custom); }}>删除连接器</button> : null}
           </div>
         ) : null}
       </div>
@@ -116,7 +121,7 @@ export function ProviderCatalogDialog({
   return (
     <Modal
       title={hasProviders ? '添加 Provider' : '添加你的第一个 Provider'}
-      description="厂商预设会自动填好地址与协议；自定义 Provider 类型选中后只需填写上游 URL 和 Key。"
+      description="厂商预设会自动填好地址与协议；自定义连接器选中后只需填写上游 URL 和 Key。"
       size="wide"
       onClose={onClose}
     >
@@ -142,20 +147,23 @@ export function ProviderCatalogDialog({
       {(customProviders.length > 0 || onManageCustomProviders) ? (
         <div className="provider-catalog-section">
           <div className="provider-catalog-section-head" style={{alignItems: 'center'}}>
-            <span className="provider-catalog-section-title">自定义 Provider</span>
-            <InfoTip text="自定义类型由 AI 通过 API 创建和编辑；右侧三点菜单只提供类型删除。选择类型创建实例时只需填写上游 URL 和 Key。">
+            <span className="provider-catalog-section-title">自定义连接器</span>
+            <InfoTip text="自定义连接器由 AI 通过 API 创建和编辑；右侧三点菜单可导出或删除。选择连接器创建实例时只需填写上游 URL 和 Key。">
               <span className="info-tip-icon" aria-hidden="true">?</span>
             </InfoTip>
             <span className="provider-catalog-section-desc">先定义协议和脚本，再创建 URL/Key 实例</span>
+            {onImportCustomProvider ? (
+              <button type="button" className="btn btn-sm" onClick={onImportCustomProvider}>导入连接器</button>
+            ) : null}
             {onManageCustomProviders ? (
-              <button type="button" className="btn success btn-sm" style={{marginLeft: 'auto'}} onClick={onManageCustomProviders}>＋ 添加自定义类型</button>
+              <button type="button" className="btn success btn-sm" style={{marginLeft: onImportCustomProvider ? 0 : 'auto'}} onClick={onManageCustomProviders}>＋ 添加自定义连接器</button>
             ) : null}
           </div>
           {customPresets.length > 0 ? (
             <div className="provider-tiles">{customPresets.map(renderCustomPreset)}</div>
           ) : (
             <div className="provider-catalog-empty">
-              {customProviders.length === 0 ? '还没有自定义 Provider 类型。点击右侧按钮先添加类型。' : `没有匹配「${query.trim()}」的自定义类型。`}
+              {customProviders.length === 0 ? '还没有自定义连接器。点击右侧按钮先添加连接器。' : `没有匹配「${query.trim()}」的自定义连接器。`}
             </div>
           )}
         </div>

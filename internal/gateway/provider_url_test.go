@@ -66,32 +66,16 @@ func TestDeriveModelsURLAnthropicOAuthBase(t *testing.T) {
 	}
 }
 
-// TestOceanDevTemplateModelCandidates 验证 Ocean Dev 的 deployment 模板会推导
-// 统一目录候选；真正的 host 判定由 isOceanDevProvider 单测覆盖，避免测试把
-// 127.0.0.1 误当成 Ocean 主机。
-func TestOceanDevTemplateModelCandidates(t *testing.T) {
-	got := templateModelBaseCandidates(oceanDevTestBaseURL)
-	want := []string{"http://ocean-dev.tuya-in.net/openai/v1", "http://ocean-dev.tuya-in.net/openai"}
-	if len(got) != len(want) {
-		t.Fatalf("candidates = %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("candidates = %v, want %v", got, want)
-		}
-	}
-}
-
-// TestResolveProviderResponsesURLDoesNotRewriteDeploymentTemplate 验证通用
-// Responses URL 构造不被 Ocean 的 deployment 特例污染。Ocean 本身只按 Chat
-// 使用，Responses 客户端会在转换入口先变成 Chat，不会走到这里。
+// TestResolveProviderResponsesURLDoesNotRewriteDeploymentTemplate 验证通用的
+// Responses URL 构造不会被 deployment 模板误改成别的协议端点。
 func TestResolveProviderResponsesURLDoesNotRewriteDeploymentTemplate(t *testing.T) {
+	const deploymentTemplate = "http://relay.example/openai/deployments/{model}/chat/completions?api-version=2024-02-01"
 	provider := domain.Provider{
 		Protocol: domain.ProtocolOpenAIChat,
-		BaseURL:  oceanDevTestBaseURL,
+		BaseURL:  deploymentTemplate,
 	}
 	got := resolveProviderResponsesURL(provider, "gpt-5.4-pro")
-	want := "http://ocean-dev.tuya-in.net/openai/deployments/gpt-5.4-pro/chat/completions?api-version=2024-02-01"
+	want := "http://relay.example/openai/deployments/gpt-5.4-pro/chat/completions?api-version=2024-02-01"
 	if got != want {
 		t.Fatalf("got %q want %q", got, want)
 	}

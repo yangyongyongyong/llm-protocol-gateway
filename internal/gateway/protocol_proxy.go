@@ -153,15 +153,6 @@ func (s *Server) doOpenAIProviderRequest(ctx context.Context, r *http.Request, p
 		// two tools, so the body is shaped before the URL is asked too.
 		body, _ = prepareOpenCodeZenChatBody(provider, body)
 	}
-	// Ocean Dev 的所有 Chat 请求先在这里整流；放在 model 提取之前，保证
-	// header 占位符和后续重试看到的是最终发出、已归一化的模型字段。
-	if isOceanDevProvider(provider) {
-		adapted, compatErr := applyOceanDevChatBodyCompat(body, provider)
-		if compatErr != nil {
-			return nil, compatErr
-		}
-		body = adapted
-	}
 	// Extract model from body for header placeholder substitution when possible.
 	model := ""
 	var payload map[string]any
@@ -503,9 +494,6 @@ type streamConverter func(http.ResponseWriter, io.Reader, string) (TokenUsage, e
 func (s *Server) proxyConvertedThroughChat(w http.ResponseWriter, r *http.Request, provider domain.Provider, model string, chatReq map[string]any, skipIncomingAuth bool, convert responseConverter, streamConvert streamConverter) (int, TokenUsage, []byte, error) {
 	stream, _ := chatReq["stream"].(bool)
 	model = applyProviderModelMapping(provider, model)
-	if isOceanDevProvider(provider) {
-		applyOceanDevChatCompat(chatReq, model)
-	}
 	// WorkBuddy refuses a non-stream chat and OpenCode serves its free tier to
 	// a streaming request only, so both always stream upstream. The stream is
 	// rebuilt into a single chat.completion before the converter runs, so a

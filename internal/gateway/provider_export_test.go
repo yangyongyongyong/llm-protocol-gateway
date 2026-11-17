@@ -65,6 +65,55 @@ func TestWorkBuddyRoundTripKeepsMaskedPhone(t *testing.T) {
 	}
 }
 
+func TestExportProvidersIncludesCustomConnectors(t *testing.T) {
+	router := NewRouter(domain.GatewayState{CustomProviders: []domain.CustomProvider{{
+		ID: "ocean", Name: "Ocean", Protocol: domain.ProtocolOpenAIResponses, AuthHeader: "api-key",
+		Script:    domain.ProviderScript{Language: "python", Entrypoint: "adapter.py", Source: "print('ocean')", UpstreamBaseURL: "https://secret.example"},
+		ScriptDir: "/tmp/should-not-export",
+	}}, Providers: []domain.Provider{{
+		ID: "p-ocean", Name: "Ocean dev", Protocol: domain.ProtocolOpenAIResponses, AuthType: domain.AuthTypeAPIKey,
+		BaseURL: "http://127.0.0.1:12345/v1", APIKeySource: "literal:key", CustomProviderID: "ocean",
+		ProviderScript: &domain.ProviderScript{Language: "python", Entrypoint: "adapter.py", Source: "print('instance')", UpstreamBaseURL: "https://vendor.example"},
+	}}})
+	bundle, errs := router.ExportProviders([]string{"p-ocean"})
+	if len(errs) != 0 {
+		t.Fatalf("export errors = %v", errs)
+	}
+	if len(bundle.CustomProviders) != 1 || bundle.CustomProviders[0].ID != "ocean" {
+		t.Fatalf("custom connectors not exported: %+v", bundle.CustomProviders)
+	}
+	custom := bundle.CustomProviders[0]
+	if custom.Script.Source != "print('ocean')" || custom.Script.UpstreamBaseURL != "" || custom.ScriptDir != "" {
+		t.Fatalf("custom connector leaked runtime fields: %+v", custom)
+	}
+}
+
+func TestImportProvidersRestoresCustomConnectors(t *testing.T) {
+	fresh := NewRouter(domain.GatewayState{})
+	result := fresh.ImportProviders(ProvidersExportBundle{Version: providersExportVersion,
+		CustomProviders: []domain.CustomProvider{{
+			ID: "ocean", Name: "Ocean", Protocol: domain.ProtocolOpenAIResponses, AuthHeader: "api-key",
+			Script: domain.ProviderScript{Language: "python", Entrypoint: "adapter.py", Source: "print('ocean')"},
+		}},
+		Providers: []domain.Provider{{
+			ID: "p-ocean", Name: "Ocean dev", Protocol: domain.ProtocolOpenAIResponses, AuthType: domain.AuthTypeAPIKey,
+			BaseURL: "http://127.0.0.1:12345/v1", APIKeySource: "literal:key", CustomProviderID: "ocean",
+			ProviderScript: &domain.ProviderScript{Language: "python", Entrypoint: "adapter.py", Source: "print('ocean')", UpstreamBaseURL: "https://vendor.example"},
+		}},
+	})
+	if len(result.Errors) != 0 || len(result.Created) != 1 {
+		t.Fatalf("import result = %+v", result)
+	}
+	custom, err := fresh.CustomProviderByID("ocean")
+	if err != nil || custom.Script.Source != "print('ocean')" {
+		t.Fatalf("custom connector not restored: %+v err=%v", custom, err)
+	}
+	provider, err := fresh.ProviderByID("p-ocean")
+	if err != nil || provider.CustomProviderID != "ocean" || provider.ProviderScript == nil {
+		t.Fatalf("provider import lost connector: %+v err=%v", provider, err)
+	}
+}
+
 func TestImportProvidersCreateUpdateByIDAndName(t *testing.T) {
 	router := NewRouter(domain.GatewayState{
 		Providers: []domain.Provider{

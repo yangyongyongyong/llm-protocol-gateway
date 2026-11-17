@@ -12,9 +12,10 @@ const providersExportVersion = 1
 
 // ProvidersExportBundle is the JSON shape used by export/import.
 type ProvidersExportBundle struct {
-	Version    int               `json:"version"`
-	ExportedAt string            `json:"exportedAt,omitempty"`
-	Providers  []domain.Provider `json:"providers"`
+	Version         int                     `json:"version"`
+	ExportedAt      string                  `json:"exportedAt,omitempty"`
+	Providers       []domain.Provider       `json:"providers"`
+	CustomProviders []domain.CustomProvider `json:"customProviders,omitempty"`
 }
 
 // ProvidersImportResult summarizes an import run.
@@ -33,15 +34,24 @@ func (r *Router) ExportProviders(ids []string) (ProvidersExportBundle, []string)
 	defer r.mu.RUnlock()
 
 	bundle := ProvidersExportBundle{
-		Version:    providersExportVersion,
-		ExportedAt: time.Now().Format(time.RFC3339),
-		Providers:  make([]domain.Provider, 0),
+		Version:         providersExportVersion,
+		ExportedAt:      time.Now().Format(time.RFC3339),
+		Providers:       make([]domain.Provider, 0),
+		CustomProviders: make([]domain.CustomProvider, 0),
 	}
 	var errors []string
+	addProvider := func(provider domain.Provider) {
+		cloned := cloneProviderForExport(provider)
+		bundle.Providers = append(bundle.Providers, cloned)
+		if customID := strings.TrimSpace(cloned.CustomProviderID); customID != "" {
+			custom, ok := r.customProviderLocked(customID)
+			appendCustomProviderExport(&bundle, custom, ok)
+		}
+	}
 
 	if len(ids) == 0 {
 		for _, provider := range r.state.Providers {
-			bundle.Providers = append(bundle.Providers, cloneProviderForExport(provider))
+			addProvider(provider)
 		}
 		return bundle, errors
 	}
@@ -61,9 +71,37 @@ func (r *Router) ExportProviders(ids []string) (ProvidersExportBundle, []string)
 			errors = append(errors, fmt.Sprintf("provider %q not found", id))
 			continue
 		}
-		bundle.Providers = append(bundle.Providers, cloneProviderForExport(provider))
+		addProvider(provider)
 	}
 	return bundle, errors
+}
+
+func (r *Router) customProviderLocked(id string) (domain.CustomProvider, bool) {
+	for _, provider := range r.state.CustomProviders {
+		if strings.TrimSpace(provider.ID) == strings.TrimSpace(id) {
+			return cloneCustomProviderForExport(provider), true
+		}
+	}
+	return domain.CustomProvider{}, false
+}
+
+func appendCustomProviderExport(bundle *ProvidersExportBundle, provider domain.CustomProvider, ok bool) {
+	if !ok || bundle == nil || strings.TrimSpace(provider.ID) == "" {
+		return
+	}
+	for _, existing := range bundle.CustomProviders {
+		if existing.ID == provider.ID {
+			return
+		}
+	}
+	bundle.CustomProviders = append(bundle.CustomProviders, provider)
+}
+
+func cloneCustomProviderForExport(provider domain.CustomProvider) domain.CustomProvider {
+	provider = cloneCustomProvider(provider)
+	provider.ScriptDir = ""
+	provider.Script.UpstreamBaseURL = ""
+	return provider
 }
 
 // ImportProviders upserts providers from a bundle without deleting unrelated ones.
@@ -83,6 +121,21 @@ func (r *Router) ImportProviders(bundle ProvidersExportBundle) ProvidersImportRe
 	if bundle.Providers == nil {
 		result.Errors = append(result.Errors, "providers array is required")
 		return result
+	}
+
+	for _, custom := range bundle.CustomProviders {
+		custom = normalizeCustomProvider(custom)
+		if custom.ID == "" || custom.Name == "" {
+			result.Errors = append(result.Errors, "custom connector id and name are required")
+			continue
+		}
+		if err := validateCustomProviderDefinition(custom); err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("custom connector %q: %s", custom.ID, err.Error()))
+			continue
+		}
+		if _, err := r.upsertCustomProviderImport(custom); err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("custom connector %q: %s", custom.ID, err.Error()))
+		}
 	}
 
 	for index, incoming := range bundle.Providers {
@@ -108,6 +161,34 @@ func (r *Router) ImportProviders(bundle ProvidersExportBundle) ProvidersImportRe
 		}
 	}
 	return result
+}
+
+func (r *Router) upsertCustomProviderImport(incoming domain.CustomProvider) (domain.CustomProvider, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	incoming = normalizeCustomProvider(incoming)
+	if incoming.ID == "" || incoming.Name == "" {
+		return domain.CustomProvider{}, fmt.Errorf("custom connector id and name are required")
+	}
+	for index := range r.state.CustomProviders {
+		if r.state.CustomProviders[index].ID == incoming.ID {
+			updated := incoming
+			updated.CreatedAt = r.state.CustomProviders[index].CreatedAt
+			updated.UpdatedAt = nowRFC3339()
+			r.state.CustomProviders[index] = updated
+			return updated, nil
+		}
+	}
+	for _, existing := range r.state.CustomProviders {
+		if strings.EqualFold(existing.Name, incoming.Name) {
+			return domain.CustomProvider{}, fmt.Errorf("custom connector name %q already exists", incoming.Name)
+		}
+	}
+	now := nowRFC3339()
+	incoming.CreatedAt = now
+	incoming.UpdatedAt = now
+	r.state.CustomProviders = append(r.state.CustomProviders, incoming)
+	return incoming, nil
 }
 
 func prepareProviderForImport(provider domain.Provider) (domain.Provider, error) {
