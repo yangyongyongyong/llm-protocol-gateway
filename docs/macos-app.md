@@ -164,7 +164,7 @@ TLS 握手阶段出现 EOF。应检查当前网络对 GitHub 附件域名的路�
 
 - 前端 `__APP_VERSION__`
 - 网关 `gateway.BuildVersion`
-- 桌面 `desktop.version`
+- 桌面 `main.version`（`-X main.version`；写成模块路径 linker 会静默忽略）
 - macOS `Info.plist` 的 `CFBundleShortVersionString` 与 `CFBundleVersion`
 
 `desktop/wails.json` 里的 `productVersion` 只是 Wails 的本地占位值，发布时会被构建脚本覆盖；不要再把它当成版本源。发布 workflow 会在上传前校验以上字段，缺一项即失败，避免出现清单写 1.0.20、安装包写 0.1.3 的错位。

@@ -8,7 +8,7 @@ ARCH="${ARCH:-arm64}"
 # 前端与二进制都要带同一个值，否则控制台的升级判断会错位（release.yml 会校验）。
 APP_VERSION="${GATEWAY_APP_VERSION:-${CURRENT_APP_VERSION:-0.0.0-dev}}"
 export GATEWAY_APP_VERSION="$APP_VERSION"
-LDFLAGS="-X github.com/luca/llm-protocol-gateway/internal/gateway.BuildVersion=$APP_VERSION -X github.com/luca/llm-protocol-gateway/desktop.version=$APP_VERSION"
+LDFLAGS="-X github.com/luca/llm-protocol-gateway/internal/gateway.BuildVersion=$APP_VERSION -X main.version=$APP_VERSION"
 if [[ -n "${UPDATE_PUBLIC_KEY:-}" ]]; then
   LDFLAGS="$LDFLAGS -X github.com/luca/llm-protocol-gateway/internal/desktopupdate.SignaturePublicKey=$UPDATE_PUBLIC_KEY"
 fi

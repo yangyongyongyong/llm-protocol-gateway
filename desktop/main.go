@@ -73,5 +73,8 @@ func logWriter() io.Writer {
 	if err != nil {
 		return os.Stdout
 	}
-	return io.MultiWriter(os.Stdout, f)
+	// 文件必须排在第一位：GUI 构建（-H windowsgui）里 os.Stdout 是无效句柄，
+	// io.MultiWriter 遇到第一个 writer 写失败就返回，后面的文件永远收不到字节，
+	// desktop.log 会一直是 0 字节，线上问题因此没有任何日志可查。
+	return io.MultiWriter(f, os.Stdout)
 }

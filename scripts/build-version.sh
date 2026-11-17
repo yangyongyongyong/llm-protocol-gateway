@@ -2,7 +2,7 @@
 # 生成并打印本次发布的版本号。
 #
 # 发布版本只有这一个输入；各平台构建脚本必须把它注入所有产物：
-#   1. 后端二进制   gateway.BuildVersion 与 desktop.version
+#   1. 后端二进制   gateway.BuildVersion 与桌面 main.version（-X main.version）
 #   2. 前端资源     GATEWAY_APP_VERSION → __APP_VERSION__
 #   3. macOS 包     Info.plist 的 CFBundleShortVersionString / CFBundleVersion
 #

@@ -68,6 +68,13 @@ jobs:
       - name: go test
         run: go test -count=1 ./...
 
+      - name: 校验桌面版本号注入写法
+        run: |
+          # desktop 是 package main：-X 只认 main.version，写模块路径会被 linker
+          # 静默忽略，变量留空（Windows 桌面版曾因此在 .app 搜索里死循环）。
+          grep -qF -- '-X main.version=$VERSION' scripts/release.sh
+          grep -qF -- '-X main.version=$APP_VERSION' scripts/build-macos-app.sh
+
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -216,7 +223,7 @@ jobs:
             fi
             build_info="$(go version -m "$APP/Contents/MacOS/LLM Protocol Gateway")"
             grep -qF -- "-X github.com/luca/llm-protocol-gateway/internal/gateway.BuildVersion=$VERSION" <<<"$build_info"
-            grep -qF -- "-X github.com/luca/llm-protocol-gateway/desktop.version=$VERSION" <<<"$build_info"
+            grep -qF -- "-X main.version=$VERSION" <<<"$build_info"
 
             STAGE="$(mktemp -d)/llm-protocol-gateway-$VERSION"
             mkdir -p "$STAGE"
@@ -345,7 +352,7 @@ jobs:
           GATEWAY_APP_VERSION: ${{ needs.gate.outputs.version }}
           # App.version 来自 build tag；-ldflags 末尾覆盖它，让控制台看到真实版本号
           UPDATE_PUBLIC_KEY: ${{ vars.UPDATE_PUBLIC_KEY }}
-          DESKTOP_LDFLAGS: -X github.com/luca/llm-protocol-gateway/internal/gateway.BuildVersion=${{ needs.gate.outputs.version }} -X github.com/luca/llm-protocol-gateway/desktop.version=${{ needs.gate.outputs.version }}
+          DESKTOP_LDFLAGS: -X github.com/luca/llm-protocol-gateway/internal/gateway.BuildVersion=${{ needs.gate.outputs.version }} -X main.version=${{ needs.gate.outputs.version }}
         run: |
           npm ci --no-audit --no-fund --prefix web
           GATEWAY_APP_VERSION="$GATEWAY_APP_VERSION" npm --prefix web run build
