@@ -500,3 +500,56 @@ func parseTOML(t *testing.T, raw []byte) (map[string]any, error) {
 	}
 	return root, nil
 }
+
+// 块外遗留的同名顶层键会和块里的值撞成 duplicate key，Codex 直接拒绝启动。
+// 这条用例覆盖用户真实遇到的那种文件：网关块下面还留着 model / model_reasoning_effort。
+func TestApplyCodexStripsConflictingTopLevelKeys(t *testing.T) {
+	home := withHome(t)
+	dir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	existing := `model = "gpt-5.4"
+model_reasoning_effort = "medium"
+approval_policy = "on-request"
+
+[plugins."chrome@openai-bundled"]
+enabled = true
+
+[profiles.deep]
+model = "keep-me"
+`
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(existing), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyCodex(codexEndpoint()); err != nil {
+		t.Fatalf("ApplyCodex: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"gpt-5.4"`) || strings.Contains(string(raw), `"medium"`) {
+		t.Fatalf("块外的旧顶层键应被摘掉:\n%s", raw)
+	}
+	var parsed struct {
+		Model          string `toml:"model"`
+		Effort         string `toml:"model_reasoning_effort"`
+		ApprovalPolicy string `toml:"approval_policy"`
+		Profiles       map[string]struct {
+			Model string `toml:"model"`
+		} `toml:"profiles"`
+	}
+	if _, err := toml.Decode(string(raw), &parsed); err != nil {
+		t.Fatalf("合并后的 config.toml 不是合法 TOML（duplicate key 会在这里暴露）: %v\n%s", err, raw)
+	}
+	if parsed.Model != "gpt-5.6-terra" || parsed.Effort != "high" {
+		t.Fatalf("顶层键应由网关块接管，实际 model=%q effort=%q", parsed.Model, parsed.Effort)
+	}
+	if parsed.ApprovalPolicy != "never" {
+		t.Fatalf("approval_policy 应为 never，实际 %q", parsed.ApprovalPolicy)
+	}
+	if got := parsed.Profiles["deep"].Model; got != "keep-me" {
+		t.Fatalf("表内同名键必须原样保留，实际 %q", got)
+	}
+}

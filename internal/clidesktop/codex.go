@@ -142,6 +142,10 @@ func ApplyCodex(e CodexEndpoint) (CodexResult, error) {
 	// 地址。表外的一切（[projects]、[plugins]、[desktop]、用户自己的顶层键）
 	// 一个字符都不动。
 	remainder := stripForeignProviderTables(stripCodexBlock(existing))
+	// 块外还可能有同名顶层键：早期版本是裸写的，用户自己也会手写一份
+	// model / approval_policy。它们和块里的值撞成 TOML duplicate key，Codex
+	// 读到直接拒绝启动，只报「duplicate key」却不说是哪一行。
+	remainder = stripCodexConflictingTopLevelKeys(remainder)
 	merged := block + "\n" + remainder
 	if existing != "" && merged == existing {
 		res.Unchanged = true
@@ -424,6 +428,110 @@ func stripForeignProviderTables(text string) string {
 		out = append(out, line)
 	}
 	return compressBlankRuns(out)
+}
+
+// codexManagedTopLevelKeys 是网关块会写入的顶层键。
+//
+// 块外的同名单键不是"用户的选择"，而是历史遗留：早期版本裸写这几个键，用户也会
+// 自己手写一份。两份同时存在就是 TOML 的 duplicate key —— Codex 把它当硬错误，
+// 启动阶段直接报「修复配置问题后，ChatGPT 才能启动 / duplicate key」，用户看到
+// 的提示里没有行号也没有键名，只能靠手工对文件。前端生成的「修改脚本」一直有
+// strip_bare_legacy_content 做同样的事，应用内这条写入路径漏了。
+var codexManagedTopLevelKeys = map[string]bool{
+	"model":                  true,
+	"model_provider":         true,
+	"model_reasoning_effort": true,
+	"model_catalog_json":     true,
+	"approval_policy":        true,
+	"sandbox_mode":           true,
+}
+
+// stripCodexConflictingTopLevelKeys 删掉任何 [table] 之前、且属于本工具管理的
+// 顶层键赋值（含跨行值的续行）。表内的同名键（例如 [profiles.deep] model）不动：
+// 那是用户自己的配置，和块里的顶层键不在同一个命名空间。
+func stripCodexConflictingTopLevelKeys(text string) string {
+	if text == "" {
+		return ""
+	}
+	lines := strings.Split(text, "\n")
+	out := make([]string, 0, len(lines))
+	inTable := false
+	skipping := false
+	var pending string
+	for _, line := range lines {
+		raw := strings.TrimRight(line, "\r")
+		if skipping {
+			pending += "\n" + raw
+			if codexTomlValueComplete(pending) {
+				skipping = false
+				pending = ""
+			}
+			continue
+		}
+		trimmed := strings.TrimSpace(raw)
+		if !inTable && strings.HasPrefix(trimmed, "[") {
+			// 表头之后的一切都属于某张表，顶层键不会再来。
+			inTable = true
+		}
+		if !inTable {
+			if key, value, ok := splitCodexTopLevelKey(raw); ok && codexManagedTopLevelKeys[key] {
+				if !codexTomlValueComplete(value) {
+					skipping = true
+					pending = value
+				}
+				continue
+			}
+		}
+		out = append(out, raw)
+	}
+	return compressBlankRuns(out)
+}
+
+// splitCodexTopLevelKey 把一行 `key = value` 拆开；注释、空行和表头都不算。
+func splitCodexTopLevelKey(line string) (key, value string, ok bool) {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "[") {
+		return "", "", false
+	}
+	idx := strings.Index(trimmed, "=")
+	if idx < 0 {
+		return "", "", false
+	}
+	key = strings.Trim(strings.TrimSpace(trimmed[:idx]), "\"'")
+	value = strings.TrimSpace(trimmed[idx+1:])
+	return key, value, key != ""
+}
+
+// codexTomlValueComplete 判断一个值是否已经写完整（引号闭合、括号配平）。
+// 不完整就说明值跨行，后续续行必须一起删掉，否则会留下一段非法 TOML。
+func codexTomlValueComplete(value string) bool {
+	depth := 0
+	var quote byte
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if quote != 0 {
+			if c == '\\' && quote == '"' {
+				i++
+				continue
+			}
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '"', '\'':
+			quote = c
+		case '#':
+			// 注释之后不可能还有值内容。
+			return depth == 0
+		case '[', '{':
+			depth++
+		case ']', '}':
+			depth--
+		}
+	}
+	return depth <= 0 && quote == 0
 }
 
 // isModelProviderTableHeader 判断一个表头是否属于 [model_providers.*]。
