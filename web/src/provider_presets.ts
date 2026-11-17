@@ -160,14 +160,14 @@ export const PROVIDER_CONNECT_CHOICES: ProviderConnectChoice[] = [
 ];
 
 const SECTION_META: Array<{ id: ProviderPresetSection; title: string; desc: string }> = [
-  { id: 'custom', title: '自定义 Provider', desc: '管理员先定义协议脚本，新建实例时只填上游 URL 和 Key' },
+  { id: 'custom', title: '自定义连接器', desc: '管理员先定义协议脚本，新建实例时只填上游 URL 和 Key' },
   { id: 'subscription', title: '订阅账号', desc: '登录一次即可，无需粘贴密钥' },
   { id: 'vendor', title: '模型厂商', desc: '厂商自己的 API 与密钥' },
   { id: 'relay', title: '中转服务', desc: '一把密钥访问多家模型' },
   { id: 'local', title: '本机与自定义', desc: '本地推理服务、任意兼容端点、脚本自注册' },
 ];
 
-/** 把管理员定义的自定义类型投影成目录磁贴。 */
+/** 把管理员定义的自定义连接器投影成目录磁贴。 */
 export function customProviderPresets(customProviders: CustomProvider[] = []): ProviderPreset[] {
   return customProviders.map((custom) => ({
     id: `custom:${custom.id}`,

@@ -744,7 +744,7 @@ export type Provider = {
   zcodeOAuth?: ZCodeOAuthInfo;
   traeOAuth?: TraeOAuthInfo;
   providerScript?: ProviderScript;
-  /** 非空表示这是某个“自定义 Provider”类型的实例。 */
+  /** 非空表示这是某个“自定义连接器”的实例。 */
   customProviderId?: string;
 };
 
@@ -1583,7 +1583,7 @@ export type ProviderPreset = {
    * <img> 渲染；否则是 currentColor 单色版，必须用 CSS mask 才能跟着主题着色。
    */
   icon?: string;
-  /** 动态自定义类型：目录磁贴直接指向这个模板 ID。 */
+  /** 动态自定义连接器：目录磁贴直接指向这个模板 ID。 */
   customProviderId?: string;
 };
 

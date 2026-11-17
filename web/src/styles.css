@@ -7706,7 +7706,7 @@ html[data-theme="dark"] .pivot-entity-card:hover {
 .provider-tile:hover .brand-icon.mask { background-color: var(--accent-strong); }
 .provider-tile.have { border-color: var(--accent-border); }
 
-/* 自定义类型磁贴右侧三点菜单：类型编辑由 AI/API 完成，这里只保留删除。 */
+/* 自定义连接器磁贴右侧三点菜单：编辑由 AI/API 完成，这里提供导出和删除。 */
 .provider-custom-tile { position: relative; min-width: 0; }
 .provider-custom-tile > .provider-tile { width: 100%; padding-right: 36px; }
 .provider-custom-menu-trigger {

@@ -531,6 +531,7 @@ function App() {
   // Provider 批量选择的 Shift 锚点：记录上一次单击/区间起点的可见顺序索引。
   const providerSelectionAnchorRef = useRef<string>('');
   const providerImportInputRef = useRef<HTMLInputElement | null>(null);
+  const connectorImportInputRef = useRef<HTMLInputElement | null>(null);
   const [selectedOutputProtocol, setSelectedOutputProtocol] = useState<Protocol>('openai_chat');
   const [publicDraft, setPublicDraft] = useState<PublicAccessSettings>(defaultPublicAccess);
   const [publicModeChoice, setPublicModeChoice] = useState<PublicAccessMode>(() => bootSession.state?.publicAccess?.mode || 'random_tunnel');
@@ -679,6 +680,7 @@ function App() {
   // 导入单独一个 busy 标记：设置 saving 会把右侧面板顶部四个按钮全禁用，`导入` 按钮被禁后
   // chip 从鼠标下方消失，浏览器随即丢掉按钮的 hover，一次性结果气泡刚出现就跟着消失。
   const [importingProviders, setImportingProviders] = useState(false);
+  const [importingConnector, setImportingConnector] = useState(false);
   const [testingProviderID, setTestingProviderID] = useState('');
   const [providerModalOpen, setProviderModalOpen] = useState(false);
   const [providerGroupsOpen, setProviderGroupsOpen] = useState(false);
@@ -3809,7 +3811,7 @@ function App() {
 
   async function deleteCustomProviderType(provider: CustomProvider) {
     const ok = await confirmDialog(
-      `删除自定义 Provider「${provider.name}」？\n只有没有实例引用它时才能删除。已创建的 Provider 不会被隐式删除。`,
+      `删除自定义连接器「${provider.name}」？\n只有没有实例引用它时才能删除。已创建的 Provider 不会被隐式删除。`,
       {confirmLabel: '删除', danger: true},
     );
     if (!ok) return;
@@ -3817,9 +3819,62 @@ function App() {
       const response = await fetch(`${API_BASE}/__custom-providers/${encodeURIComponent(provider.id)}`, {method: 'DELETE'});
       if (!response.ok) throw new Error(await response.text());
       await refreshState(false);
-      showToast(`已删除自定义 Provider：${provider.name}`);
+      showToast(`已删除自定义连接器：${provider.name}`);
     } catch (error) {
       showToast(`删除失败：${String(error)}`);
+    }
+  }
+
+  async function exportCustomConnector(provider: CustomProvider) {
+    try {
+      const response = await fetch(`${API_BASE}/__custom-providers/${encodeURIComponent(provider.id)}/export`);
+      if (!response.ok) throw new Error(await response.text());
+      const bundle = await response.json();
+      const filename = `${provider.id || provider.name}.custom-connector.json`.replace(/[^a-zA-Z0-9._-]+/g, '-');
+      const saved = await saveJSONFile(filename, bundle);
+      if (!saved.saved) {
+        showToast('已取消导出连接器');
+        return;
+      }
+      showToast(saved.path ? `已导出自定义连接器：${saved.path}` : `已导出自定义连接器：${provider.name}`);
+    } catch (error) {
+      showToast(`导出连接器失败：${String(error)}`);
+    }
+  }
+
+  async function importCustomConnectorFromFile(file: File) {
+    setImportingConnector(true);
+    try {
+      const text = await file.text();
+      let bundle: unknown;
+      try {
+        bundle = JSON.parse(text);
+      } catch {
+        throw new Error('JSON 解析失败');
+      }
+      let response = await fetch(`${API_BASE}/__custom-providers/import`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(bundle),
+      });
+      if (response.status === 409) {
+        const ok = await confirmDialog('同 ID 的自定义连接器已存在，是否覆盖并刷新引用它的实例脚本？', {confirmLabel: '覆盖导入'});
+        if (!ok) return;
+        response = await fetch(`${API_BASE}/__custom-providers/import?replace=true`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(bundle),
+        });
+      }
+      if (!response.ok) throw new Error(await response.text());
+      await refreshState(false);
+      await refreshAppLogs();
+      showToast('自定义连接器已导入');
+    } catch (error) {
+      showToast(`导入连接器失败：${String(error)}`);
+    } finally {
+      setImportingConnector(false);
+      if (connectorImportInputRef.current) connectorImportInputRef.current.value = '';
     }
   }
 
@@ -4719,6 +4774,18 @@ function App() {
     anchor.click();
     anchor.remove();
     URL.revokeObjectURL(url);
+  }
+
+  async function saveJSONFile(filename: string, payload: unknown): Promise<{saved: boolean; path?: string; fallback?: boolean}> {
+    const text = `${JSON.stringify(payload, null, 2)}\n`;
+    const saveTextFile = (window as any)?.go?.main?.App?.SaveTextFile;
+    if (typeof saveTextFile === 'function') {
+      const result = await saveTextFile(filename, text) as {saved?: boolean; cancelled?: boolean; path?: string};
+      if (result?.saved) return {saved: true, path: result.path};
+      return {saved: false};
+    }
+    downloadJSONFile(filename, payload);
+    return {saved: true, fallback: true};
   }
 
   async function exportProviders(ids?: string[]) {
@@ -6280,7 +6347,19 @@ function App() {
                   setProviderSheetOpen(false);
                   openCreateCustomProvider();
                 } : undefined}
+                onImportCustomProvider={isAdminUser && canDo('providers.create') ? () => connectorImportInputRef.current?.click() : undefined}
+                onExportCustomProvider={isAdminUser ? (provider) => void exportCustomConnector(provider) : undefined}
                 onDeleteCustomProvider={isAdminUser ? (provider) => void deleteCustomProviderType(provider) : undefined}
+              />
+              <input
+                ref={connectorImportInputRef}
+                type="file"
+                accept="application/json,.json,.custom-connector.json"
+                hidden
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) void importCustomConnectorFromFile(file);
+                }}
               />
             </div>
           </section>
@@ -8359,21 +8438,21 @@ function App() {
           : '';
         return (
           <Modal
-            title="添加自定义 Provider 类型"
+            title="添加自定义连接器"
             description="此页面只提供 AI Prompt，不提供手动配置。把 Prompt 复制给 AI，由它通过 API 完成新建、编辑、删除、实例化和验收。"
             size="wide"
             onClose={() => setCustomProviderModalOpen(false)}
           >
             <div className="provider-script-panel">
               <div className="hint-text">
-                自定义类型由 AI 调用 API 管理；脚本由服务端落盘到 App 数据目录。类型磁贴右侧只保留删除菜单。
+                自定义连接器由 AI 调用 API 管理；脚本由服务端落盘到 App 数据目录。连接器磁贴右侧提供导出和删除菜单。
               </div>
               <pre className="json-preview" style={{whiteSpace: 'pre-wrap', userSelect: 'text'}}>
                 {prompt || (customProviderAIPrompt.loading ? '正在加载 AI Prompt…' : customProviderAIPrompt.error || '暂无 Prompt')}
               </pre>
               <div className="actions" style={{gap: 8, flexWrap: 'wrap'}}>
-                <button type="button" className="mini-btn" onClick={() => void refreshState(false)}>刷新类型目录</button>
-                <button type="button" className="btn primary" disabled={!prompt} onClick={() => void copyToClipboard(prompt).then((ok) => showToast(ok ? '自定义 Provider API Prompt 已复制' : '复制失败，请手动选中文本'))}>
+                <button type="button" className="mini-btn" onClick={() => void refreshState(false)}>刷新连接器目录</button>
+                <button type="button" className="btn primary" disabled={!prompt} onClick={() => void copyToClipboard(prompt).then((ok) => showToast(ok ? '自定义连接器 API Prompt 已复制' : '复制失败，请手动选中文本'))}>
                   复制给 AI
                 </button>
               </div>
@@ -8398,7 +8477,7 @@ function App() {
             {providerDraft.customProviderId ? (
               <div className="provider-script-panel field field-full">
                 <div className="hint-text">
-                  自定义 Provider 类型：<b>{providerDraft.customProviderName || providerDraft.customProviderId}</b>
+                  自定义连接器：<b>{providerDraft.customProviderName || providerDraft.customProviderId}</b>
                   {' · '}{protocolLabel(providerDraft.customProviderProtocol)}
                 </div>
                 <div className="hint-text">
@@ -8546,7 +8625,7 @@ function App() {
                 ) : (
                   <div className="provider-script-panel">
                     <div className="hint-text">
-                      这是旧版内联脚本 Provider。脚本正文已改为在「自定义 Provider」类型中统一维护；这里只保留该实例的上游 URL 和 Key。
+                      这是旧版内联脚本 Provider。脚本正文已改为在「自定义连接器」中统一维护；这里只保留该实例的上游 URL 和 Key。
                     </div>
                     <Field fullWidth label="上游 Base URL" value={providerDraft.scriptUpstreamBaseUrl} onChange={(value) => setProviderDraft((current) => ({ ...current, scriptUpstreamBaseUrl: value }))} />
                     <Field fullWidth label="上游 API Key" value={providerDraft.apiKeySource} onChange={(value) => setProviderDraft((current) => ({ ...current, apiKeySource: value }))} />

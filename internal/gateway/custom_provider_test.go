@@ -250,6 +250,70 @@ func TestCustomProviderCRUDWritesAndRemovesScriptFiles(t *testing.T) {
 	}
 }
 
+func TestCustomProviderExportImportBundle(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("GATEWAY_CUSTOM_PROVIDER_DIR", root)
+	server := NewServer(NewRouter(domain.GatewayState{}), monitor.NewStore())
+	withAdmin := func(request *http.Request) *http.Request {
+		return request.WithContext(context.WithValue(request.Context(), authContextKey{}, adminIdentity()))
+	}
+	created, err := server.router.AddCustomProvider(domain.CustomProvider{
+		ID: "share-me", Name: "Share Me", Protocol: domain.ProtocolOpenAIResponses, AuthHeader: "api-key", DefaultModel: "gpt-5.5",
+		Script: domain.ProviderScript{Language: "python", Entrypoint: "adapter.py", Source: "print('share')", HealthPath: "/health"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exportReq := withAdmin(httptest.NewRequest(http.MethodGet, "/__custom-providers/share-me/export", nil))
+	exportReq.SetPathValue("id", created.ID)
+	exportRec := httptest.NewRecorder()
+	server.handleExportCustomProvider(exportRec, exportReq)
+	if exportRec.Code != http.StatusOK {
+		t.Fatalf("export status=%d body=%s", exportRec.Code, exportRec.Body.String())
+	}
+	var bundle customConnectorBundle
+	if err := json.Unmarshal(exportRec.Body.Bytes(), &bundle); err != nil {
+		t.Fatal(err)
+	}
+	if bundle.Kind != customConnectorBundleKind || bundle.CustomProvider.Script.Source != "print('share')" || bundle.CustomProvider.Script.UpstreamBaseURL != "" || bundle.CustomProvider.ScriptDir != "" {
+		t.Fatalf("bad bundle: %+v", bundle)
+	}
+	if err := server.router.DeleteCustomProvider(created.ID); err != nil {
+		t.Fatal(err)
+	}
+	importReq := withAdmin(httptest.NewRequest(http.MethodPost, "/__custom-providers/import", strings.NewReader(exportRec.Body.String())))
+	importRec := httptest.NewRecorder()
+	server.handleImportCustomProvider(importRec, importReq)
+	if importRec.Code != http.StatusOK {
+		t.Fatalf("import status=%d body=%s", importRec.Code, importRec.Body.String())
+	}
+	imported, err := server.router.CustomProviderByID("share-me")
+	if err != nil || imported.Protocol != domain.ProtocolOpenAIResponses || imported.Script.Source != "print('share')" {
+		t.Fatalf("imported=%+v err=%v", imported, err)
+	}
+	if body, err := os.ReadFile(filepath.Join(root, "share-me", "adapter.py")); err != nil || string(body) != "print('share')" {
+		t.Fatalf("imported file=%q err=%v", body, err)
+	}
+}
+
+func TestCustomProviderImportConflictRequiresReplace(t *testing.T) {
+	server := NewServer(NewRouter(domain.GatewayState{}), monitor.NewStore())
+	withAdmin := func(request *http.Request) *http.Request {
+		return request.WithContext(context.WithValue(request.Context(), authContextKey{}, adminIdentity()))
+	}
+	if _, err := server.router.AddCustomProvider(domain.CustomProvider{ID: "dup", Name: "Dup", Protocol: domain.ProtocolOpenAIChat, Script: domain.ProviderScript{Source: "print('old')"}}); err != nil {
+		t.Fatal(err)
+	}
+	bundle := customConnectorBundle{Kind: customConnectorBundleKind, Version: 1, CustomProvider: domain.CustomProvider{ID: "dup", Name: "Dup New", Protocol: domain.ProtocolOpenAIChat, Script: domain.ProviderScript{Source: "print('new')"}}}
+	body, _ := json.Marshal(bundle)
+	req := withAdmin(httptest.NewRequest(http.MethodPost, "/__custom-providers/import", strings.NewReader(string(body))))
+	rec := httptest.NewRecorder()
+	server.handleImportCustomProvider(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected conflict, got status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestCustomProviderAIPromptCoversCRUDAndABI(t *testing.T) {
 	server := NewServer(NewRouter(domain.GatewayState{}), monitor.NewStore())
 	request := httptest.NewRequest(http.MethodGet, "/__custom-providers/ai-prompt", nil)

@@ -478,6 +478,41 @@ func (a *App) OpenDataDirectory() {
 	}
 }
 
+// SaveTextFile 弹出系统“另存为”对话框，并把前端传入的文本写入用户选择的位置。
+//
+// 连接器导出不能静默落到浏览器默认下载目录：用户需要知道文件放在哪里，也经常
+// 要直接保存到项目/云盘目录。这里用 Wails 原生 SaveFileDialog 做桌面端路径选择；
+// 返回空 path 表示用户取消，不视为错误。
+func (a *App) SaveTextFile(defaultFilename string, content string) (map[string]any, error) {
+	if a.ctx == nil {
+		return map[string]any{"saved": false, "cancelled": true}, nil
+	}
+	filename := strings.TrimSpace(defaultFilename)
+	if filename == "" {
+		filename = "export.json"
+	}
+	path, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+		Title:                "保存文件",
+		DefaultFilename:      filename,
+		CanCreateDirectories: true,
+		Filters: []runtime.FileFilter{{
+			DisplayName: "JSON 文件 (*.json)",
+			Pattern:     "*.json",
+		}},
+	})
+	if err != nil {
+		return nil, err
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return map[string]any{"saved": false, "cancelled": true}, nil
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		return nil, err
+	}
+	return map[string]any{"saved": true, "path": path}, nil
+}
+
 // StopLaunchAgent boots out the headless LaunchAgent so the App can own the port.
 func (a *App) StopLaunchAgent() (string, error) {
 	return stopLaunchAgent(launchAgentLabel)
