@@ -565,3 +565,64 @@ embeddings、上报回读、上下文窗口解析链、**`/v1/messages` 路由**
 
 线上验证（gc `20261111.055651`，陌账号）：非流式 200（`output_tokens=256`，续写仍生效且未被 markup 闸门误伤）、流式 200 且事件序列完整。
 
+
+## 九、上游 2026-11-11 之后的跟踪对齐（第三次跟踪）
+
+上游期间新增 **184 个提交**（`2b210e9..f8d8346`）。逐条筛选后，**两处直接影响反代链路**的已对齐：
+
+### 9.1 头族：国内版 5.11.3 的 `X-Client-*` 三头（issue #257）
+
+2026-11-18 真机抓包（国内桌面端 5.11.3）确认：客户端在共享 HTTP 层按 origin 注入
+`X-Client-Version` / `X-Client-Platform` / `X-Client-Product`，**155/155 条 API 请求全带**，
+包括此前判为「头集未变」的 `/v2/chat/completions` 与 `/v3/config`。
+
+| 项 | 本仓处理 |
+| --- | --- |
+| 版本号 | CN `5.9.3` → **`5.11.3`**，CLI `2.165.0` → **`2.176.0`**；国际版保持 `5.9.4` / `2.165.0` |
+| CLI 段 | 改为按 realm 取（`workBuddyCLIVersionFor`）。两个分发包是不同 release，单一值会让一侧 UA 自相矛盾 |
+| 三头 | 取值 `windows` / `WorkBuddy`，版本段跟随账号的 client version |
+| 注入点 | chat 头族、账号调用头表（`workBuddyAccountHeaders`）、桌面 report 头表 |
+| realm 隔离 | **仅国内版**。国际包停在 5.9.4，没有这层注入机制，套用国内形态等于加官方不存在的指纹 |
+| 口径冲突 | 小程序口径（`2.4.0`/`mp-weixin`/`workbuddy-mp`）与 web 领奖口径（`x-client-platform: web`）都**撤掉**桌面三头，否则会发出 `5.11.3 / miniprogram / WorkBuddy` 这种谁都不像的第四种组合（上游 `dropClientIdentityHeaders` 同义） |
+| `X-Device-Token` | 仍不注入：取值只有客户端 Turing SDK 能产，账号配了才带 |
+
+**上游同时纠正了一个我们也有过的思路**：头序不是判别特征——官方自己有 node fetch / axios /
+渲染器三族不同顺序，同一路径 `/v2/report` 都有两种排列。我们已有的头序层保留（无害），但不必再投入。
+
+### 9.2 脱敏：上游服务端注入的身份指令（issue #187）
+
+服务端把 `When asked about your model identity, identify yourself as Tencent Hunyuan Hy.`
+拼进模型可见上下文。这句不在出站 body 里，但模型会**复述进 `reasoning_content`**，客户端把思维链
+带回历史，下一轮原样出站——「声明 → 进历史 → 再看到 → 再声明」的滚雪球。
+
+- 新增 `workbuddy_injected_identity.go`：整句改写为中性表述 + 剥 `<model_identity>` 标签（保留内部文本）
+- 正则收紧到整句，避免误伤 `Do not identify yourself as an AI.` 这类正常指令；句尾按「点后不接字母数字」收，
+  因为身份名本身可带点（`GPT-4.1`），遇到第一个点就停会留下 `1 by OpenAI.` 半句
+- **作用域严格**：仅 assistant 正文 + 任意角色的 `reasoning_content`/`reasoning`。system/user 里的同形句
+  是用户自己的人设指令，改写它等于篡改提示词——这条边界由测试钉住（我第一版按角色宽判，被测试抓出来）
+
+### 9.3 线上验证（gc `20261118.022835`）
+
+```
+/v1/chat/completions（已有 key → 陌账号，hy4free） → HTTP 200，返回「收到」
+```
+
+新的版本号与三头没有让上游拒绝，脱敏改动也没有误伤正常对话。
+
+### 9.4 未跟（评估后跳过）
+
+| 上游提交 | 原因 |
+| --- | --- |
+| `615dc75`/`d6301fe` tools schema 深度规整 + `11129` 业务码识别 | 属判定层而非链路形态，且 `11129` 需要真机样本才能定阈值；单独评估 |
+| `f8d8346`/`1618fea` 等 narration 三处救援判据 | 「说一句就停」救援是上游自建 SSE 才有的能力，本仓是透传，属新增功能 |
+| `0e41952` `/v1/responses` 思维链保真回放 | 本仓 Responses 路径已有自己的历史回放实现，需单独比对 |
+| `three_d.go`（306 行） | 新增三维能力端点，非链路对齐 |
+| `65e644e` 号池分区 | 上游自己已 revert |
+
+### 9.5 环境说明
+
+本机无 Python，`TestProviderScript*` / `TestCustomProvider*` 共 12 条在改动前后均失败——已用 `git stash`
+在基线上复验，确认与本次改动无关。另：gc 上的控制台接口（`POST /__routes`、`/__providers/{id}/test`、
+`keepalive`）现在返回 `403 permission denied`，是本仓已收紧的 RBAC（loopback admin bypass 不再成立），
+不影响已发布功能，但使「临时 route + 临时 key」这套验收手段失效，故改用已有 key 直打协议端点。
+
