@@ -862,7 +862,7 @@ func TestApplyWorkBuddyHeadersIntlChatFingerprint(t *testing.T) {
 	if request.Header.Get("User-Agent") != site.chatUserAgent() {
 		t.Fatalf("User-Agent = %q, want %q", request.Header.Get("User-Agent"), site.chatUserAgent())
 	}
-	wantUA := "WorkBuddy/" + workBuddyClientVersionIntl + " workbuddy-ai/" + workBuddyClientVersionIntl + " CLI/" + workBuddyCLIVersion
+	wantUA := "WorkBuddy/" + workBuddyClientVersionIntl + " workbuddy-ai/" + workBuddyClientVersionIntl + " CLI/" + workBuddyCLIVersionFor(true)
 	if request.Header.Get("User-Agent") != wantUA {
 		t.Fatalf("User-Agent shape = %q, want %q", request.Header.Get("User-Agent"), wantUA)
 	}

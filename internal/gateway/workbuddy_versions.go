@@ -47,5 +47,18 @@ func workBuddyDesktopVersion(intl bool) string {
 // workBuddyCLIVersionValue is the version of the CLI the desktop client bundles,
 // which the User-Agent's last segment and the sign-in page both name.
 func workBuddyCLIVersionValue() string {
-	return workBuddyVersionOverride(workBuddyVersionCLIEnv, workBuddyCLIVersion)
+	return workBuddyVersionOverride(workBuddyVersionCLIEnv, workBuddyCLIVersionCN)
+}
+
+// workBuddyCLIVersionFor is the CLI segment for one realm.
+//
+// The two builds bundle different `@genie/agent-cli` versions (CN 2.176.0 on 5.11.3,
+// intl 2.165.0 on 5.9.4), so a single value would make one realm's UA disagree with the
+// app it claims to be. An explicit WORKBUDDY_VERSION_CLI override still applies to both.
+func workBuddyCLIVersionFor(intl bool) string {
+	defaultVersion := workBuddyCLIVersionCN
+	if intl {
+		defaultVersion = workBuddyCLIVersionIntl
+	}
+	return workBuddyVersionOverride(workBuddyVersionCLIEnv, defaultVersion)
 }

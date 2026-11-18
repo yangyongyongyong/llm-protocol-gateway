@@ -177,7 +177,7 @@ func workBuddyReportMP(ctx context.Context, site workBuddySite, credential domai
 // carries. There is deliberately no X-Requested-With here: only the renderer's
 // UA family sends that one, and this channel speaks as the CLI-SDK family.
 func workBuddyDesktopReportHeaders(site workBuddySite, credential domain.WorkBuddyCredential) map[string]string {
-	return map[string]string{
+	headers := map[string]string{
 		"Authorization":  "Bearer " + credential.AccessToken,
 		"Accept":         "application/json, text/plain, */*",
 		"Content-Type":   "application/json;charset=UTF-8",
@@ -188,6 +188,14 @@ func workBuddyDesktopReportHeaders(site workBuddySite, credential domain.WorkBud
 		"X-Domain":       workBuddyWebHost(site),
 		"X-Product-Name": "WorkBuddy",
 	}
+	// Reports carry the desktop identity too: /v2/report was one of the paths the
+	// 2026-11-18 capture showed with all three headers.
+	if !site.intl {
+		headers["X-Client-Version"] = site.clientVersion()
+		headers["X-Client-Platform"] = workBuddyClientPlatform
+		headers["X-Client-Product"] = workBuddyClientProduct
+	}
+	return headers
 }
 
 // workBuddyPostEvents sends a batch to /v2/report. A report that the vendor

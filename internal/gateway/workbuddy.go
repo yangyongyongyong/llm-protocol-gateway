@@ -42,9 +42,18 @@ import (
 const (
 	// Desktop client versions aligned with active workbuddy2api-panel references
 	// (CN install-manifest / intl 5.9.4 + CLI product.json genieVersion).
-	workBuddyClientVersionCN        = "5.9.3"
-	workBuddyClientVersionIntl      = "5.9.4"
-	workBuddyCLIVersion             = "2.165.0"
+	// The China desktop build is on 5.11.3 with CLI 2.176.0 (real capture 2026-11-18);
+	// the international distribution is still 5.9.4 / 2.165.0. They are separate
+	// releases, so the CLI segment is per realm too — a CN UA reading `CLI/2.165.0`
+	// claims a CLI the 5.11.3 build does not bundle.
+	workBuddyClientVersionCN   = "5.11.3"
+	workBuddyClientVersionIntl = "5.9.4"
+	workBuddyCLIVersionCN      = "2.176.0"
+	workBuddyCLIVersionIntl    = "2.165.0"
+
+	// workBuddyCLIVersion is the China CLI version, kept as the name the sign-in page and
+	// older call sites use.
+	workBuddyCLIVersion             = workBuddyCLIVersionCN
 	workBuddyDefaultConcurrencyCN   = 3
 	workBuddyDefaultConcurrencyIntl = 2
 
@@ -217,7 +226,7 @@ func (w workBuddySite) uaBrand() string {
 // chatUserAgent is the three-segment UA WorkBuddy's chat SDK sends.
 func (w workBuddySite) chatUserAgent() string {
 	ver := w.clientVersion()
-	return "WorkBuddy/" + ver + " " + w.uaBrand() + "/" + ver + " CLI/" + workBuddyCLIVersionValue()
+	return "WorkBuddy/" + ver + " " + w.uaBrand() + "/" + ver + " CLI/" + workBuddyCLIVersionFor(w.intl)
 }
 
 // rpcUserAgent is the desktop RPC layer (refresh, plugin auth, …).
@@ -230,12 +239,12 @@ func (w workBuddySite) chatUserAgent() string {
 // `workbuddy-ai/` is the shape that gets refused.
 func (w workBuddySite) rpcUserAgent() string {
 	ver := w.clientVersion()
-	return "WorkBuddy/" + ver + " " + w.uaBrand() + "/" + ver + " CLI/" + workBuddyCLIVersionValue()
+	return "WorkBuddy/" + ver + " " + w.uaBrand() + "/" + ver + " CLI/" + workBuddyCLIVersionFor(w.intl)
 }
 
 // v3ConfigUserAgent is what /v3/config model discovery sends.
 func (w workBuddySite) v3ConfigUserAgent() string {
-	return "WorkBuddy/" + w.clientVersion() + " CLI/" + workBuddyCLIVersionValue()
+	return "WorkBuddy/" + w.clientVersion() + " CLI/" + workBuddyCLIVersionFor(w.intl)
 }
 
 func workBuddyDefaultConcurrency(authType string) int {
@@ -1285,6 +1294,13 @@ func unflagWorkBuddyMessages(messages []any) ([]any, bool) {
 		switch content := message["content"].(type) {
 		case string:
 			text := unflagWorkBuddyTextFor(content, identity)
+			// An assistant turn that quoted the injected identity sentence is one carrier
+			// of the snowball. Only the assistant's own words: a system or user turn saying
+			// the same thing is the user's persona instruction (see
+			// workbuddy_injected_identity.go).
+			if role == "assistant" {
+				text = scrubWorkBuddyInjectedIdentity(text)
+			}
 			if text == content {
 				break
 			}
@@ -1318,7 +1334,11 @@ func unflagWorkBuddyMessages(messages []any) ([]any, bool) {
 			if !isText || text == "" {
 				continue
 			}
-			if replaced := unflagWorkBuddyTextFor(text, identity); replaced != text {
+			replaced := unflagWorkBuddyTextFor(text, identity)
+			// The reasoning trace is where the upstream's injected identity sentence
+			// survives into the next request — see workbuddy_injected_identity.go.
+			replaced = scrubWorkBuddyInjectedIdentity(replaced)
+			if replaced != text {
 				message[field] = replaced
 				changed = true
 			}
@@ -2673,13 +2693,22 @@ func (n *workBuddyNumber) UnmarshalJSON(raw []byte) error {
 // bearer plus the two identity headers the account is asked with. Every account
 // endpoint takes them — the credit summary and the daily check-in alike.
 func workBuddyAccountHeaders(site workBuddySite, credential domain.WorkBuddyCredential) map[string]string {
-	return map[string]string{
+	headers := map[string]string{
 		"Authorization": "Bearer " + credential.AccessToken,
 		"X-User-Id":     credential.UserID,
 		"X-Domain":      workBuddyDomain(site, credential),
 		"X-Product":     "SaaS",
 		"X-IDE-Type":    "WorkBuddy",
 	}
+	// The CN 5.11.3 desktop build attaches its X-Client-* identity to every account call
+	// as well (see workbuddy_client_identity.go). The mini-program caliber overrides these
+	// with its own values in workBuddyGrowthHeaders.
+	if !site.intl {
+		headers["X-Client-Version"] = site.clientVersion()
+		headers["X-Client-Platform"] = workBuddyClientPlatform
+		headers["X-Client-Product"] = workBuddyClientProduct
+	}
+	return headers
 }
 
 // workBuddyStreamPayloads lists the JSON payloads in a stream body, one per value.

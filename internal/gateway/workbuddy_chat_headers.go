@@ -224,6 +224,9 @@ func applyWorkBuddyChatHeaders(request *http.Request, site workBuddySite, creden
 	request.Header.Set("baggage", workBuddyBaggage(conversationID, conversationRequestID))
 	applyWorkBuddyTraceHeaders(request)
 
+	// The 5.11.3 desktop build injects these on every request it makes, chat included
+	// (155/155 in the 2026-11-18 capture). CN only: the intl build has no such layer.
+	applyWorkBuddyClientIdentity(request, site)
 	request.Header.Set("User-Agent", site.chatUserAgent())
 	if credential != nil {
 		request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(credential.AccessToken))

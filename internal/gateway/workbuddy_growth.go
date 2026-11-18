@@ -93,7 +93,12 @@ func workBuddyGrowthHeaders(site workBuddySite, credential domain.WorkBuddyCrede
 	headers := workBuddyAccountHeaders(site, credential)
 	headers["X-Domain"] = workBuddyWebHost(site)
 	if mp {
+		// The mini-program is its own client (2.4.0 / mp-weixin / workbuddy-mp), so it
+		// must not inherit the desktop identity: `5.11.3 / miniprogram / WorkBuddy` is a
+		// combination neither client produces (see workbuddy_client_identity.go).
+		headers["X-Client-Version"] = workBuddyMPVersion
 		headers["X-Client-Platform"] = workBuddyMPPlatform
+		headers["X-Client-Product"] = workBuddyMPProduct
 	}
 	return headers
 }
@@ -109,6 +114,16 @@ func workBuddyGrowthCall(ctx context.Context, site workBuddySite, credential dom
 func workBuddyGrowthCallExtra(ctx context.Context, site workBuddySite, credential domain.WorkBuddyCredential, mp bool, extra map[string]string, method, path string, body, dst any) error {
 	endpoint := workBuddyWebBase(site) + path
 	headers := workBuddyGrowthHeaders(site, credential, mp)
+	// An explicit platform override means the caller is speaking as another client — the
+	// claim's `x-client-platform: web` is the one that matters. The desktop identity from
+	// workBuddyAccountHeaders has to go with it, or the request would mix two clients and
+	// the map would carry both spellings of the same header.
+	if _, overridesPlatform := extra["x-client-platform"]; overridesPlatform {
+		drop := []string{"X-Client-Version", "X-Client-Platform", "X-Client-Product"}
+		for _, name := range drop {
+			delete(headers, name)
+		}
+	}
 	for key, value := range extra {
 		headers[key] = value
 	}
