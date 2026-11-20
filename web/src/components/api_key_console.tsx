@@ -1613,13 +1613,33 @@ function ParamsTab({
           </span>
         </div>
         <div className="akc-form">
+          {/* 「固定模型」（key 级 modelOverride）必须是这一页的一个字段。
+              它曾经被整个搬到「转发方案」里按节点配置，页签名却还写着「模型覆写」——
+              切完方案回到基本信息页，模型覆写就"用不了"了（找不到入口）。
+              两处都要有：这里是这条 Key 的首选模型（随方案一起保存/恢复，后端
+              activateProfileLocked 会把 profile.ModelOverride 写回），链路页那份
+              是每个备选节点各自的固定模型。 */}
+          <div className="akc-field">
+            <div className="akc-label-row">
+              <label>固定模型（首选）</label>
+              <InfoTip text="这条 Key 的首选节点固定用哪个模型。留空 = 按客户端请求里的模型，没有就用该 Provider 的默认模型。它是方案的一部分：切换方案时会跟着换回该方案自己的值。" />
+            </div>
+            <SearchableModelSelect
+              value={keyItem.modelOverride || ''}
+              models={providerModels}
+              disabled={saving}
+              emptyLabel="（不覆盖：按客户端 / Provider 默认）"
+              onChange={(value) => void panel.onUpdateField(keyItem, 'modelOverride', value)}
+            />
+          </div>
+
           {/* 「固定模型替换」已经挪到「转发方案与容灾链路」——首选和备选各有自己
               的模型覆盖，放在那边才能一眼看见整条链路用的是哪个模型。这里只留
               刷新按钮：模型清单是链路配模型的前提，放在哪一页都要够得着。 */}
           <div className="akc-field">
             <div className="akc-label-row">
               <label>模型清单</label>
-              <InfoTip text="模型替换在「转发方案与容灾链路」里按节点配置：首选和每个备选各有自己的模型。这里只负责把这个 Provider 的模型列表拉新。" />
+              <InfoTip text="上面「固定模型」与「转发方案」里每个备选的模型，都从这个清单里选。这里负责把该 Provider 的模型列表拉新。" />
             </div>
             <div className="akc-field-inline">
               <span className="akc-muted-inline">
