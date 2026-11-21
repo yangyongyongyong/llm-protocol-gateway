@@ -479,10 +479,13 @@ func TestMonitorHealthyPastDeadlineCommitsUpdate(t *testing.T) {
 	if err := os.Mkdir(backup, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	oldDelay, oldInterval := rollbackMonitorStartDelay, rollbackMonitorInterval
+	oldDelay, oldInterval, oldHealthy := rollbackMonitorStartDelay, rollbackMonitorInterval, rollbackHealthyThreshold
 	rollbackMonitorStartDelay = time.Millisecond
 	rollbackMonitorInterval = time.Millisecond
-	t.Cleanup(func() { rollbackMonitorStartDelay, rollbackMonitorInterval = oldDelay, oldInterval })
+	rollbackHealthyThreshold = 2
+	t.Cleanup(func() {
+		rollbackMonitorStartDelay, rollbackMonitorInterval, rollbackHealthyThreshold = oldDelay, oldInterval, oldHealthy
+	})
 	m := New(Options{
 		Version:      "1.1.0",
 		BundlePath:   filepath.Join(root, "LLM Protocol Gateway.app"),
@@ -518,4 +521,56 @@ func TestMonitorHealthyPastDeadlineCommitsUpdate(t *testing.T) {
 	cancel()
 	<-done
 	t.Fatal("healthy update was not committed")
+}
+
+// A healthy build must be committed as soon as it has passed a short streak of
+// probes. Waiting for the watchdog deadline made the result depend on wall-clock
+// sleep: the shell could wake first, see no marker, and roll back a good build.
+func TestMonitorHealthyCommitsBeforeWatchdogDeadline(t *testing.T) {
+	root := t.TempDir()
+	backup := filepath.Join(root, ".previous.app")
+	if err := os.Mkdir(backup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldDelay, oldInterval, oldHealthy := rollbackMonitorStartDelay, rollbackMonitorInterval, rollbackHealthyThreshold
+	rollbackMonitorStartDelay = time.Millisecond
+	rollbackMonitorInterval = time.Millisecond
+	rollbackHealthyThreshold = 2
+	t.Cleanup(func() {
+		rollbackMonitorStartDelay, rollbackMonitorInterval, rollbackHealthyThreshold = oldDelay, oldInterval, oldHealthy
+	})
+	m := New(Options{
+		Version:      "1.1.0",
+		BundlePath:   filepath.Join(root, "LLM Protocol Gateway.app"),
+		SettingsPath: filepath.Join(root, "settings.json"),
+	})
+	m.rollback = &rollbackJournal{
+		BundlePath:      filepath.Join(root, "LLM Protocol Gateway.app"),
+		BackupPath:      backup,
+		PreviousVersion: "1.0.0",
+		NewVersion:      "1.1.0",
+		StartedAt:       time.Now().UTC().Format(time.RFC3339),
+		Deadline:        time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339),
+	}
+	if err := saveRollbackJournal(m.rollbacks.Journal, *m.rollback); err != nil {
+		t.Fatal(err)
+	}
+	m.SetHealthCheck(func() error { return nil })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); m.monitorRollback(ctx) }()
+	select {
+	case <-done:
+		if m.Status().RollbackPending {
+			t.Fatal("healthy update still pending rollback")
+		}
+		if _, err := os.Stat(m.rollbacks.Commit); err != nil {
+			t.Fatalf("healthy marker missing: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("healthy update waited for the watchdog deadline instead of committing early")
+	}
 }

@@ -159,6 +159,7 @@ journal_file=$9
 log_file=${10}
 old_pid=${11}
 timeout_seconds=${12}
+post_timeout_grace_seconds=${13}
 
 umask 077
 exec >>"$log_file" 2>&1
@@ -181,8 +182,10 @@ if [ "$old_pid" -gt 0 ] 2>/dev/null; then
 fi
 
 started=$(date +%s)
+last_tick=$started
 seen_new=0
 gone_seconds=0
+timeout_extended=0
 reason=""
 while :; do
   if [ -f "$commit_marker" ]; then
@@ -195,6 +198,17 @@ while :; do
     break
   fi
   now=$(date +%s)
+  tick=$((now - last_tick))
+  if [ "$tick" -gt 5 ]; then
+    # macOS sleep suspends both the App and this shell. Wall-clock time then
+    # jumps by minutes while no health check had a chance to run. Shift the
+    # start line by the suspended interval so the grace window measures active
+    # runtime, not lid-closed time.
+    suspended=$((tick - 1))
+    started=$((started + suspended))
+    echo "[rollback-watchdog] process suspended for ${suspended}s; health timer paused"
+  fi
+  last_tick=$now
   elapsed=$((now - started))
   if pgrep -f "^${new_bundle}/Contents/MacOS/LLM Protocol Gateway" >/dev/null 2>&1; then
     seen_new=1
@@ -211,8 +225,14 @@ while :; do
     break
   fi
   if [ "$elapsed" -ge "$timeout_seconds" ]; then
-    reason="New App health window timed out"
-    break
+    if [ "$timeout_extended" -eq 0 ]; then
+      timeout_extended=1
+      timeout_seconds=$((timeout_seconds + post_timeout_grace_seconds))
+      echo "[rollback-watchdog] active health window elapsed; waiting ${post_timeout_grace_seconds}s for commit/request"
+    else
+      reason="New App health window timed out"
+      break
+    fi
   fi
   sleep 1
 done
@@ -269,6 +289,7 @@ func launchRollbackWatchdog(_ context.Context, artifacts rollbackArtifacts, jour
 		artifacts.WatchdogLog,
 		strconv.Itoa(oldPID),
 		strconv.Itoa(int(timeout.Seconds())),
+		strconv.Itoa(int(rollbackPostTimeoutGrace.Seconds())),
 	)
 	cmd.Stdin = nil
 	cmd.Stdout = logFile

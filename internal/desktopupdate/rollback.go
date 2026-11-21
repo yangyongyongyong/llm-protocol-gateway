@@ -186,6 +186,8 @@ var (
 	rollbackMonitorStartDelay = 2 * time.Second
 	rollbackMonitorInterval   = 5 * time.Second
 	rollbackFailureThreshold  = 3
+	rollbackHealthyThreshold  = 6
+	rollbackPostTimeoutGrace  = 30 * time.Second
 )
 
 func (m *Manager) monitorRollback(ctx context.Context) {
@@ -193,7 +195,7 @@ func (m *Manager) monitorRollback(ctx context.Context) {
 	ticker := time.NewTicker(rollbackMonitorInterval)
 	defer ticker.Stop()
 	failures := 0
-	healthyChecks := 0
+	consecutiveHealthy := 0
 	for {
 		m.mu.Lock()
 		journal := m.rollback
@@ -216,25 +218,17 @@ func (m *Manager) monitorRollback(ctx context.Context) {
 		}
 		if healthErr == nil {
 			failures = 0
-			healthyChecks++
+			consecutiveHealthy++
+			if consecutiveHealthy >= rollbackHealthyThreshold {
+				m.commitRollback()
+				return
+			}
 		} else {
 			failures++
+			consecutiveHealthy = 0
 		}
 		if failures >= rollbackFailureThreshold {
 			m.requestRollback("更新后健康检查连续失败：" + healthErr.Error())
-			return
-		}
-		deadline, err := journal.deadline()
-		if err != nil {
-			m.requestRollback("更新回退截止时间无效：" + err.Error())
-			return
-		}
-		if !time.Now().Before(deadline) {
-			if healthyChecks > 0 && failures == 0 {
-				m.commitRollback()
-			} else {
-				m.requestRollback("更新后健康观察期结束，但网关未通过健康检查")
-			}
 			return
 		}
 		select {
@@ -262,16 +256,8 @@ func (m *Manager) commitRollback() {
 		m.state = StateIdle
 	}
 	m.err = ""
-	m.message = fmt.Sprintf("新版本 %s 已通过 %.0f 分钟健康观察，更新已确认", journal.NewVersion, time.Until(mustDeadline(journal)).Minutes())
+	m.message = fmt.Sprintf("新版本 %s 已连续通过 %d 次健康检查，更新已确认", journal.NewVersion, rollbackHealthyThreshold)
 	m.mu.Unlock()
-}
-
-func mustDeadline(j *rollbackJournal) time.Time {
-	if j == nil {
-		return time.Now()
-	}
-	t, _ := j.deadline()
-	return t
 }
 
 func (m *Manager) requestRollback(reason string) {

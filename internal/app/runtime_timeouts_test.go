@@ -1,6 +1,9 @@
 package app
 
 import (
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -33,5 +36,30 @@ func TestHTTPServerBoundsSlowClients(t *testing.T) {
 	}
 	if srv.IdleTimeout > time.Minute {
 		t.Fatalf("an idle connection should not survive a whole minute of client silence, got %v", srv.IdleTimeout)
+	}
+}
+
+// A health probe must enforce its own timeout even when the TCP peer accepts
+// the connection but never writes a response. With the old default http.Get
+// this call waited forever; the updater therefore never wrote either a healthy
+// marker or an explicit rollback request, and the detached watchdog eventually
+// rolled the new build back as "timed out".
+func TestWaitHealthyBoundsStalledHTTPResponse(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+	}))
+	t.Cleanup(func() {
+		close(release)
+		server.Close()
+	})
+	rt := New()
+	rt.port = server.Listener.Addr().(*net.TCPAddr).Port
+	started := time.Now()
+	if err := rt.WaitHealthy(150 * time.Millisecond); err == nil {
+		t.Fatal("stalled health endpoint unexpectedly reported healthy")
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("health probe ignored its deadline and blocked for %s", elapsed)
 	}
 }

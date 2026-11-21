@@ -426,7 +426,7 @@ func (m *Manager) SetSettings(s Settings) (Status, error) {
 	pendingRollback := m.rollback != nil
 	m.mu.Unlock()
 	if pendingRollback && !s.AutoRollback {
-		return m.Status(), errors.New("更新回退观察期内不能关闭自动回退")
+		return m.Status(), errors.New("更新异常回退尚未完成，不能关闭自动回退")
 	}
 	if err := saveSettings(m.settingsPath, s); err != nil {
 		return m.Status(), err

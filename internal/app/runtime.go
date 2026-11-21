@@ -617,10 +617,18 @@ func closeStore(ctx context.Context, db *store.Store) error {
 
 // WaitHealthy polls /__health until ok or timeout.
 func (rt *Runtime) WaitHealthy(timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = time.Second
+	}
 	deadline := time.Now().Add(timeout)
 	url := rt.LocalURL() + "/__health"
+	// A health probe must never outlive its caller. The previous http.Get used
+	// the process-wide default client (Timeout=0), so a socket that accepted but
+	// never answered could block the desktop update health monitor forever. The
+	// watchdog then saw no success marker and rolled a healthy build back.
+	client := &http.Client{Timeout: timeout}
 	for time.Now().Before(deadline) {
-		resp, err := http.Get(url)
+		resp, err := client.Get(url)
 		if err == nil {
 			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {

@@ -227,7 +227,7 @@ export function DesktopUpdateCard({onToast}: {onToast: (message: string) => void
                     </select>
                 </label>
             </div>
-            <div className="hint-text">自动回退会保留上一版 App，更新后连续检查本机网关 /__health；启动失败、进程退出或连续健康检查失败时自动恢复上一版并重新打开。观察期内健康才确认并清理旧版。</div>
+            <div className="hint-text">自动回退会保留上一版 App，更新后连续检查本机网关 /__health；启动失败、进程退出或连续健康检查失败时自动恢复上一版并重新打开。连续健康后立即确认并清理旧版；系统睡眠时间不计入异常观察期。</div>
 
             {status.state === 'downloading' ? (
                 <div className="desktop-update-progress-wrap">
