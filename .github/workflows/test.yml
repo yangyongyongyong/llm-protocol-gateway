@@ -29,7 +29,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # macos-latest repeatedly stayed queued for 15 minutes with runner_id=0
+        # and was auto-cancelled by GitHub without running a single step. Pin an
+        # explicit image with capacity instead of dropping the macOS coverage.
+        os: [ubuntu-latest, macos-14, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
