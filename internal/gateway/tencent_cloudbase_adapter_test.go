@@ -39,7 +39,9 @@ print(json.dumps({"responses_usage":responses["usage"],"claude_usage":claude["us
 	if err := writeTestFile(path, mustReadBuiltinCloudBaseAdapter(t)); err != nil {
 		t.Fatal(err)
 	}
-	script = strings.ReplaceAll(script, "__ADAPTER_PATH__", path)
+	// Python accepts forward slashes on every platform; inserting a raw Windows
+	// path here would turn C:\Users into a \U Unicode escape.
+	script = strings.ReplaceAll(script, "__ADAPTER_PATH__", filepath.ToSlash(path))
 	cmd := exec.Command(python, "-c", script)
 	cmd.Env = append(cmd.Environ(), "PROVIDER_SCRIPT_PORT=19999")
 	out, err := cmd.CombinedOutput()
