@@ -24,6 +24,9 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
     go build -trimpath \
       -ldflags "-s -w -X github.com/luca/llm-protocol-gateway/internal/gateway.BuildVersion=${VERSION}" \
       -o /out/gateway ./cmd/gateway
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+      -o /out/gatewayctl ./cmd/gatewayctl
 
 ########## 3) 运行时镜像 ##########
 FROM alpine:3.20
@@ -31,6 +34,7 @@ RUN apk add --no-cache ca-certificates wget \
     && adduser -D -u 10001 app
 WORKDIR /app
 COPY --from=build /out/gateway /app/gateway
+COPY --from=build /out/gatewayctl /app/gatewayctl
 COPY --from=web   /web/dist    /app/web-dist
 ENV GATEWAY_ADDR=0.0.0.0:18093 \
     GATEWAY_WEB_DIST=/app/web-dist \

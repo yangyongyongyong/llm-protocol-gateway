@@ -1,6 +1,6 @@
 import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {API_BASE} from '../lib';
-import {Badge, Field, Modal} from './ui';
+import {Badge, CopyButton, Field, InfoTip, Modal, Switch} from './ui';
 import {confirmDialog} from '../dialogs';
 import type {GrantTarget} from './rbac_types';
 import {ProviderGrantPicker} from './provider_grant_picker';
@@ -123,6 +123,7 @@ export function PeersPage({
   const [maxHopsSaving, setMaxHopsSaving] = useState(false);
   const [allowCidrs, setAllowCidrs] = useState('');
   const [registrationOpen, setRegistrationOpen] = useState(true);
+  const [approvalRequired, setApprovalRequired] = useState(false);
   const [peersLoading, setPeersLoading] = useState(true);
   const [peersError, setPeersError] = useState('');
   /** 正在调授权的下游网关；null = 关闭。 */
@@ -133,6 +134,7 @@ export function PeersPage({
   const [draftSaving, setDraftSaving] = useState(false);
   const [busyId, setBusyId] = useState('');
   const [renameTarget, setRenameTarget] = useState<PeerUpstream | null>(null);
+  const [credentialsTarget, setCredentialsTarget] = useState<PeerUpstream | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [renameBusy, setRenameBusy] = useState(false);
   // 「测试连接」的结果：按上游 providerId 记，成功也留一条——运维点完按钮要的
@@ -175,6 +177,7 @@ export function PeersPage({
       setMaxHopsDraft(String(payload.maxHops || 0));
       setAllowCidrs(payload.registrationAllowCidrs || '');
       setRegistrationOpen(payload.registrationOpen ?? true);
+      setApprovalRequired(Boolean(payload.approvalRequired));
       setPeersError('');
     } catch (error) {
       setPeersError((error as Error).message);
@@ -318,6 +321,39 @@ export function PeersPage({
     }
   };
 
+  const approvePeer = async (peer: PeerGateway) => {
+    setBusyId(peer.userId);
+    try {
+      await jsonRequest(`${API_BASE}/__peers/${encodeURIComponent(peer.userId)}/approve`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({}),
+      });
+      await loadPeers();
+      onChanged?.();
+    } catch (error) {
+      setPeersError((error as Error).message);
+    } finally {
+      setBusyId('');
+    }
+  };
+
+  const saveApprovalRequired = async (required: boolean) => {
+    setApprovalRequired(required);
+    try {
+      const payload = await jsonRequest<{ required?: boolean }>(`${API_BASE}/__settings/peer-approval`, {
+        method: 'PATCH',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({required}),
+      });
+      setApprovalRequired(Boolean(payload.required));
+      setPeersError('');
+    } catch (error) {
+      setApprovalRequired(!required);
+      setPeersError((error as Error).message);
+    }
+  };
+
   // 断开一条上游：删的是「这一组」，不是一个协议的那一行。一次注册会落下多条
   // 成员行（每个协议一条），只删一条会留下半条链路——界面还连着、模型却少一半。
   // 本地断开不会让上游忘记这台下游，那要在上游自己的「网关互联」页里吊销，所以
@@ -338,6 +374,39 @@ export function PeersPage({
     } finally {
       setBusyId('');
     }
+  };
+
+  // 重连必须用第一次注册时的同一组账号密码。列表只拿到"是否保存"，
+  // 真正密码走独立的 manage-only 凭据接口；读到后直接把表单填好，避免运维/AI
+  // 每次重新猜密码，也避免把密码塞进列表响应。
+  const openReconnectUpstream = async (upstream: PeerUpstream) => {
+    setBusyId(upstream.providerId);
+    let username = upstream.loginUsername || upstream.peerUsername || '';
+    let password = '';
+    let credentialsError = '';
+    try {
+      const credential = await jsonRequest<{ username?: string; password?: string; stored?: boolean }>(
+        `${API_BASE}/__peer-upstreams/${encodeURIComponent(upstream.providerId)}/credentials`,
+      );
+      username = credential.username || username;
+      password = credential.password || '';
+      if (!credential.stored || !password) {
+        credentialsError = '本机没有保存这组登录密码，请手动填写后再重新注册。';
+      }
+    } catch (error) {
+      credentialsError = `读取本机登录凭据失败：${(error as Error).message}`;
+    } finally {
+      setBusyId('');
+    }
+    setDraftError(credentialsError);
+    setDraft({
+      providerId: upstream.providerId,
+      parentUrl: upstream.parentUrl,
+      username,
+      password,
+      name: upstream.name,
+      requestedProviderIds: [],
+    });
   };
 
   const openRenameUpstream = (upstream: PeerUpstream) => {
@@ -499,6 +568,8 @@ export function PeersPage({
                       </span>
                     ) : null}
                     {upstream.peerUsername ? <span>上游账号 {upstream.peerUsername}</span> : null}
+                    {upstream.loginUsername ? <span>登录账号 {upstream.loginUsername}</span> : null}
+                    {upstream.credentialsStored ? <span title="密码保存在本机 SQLite，仅 peers.manage 权限可读取">登录凭据已保存</span> : null}
                     {upstream.autoRenew ? <span title="已保存续签凭据；重启或 token 轮换后会自动恢复">自动续签已开启</span> : null}
                     {upstream.grantsSynced ? (
                       <span title={grantedProviderTitles(upstream)}>上游授权 {upstream.grantCount} 个 Provider</span>
@@ -552,19 +623,19 @@ export function PeersPage({
                       <button
                         className="mini-btn"
                         type="button"
-                        onClick={() => {
-                          setDraftError('');
-                          setDraft({
-                            providerId: upstream.providerId,
-                            parentUrl: upstream.parentUrl,
-                            username: '',
-                            password: '',
-                            name: upstream.name,
-                            requestedProviderIds: [],
-                          });
-                        }}
+                        disabled={busy(upstream.providerId)}
+                        onClick={() => void openReconnectUpstream(upstream)}
                       >
-                        {upstream.autoRenew ? '更新注册凭据' : '启用自动续签'}
+                        {busy(upstream.providerId) ? '读取凭据…' : upstream.autoRenew ? '更新注册凭据' : '启用自动续签'}
+                      </button>
+                      <button
+                        className="mini-btn"
+                        type="button"
+                        disabled={!upstream.credentialsStored || busy(upstream.providerId)}
+                        title={upstream.credentialsStored ? '查看并复制本机保存的登录用户名和密码' : '本机还没保存登录密码'}
+                        onClick={() => setCredentialsTarget(upstream)}
+                      >
+                        查看凭据
                       </button>
                       <button
                         className="mini-btn danger"
@@ -622,7 +693,7 @@ export function PeersPage({
                   <div className="peer-upstream-main">
                     <div className="peer-upstream-name">
                       {peer.name?.trim() || peer.username}
-                      {peer.enabled ? null : <Badge tone="slate">已吊销</Badge>}
+                      {peer.enabled ? null : <Badge tone={peer.keyEnabled ? 'amber' : 'slate'}>{peer.keyEnabled ? '待审批' : '已吊销'}</Badge>}
                       {peer.keyEnabled ? <Badge tone="green">凭据有效</Badge> : null}
                     </div>
                     <div className="peer-upstream-url" title={peer.username}>{peer.username}</div>
@@ -676,6 +747,16 @@ export function PeersPage({
                     <div className="hint-text">最近 {formatTime(peer.lastSeenAt)}</div>
                   </div>
                   <div className="peer-upstream-actions">
+                    {canManage && !peer.enabled && peer.keyEnabled ? (
+                      <button
+                        className="mini-btn"
+                        type="button"
+                        disabled={busy(peer.userId)}
+                        onClick={() => void approvePeer(peer)}
+                      >
+                        审批
+                      </button>
+                    ) : null}
                     {canManage ? (
                       <button
                         className="mini-btn"
@@ -703,6 +784,10 @@ export function PeersPage({
 
           {canManage ? (
             <div className="peer-cidr-editor">
+              <div className="peer-approval-policy">
+                <Switch checked={approvalRequired} onChange={(value) => void saveApprovalRequired(value)} label="新下游需要管理员审批" />
+                <span className="hint-text">开启后，新注册或重新注册的下游会先停在「待审批」；批准后才按授权 Provider 取流量。</span>
+              </div>
               <Field
                 fullWidth
                 label="允许注册的来源"
@@ -777,6 +862,10 @@ export function PeersPage({
         </Modal>
       ) : null}
 
+      {credentialsTarget ? (
+        <UpstreamCredentialsModal upstream={credentialsTarget} onClose={() => setCredentialsTarget(null)} />
+      ) : null}
+
       {draft ? (
         <UpstreamDraftModal
           draft={draft}
@@ -788,6 +877,70 @@ export function PeersPage({
         />
       ) : null}
     </section>
+  );
+}
+
+function UpstreamCredentialsModal({ upstream, onClose }: { upstream: PeerUpstream; onClose: () => void }) {
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [username, setUsername] = useState(upstream.loginUsername || '');
+  const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      try {
+        const payload = await jsonRequest<{ username?: string; password?: string; stored?: boolean }>(
+          `${API_BASE}/__peer-upstreams/${encodeURIComponent(upstream.providerId)}/credentials`,
+        );
+        if (!alive) return;
+        setUsername(payload.username || upstream.loginUsername || '');
+        setPassword(payload.password || '');
+        setError(payload.stored && payload.password ? '' : '本机没有保存这组登录密码；请点「更新注册凭据」重新填写并保存。');
+      } catch (fetchError) {
+        if (alive) setError((fetchError as Error).message);
+      } finally {
+        if (alive) setLoading(false);
+      }
+    })();
+    return () => { alive = false; };
+  }, [upstream.loginUsername, upstream.providerId]);
+
+  return (
+    <Modal
+      title="上游登录凭据"
+      description="这组用户名和密码由本机保存，用于上游吊销凭据或续签失效后重新注册。密码只通过需要 peers.manage 权限的独立接口读取。"
+      onClose={onClose}
+    >
+      {loading ? <div className="empty-state">读取中…</div> : null}
+      {error ? <div className="rbac-form-error">{error}</div> : null}
+      {!loading ? (
+        <div className="peer-credential-view">
+          <label>
+            <span>用户名</span>
+            <div className="peer-credential-value">
+              <input readOnly value={username} />
+              <CopyButton value={username} label="复制用户名" />
+            </div>
+          </label>
+          <label>
+            <span>密码</span>
+            <div className="peer-credential-value">
+              <input readOnly type={showPassword ? 'text' : 'password'} value={password} placeholder="未保存" />
+              <button className="mini-btn" type="button" onClick={() => setShowPassword((value) => !value)} disabled={!password}>
+                {showPassword ? '隐藏' : '显示'}
+              </button>
+              <CopyButton value={password} label="复制密码" />
+            </div>
+          </label>
+          <p className="hint-text">上游地址：{upstream.parentUrl}</p>
+        </div>
+      ) : null}
+      <div className="modal-actions">
+        <button className="btn primary" type="button" onClick={onClose}>关闭</button>
+      </div>
+    </Modal>
   );
 }
 
@@ -807,6 +960,7 @@ function UpstreamDraftModal({
   onSubmit: () => void;
 }) {
   const editing = Boolean(draft.providerId);
+  const [showPassword, setShowPassword] = useState(false);
   // 「测试连接」：只问上游能不能连通、允不允许本机注册，不建账号、不换凭据。
   const [probing, setProbing] = useState(false);
   const [probeResult, setProbeResult] = useState<{ ok: boolean; text: string } | null>(null);
@@ -903,13 +1057,24 @@ function UpstreamDraftModal({
           placeholder="自己定一个用户名"
           onChange={(value) => onChange({ ...draft, username: value })}
         />
-        <Field
-          label="密码"
-          hint="同样是第一次注册时自己设定（至少 8 位），之后重新注册必须一字不差。上游只存摘要，本机不保存密码。"
-          value={draft.password}
-          placeholder="自己设定一个密码"
-          onChange={(value) => onChange({ ...draft, password: value })}
-        />
+        <div className="field">
+          <div className="field-label-row">
+            <label>密码</label>
+            <InfoTip text="第一次注册时自己设定（至少 8 位），之后重新注册必须一字不差。上游只存摘要；本机为了下次自动填入和可见复制，会把密码保存在本地 SQLite。" />
+          </div>
+          <div className="peer-password-field">
+            <input
+              type={showPassword ? 'text' : 'password'}
+              value={draft.password}
+              placeholder="自己设定一个密码"
+              onChange={(event) => onChange({ ...draft, password: event.target.value })}
+            />
+            <button className="mini-btn" type="button" disabled={!draft.password} onClick={() => setShowPassword((value) => !value)}>
+              {showPassword ? '隐藏' : '显示'}
+            </button>
+            <CopyButton value={draft.password} label="复制" />
+          </div>
+        </div>
         {editing ? null : (
           <>
             <Field

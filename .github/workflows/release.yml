@@ -203,6 +203,7 @@ jobs:
             test -d "$APP/Contents/Resources/web-dist"
             test -x "$APP/Contents/Resources/bin/cloudflared"
             test -x "$APP/Contents/Resources/bin/bun"
+            test -x "$APP/Contents/Resources/bin/gatewayctl"
             test -f "$APP/Contents/Resources/cursor-bridge/standalone.ts"
             # 控制台资源必须内嵌进可执行文件：用户常把 .app 单独拷走，
             # 只靠 Resources/web-dist 时窗口里会只剩 404。

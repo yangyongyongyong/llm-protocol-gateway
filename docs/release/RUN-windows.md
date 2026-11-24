@@ -5,6 +5,7 @@
 ```
 start.cmd        启动器（双击或命令行运行）
 gateway.exe      无界面网关
+gatewayctl.exe   AI / 脚本管理 CLI（输出 JSON）
 web-dist\        管理页
 RUN.txt          本文件
 VERSION          版本与源码修订号
@@ -14,6 +15,13 @@ VERSION          版本与源码修订号
 
 ```powershell
 .\start.cmd
+```
+
+另一个 PowerShell 窗口可以直接操作同一实例：
+
+```powershell
+.\gatewayctl.exe status
+.\gatewayctl.exe upstream list
 ```
 
 它只是把管理页目录指到同级的 `web-dist\` 再启动 `gateway.exe`。直接跑 `gateway.exe` 也能启动，

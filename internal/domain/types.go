@@ -231,15 +231,18 @@ type ProviderGroup struct {
 }
 
 type Provider struct {
-	ID                   string   `json:"id"`
-	Name                 string   `json:"name"`
-	Protocol             Protocol `json:"protocol"`
-	BaseURL              string   `json:"baseUrl"`
-	APIKeySource         string   `json:"apiKeySource"`
-	DefaultModel         string   `json:"defaultModel"`
-	DefaultThinkingDepth string   `json:"defaultThinkingDepth,omitempty"`
-	Models               []Model  `json:"models"`
-	HealthStatus         string   `json:"healthStatus"`
+	ID           string   `json:"id"`
+	Name         string   `json:"name"`
+	Protocol     Protocol `json:"protocol"`
+	BaseURL      string   `json:"baseUrl"`
+	APIKeySource string   `json:"apiKeySource"`
+	// APIKeyConfigured is a runtime-only console projection set by redaction.
+	// The actual APIKeySource never leaves the server in console responses.
+	APIKeyConfigured     bool    `json:"apiKeyConfigured,omitempty"`
+	DefaultModel         string  `json:"defaultModel"`
+	DefaultThinkingDepth string  `json:"defaultThinkingDepth,omitempty"`
+	Models               []Model `json:"models"`
+	HealthStatus         string  `json:"healthStatus"`
 	// NextRetryAt is a runtime-only hint (RFC3339) shown by the console when
 	// HealthStatus == "unavailable": a live upstream request just failed
 	// against this provider, and the background recovery loop

@@ -92,6 +92,21 @@ cp "$BUN_SRC" "$BIN_DIR/bun"
 chmod 755 "$BIN_DIR/bun"
 xattr -dr com.apple.quarantine "$BIN_DIR/bun" 2>/dev/null || true
 
+echo "==> bundling gatewayctl ($ARCH)"
+case "$ARCH" in
+  arm64) GOARCH=arm64 ;;
+  amd64|x86_64) GOARCH=amd64; ARCH=amd64 ;;
+  *) echo "unsupported arch: $ARCH" >&2; exit 1 ;;
+esac
+(
+  cd "$ROOT"
+  CGO_ENABLED=0 GOOS=darwin GOARCH="$GOARCH" GOWORK=off \
+    go build -trimpath -buildvcs=true \
+    -ldflags "-s -w -X main.version=${GATEWAY_APP_VERSION:-dev}" \
+    -o "$BIN_DIR/gatewayctl" ./cmd/gatewayctl
+)
+chmod 755 "$BIN_DIR/gatewayctl"
+
 echo "==> bundling cursor-bridge"
 rm -rf "$BRIDGE_DST"
 mkdir -p "$BRIDGE_DST"
@@ -116,11 +131,13 @@ echo "==> verifying bundle"
 test -f "$WEB_DIST_DST/index.html"
 test -x "$BIN_DIR/cloudflared"
 test -x "$BIN_DIR/bun"
+test -x "$BIN_DIR/gatewayctl"
 test -f "$BRIDGE_DST/standalone.ts"
 test -d "$BRIDGE_DST/node_modules"
 
 "$BIN_DIR/cloudflared" --version | head -1
 "$BIN_DIR/bun" --version
+"$BIN_DIR/gatewayctl" --version
 
 du -sh "$BIN_DIR/cloudflared" "$BIN_DIR/bun" "$BRIDGE_DST" "$WEB_DIST_DST" | sed 's/^/    /'
 echo "OK: bundled into $RESOURCES"

@@ -216,6 +216,13 @@ type Server struct {
 	// the manual "测试连接" button and the periodic background poll must not
 	// reconcile the same peer member group at the same time.
 	peerUpstreamSyncMu sync.Mutex
+	// peerCredentialsMu guards the local copy of downstream registration
+	// credentials. These are kept separately from Provider.PeerGrants so the
+	// console state/export paths never carry the plaintext login password by
+	// accident. Only the dedicated manage-only credential endpoint reveals it.
+	peerCredentialsMu     sync.Mutex
+	peerCredentials       map[string]peerUpstreamCredential
+	peerCredentialsLoaded bool
 	// peerCredentialRenewMu coalesces concurrent 401 recoveries for one peer
 	// group: the first successful renew updates every member row, later callers
 	// re-read the new token instead of each rotating the credential again.
@@ -781,10 +788,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH /__peers/{id}/owner", s.handleSetPeerOwner)
 	mux.HandleFunc("DELETE /__peers/{id}", s.handleRevokePeer)
 	mux.HandleFunc("PATCH /__settings/peer-registration-cidrs", s.handleSetPeerRegistrationCIDRs)
+	mux.HandleFunc("PATCH /__settings/peer-approval", s.handleSetPeerApprovalRequired)
 	mux.HandleFunc("PATCH /__settings/peer-max-hops", s.handleSetPeerMaxHops)
 	// 修改一个已注册下游的授权（按层授权的编辑入口）：注册时的预置授权只是一次
 	// 快照，之后上游随时可以改，立即生效。
 	mux.HandleFunc("PATCH /__peers/{id}/grants", s.handleSetPeerGrants)
+	mux.HandleFunc("POST /__peers/{id}/approve", s.handleApprovePeer)
 	// 下游侧：本机注册到上游网关，与上面那组是同一张页面的两半——上半是
 	// "谁连到我"，下半是"我连到谁"。凭据（gwpeer-…）落在 provider 的
 	// apiKeySource 上，所以这一组本质是普通的 provider 管理动作，只是包一层，
@@ -795,6 +804,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /__peer-upstreams", s.handleRegisterPeerUpstream)
 	mux.HandleFunc("POST /__peer-upstreams/{id}/refresh", s.handleRefreshPeerUpstream)
 	mux.HandleFunc("POST /__peer-upstreams/{id}/reconnect", s.handleReconnectPeerUpstream)
+	mux.HandleFunc("GET /__peer-upstreams/{id}/credentials", s.handlePeerUpstreamCredentials)
 	mux.HandleFunc("PATCH /__peer-upstreams/{id}", s.handleRenamePeerUpstream)
 	// 断开一条上游＝删掉它这一组的全部成员行（见 handleDisconnectPeerUpstream）。
 	mux.HandleFunc("DELETE /__peer-upstreams/{id}", s.handleDisconnectPeerUpstream)
@@ -1017,6 +1027,8 @@ func redactProvidersForClient(providers []domain.Provider) []domain.Provider {
 }
 
 func redactProviderForClient(provider domain.Provider) domain.Provider {
+	provider.APIKeyConfigured = strings.TrimSpace(provider.APIKeySource) != ""
+	provider.APIKeySource = ""
 	if provider.ClaudeOAuth != nil {
 		original := provider.ClaudeOAuth
 		provider.ClaudeOAuth = &domain.ClaudeOAuthCredential{
@@ -2549,6 +2561,10 @@ func (s *Server) applyTunnelURL(state tunnel.State) {
 
 // withTunnelRuntime attaches the live tunnel manager snapshot to a settings copy.
 func (s *Server) withTunnelRuntime(settings domain.PublicAccessSettings) domain.PublicAccessSettings {
+	// TunnelToken is a write-only credential. Persisting it is required to
+	// restart the named tunnel, but every console/public-status response uses
+	// this method, so strip it at the single response boundary.
+	settings.TunnelToken = ""
 	if settings.Mode == domain.PublicAccessModeExternalDNS {
 		settings.Tunnel = nil
 		return settings

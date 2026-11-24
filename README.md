@@ -163,6 +163,7 @@ Base URL 支持 `{model}` 占位符（例如 Azure OpenAI 的
 - **WorkBuddy 任务中心**：成长任务列表、一键完成可自动任务（按动作表逐项推进，只有服务端确认领奖才算完成）、活跃上报、保活（续期令牌 + 活跃上报 + 签到 + 补领达标未领的奖励），外加「每日自动任务」「每日保活」两个开关；小程序专属任务与专家召唤链一并覆盖，国际版账号只读。
 - **用户与角色**：管理员可用全部 Provider；普通用户只看到输入 Provider、模型列表、API 密钥、API 日志、用量统计、额度保活六个页面，且只能操作自己的数据。
 - **网关互联授权**：父网关可给下游指定 Provider，也可选择「全部 Provider · 动态」；下游成员卡片继承上游的账号、连接类型与额度快照，流量 bearer 与自动续签凭据分离，重启后自动恢复。
+- **`gatewayctl` AI 运维接口**：上游继承/重连、下游审批与授权、Provider 管理、内网穿透 URL 和通用管理 API 都可用 JSON CLI 操作；上游登录用户名密码本机保存，重连自动填入，并在有 `peers.manage` 权限时可显式查看复制。
 - **登录**：远程首次访问需设置管理员密码，本机 `127.0.0.1` 直连免密（SSH 端口转发同样可用）。
 
 ---
@@ -287,6 +288,7 @@ bash scripts/package-desktop-linux.sh                # Linux AppImage / deb
 ## 📚 文档
 
 - [Bearer 令牌 Provider](docs/bearer-provider.md) —— 配置、鉴权、健康探测、故障转移、自注册
+- [gatewayctl：AI / 脚本 CLI](docs/gatewayctl.md) —— 上游继承、下游审批授权、隧道 URL 与通用 API
 - [容器部署（Docker / Compose / K8s）](docs/deploy.md)
 - [Linux 裸机部署（systemd）](docs/deploy-linux-bare-metal.md)
 - [macOS App](docs/macos-app.md)
@@ -311,7 +313,10 @@ curl -s http://127.0.0.1:18093/v1/chat/completions \
 
 ## 🔒 安全说明
 
-- API Key、OAuth 令牌、Tunnel Token 只在网关进程内使用，不会出现在 `/__state`、管理接口或前端页面中。
+- API Key、OAuth 令牌、Tunnel Token 不会批量出现在 `/__state` 或普通列表响应中。
+- 网关互联的上游登录密码保存在本机 SQLite，仅供 `peers.manage` 通过显式
+  `GET /__peer-upstreams/{id}/credentials` / `gatewayctl upstream credentials`
+  读取并复制；密码不会进入普通列表、`/__state` 或 Provider 导出的互联快照。
 - 远程访问必须通过管理员密码登录；只有本机 loopback 请求才享受免密。
 - 上游凭证、请求/响应正文与日志均存放在本地 SQLite，请自行做好磁盘与备份的访问控制。
 - 截图与文档不得包含真实密钥、账号邮箱或服务器地址。

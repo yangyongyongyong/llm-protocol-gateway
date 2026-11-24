@@ -13263,11 +13263,29 @@ html[data-theme="dark"] .wb-task-badge[data-tone="ok"] { color: #6ee7b7; border-
 }
 .peer-upstream-test-result.ok { color: var(--muted); }
 .peer-upstream-test-result.bad { color: var(--danger, #dc2626); }
+.peer-password-field,
+.peer-credential-value {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.peer-password-field input,
+.peer-credential-value input { flex: 1 1 auto; min-width: 0; }
+.peer-credential-view { display: flex; flex-direction: column; gap: 14px; }
+.peer-credential-view > label { display: flex; flex-direction: column; gap: 6px; }
+.peer-credential-view > label > span { font-size: var(--fs-sm); color: var(--muted); }
+.peer-credential-view .hint-text { margin: 0; overflow-wrap: anywhere; }
 
 .peer-cidr-editor {
   display: flex; flex-direction: column; gap: 8px;
   margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border);
 }
+.peer-approval-policy {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px;
+  background: var(--surface-soft, rgba(127, 127, 127, 0.05));
+}
+.peer-approval-policy .hint-text { margin: 0; flex: 1 1 320px; }
 .peer-cidr-actions {
   display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px;
 }

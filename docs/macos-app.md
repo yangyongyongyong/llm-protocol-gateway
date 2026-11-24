@@ -18,6 +18,7 @@
 | 管理页 UI | `Resources/web-dist/` |
 | cloudflared | `Resources/bin/cloudflared` |
 | bun | `Resources/bin/bun` |
+| gatewayctl | `Resources/bin/gatewayctl` |
 | Cursor bridge | `Resources/cursor-bridge/`（含 node_modules） |
 
 运行时优先使用包内二进制，**无需**本机安装 Go / Node / brew / 仓库源码。
@@ -27,6 +28,14 @@
 - 目标机架构需匹配（当前默认 `arm64`；Intel 用 `ARCH=amd64 ./scripts/build-macos-app.sh`）
 - 未做 Apple 公证时，首次打开可能需「右键 → 打开」或去掉隔离属性
 - Cloudflare 登录证书仍写在用户目录 `~/.cloudflared`（正常）
+
+AI / 脚本可调用 App 内置 CLI：
+
+```bash
+"/Applications/LLM Protocol Gateway.app/Contents/Resources/bin/gatewayctl" status
+```
+
+完整命令见 [gatewayctl](gatewayctl.md)。
 
 ## 用户数据目录（更新 App 不丢数据）
 

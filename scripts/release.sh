@@ -36,7 +36,7 @@ MODE="${1:-}"
 shift || true
 
 if [[ ! -f .github/workflows/release.yml ]]; then
-  echo "release.sh 必须在仓库根目录执行（找不到 .github/workflows/release.yml，当前 $PWD）" >&2
+  echo "release.sh 必须在仓库根目录执行（找不到 .github/workflows/release.yml，当前 ${PWD}）" >&2
   exit 1
 fi
 
@@ -64,6 +64,7 @@ mkdir -p "$CACHE"
 commit="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 ldflags="-s -w -X github.com/luca/llm-protocol-gateway/internal/gateway.BuildVersion=$VERSION"
+gatewayctl_ldflags="-s -w -X main.version=$VERSION"
 
 log() { printf '==> %s\n' "$*" >&2; }
 
@@ -98,7 +99,7 @@ build_web() {
   if [[ "${SKIP_WEB:-0}" == "1" && -f web/dist/index.html ]]; then
     log "复用已构建的 web/dist（SKIP_WEB=1）"
   else
-    log "构建管理页（版本 $VERSION）"
+    log "构建管理页（版本 ${VERSION}）"
     (
       cd web
       if [[ ! -d node_modules ]]; then
@@ -108,7 +109,7 @@ build_web() {
     )
   fi
   if ! grep -rqF -- "$VERSION" web/dist/assets/*.js; then
-    echo "web/dist 的 JS 里找不到版本号 $VERSION：前端会被当成开发构建，控制台永远不提示升级" >&2
+    echo "web/dist 的 JS 里找不到版本号 ${VERSION}：前端会被当成开发构建，控制台永远不提示升级" >&2
     exit 1
   fi
   # 桌面 App 内置的只是一个跳板页（desktop/frontend/dist），壳启动后会导航到本地网关。
@@ -138,6 +139,8 @@ build_target() {
   log "编译 $target"
   env "${env[@]}" go build -trimpath -buildvcs=true \
     -ldflags "$ldflags" -o "$work/gateway$ext" ./cmd/gateway
+  env "${env[@]}" go build -trimpath -buildvcs=true \
+    -ldflags "$gatewayctl_ldflags" -o "$work/gatewayctl$ext" ./cmd/gatewayctl
 
   # ------------------------------------------------------------ 包内容
   cp -R web/dist "$work/web-dist"

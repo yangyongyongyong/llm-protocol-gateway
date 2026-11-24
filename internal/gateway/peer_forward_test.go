@@ -408,6 +408,92 @@ func TestPeerGrantsEditableAfterRegistration(t *testing.T) {
 	}
 }
 
+func TestApprovePeerReenablesAndGrants(t *testing.T) {
+	server := newPeerTestServer(t,
+		domain.Provider{ID: "p-a", Name: "A", Protocol: domain.ProtocolOpenAIChat, APIKeySource: "literal:sk-a"},
+		domain.Provider{ID: "p-b", Name: "B", Protocol: domain.ProtocolClaude, APIKeySource: "literal:sk-b"},
+	)
+	_, response := peerRegister(t, server, peerRegisterPayload(map[string]any{"requestedProviderIds": []string{}}))
+	user, err := server.userStore.UserByID(response.UserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	user.Enabled = false
+	if err := server.userStore.UpdateUser(user); err != nil {
+		t.Fatal(err)
+	}
+	recorder := adminCall(t, server.handleApprovePeer, http.MethodPost, "/__peers/{id}/approve", map[string]any{
+		"grantMode": "all",
+	}, map[string]string{"id": user.ID})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("approve status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	approved, err := server.userStore.UserByID(user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !approved.Enabled {
+		t.Fatal("approve must re-enable the downstream account")
+	}
+	all, granted := server.peerGrantState(user.ID)
+	if !all || len(granted) != 2 {
+		t.Fatalf("approve grants = all:%v ids:%v", all, granted)
+	}
+	if !strings.Contains(recorder.Body.String(), `"credentialReady":true`) {
+		t.Fatalf("approve response should report usable credentials: %s", recorder.Body.String())
+	}
+}
+
+func TestPeerApprovalRequiredKeepsRegistrationPending(t *testing.T) {
+	server := newPeerTestServer(t)
+	settings := newMemoryAdminAuthStore()
+	server.SetAdminAuthStore(settings)
+	if err := server.setPeerApprovalRequired(true); err != nil {
+		t.Fatal(err)
+	}
+	restarted := NewServer(NewRouter(domain.GatewayState{}), monitor.NewStore())
+	restarted.SetAdminAuthStore(settings)
+	if !restarted.peerApprovalRequired() {
+		t.Fatal("approval policy did not survive restart")
+	}
+	_, response := peerRegister(t, server, peerRegisterPayload(nil))
+	user, err := server.userStore.UserByID(response.UserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.Enabled {
+		t.Fatal("registration must stay pending while approval is required")
+	}
+	keyReady := false
+	for _, key := range server.router.State().APIKeys {
+		if strings.TrimSpace(key.OwnerUserID) == user.ID && key.Enabled && strings.HasPrefix(key.Key, peerTokenPrefix) {
+			keyReady = true
+		}
+	}
+	if !keyReady {
+		t.Fatal("pending registration should keep its key so approval can enable it without rotating credentials")
+	}
+	recorder := adminCall(t, server.handleApprovePeer, http.MethodPost, "/__peers/{id}/approve", map[string]any{}, map[string]string{"id": user.ID})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("approve status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	user, err = server.userStore.UserByID(user.ID)
+	if err != nil || !user.Enabled {
+		t.Fatalf("approved peer is not enabled: %+v err=%v", user, err)
+	}
+}
+
+func TestPeerApprovalPolicyUsesPeersManagePermission(t *testing.T) {
+	permission := routePermission(http.MethodPatch, "/__settings/peer-approval")
+	if permission == nil || *permission != domain.PermPeersManage {
+		t.Fatalf("peer approval policy permission = %v, want %s", permission, domain.PermPeersManage)
+	}
+	approve := routePermission(http.MethodPost, "/__peers/peer-1/approve")
+	if approve == nil || *approve != domain.PermPeersManage {
+		t.Fatalf("peer approve permission = %v, want %s", approve, domain.PermPeersManage)
+	}
+}
+
 // 「全部 Provider」是动态语义：授权表里只存一个内部标记，读取时按当前
 // Provider 集合展开。新增 Provider 后，同一把下游凭据立刻就能看到它。
 func TestPeerAllProvidersGrantIsDynamic(t *testing.T) {

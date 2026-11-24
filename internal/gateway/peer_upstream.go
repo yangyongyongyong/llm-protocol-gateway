@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -27,8 +28,8 @@ type peerUpstreamRegisterRequest struct {
 	// ParentURL 是上游网关地址，允许只填主机名（见 normalizePeerParentURL）。
 	ParentURL string `json:"parentUrl"`
 	// Username / Password 是本机在上游的账号——由本机运维自己定，第一次注册
-	// 时上游原样建成账号，之后重新注册必须填同一个。密码不落本机：它只在注册
-	// 这一刻用来换凭据，换回来的 token 才是长期保存的东西。
+	// 时上游原样建成账号，之后重新注册必须填同一个。密码按用户要求保存在本机
+	// 独立设置项中，供重连自动填入和显式查看/复制；普通列表与 Provider 快照不携带它。
 	Username string `json:"username"`
 	Password string `json:"password"`
 	// Name 是本机给这个上游起的名字，也是新建 provider 的名字。
@@ -86,6 +87,11 @@ type peerUpstreamSummary struct {
 	// 上游用户管理页里的那一行。
 	PeerUsername    string `json:"peerUsername,omitempty"`
 	ParentGatewayID string `json:"parentGatewayId,omitempty"`
+	// LoginUsername 是本机注册到该上游时使用的用户名；密码不在这里返回。
+	// CredentialsStored 只说明本机是否留有可自动填入的登录密码，真正的密码由
+	// GET /__peer-upstreams/{id}/credentials 单独向 peers.manage 调用者返回。
+	LoginUsername     string `json:"loginUsername,omitempty"`
+	CredentialsStored bool   `json:"credentialsStored"`
 	// UpstreamKey / UpstreamName 是这一组的分组标识与显示名：本机落下来的每个
 	// 成员行都带着同一份，界面据此把"属于某个上游"说清楚。
 	UpstreamKey  string `json:"upstreamKey,omitempty"`
@@ -140,6 +146,7 @@ func (s *Server) handleListPeerUpstreams(w http.ResponseWriter, r *http.Request)
 // 显示和以前完全一样。
 func (s *Server) peerUpstreamSummaries() []peerUpstreamSummary {
 	state := s.router.State()
+	credentials := s.peerUpstreamCredentialsSnapshot()
 	modelsByProvider := map[string][]string{}
 	for _, model := range state.Models {
 		if id := strings.TrimSpace(model.ID); id != "" {
@@ -197,6 +204,10 @@ func (s *Server) peerUpstreamSummaries() []peerUpstreamSummary {
 			if grants.GrantedProviders != nil {
 				summary.GrantedProviders = grants.GrantedProviders
 			}
+		}
+		if credential, ok := credentials[key]; ok {
+			summary.LoginUsername = credential.Username
+			summary.CredentialsStored = strings.TrimSpace(credential.Username) != "" && strings.TrimSpace(credential.Password) != ""
 		}
 	}
 	out := make([]peerUpstreamSummary, 0, len(order))
@@ -349,6 +360,13 @@ func (s *Server) handleRegisterPeerUpstream(w http.ResponseWriter, r *http.Reque
 			s.logs.AddApp("warn", "peer upstream route not created", fmt.Sprintf("provider=%s: %v", provider.ID, routeErr))
 		}
 	}
+	if len(created) > 0 {
+		upstreamKey := peerGroupKeyForProvider(created[0])
+		if err := s.setPeerUpstreamCredential(upstreamKey, registration.ParentURL, registration.Username, password); err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "failed to remember upstream login credentials: "+err.Error())
+			return
+		}
+	}
 	if err := s.saveState(); err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
 		return
@@ -359,7 +377,7 @@ func (s *Server) handleRegisterPeerUpstream(w http.ResponseWriter, r *http.Reque
 		"username":  registration.Username,
 		"userId":    registration.UserID,
 		"gatewayId": selfID,
-		"providers": created,
+		"providers": redactProvidersForClient(created),
 	}
 	if len(created) > 0 {
 		response["upstream"] = s.peerUpstreamSummaryOf(created[0].ID)
@@ -1193,11 +1211,43 @@ func (s *Server) handleDisconnectPeerUpstream(w http.ResponseWriter, r *http.Req
 		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())
 		return
 	}
+	if err := s.deletePeerUpstreamCredential(upstreamKey); err != nil {
+		s.logs.AddApp("warn", "peer upstream credentials not removed", fmt.Sprintf("upstream=%s: %v", upstreamKey, err))
+	}
 	s.logs.AddApp("info", "peer upstream disconnected", fmt.Sprintf("upstream=%s removed=%d/%d", upstreamKey, len(removed), len(memberIDs)))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"disconnected": true,
 		"removed":      len(removed),
 		"total":        len(memberIDs),
+	})
+}
+
+// handlePeerUpstreamCredentials returns the locally remembered registration
+// username/password for one upstream group. It is deliberately separate from
+// the list endpoint: the list only says whether credentials exist, while this
+// endpoint is the explicit "show/copy" action and therefore requires
+// peers.manage rather than peers.view.
+func (s *Server) handlePeerUpstreamCredentials(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePermission(w, r, domain.PermPeersManage) {
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	provider, ok := s.peerUpstreamByID(w, r)
+	if !ok {
+		return
+	}
+	upstreamKey := peerGroupKeyForProvider(provider)
+	credential, stored := s.peerUpstreamCredential(upstreamKey)
+	username := strings.TrimSpace(credential.Username)
+	if username == "" && provider.PeerGrants != nil {
+		username = strings.TrimSpace(provider.PeerGrants.Username)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"providerId": provider.ID,
+		"username":   username,
+		"password":   credential.Password,
+		"stored":     stored && strings.TrimSpace(credential.Password) != "",
+		"updatedAt":  credential.UpdatedAt,
 	})
 }
 
@@ -1214,14 +1264,23 @@ func (s *Server) handleReconnectPeerUpstream(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	var payload peerUpstreamRegisterRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&payload); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&payload); err != nil && !errors.Is(err, io.EOF) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
+	upstreamKey := peerGroupKeyForProvider(provider)
 	username := strings.TrimSpace(payload.Username)
 	password := strings.TrimSpace(payload.Password)
+	if stored, ok := s.peerUpstreamCredential(upstreamKey); ok {
+		if username == "" {
+			username = strings.TrimSpace(stored.Username)
+		}
+		if password == "" {
+			password = stored.Password
+		}
+	}
 	if username == "" || password == "" {
-		writeOpenAIError(w, http.StatusBadRequest, "用户名和密码都必须填写，且与第一次注册时填的完全一样")
+		writeOpenAIError(w, http.StatusBadRequest, "本机还没有保存这组登录凭据；请填写第一次注册时的用户名和密码")
 		return
 	}
 	// 协议与名字都沿用这条 provider 现有的：换协议等于换一条链路，该新建一条。
@@ -1231,7 +1290,6 @@ func (s *Server) handleReconnectPeerUpstream(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	// 新凭据要落到这一组的每一条成员行上：它们各存一份 apiKeySource。
-	upstreamKey := peerGroupKeyForProvider(provider)
 	upstreamName := provider.Name
 	if provider.PeerGrants != nil && strings.TrimSpace(provider.PeerGrants.UpstreamName) != "" {
 		upstreamName = provider.PeerGrants.UpstreamName
@@ -1269,6 +1327,10 @@ func (s *Server) handleReconnectPeerUpstream(w http.ResponseWriter, r *http.Requ
 				s.logs.AddApp("warn", "peer upstream route not created", fmt.Sprintf("provider=%s: %v", member.ID, routeErr))
 			}
 		}
+	}
+	if err := s.setPeerUpstreamCredential(upstreamKey, registration.ParentURL, registration.Username, password); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to remember upstream login credentials: "+err.Error())
+		return
 	}
 	if err := s.saveState(); err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "failed to save configuration: "+err.Error())

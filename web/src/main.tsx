@@ -3648,7 +3648,8 @@ function App() {
       name: provider.name,
       protocol: provider.protocol,
       baseUrl: custom || legacyScript ? (provider.providerScript?.upstreamBaseUrl || '') : provider.baseUrl,
-      apiKeySource: provider.apiKeySource,
+      // apiKeySource 永远不回传；留空表示“保持已保存的密钥”。
+      apiKeySource: '',
       defaultModel: provider.defaultModel || '',
       defaultThinkingDepth: provider.defaultThinkingDepth || '',
       authType: resolveProviderAuthType(provider),
@@ -3693,7 +3694,8 @@ function App() {
       baseUrl: cloneAuthType === 'self_register'
         ? selfRegisterPlaceholderBaseURL(provider.protocol)
         : custom || legacyScript ? (provider.providerScript?.upstreamBaseUrl || '') : provider.baseUrl,
-      apiKeySource: provider.apiKeySource,
+      // 克隆不能复制服务端密钥；新实例需要用户重新填写。
+      apiKeySource: '',
       defaultModel: provider.defaultModel || '',
       defaultThinkingDepth: provider.defaultThinkingDepth || '',
       authType: cloneAuthType,
@@ -8633,12 +8635,12 @@ function App() {
                 {providerDraft.customProviderId ? (
                   <>
                     <Field fullWidth label="上游 Base URL" hint="只填这个实例对应的私有上游根地址；脚本地址由网关自动生成。" value={providerDraft.baseUrl} onChange={(value) => setProviderDraft((current) => ({ ...current, baseUrl: value }))} />
-                    <Field fullWidth label="上游 API Key" hint="通过 UPSTREAM_API_KEY 注入该类型的脚本；不会回显到脚本正文。" value={providerDraft.apiKeySource} onChange={(value) => setProviderDraft((current) => ({ ...current, apiKeySource: value }))} />
+                    <Field fullWidth label="上游 API Key" hint={editingProviderID && state.providers.find((item) => item.id === editingProviderID)?.apiKeyConfigured ? '已保存密钥；留空保持不变，填写新值才会替换。' : '通过 UPSTREAM_API_KEY 注入该类型的脚本；不会回显到脚本正文。'} placeholder={editingProviderID && state.providers.find((item) => item.id === editingProviderID)?.apiKeyConfigured ? '已保存；留空保持不变' : ''} value={providerDraft.apiKeySource} onChange={(value) => setProviderDraft((current) => ({ ...current, apiKeySource: value }))} />
                   </>
                 ) : !providerDraft.scriptMode ? (
                   <>
                     <Field fullWidth label="Base URL" value={providerDraft.baseUrl} onChange={(value) => setProviderDraft((current) => ({ ...current, baseUrl: value }))} />
-                    <Field fullWidth label="API Key Source（可选）" hint="留空时透传客户端 Authorization；也可直接填 sk-xxx，或填 env:VAR_NAME / literal:sk-xxx。" value={providerDraft.apiKeySource} onChange={(value) => setProviderDraft((current) => ({ ...current, apiKeySource: value }))} />
+                    <Field fullWidth label="API Key Source（可选）" hint={editingProviderID && state.providers.find((item) => item.id === editingProviderID)?.apiKeyConfigured ? '已保存密钥；留空保持不变，填写新值才会替换。' : '留空时透传客户端 Authorization；也可直接填 sk-xxx，或填 env:VAR_NAME / literal:sk-xxx。'} placeholder={editingProviderID && state.providers.find((item) => item.id === editingProviderID)?.apiKeyConfigured ? '已保存；留空保持不变' : ''} value={providerDraft.apiKeySource} onChange={(value) => setProviderDraft((current) => ({ ...current, apiKeySource: value }))} />
                     {/(?:bigmodel\.cn|z\.ai)/i.test(providerDraft.baseUrl) && (
                       <>
                         <Field label="智谱组织 ID（团队版填，个人版留空）" value={providerDraft.teamOrganizationId} onChange={(value) => setProviderDraft((current) => ({ ...current, teamOrganizationId: value }))} />
@@ -8652,7 +8654,7 @@ function App() {
                       这是旧版内联脚本 Provider。脚本正文已改为在「自定义连接器」中统一维护；这里只保留该实例的上游 URL 和 Key。
                     </div>
                     <Field fullWidth label="上游 Base URL" value={providerDraft.scriptUpstreamBaseUrl} onChange={(value) => setProviderDraft((current) => ({ ...current, scriptUpstreamBaseUrl: value }))} />
-                    <Field fullWidth label="上游 API Key" value={providerDraft.apiKeySource} onChange={(value) => setProviderDraft((current) => ({ ...current, apiKeySource: value }))} />
+                    <Field fullWidth label="上游 API Key" hint={editingProviderID && state.providers.find((item) => item.id === editingProviderID)?.apiKeyConfigured ? '已保存密钥；留空保持不变，填写新值才会替换。' : ''} placeholder={editingProviderID && state.providers.find((item) => item.id === editingProviderID)?.apiKeyConfigured ? '已保存；留空保持不变' : ''} value={providerDraft.apiKeySource} onChange={(value) => setProviderDraft((current) => ({ ...current, apiKeySource: value }))} />
                   </div>
                 )}
               </>

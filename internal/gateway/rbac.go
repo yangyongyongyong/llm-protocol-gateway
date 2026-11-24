@@ -249,7 +249,7 @@ func routePermission(method, path string) *domain.Permission {
 	case "/__peers/owners":
 		// 归属候选只用于展示与编辑辅助；只看不改的角色也可以读取。
 		return perm(domain.PermPeersView)
-	case "/__settings/peer-registration-cidrs":
+	case "/__settings/peer-registration-cidrs", "/__settings/peer-approval":
 		return perm(domain.PermPeersManage)
 	case "/__providers":
 		if method == http.MethodPost {

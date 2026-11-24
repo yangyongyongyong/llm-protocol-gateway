@@ -5,6 +5,7 @@
 ```
 start.sh         启动器（把管理页指到同级 web-dist 后启动）
 gateway          无界面网关
+gatewayctl       AI / 脚本管理 CLI（输出 JSON）
 web-dist/        管理页
 RUN.txt          本文件
 VERSION          版本与源码修订号
@@ -15,6 +16,13 @@ VERSION          版本与源码修订号
 ```bash
 chmod +x start.sh gateway
 ./start.sh
+```
+
+另一个终端可以直接操作同一实例：
+
+```bash
+./gatewayctl status
+./gatewayctl upstream list
 ```
 
 `start.sh` 只做一件事：`GATEWAY_WEB_DIST=$(dirname $0)/web-dist` 后 exec `gateway`。

@@ -674,6 +674,8 @@ export type Provider = {
   protocol: Protocol;
   baseUrl: string;
   apiKeySource: string;
+  /** 服务端只告诉控制台是否已经配置密钥；真实 apiKeySource 永不回传。 */
+  apiKeyConfigured?: boolean;
   // 实际发送凭证时使用的请求头名（Claude 默认 x-api-key，其余默认
   // Authorization）；自助注册脚本可以在协议不匹配时一并声明修正。
   authHeader?: string;
@@ -939,6 +941,8 @@ export type PeersResponse = {
   registrationAllowCidrs: string;
   /** true = 没有白名单，任何来源都能注册（默认）。 */
   registrationOpen: boolean;
+  /** true = 新注册下游先进入待审批状态，管理员批准后才能取流量。 */
+  approvalRequired?: boolean;
 };
 
 /** 本机注册到的一个上游网关。它在本机就是一条 authType=peer 的 provider。 */
@@ -971,6 +975,10 @@ export type PeerUpstream = {
   grantedProviders?: PeerGrantedProvider[];
   /** 上游为这台机器建的账号名，对得上上游用户管理页那一行。 */
   peerUsername?: string;
+  /** 本机注册时使用的用户名；重连弹窗会自动填入。 */
+  loginUsername?: string;
+  /** 本机是否保存了可自动填入的登录密码；密码本身由独立凭据接口返回。 */
+  credentialsStored?: boolean;
   /** 上游网关自己的身份。 */
   parentGatewayId?: string;
   /** 分组键：同一次注册落下来的成员行共享它。 */

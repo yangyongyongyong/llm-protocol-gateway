@@ -721,7 +721,13 @@ func (r *Router) updateProviderWithScript(providerID string, patch domain.Provid
 		if strings.TrimSpace(patch.BaseURL) != "" {
 			updated.BaseURL = strings.TrimSpace(patch.BaseURL)
 		}
-		updated.APIKeySource = strings.TrimSpace(patch.APIKeySource)
+		// Console responses never carry the API key source. An empty patch value
+		// therefore means "keep the existing credential", not "erase it".
+		// Self-registration and OAuth flows that genuinely need to replace the
+		// credential always send a non-empty value.
+		if strings.TrimSpace(patch.APIKeySource) != "" {
+			updated.APIKeySource = strings.TrimSpace(patch.APIKeySource)
+		}
 		if strings.TrimSpace(patch.PeerRefreshToken) != "" {
 			updated.PeerRefreshToken = strings.TrimSpace(patch.PeerRefreshToken)
 		}

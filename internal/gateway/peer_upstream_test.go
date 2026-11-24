@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/luca/llm-protocol-gateway/internal/domain"
+	"github.com/luca/llm-protocol-gateway/internal/monitor"
 )
 
 // 下游这一侧的控制台接口：注册到一个上游网关，然后本机就能像用普通
@@ -112,6 +113,109 @@ func TestPeerUpstreamRegisterCreatesProvider(t *testing.T) {
 	refreshedPeers := child.peerUpstreamMembers(peerGroupKeyForProvider(created))
 	if len(refreshedPeers) == 0 || peerUpstreamToken(refreshedPeers[0]) == peerUpstreamToken(created) {
 		t.Fatalf("自动续签后成员行应当持有新的流量凭据：%+v", refreshedPeers)
+	}
+}
+
+// 上游注册用的用户名和密码必须留在本机，用于表单自动填入和显式重连；
+// 同时它们不能混进列表/控制台状态，只有 peers.manage 的凭据接口能看见密码。
+func TestPeerUpstreamStoresLoginCredentialsAndReconnectsWithoutResubmittingPassword(t *testing.T) {
+	parent := newPeerTestServer(t)
+	parent.SetGatewayID(otherID)
+	parentHTTP := httptest.NewServer(parent.Handler())
+	defer parentHTTP.Close()
+
+	child := newPeerTestServer(t)
+	child.SetGatewayID(gwID)
+	body, _ := json.Marshal(map[string]any{
+		"parentUrl": parentHTTP.URL,
+		"username":  "sub-gw",
+		"password":  "a-strong-password",
+		"name":      "vps1",
+	})
+	request := httptest.NewRequest(http.MethodPost, "/__peer-upstreams", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Host = "127.0.0.1"
+	request.RemoteAddr = "127.0.0.1:40000"
+	recorder := httptest.NewRecorder()
+	child.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("register status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var providerID string
+	for _, provider := range child.router.State().Providers {
+		if provider.AuthType == domain.AuthTypePeer {
+			providerID = provider.ID
+			break
+		}
+	}
+	if providerID == "" {
+		t.Fatal("registration did not create a peer provider")
+	}
+	summary := child.peerUpstreamSummaryOf(providerID)
+	if !summary.CredentialsStored || summary.LoginUsername != "sub-gw" {
+		t.Fatalf("summary did not expose credential availability: %+v", summary)
+	}
+
+	// List/state responses may say that credentials exist, but never carry the password.
+	list := adminCall(t, child.handleListPeerUpstreams, http.MethodGet, "/__peer-upstreams", nil, nil)
+	if list.Code != http.StatusOK || strings.Contains(list.Body.String(), "a-strong-password") {
+		t.Fatalf("list leaked password or failed: %d %s", list.Code, list.Body.String())
+	}
+	if !strings.Contains(list.Body.String(), `"credentialsStored":true`) {
+		t.Fatalf("list missing credentialsStored: %s", list.Body.String())
+	}
+	stateRecorder := httptest.NewRecorder()
+	stateRequest := httptest.NewRequest(http.MethodGet, "/__state", nil)
+	stateRequest.Host = "127.0.0.1"
+	stateRequest.RemoteAddr = "127.0.0.1:40000"
+	child.Handler().ServeHTTP(stateRecorder, stateRequest)
+	if stateRecorder.Code != http.StatusOK || strings.Contains(stateRecorder.Body.String(), "a-strong-password") {
+		t.Fatalf("gateway state leaked password or failed: %d", stateRecorder.Code)
+	}
+
+	credentials := adminCall(t, child.handlePeerUpstreamCredentials, http.MethodGet, "/__peer-upstreams/{id}/credentials", nil, map[string]string{"id": providerID})
+	if credentials.Code != http.StatusOK {
+		t.Fatalf("credentials status=%d body=%s", credentials.Code, credentials.Body.String())
+	}
+	var credentialResponse struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+		Stored   bool   `json:"stored"`
+	}
+	if err := json.Unmarshal(credentials.Body.Bytes(), &credentialResponse); err != nil {
+		t.Fatal(err)
+	}
+	if !credentialResponse.Stored || credentialResponse.Username != "sub-gw" || credentialResponse.Password != "a-strong-password" {
+		t.Fatalf("credentials = %+v", credentialResponse)
+	}
+
+	// Empty reconnect body means "use the credentials remembered locally". The
+	// parent still validates the same username/password and rotates the bearer.
+	reconnect := httptest.NewRequest(http.MethodPost, "/__peer-upstreams/"+providerID+"/reconnect", nil)
+	reconnect.Host = "127.0.0.1"
+	reconnect.RemoteAddr = "127.0.0.1:40000"
+	reconnectRecorder := httptest.NewRecorder()
+	child.Handler().ServeHTTP(reconnectRecorder, reconnect)
+	if reconnectRecorder.Code != http.StatusOK {
+		t.Fatalf("stored-credential reconnect status=%d body=%s", reconnectRecorder.Code, reconnectRecorder.Body.String())
+	}
+	if got := child.peerUpstreamSummaryOf(providerID); !got.CredentialsStored || got.LoginUsername != "sub-gw" {
+		t.Fatalf("reconnect lost saved credentials: %+v", got)
+	}
+}
+
+func TestPeerUpstreamCredentialsPersistAcrossServerRestart(t *testing.T) {
+	settings := newMemoryAdminAuthStore()
+	first := NewServer(NewRouter(domain.GatewayState{}), monitor.NewStore())
+	first.SetAdminAuthStore(settings)
+	if err := first.setPeerUpstreamCredential("gw_parent|https://parent.example", "https://parent.example", "peer-a", "local-password"); err != nil {
+		t.Fatal(err)
+	}
+	second := NewServer(NewRouter(domain.GatewayState{}), monitor.NewStore())
+	second.SetAdminAuthStore(settings)
+	credential, ok := second.peerUpstreamCredential("gw_parent|https://parent.example")
+	if !ok || credential.Username != "peer-a" || credential.Password != "local-password" {
+		t.Fatalf("credential did not survive restart: %+v ok=%v", credential, ok)
 	}
 }
 

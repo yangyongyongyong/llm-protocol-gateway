@@ -2,7 +2,9 @@ package gateway
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sort"
@@ -163,10 +165,34 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 		// 让界面能把限额直接写在提示里，而不是写死一个数字。
 		"maxHops":                s.maxGatewayHopsConfigured(),
 		"registrationAllowCidrs": s.router.PeerRegistrationAllowCIDRs(),
+		"approvalRequired":       s.peerApprovalRequired(),
 		// registrationOpen 表示当前没有来源白名单：任何来源都能发起注册，
 		// 界面的提示语据此区分「默认全放行」和「只放行这些网段」。
 		"registrationOpen": strings.TrimSpace(s.router.PeerRegistrationAllowCIDRs()) == "",
 	})
+}
+
+func (s *Server) handleSetPeerApprovalRequired(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePermission(w, r, domain.PermPeersManage) {
+		return
+	}
+	var payload struct {
+		Required *bool `json:"required"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	if payload.Required == nil {
+		writeOpenAIError(w, http.StatusBadRequest, "required is required")
+		return
+	}
+	if err := s.setPeerApprovalRequired(*payload.Required); err != nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	s.logs.AddApp("info", "peer approval policy updated", fmt.Sprintf("required=%t", *payload.Required))
+	writeJSON(w, http.StatusOK, map[string]any{"required": *payload.Required})
 }
 
 // peerIngressCount 统计某个下游最近送进来的请求数。
@@ -392,43 +418,25 @@ func (s *Server) handleSetPeerOwner(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"userId": peer.ID, "ownerUserId": ownerID})
 }
 
-// handleSetPeerGrants 修改一个已注册下游网关的授权。
-//
-// 注册时的预置授权（applyPeerRequestedGrants）只是一次快照；上游的授权应当
-// 随时可以调整——新增、收回都立即生效，不需要下游重新注册。校验规则与注册
-// 时一致：只接受真实存在、未删除的 provider；传空列表等于收回全部授权，
-// 下游下一次请求就会拿不到任何 provider。
-//
-// 权限走 /__peers/ 前缀已有的 PermPeersManage（rbac routePermission）。
-func (s *Server) handleSetPeerGrants(w http.ResponseWriter, r *http.Request) {
-	if !s.requirePermission(w, r, domain.PermPeersManage) {
-		return
-	}
-	if s.userStore == nil {
-		writeOpenAIError(w, http.StatusServiceUnavailable, "user store is not configured")
-		return
-	}
-	user, err := s.userStore.UserByID(r.PathValue("id"))
-	if err != nil {
-		writeOpenAIError(w, http.StatusNotFound, "peer not found")
-		return
-	}
-	if !user.IsPeer() {
-		writeOpenAIError(w, http.StatusBadRequest, "this account is not a peer gateway")
-		return
-	}
-	var payload struct {
-		ProviderIDs *[]string `json:"providerIds"`
-		GrantMode   string    `json:"grantMode,omitempty"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid json: "+err.Error())
-		return
-	}
+type peerGrantMutation struct {
+	ProviderIDs *[]string `json:"providerIds"`
+	GrantMode   string    `json:"grantMode,omitempty"`
+}
+
+type peerGrantMutationResult struct {
+	Mode    string
+	Granted []string
+	All     bool
+}
+
+// applyPeerGrantMutation performs the shared authorization edit used by both
+// grants and approval. It writes an error response and returns false on failure;
+// callers shape their own success response.
+func (s *Server) applyPeerGrantMutation(w http.ResponseWriter, r *http.Request, user domain.User, payload peerGrantMutation) (peerGrantMutationResult, bool) {
 	mode, err := normalizePeerGrantMode(payload.GrantMode)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error())
-		return
+		return peerGrantMutationResult{}, false
 	}
 	identity := s.requestIdentity(r)
 	actorID := strings.TrimSpace(identity.UserID)
@@ -449,26 +457,26 @@ func (s *Server) handleSetPeerGrants(w http.ResponseWriter, r *http.Request) {
 		user.OwnerUserID = actorID
 		if err := s.userStore.UpdateUser(user); err != nil {
 			writeOpenAIError(w, http.StatusInternalServerError, err.Error())
-			return
+			return peerGrantMutationResult{}, false
 		}
 	}
 	_, beforeGranted := s.peerGrantState(user.ID)
 	if mode == peerGrantModeAll {
 		if err := s.setPeerAllProviders(user.ID); err != nil {
 			writeOpenAIError(w, http.StatusInternalServerError, err.Error())
-			return
+			return peerGrantMutationResult{}, false
 		}
 	} else {
 		if payload.ProviderIDs == nil {
 			writeOpenAIError(w, http.StatusBadRequest, "providerIds is required when grantMode=selected (an empty list revokes all grants)")
-			return
+			return peerGrantMutationResult{}, false
 		}
 		// 与注册预置同一套校验：不存在的 ID 静默丢弃而不是整单拒绝——授权列表
 		// 本来就不可信（可能来自旧控制台页面缓存），删掉的 provider 不该让管理员
 		// 连合法的部分都存不进去。空列表在这里是"收回全部"，与注册的"不动"区分。
 		if err := s.setPeerGrants(user.ID, *payload.ProviderIDs); err != nil {
 			writeOpenAIError(w, http.StatusInternalServerError, err.Error())
-			return
+			return peerGrantMutationResult{}, false
 		}
 	}
 	allProviders, granted := s.peerGrantState(user.ID)
@@ -490,9 +498,132 @@ func (s *Server) handleSetPeerGrants(w http.ResponseWriter, r *http.Request) {
 	} else {
 		s.logs.AddApp("info", "peer grants updated", fmt.Sprintf("%s (%s) → %d 个 provider", user.Username, user.GatewayID, len(granted)))
 	}
+	return peerGrantMutationResult{Mode: mode, Granted: granted, All: allProviders}, true
+}
+
+// handleSetPeerGrants 修改一个已注册下游网关的授权。
+//
+// 注册时的预置授权（applyPeerRequestedGrants）只是一次快照；上游的授权应当
+// 随时可以调整——新增、收回都立即生效，不需要下游重新注册。校验规则与注册
+// 时一致：只接受真实存在、未删除的 provider；传空列表等于收回全部授权，
+// 下游下一次请求就会拿不到任何 provider。
+//
+// 权限走 /__peers/ 前缀已有的 PermPeersManage（rbac routePermission）。
+func (s *Server) handleSetPeerGrants(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePermission(w, r, domain.PermPeersManage) {
+		return
+	}
+	user, ok := s.peerByID(w, r)
+	if !ok {
+		return
+	}
+	var payload peerGrantMutation
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	result, ok := s.applyPeerGrantMutation(w, r, user, payload)
+	if !ok {
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"userId":             user.ID,
+		"grantMode":          result.Mode,
+		"grantedProviderIds": result.Granted,
+	})
+}
+
+// handleApprovePeer makes a pending/disabled downstream usable and optionally
+// applies its provider authorization in the same explicit admin action. A
+// revoked peer key is not recreated here: the downstream re-registers with its
+// locally remembered username/password, which keeps the credential from being
+// exposed in an admin response.
+func (s *Server) handleApprovePeer(w http.ResponseWriter, r *http.Request) {
+	if !s.requirePermission(w, r, domain.PermPeersManage) {
+		return
+	}
+	user, ok := s.peerByID(w, r)
+	if !ok {
+		return
+	}
+	var payload peerGrantMutation
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil && !errors.Is(err, io.EOF) {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+
+	identity := s.requestIdentity(r)
+	actorID := strings.TrimSpace(identity.UserID)
+	if actorID == "" || actorID == legacyAdminUserID {
+		actorID = s.adminOwnerID()
+	}
+	changed := false
+	if strings.TrimSpace(user.OwnerUserID) == "" {
+		user.OwnerUserID = actorID
+		changed = true
+	}
+	if !user.Enabled {
+		user.Enabled = true
+		changed = true
+	}
+	if changed {
+		if err := s.userStore.UpdateUser(user); err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+
+	mode := ""
+	granted := []string{}
+	if payload.GrantMode != "" || payload.ProviderIDs != nil {
+		result, applied := s.applyPeerGrantMutation(w, r, user, payload)
+		if !applied {
+			return
+		}
+		mode, granted = result.Mode, result.Granted
+	} else {
+		_, granted = s.peerGrantState(user.ID)
+		if granted == nil {
+			granted = []string{}
+		}
+	}
+
+	credentialReady := false
+	for _, key := range s.router.State().APIKeys {
+		if strings.TrimSpace(key.OwnerUserID) == user.ID && key.Enabled && strings.HasPrefix(key.Key, peerTokenPrefix) {
+			credentialReady = true
+			break
+		}
+	}
+	message := "下游已审批"
+	if !credentialReady {
+		message = "下游已审批，但旧凭据已被吊销；请让下游用本机保存的用户名和密码重新注册"
+	}
+	s.logs.AddApp("info", "peer approved", fmt.Sprintf("%s (%s) credentialReady=%t", user.Username, user.GatewayID, credentialReady))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"userId":             user.ID,
+		"approved":           true,
+		"enabled":            true,
+		"credentialReady":    credentialReady,
 		"grantMode":          mode,
 		"grantedProviderIds": granted,
+		"message":            message,
 	})
+}
+
+func (s *Server) peerByID(w http.ResponseWriter, r *http.Request) (domain.User, bool) {
+	if s.userStore == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "user store is not configured")
+		return domain.User{}, false
+	}
+	user, err := s.userStore.UserByID(r.PathValue("id"))
+	if err != nil {
+		writeOpenAIError(w, http.StatusNotFound, "peer not found")
+		return domain.User{}, false
+	}
+	if !user.IsPeer() {
+		writeOpenAIError(w, http.StatusBadRequest, "this account is not a peer gateway")
+		return domain.User{}, false
+	}
+	return user, true
 }

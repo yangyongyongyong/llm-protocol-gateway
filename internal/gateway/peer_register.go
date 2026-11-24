@@ -25,9 +25,8 @@ const peerAllProvidersGrant = "peer:all-providers"
 // 建成一行 users(kind=peer) 加一把 api_keys，于是它立刻出现在用户管理页里，
 // 和其它账号并排显示、并排授权、并排禁用。
 //
-// 密码只在注册时用一次，换回的是一把长期的对端凭据。之后所有透传请求都用
-// 那把凭据，不再发密码——密码是可被浏览器/代理缓存和回放的东西，凭据则能
-// 单独吊销、单独看最后一次使用时间。
+// 透传请求始终使用对端 bearer，不用密码。下游可以按用户要求在本地保存这组
+// 登录凭据，用于显式重连；上游只保留 bcrypt 摘要，凭据本身仍可单独吊销和审计。
 
 // peerRegisterRequest 是 POST /__peer/register 的请求体。
 type peerRegisterRequest struct {
@@ -159,7 +158,10 @@ func (s *Server) handlePeerRegister(w http.ResponseWriter, r *http.Request) {
 	// 所以这里要把它重新启用。凭据还没换发就已经验过用户名密码了，所以这不
 	// 是一条绕过吊销的口子——能走到这里的人本来就知道那组密码。
 	if !account.User.Enabled {
-		account.User.Enabled = true
+		// When approval is required, a re-registration remains pending until an
+		// administrator explicitly approves it. The normal policy keeps the
+		// historical behavior where knowing the password restores a revoked peer.
+		account.User.Enabled = !s.peerApprovalRequired()
 		if err := s.userStore.UpdateUser(account.User); err != nil {
 			writeOpenAIError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -369,7 +371,7 @@ func (s *Server) createPeerAccount(gatewayID, username, password, displayName st
 		Role:        domain.UserRoleUser,
 		RoleID:      domain.RoleIDUser,
 		DisplayName: strings.TrimSpace(displayName),
-		Enabled:     true,
+		Enabled:     !s.peerApprovalRequired(),
 		CreatedAt:   nowRFC3339(),
 		Kind:        domain.UserKindPeer,
 		GatewayID:   gatewayID,
