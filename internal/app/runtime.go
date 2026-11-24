@@ -266,6 +266,15 @@ func (rt *Runtime) Start(cfg Config) error {
 	// 内置连接器随二进制发布：每次启动都把最新定义合入状态，
 	// 这样升级后所有实例都能在「自定义连接器」目录里直接看到它。
 	gateway.EnsureBuiltinCustomProviders(&state)
+	if refreshed, err := gateway.RefreshBuiltinCustomProviderInstanceScripts(&state); err != nil {
+		slog.Warn("builtin provider instance refresh failed", "error", err)
+	} else if refreshed > 0 {
+		if err := db.Save(state); err != nil {
+			slog.Warn("builtin provider instance refresh not persisted", "providers", refreshed, "error", err)
+		} else {
+			slog.Info("builtin provider instance scripts refreshed", "providers", refreshed)
+		}
+	}
 	if upgraded, err := gateway.UpgradeLegacyTencentCloudBaseProviders(&state); err != nil {
 		slog.Warn("legacy CloudBase provider migration failed", "error", err)
 	} else if upgraded > 0 {

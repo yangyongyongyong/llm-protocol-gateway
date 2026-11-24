@@ -111,4 +111,10 @@ func TestChatStreamToResponsesKeepsPreambleBeforeToolCall(t *testing.T) {
 	if got := stringValue(tool["type"]); got != "function_call" {
 		t.Fatalf("second item type = %q, want function_call", got)
 	}
+	if got := stringValue(message["phase"]); got != "commentary" {
+		t.Fatalf("preamble phase = %q, want commentary", got)
+	}
+	if got := stringValue(response["status"]); got != "completed" {
+		t.Fatalf("status = %q, want completed", got)
+	}
 }

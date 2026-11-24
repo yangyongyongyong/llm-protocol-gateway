@@ -261,12 +261,67 @@ def completion_details(completion: dict[str, Any]) -> tuple[str, list[dict[str, 
     return text, tool_calls, finish_reason, usage
 
 
+def apply_responses_output_phases(output: list[dict[str, Any]], done: bool) -> None:
+    """按 Magpie / OpenAI Responses 的语义给 assistant message 标注 phase。
+
+    Codex 会把没有 phase 的 assistant message 当成最终答复；工具调用前的说明
+    因此会让回合看起来“已经说完”。工具调用前或另一个非 reasoning 输出前的
+    message 是 commentary，只有正常结束时的最后一个非 reasoning item 才是
+    final_answer。上游若已给出 phase 则原样保留。
+    """
+    if not isinstance(output, list):
+        return
+    last = -1
+    for index, item in enumerate(output):
+        if isinstance(item, dict) and item.get("type") != "reasoning":
+            last = index
+    for index, item in enumerate(output):
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        if item.get("role") not in (None, "assistant"):
+            continue
+        if item.get("phase"):
+            continue
+        if index < last:
+            item["phase"] = "commentary"
+        elif index == last and done:
+            item["phase"] = "final_answer"
+
+
 def usage_numbers(usage: dict[str, Any]) -> tuple[int, int, int]:
     """把不同协议的 usage 字段归一成输入、输出、总 token。"""
     prompt = safe_int(usage.get("prompt_tokens") or usage.get("input_tokens"))
     output = safe_int(usage.get("completion_tokens") or usage.get("output_tokens"))
     total = safe_int(usage.get("total_tokens"), prompt + output)
     return prompt, output, total
+
+
+def cache_read_tokens(usage: dict[str, Any]) -> int:
+    """读取上游的提示缓存命中数，兼容 OpenAI / Responses / Claude 三种命名。"""
+    if not isinstance(usage, dict):
+        return 0
+    for key in ("cache_read_input_tokens", "prompt_cache_hit_tokens"):
+        value = safe_int(usage.get(key))
+        if value > 0:
+            return value
+    for key in ("prompt_tokens_details", "input_tokens_details"):
+        details = usage.get(key)
+        if isinstance(details, dict):
+            value = safe_int(details.get("cached_tokens"))
+            if value > 0:
+                return value
+    return 0
+
+
+def cache_creation_tokens(usage: dict[str, Any]) -> int:
+    """读取上游的提示缓存写入数。"""
+    if not isinstance(usage, dict):
+        return 0
+    for key in ("cache_creation_input_tokens", "cache_write_input_tokens"):
+        value = safe_int(usage.get(key))
+        if value > 0:
+            return value
+    return 0
 
 
 def normalize_chat_tools(tools: Any) -> list[dict[str, Any]]:
@@ -505,8 +560,11 @@ def completion_to_response(
     """把 Chat completion 包装成 OpenAI Responses 响应。"""
     text, tool_calls, finish_reason, usage = completion_details(completion)
     prompt, output_tokens, total_tokens = usage_numbers(usage)
+    cache_read = cache_read_tokens(usage)
     response_id = new_id("resp_")
     status = "incomplete" if finish_reason in ("length", "max_tokens") else "completed"
+    output = response_output_items(text, tool_calls)
+    apply_responses_output_phases(output, status == "completed")
     response = {
         "id": response_id,
         "object": "response",
@@ -517,7 +575,7 @@ def completion_to_response(
         "instructions": payload.get("instructions"),
         "max_output_tokens": payload.get("max_output_tokens"),
         "model": model,
-        "output": response_output_items(text, tool_calls),
+        "output": output,
         "parallel_tool_calls": bool(payload.get("parallel_tool_calls", True)),
         "previous_response_id": payload.get("previous_response_id"),
         "reasoning": payload.get("reasoning") or {"effort": None, "summary": None},
@@ -530,7 +588,7 @@ def completion_to_response(
         "truncation": payload.get("truncation", "disabled"),
         "usage": {
             "input_tokens": prompt,
-            "input_tokens_details": {"cached_tokens": safe_int(usage.get("cache_read_input_tokens"))},
+            "input_tokens_details": {"cached_tokens": cache_read},
             "output_tokens": output_tokens,
             "output_tokens_details": {"reasoning_tokens": safe_int(usage.get("reasoning_tokens"))},
             "total_tokens": total_tokens,
@@ -616,6 +674,11 @@ def completion_to_claude(completion: dict[str, Any], model: str) -> dict[str, An
     """把 Chat completion 包装成 Anthropic Messages 响应。"""
     text, tool_calls, finish_reason, usage = completion_details(completion)
     prompt, output_tokens, _ = usage_numbers(usage)
+    cache_read = cache_read_tokens(usage)
+    cache_create = cache_creation_tokens(usage)
+    # OpenAI Chat / Responses 的 prompt_tokens 已包含缓存读取与写入；Anthropic
+    # 的 input_tokens 只算未缓存部分，所以这里要减掉，避免下游重复累计。
+    exclusive_input = max(prompt - cache_read - cache_create, 0)
     content: list[dict[str, Any]] = []
     if text:
         content.append({"type": "text", "text": text})
@@ -642,10 +705,8 @@ def completion_to_claude(completion: dict[str, Any], model: str) -> dict[str, An
         "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": None,
-        "usage": {"input_tokens": prompt, "output_tokens": output_tokens},
+        "usage": {"input_tokens": exclusive_input, "output_tokens": output_tokens},
     }
-    cache_read = safe_int(usage.get("cache_read_input_tokens"))
-    cache_create = safe_int(usage.get("cache_creation_input_tokens"))
     if cache_read:
         result["usage"]["cache_read_input_tokens"] = cache_read
     if cache_create:

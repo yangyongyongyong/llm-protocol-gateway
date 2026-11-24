@@ -70,6 +70,41 @@ func EnsureBuiltinCustomProviders(state *domain.GatewayState) {
 	}
 }
 
+// RefreshBuiltinCustomProviderInstanceScripts 把内置连接器的最新脚本文本同步到
+// 所有引用它的 Provider 实例。实例里保存的是解析后的脚本快照，升级时只刷新
+// 自定义类型模板还不够；否则旧实例会继续运行旧 adapter.py，并把过期的脚本
+// 再写回数据库。实例自己的上游 URL、Key、端口和并发/超时配置保持不变。
+func RefreshBuiltinCustomProviderInstanceScripts(state *domain.GatewayState) (int, error) {
+	if state == nil {
+		return 0, nil
+	}
+	templates := make(map[string]domain.CustomProvider, len(builtinCustomProviders()))
+	for _, item := range builtinCustomProviders() {
+		templates[item.ID] = item
+	}
+	refreshed := 0
+	for index := range state.Providers {
+		provider := &state.Providers[index]
+		if provider.ProviderScript == nil {
+			continue
+		}
+		template, ok := templates[strings.TrimSpace(provider.CustomProviderID)]
+		if !ok {
+			continue
+		}
+		upstream := provider.ProviderScript.UpstreamBaseURL
+		port := provider.ProviderScript.ListenPort
+		startCommand := provider.ProviderScript.StartCommand
+		script := template.Script
+		script.UpstreamBaseURL = upstream
+		script.ListenPort = port
+		script.StartCommand = startCommand
+		provider.ProviderScript = &script
+		refreshed++
+	}
+	return refreshed, nil
+}
+
 // UpgradeLegacyTencentCloudBaseProviders 把早期“直连 aiProxy”的 Provider 迁移到
 // 内置本地适配器。直连云函数只能接 Chat 事件，而且不会输出 SSE；对 Responses /
 // Claude 的非流式请求可以靠网关转换，流式请求则会因为上游返回 JSON 而失败。

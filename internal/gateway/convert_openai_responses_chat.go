@@ -1052,6 +1052,7 @@ func openAIChatToResponsesResponseWithTools(chatBody []byte, model string, toolC
 	if incompleteReason != "" {
 		response["incomplete_details"] = map[string]any{"reason": incompleteReason}
 	}
+	phaseOutput(toAnySlice(output), status == "completed")
 	body, err := json.Marshal(response)
 	return body, usage, err
 }

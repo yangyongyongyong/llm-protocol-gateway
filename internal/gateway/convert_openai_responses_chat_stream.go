@@ -504,6 +504,7 @@ func (s *chatToResponsesStreamState) finalize() error {
 		return fmt.Errorf("openai stream ended without any chunks")
 	}
 	output := s.buildCompletedOutput()
+	phaseOutput(toAnySlice(output), s.incompleteReason == "")
 	text := s.fullText.String()
 	response := map[string]any{
 		"id":          s.responseID,

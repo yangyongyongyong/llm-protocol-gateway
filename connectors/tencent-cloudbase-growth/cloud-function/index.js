@@ -112,6 +112,16 @@ function completion(model, text, usage, toolCalls) {
   /** 把 Node SDK 的 generateText 结果包装成 OpenAI Chat completion。 */
   const prompt = Number(usage?.prompt_tokens || usage?.input_tokens || 0)
   const completionTokens = Number(usage?.completion_tokens || usage?.output_tokens || 0)
+  // 不同模型 / provider 可能给 OpenAI 风格、Responses 风格或 Claude 风格的
+  // 缓存字段。这里保留原始计数，让本地 adapter 归一到各协议的 usage。
+  const cacheRead = Number(
+    usage?.cache_read_input_tokens ||
+    usage?.prompt_cache_hit_tokens ||
+    usage?.prompt_tokens_details?.cached_tokens ||
+    usage?.input_tokens_details?.cached_tokens ||
+    0,
+  )
+  const cacheCreation = Number(usage?.cache_creation_input_tokens || 0)
   const calls = Array.isArray(toolCalls) ? toolCalls : []
   const message = { role: 'assistant', content: String(text || '') }
   if (calls.length) message.tool_calls = calls
@@ -129,6 +139,11 @@ function completion(model, text, usage, toolCalls) {
       prompt_tokens: prompt,
       completion_tokens: completionTokens,
       total_tokens: Number(usage?.total_tokens || prompt + completionTokens),
+      prompt_cache_hit_tokens: cacheRead,
+      cache_read_input_tokens: cacheRead,
+      cache_creation_input_tokens: cacheCreation,
+      prompt_tokens_details: { cached_tokens: cacheRead },
+      input_tokens_details: { cached_tokens: cacheRead },
     },
   }
 }

@@ -120,3 +120,38 @@ func TestUpgradeLegacyTencentCloudBaseProviders(t *testing.T) {
 		t.Fatalf("second upgrade = %d, %v; want idempotent 0", upgradedAgain, err)
 	}
 }
+
+func TestRefreshBuiltinCustomProviderInstanceScripts(t *testing.T) {
+	state := domain.GatewayState{Providers: []domain.Provider{{
+		ID:               "cloudbase",
+		CustomProviderID: builtinTencentCloudBaseID,
+		ProviderScript: &domain.ProviderScript{
+			Language:        "python",
+			Entrypoint:      "adapter.py",
+			Source:          "outdated",
+			UpstreamBaseURL: "https://dev.example.com/aiProxy",
+			ListenPort:      12345,
+		},
+	}, {
+		ID:               "custom-script",
+		CustomProviderID: "user-defined",
+		ProviderScript:   &domain.ProviderScript{Source: "keep me"},
+	}}}
+	refreshed, err := RefreshBuiltinCustomProviderInstanceScripts(&state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed != 1 {
+		t.Fatalf("refreshed = %d, want 1", refreshed)
+	}
+	script := state.Providers[0].ProviderScript
+	if script == nil || strings.Contains(script.Source, "outdated") || !strings.Contains(script.Source, "def cache_read_tokens") {
+		t.Fatalf("builtin instance script was not refreshed: %+v", script)
+	}
+	if script.UpstreamBaseURL != "https://dev.example.com/aiProxy" || script.ListenPort != 12345 {
+		t.Fatalf("instance settings were not preserved: %+v", script)
+	}
+	if state.Providers[1].ProviderScript == nil || state.Providers[1].ProviderScript.Source != "keep me" {
+		t.Fatalf("user-defined script must not be touched: %+v", state.Providers[1].ProviderScript)
+	}
+}
