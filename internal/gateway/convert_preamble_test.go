@@ -114,6 +114,26 @@ func TestChatStreamToResponsesKeepsPreambleBeforeToolCall(t *testing.T) {
 	if got := stringValue(message["phase"]); got != "commentary" {
 		t.Fatalf("preamble phase = %q, want commentary", got)
 	}
+	// 逐帧的 output_item.done 也必须带 phase：严格客户端只读这一帧。
+	var donePhase string
+	for _, block := range strings.Split(recorder.Body.String(), "\n\n") {
+		if !strings.Contains(block, "response.output_item.done") {
+			continue
+		}
+		var event map[string]any
+		payload := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(block[strings.Index(block, "data:"):]), "data:"))
+		if err := json.Unmarshal([]byte(payload), &event); err != nil {
+			continue
+		}
+		item, _ := event["item"].(map[string]any)
+		if stringValue(item["type"]) != "message" {
+			continue
+		}
+		donePhase = stringValue(item["phase"])
+	}
+	if donePhase != "commentary" {
+		t.Fatalf("output_item.done phase = %q, want commentary", donePhase)
+	}
 	if got := stringValue(response["status"]); got != "completed" {
 		t.Fatalf("status = %q, want completed", got)
 	}

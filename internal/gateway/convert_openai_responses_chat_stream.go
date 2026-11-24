@@ -210,7 +210,13 @@ func (s *chatToResponsesStreamState) appendTextDelta(text string) error {
 	})
 }
 
-func (s *chatToResponsesStreamState) closeMessageItem() error {
+// closeMessageItem closes the streaming message item. phase is what the
+// Responses message carries: "commentary" for text that precedes a tool call
+// or another output item, "final_answer" for the message that ends a
+// completed turn, and "" when the turn was cut short (never guess a final
+// answer). Codex reads a message with no phase as the answer, so a progress
+// line left unphased was taken for work already finished.
+func (s *chatToResponsesStreamState) closeMessageItem(phase string) error {
 	if !s.messageOpened || s.messageClosed {
 		return nil
 	}
@@ -239,21 +245,25 @@ func (s *chatToResponsesStreamState) closeMessageItem() error {
 	}); err != nil {
 		return err
 	}
+	item := map[string]any{
+		"id":     s.messageItemID,
+		"type":   "message",
+		"role":   "assistant",
+		"status": "completed",
+		"content": []map[string]any{{
+			"type":        "output_text",
+			"text":        text,
+			"annotations": []any{},
+		}},
+	}
+	if phase != "" {
+		item["phase"] = phase
+	}
 	if err := writeResponsesSSEEvent(s.w, "response.output_item.done", map[string]any{
 		"type":            "response.output_item.done",
 		"sequence_number": s.nextSeq(),
 		"output_index":    s.outputIndex,
-		"item": map[string]any{
-			"id":     s.messageItemID,
-			"type":   "message",
-			"role":   "assistant",
-			"status": "completed",
-			"content": []map[string]any{{
-				"type":        "output_text",
-				"text":        text,
-				"annotations": []any{},
-			}},
-		},
+		"item":            item,
 	}); err != nil {
 		return err
 	}
@@ -326,7 +336,8 @@ func (s *chatToResponsesStreamState) handleToolCallDelta(rawToolCalls []any) err
 		}
 		if !state.opened {
 			if s.messageOpened && !s.messageClosed {
-				if err := s.closeMessageItem(); err != nil {
+				// A tool call follows: this message is progress, not the answer.
+				if err := s.closeMessageItem("commentary"); err != nil {
 					return err
 				}
 			}
@@ -493,7 +504,11 @@ func (s *chatToResponsesStreamState) finalize() error {
 		}
 	}
 	if s.messageOpened && !s.messageClosed {
-		if err := s.closeMessageItem(); err != nil {
+		phase := "final_answer"
+		if s.incompleteReason != "" {
+			phase = ""
+		}
+		if err := s.closeMessageItem(phase); err != nil {
 			return err
 		}
 	}

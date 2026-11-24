@@ -166,7 +166,7 @@ func TestSaveCheckinWritesHistory(t *testing.T) {
 	now := time.Now().UTC()
 	if err := s.SaveCheckin(domain.CheckinRecord{
 		ProviderID: "p1", AccountKey: "site|uid", Day: now.Format("2006-01-02"),
-		At: now.Format(time.RFC3339),
+		At:      now.Format(time.RFC3339),
 		Outcome: "ok", Credit: 5, Streak: 2, Message: "done", Tries: 1,
 	}); err != nil {
 		t.Fatal(err)

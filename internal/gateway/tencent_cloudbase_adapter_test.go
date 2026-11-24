@@ -11,10 +11,7 @@ import (
 // 内置适配器必须能读取上游各种缓存字段，并把它们写进 Responses / Claude 的
 // usage。CloudBase SDK 的字段名不固定，丢掉任何一个都会让统计长期显示 0。
 func TestBuiltinCloudBaseAdapterPreservesCacheUsage(t *testing.T) {
-	python := "python3"
-	if _, err := exec.LookPath(python); err != nil {
-		t.Skip("python3 not available")
-	}
+	python := findPython(t)
 	source := string(mustReadBuiltinCloudBaseAdapter(t))
 	for _, snippet := range []string{
 		"def cache_read_tokens",
@@ -67,6 +64,19 @@ func mustReadBuiltinCloudBaseAdapter(t *testing.T) []byte {
 		t.Fatalf("builtin providers = %d", len(providers))
 	}
 	return []byte(providers[0].Script.Source)
+}
+
+// findPython 在 CI 的三个平台上找可用的解释器：Linux/macOS 是 python3，
+// Windows 的安装通常只提供 py 启动器。找不到就跳过，不让环境差异把测试判失败。
+func findPython(t *testing.T) string {
+	t.Helper()
+	for _, candidate := range []string{"python3", "python", "py"} {
+		if _, err := exec.LookPath(candidate); err == nil {
+			return candidate
+		}
+	}
+	t.Skip("no python interpreter available")
+	return ""
 }
 
 func writeTestFile(path string, body []byte) error {
