@@ -27,6 +27,9 @@ func NewRouter(state domain.GatewayState) *Router {
 	if state.CustomProviders == nil {
 		state.CustomProviders = []domain.CustomProvider{}
 	}
+	for index := range state.Providers {
+		normalizeTencentCloudBaseProxyProvider(&state.Providers[index])
+	}
 	rebuildModels(&state)
 	return &Router{state: state}
 }
@@ -764,6 +767,7 @@ func (r *Router) updateProviderWithScript(providerID string, patch domain.Provid
 func normalizeProvider(provider *domain.Provider) {
 	provider.APIKeySource = strings.TrimSpace(provider.APIKeySource)
 	provider.AuthType = strings.TrimSpace(provider.AuthType)
+	normalizeTencentCloudBaseProxyProvider(provider)
 	// A mistyped first-packet limit must not park a request for hours; the
 	// request path clamps too, so a legacy row keeps the same bound.
 	if provider.FirstPacketTimeoutSec < 0 {

@@ -2,8 +2,11 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/luca/llm-protocol-gateway/internal/domain"
@@ -31,6 +34,113 @@ func TestTencentCloudBaseProviderGroup(t *testing.T) {
 				t.Fatalf("got group=%q ok=%v, want group=%q ok=%v", group, ok, tc.group, tc.accept)
 			}
 		})
+	}
+}
+
+func TestTencentCloudBaseProxyFunctionURL(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		base   string
+		want   string
+		accept bool
+	}{
+		{"aiProxy", "https://dev.api.tcloudbasegateway.com/v1/functions/aiProxy", "https://dev.api.tcloudbasegateway.com/v1/functions/aiProxy", true},
+		{"trailing slash and query", "https://dev.api.tcloudbasegateway.com/v1/functions/aiProxy/?x=1", "https://dev.api.tcloudbasegateway.com/v1/functions/aiProxy", true},
+		{"case insensitive", "https://dev.api.tcloudbasegateway.com/v1/functions/aiproxy", "https://dev.api.tcloudbasegateway.com/v1/functions/aiproxy", true},
+		{"other function", "https://dev.api.tcloudbasegateway.com/v1/functions/other", "", false},
+		{"extra path", "https://dev.api.tcloudbasegateway.com/v1/functions/aiProxy/chat", "", false},
+		{"other host", "https://relay.example.com/v1/functions/aiProxy", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := tencentCloudBaseProxyFunctionURL(domain.Provider{BaseURL: tc.base})
+			if ok != tc.accept || got != tc.want {
+				t.Fatalf("got url=%q ok=%v, want url=%q ok=%v", got, ok, tc.want, tc.accept)
+			}
+		})
+	}
+}
+
+func TestFetchTencentCloudBaseProxyModels(t *testing.T) {
+	t.Parallel()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer jwt-test" {
+			t.Fatalf("Authorization = %q", got)
+		}
+		body, _ := io.ReadAll(r.Body)
+		var payload map[string]string
+		if err := json.Unmarshal(body, &payload); err != nil || payload["action"] != "ping" {
+			t.Fatalf("body = %s", body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true,"envId":"dev","models":["hy4-flash","hy3","hy4-flash"],"protocols":["chat","responses","claude"]}`)
+	}))
+	defer upstream.Close()
+
+	provider := domain.Provider{
+		ID:           "cloudbase",
+		Protocol:     domain.ProtocolOpenAIChat,
+		AuthType:     domain.AuthTypeAPIKey,
+		AuthHeader:   "Authorization",
+		APIKeySource: "literal:jwt-test",
+	}
+	models, protocols, err := fetchTencentCloudBaseProxyModels(context.Background(), provider, upstream.URL)
+	if err != nil {
+		t.Fatalf("fetch models: %v", err)
+	}
+	if len(models) != 2 {
+		t.Fatalf("models = %+v, want 2 unique ids", models)
+	}
+	if models[0].ID != "hy4-flash" || models[0].ContextLength != 1_000_000 || models[0].MaxOutputTokens != 64_000 || models[0].Protocol != domain.ProtocolOpenAIChat {
+		t.Fatalf("unexpected hy4-flash model: %+v", models[0])
+	}
+	if models[1].ID != "hy3" || models[1].ContextLength != 256_000 || models[1].MaxOutputTokens != 16_384 {
+		t.Fatalf("unexpected hy3 model: %+v", models[1])
+	}
+	if got := strings.Join(protocols, ","); got != "chat,responses,claude" {
+		t.Fatalf("protocols = %q", got)
+	}
+}
+
+func TestNewRouterNormalizesTencentCloudBaseProxyProtocol(t *testing.T) {
+	t.Parallel()
+	router := NewRouter(domain.GatewayState{Providers: []domain.Provider{
+		{
+			ID:       "cloudbase-proxy",
+			Name:     "CloudBase proxy",
+			Protocol: domain.ProtocolOpenAIResponses,
+			BaseURL:  "https://dev.api.tcloudbasegateway.com/v1/functions/aiProxy",
+			Models: []domain.Model{{
+				ID: "hy3", ProviderID: "cloudbase-proxy", Protocol: domain.ProtocolOpenAIResponses,
+			}},
+		},
+		{
+			ID:       "responses-relay",
+			Name:     "Responses relay",
+			Protocol: domain.ProtocolOpenAIResponses,
+			BaseURL:  "https://relay.example.com/v1",
+		},
+	}})
+	provider, err := router.ProviderByID("cloudbase-proxy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider.Protocol != domain.ProtocolOpenAIChat {
+		t.Fatalf("aiProxy protocol = %q, want openai_chat", provider.Protocol)
+	}
+	if len(provider.Models) != 1 || provider.Models[0].Protocol != domain.ProtocolOpenAIChat {
+		t.Fatalf("aiProxy models were not normalized: %+v", provider.Models)
+	}
+	relay, err := router.ProviderByID("responses-relay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if relay.Protocol != domain.ProtocolOpenAIResponses {
+		t.Fatalf("unrelated relay protocol = %q, want openai_responses", relay.Protocol)
 	}
 }
 

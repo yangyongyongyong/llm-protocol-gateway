@@ -6024,6 +6024,36 @@ func (s *Server) fetchProviderModels(r *http.Request, provider domain.Provider, 
 			}
 		}
 	}
+	// CloudBase 成长计划把 SDK 调用包在自有 aiProxy 云函数里。这个入口没有
+	// 标准 GET /models；通用推导会请求 <function>/models，云函数把空 body 当成
+	// 对话并返回 HTTP 200 + "model is required"。ping 动作不消耗额度，还会返回
+	// 当前允许的模型和协议，正好作为模型发现接口。
+	if functionURL, ok := tencentCloudBaseProxyFunctionURL(provider); ok {
+		models, protocols, fetchErr := fetchTencentCloudBaseProxyModels(r.Context(), provider, functionURL)
+		if fetchErr != nil {
+			return providerTestResult{
+				Success:   false,
+				Provider:  provider.ID,
+				ModelsURL: functionURL,
+				LatencyMs: time.Since(started).Milliseconds(),
+				Error:     "腾讯云 CloudBase aiProxy 不支持标准 /models，读取 ping 模型目录失败：" + fetchErr.Error(),
+				Models:    []domain.Model{},
+			}
+		}
+		preview := fmt.Sprintf("CloudBase aiProxy ping 返回 %d 个模型", len(models))
+		if len(protocols) > 0 {
+			preview += "，声明协议：" + strings.Join(protocols, ", ")
+		}
+		return providerTestResult{
+			Success:   true,
+			Provider:  provider.ID,
+			ModelsURL: functionURL,
+			Status:    http.StatusOK,
+			LatencyMs: time.Since(started).Milliseconds(),
+			Models:    models,
+			Preview:   preview,
+		}
+	}
 	// 腾讯云 CloudBase 只开放对话端点，没有标准 GET /models。通用推导会请求
 	// /v1/ai/<provider>/models，上游统一返回 AI_MODEL_NOT_SUPPORTED。这里改用
 	// CloudBase 控制台展示的公开模型目录，再按 Base URL 的 provider 组过滤。

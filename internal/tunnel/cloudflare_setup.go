@@ -505,10 +505,31 @@ func CustomDomainConfigReusable(configFile, credentialsFile, apiDomain, uiDomain
 	return true
 }
 
+// remoteTunnelExists reports whether a tunnel UUID is still present in the
+// connected Cloudflare account. Used only before reclaiming a DNS target from a
+// record already pointing at some tunnel id.
+func (c *CloudflareSetup) remoteTunnelExists(ctx context.Context, tunnelID string) bool {
+	tunnelID = strings.TrimSpace(tunnelID)
+	if tunnelID == "" {
+		return false
+	}
+	output, err := c.run(ctx, "tunnel", "list")
+	if err != nil {
+		return true // unknown: be conservative, treat as live
+	}
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && strings.EqualFold(fields[0], tunnelID) {
+			return true
+		}
+	}
+	return false
+}
+
 // routeDNS creates a CNAME for hostname → tunnel. A pre-existing record is
-// never silently stolen from another tunnel: if the final CNAME targets a
-// different tunnel id, this returns an explicit conflict. This is what keeps
-// two machines on one Cloudflare account from fighting over the same hostname.
+// never silently stolen from another live tunnel. The only takeover cases are:
+// the record already targets this tunnel, or it targets a tunnel id that no
+// longer exists in the account (an old deleted/shared default).
 func (c *CloudflareSetup) routeDNS(ctx context.Context, tunnelName, tunnelID, hostname string) error {
 	tunnelID = strings.TrimSpace(tunnelID)
 	if tunnelID == "" {
@@ -520,24 +541,35 @@ func (c *CloudflareSetup) routeDNS(ctx context.Context, tunnelName, tunnelID, ho
 		if !dnsRecordConflict(combined) {
 			return fmt.Errorf("route dns for %s: %w", hostname, err)
 		}
-		// cloudflared offers --overwrite-dns, but that would steal a hostname
-		// already used by another computer. Inspect the current CNAME and allow
-		// the update only when it already points at this same tunnel (for
-		// example a stale record left by an earlier run of this machine).
+		// Inspect the current CNAME before overwriting. A record is reclaimed
+		// only when it already targets this tunnel or a tunnel id that is gone
+		// from the account; a live foreign tunnel is refused.
 		currentTunnelID, owned, inspectErr := c.hostnameCNAMETunnelID(ctx, hostname)
-		if inspectErr == nil && owned && strings.EqualFold(currentTunnelID, tunnelID) {
+		switch {
+		case inspectErr == nil && owned && strings.EqualFold(currentTunnelID, tunnelID):
+			// Same tunnel, stale route: safe to repair.
 			output, err = c.run(ctx, "tunnel", "route", "dns", "--overwrite-dns", tunnelName, hostname)
 			if err != nil {
 				return fmt.Errorf("route dns for %s (repair same tunnel): %w", hostname, err)
 			}
-		} else if owned {
-			return fmt.Errorf("域名 %s 已被另一条隧道占用（%s）。为避免抢走另一台电脑的流量，不会自动覆盖 DNS；请换成本机自己的子域名。", hostname, currentTunnelID)
-		} else if inspectErr != nil {
+		case inspectErr == nil && owned && !c.remoteTunnelExists(ctx, currentTunnelID):
+			// The record points at a tunnel that no longer exists in this Cloudflare
+			// account (e.g. an old deleted/shared default). It is dead, not another
+			// live machine, so taking it over is safe.
+			output, err = c.run(ctx, "tunnel", "route", "dns", "--overwrite-dns", tunnelName, hostname)
+			if err != nil {
+				return fmt.Errorf("route dns for %s (replace dead tunnel): %w", hostname, err)
+			}
+		case inspectErr == nil && owned:
+			return fmt.Errorf("域名 %s 已被另一条仍在使用的隧道占用（%s）。为避免抢走另一台电脑的流量，不会自动覆盖 DNS；请换成本机自己的子域名。", hostname, currentTunnelID)
+		case inspectErr != nil:
 			return fmt.Errorf("域名 %s 已有 DNS 记录，但无法确认归属：%v。为避免覆盖另一台电脑，不会自动接管。", hostname, inspectErr)
-		} else {
+		default:
 			return fmt.Errorf("域名 %s 已有非隧道 DNS 记录。为避免覆盖现有服务，不会自动接管；请换成本机自己的子域名。", hostname)
 		}
 	}
+	// Re-read the zone after an overwrite; the pre-overwrite list still describes
+	// the old target and must not be treated as the final state.
 	if err := c.ensureHostnameCNAME(ctx, hostname, tunnelID); err != nil {
 		return fmt.Errorf("ensure dns for %s → %s: %w", hostname, tunnelID, err)
 	}

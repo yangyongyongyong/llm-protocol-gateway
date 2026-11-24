@@ -165,6 +165,9 @@ IjoiY2Z1dF90ZXN0In0=
 	setup.run = func(ctx context.Context, args ...string) (string, error) {
 		calls++
 		joined := strings.Join(args, " ")
+		if joined == "tunnel list" {
+			return "ID                                   NAME CREATED\nff2f197e-d383-40f7-9fc8-50772d7e9c26 old-tunnel 2026-01-01T00:00:00Z\n", nil
+		}
 		if strings.Contains(joined, "--overwrite-dns") {
 			return "added route", nil
 		}
@@ -201,8 +204,8 @@ IjoiY2Z1dF90ZXN0In0=
 	if err := setup.routeDNS(ctxBackground(), "llm-protocol-gateway", wantID, "gateway.lucadesign.uk"); err == nil {
 		t.Fatal("expected a foreign DNS target to be refused")
 	}
-	if calls != 1 {
-		t.Fatalf("calls=%d want 1 (route conflict only; never overwrite another tunnel), got %v", calls, calls)
+	if calls != 3 {
+		t.Fatalf("calls=%d want 3 (route conflict + tunnel list + retry route; never overwrite another tunnel), got %v", calls, calls)
 	}
 	if putCalls != 0 {
 		t.Fatalf("must not overwrite another tunnel's DNS, putCalls=%d", putCalls)
@@ -532,5 +535,51 @@ IjoiY2Z1dF90ZXN0In0=
 	}
 	if !overwrote {
 		t.Fatal("a record already pointing at this same tunnel should be repairable")
+	}
+}
+
+func TestRouteDNSReclaimsDeadTunnelRecord(t *testing.T) {
+	tmp := t.TempDir()
+	cert := []byte(`-----BEGIN ARGO TUNNEL TOKEN-----
+eyJ6b25lSUQiOiJ6b25lLTEiLCJhY2NvdW50SUQiOiJhY2MtMSIsImFwaVRva2Vu
+IjoiY2Z1dF90ZXN0In0=
+-----END ARGO TUNNEL TOKEN-----
+`)
+	if err := os.WriteFile(filepath.Join(tmp, "cert.pem"), cert, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deadID := "deadbeef-dead-beef-dead-beefdeadbeef"
+	wantID := "ff2f197e-d383-40f7-9fc8-50772d7e9c26"
+	var overwrite bool
+	setup := NewCloudflareSetup()
+	setup.homeDir = func() (string, error) { return tmp, nil }
+	setup.run = func(ctx context.Context, args ...string) (string, error) {
+		joined := strings.Join(args, " ")
+		if joined == "tunnel list" {
+			return "ID NAME CREATED\n", nil
+		}
+		if strings.Contains(joined, "--overwrite-dns") {
+			overwrite = true
+			return "added", nil
+		}
+		return "Failed to add route: code: 1003, reason: An A, AAAA, or CNAME record with that host already exists.", fmt.Errorf("exit status 1")
+	}
+	setup.httpDo = func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodGet && strings.Contains(req.URL.Path, "/dns_records") {
+			content := deadID + ".cfargotunnel.com"
+			if overwrite {
+				content = wantID + ".cfargotunnel.com"
+			}
+			return jsonHTTPResponse(200, map[string]any{"success": true, "result": []map[string]any{{
+				"id": "rec-1", "type": "CNAME", "name": "gateway.lucadesign.uk", "content": content, "proxied": true,
+			}}}), nil
+		}
+		return jsonHTTPResponse(404, map[string]any{"success": false}), nil
+	}
+	if err := setup.routeDNS(ctxBackground(), "llm-protocol-gateway", wantID, "gateway.lucadesign.uk"); err != nil {
+		t.Fatal(err)
+	}
+	if !overwrite {
+		t.Fatal("dead tunnel target should be reclaimed")
 	}
 }

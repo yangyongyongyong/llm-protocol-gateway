@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"embed"
+	"fmt"
+	"strings"
 
 	"github.com/luca/llm-protocol-gateway/internal/domain"
 )
@@ -66,6 +68,63 @@ func EnsureBuiltinCustomProviders(state *domain.GatewayState) {
 		builtin.UpdatedAt = now
 		state.CustomProviders = append(state.CustomProviders, builtin)
 	}
+}
+
+// UpgradeLegacyTencentCloudBaseProviders 把早期“直连 aiProxy”的 Provider 迁移到
+// 内置本地适配器。直连云函数只能接 Chat 事件，而且不会输出 SSE；对 Responses /
+// Claude 的非流式请求可以靠网关转换，流式请求则会因为上游返回 JSON 而失败。
+// 本地适配器保留原上游 URL 和 Key，同时提供 Chat / Responses / Claude 三种原生
+// 入口与 SSE 合成，因此旧配置不应继续停留在直连形态。
+func UpgradeLegacyTencentCloudBaseProviders(state *domain.GatewayState) (int, error) {
+	if state == nil {
+		return 0, nil
+	}
+	var template *domain.CustomProvider
+	for _, item := range builtinCustomProviders() {
+		if item.ID == builtinTencentCloudBaseID {
+			copy := item
+			template = &copy
+			break
+		}
+	}
+	if template == nil {
+		return 0, fmt.Errorf("built-in provider %q is unavailable", builtinTencentCloudBaseID)
+	}
+
+	upgraded := 0
+	for index := range state.Providers {
+		provider := &state.Providers[index]
+		if provider.Deleted || provider.ProviderScript != nil || strings.TrimSpace(provider.CustomProviderID) != "" {
+			continue
+		}
+		if provider.AuthType != "" && provider.AuthType != domain.AuthTypeAPIKey {
+			continue
+		}
+		upstream, ok := tencentCloudBaseProxyFunctionURL(*provider)
+		if !ok {
+			continue
+		}
+		script := template.Script
+		script.UpstreamBaseURL = upstream
+		script.ListenPort = 0
+		provider.CustomProviderID = template.ID
+		provider.ProviderScript = &script
+		provider.Protocol = domain.ProtocolOpenAIChat
+		provider.ProtocolSupport = []string{string(domain.ProtocolOpenAIChat), string(domain.ProtocolOpenAIResponses), string(domain.ProtocolClaude)}
+		provider.ProtocolProbedAt = nowRFC3339()
+		provider.AuthType = domain.AuthTypeAPIKey
+		provider.AuthHeader = firstNonEmpty(template.AuthHeader, "Authorization")
+		if strings.TrimSpace(provider.DefaultModel) == "" {
+			provider.DefaultModel = strings.TrimSpace(template.DefaultModel)
+		}
+		provider.BaseURL = providerScriptRuntimes.apiBaseURL(*provider)
+		for modelIndex := range provider.Models {
+			provider.Models[modelIndex].ProviderID = provider.ID
+			provider.Models[modelIndex].Protocol = provider.Protocol
+		}
+		upgraded++
+	}
+	return upgraded, nil
 }
 
 // SyncBuiltinCustomProviderScripts 在每次启动时把内置脚本写到用户数据目录。

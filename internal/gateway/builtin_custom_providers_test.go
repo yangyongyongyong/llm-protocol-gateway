@@ -58,3 +58,65 @@ func TestBuiltinCustomProviderIsImmutable(t *testing.T) {
 		t.Fatal("builtin provider ID must not be re-creatable")
 	}
 }
+
+func TestUpgradeLegacyTencentCloudBaseProviders(t *testing.T) {
+	state := domain.GatewayState{Providers: []domain.Provider{
+		{
+			ID:           "腾讯云-tokenhub",
+			Name:         "腾讯云 TokenHub",
+			Protocol:     domain.ProtocolOpenAIResponses,
+			BaseURL:      "https://dev.api.tcloudbasegateway.com/v1/functions/aiProxy",
+			AuthType:     domain.AuthTypeAPIKey,
+			AuthHeader:   "Authorization",
+			APIKeySource: "literal:cloudbase-key",
+			Models: []domain.Model{{
+				ID: "hy3", ProviderID: "腾讯云-tokenhub", Protocol: domain.ProtocolOpenAIResponses,
+			}},
+		},
+		{
+			ID:       "other",
+			Name:     "Other",
+			Protocol: domain.ProtocolOpenAIResponses,
+			BaseURL:  "https://relay.example.com/v1",
+		},
+	}}
+	EnsureBuiltinCustomProviders(&state)
+
+	upgraded, err := UpgradeLegacyTencentCloudBaseProviders(&state)
+	if err != nil {
+		t.Fatalf("upgrade: %v", err)
+	}
+	if upgraded != 1 {
+		t.Fatalf("upgraded = %d, want 1", upgraded)
+	}
+	provider := state.Providers[0]
+	if provider.ProviderScript == nil || provider.CustomProviderID != builtinTencentCloudBaseID {
+		t.Fatalf("provider was not attached to builtin connector: %+v", provider)
+	}
+	if provider.ProviderScript.UpstreamBaseURL != "https://dev.api.tcloudbasegateway.com/v1/functions/aiProxy" {
+		t.Fatalf("upstream URL was not preserved: %q", provider.ProviderScript.UpstreamBaseURL)
+	}
+	if !strings.HasPrefix(provider.BaseURL, "http://127.0.0.1:") || !strings.HasSuffix(provider.BaseURL, "/v1") {
+		t.Fatalf("runtime base URL = %q", provider.BaseURL)
+	}
+	if provider.Protocol != domain.ProtocolOpenAIChat || provider.DefaultModel != "hy3" {
+		t.Fatalf("provider protocol/default were not normalized: %+v", provider)
+	}
+	if got := strings.Join(provider.ProtocolSupport, ","); got != "openai_chat,openai_responses,claude" {
+		t.Fatalf("protocol support = %q", got)
+	}
+	if strings.TrimSpace(provider.ProtocolProbedAt) == "" {
+		t.Fatal("protocol probe timestamp was not set")
+	}
+	if len(provider.Models) != 1 || provider.Models[0].Protocol != domain.ProtocolOpenAIChat {
+		t.Fatalf("models were not normalized: %+v", provider.Models)
+	}
+	if state.Providers[1].ProviderScript != nil {
+		t.Fatalf("unrelated provider was migrated: %+v", state.Providers[1])
+	}
+
+	upgradedAgain, err := UpgradeLegacyTencentCloudBaseProviders(&state)
+	if err != nil || upgradedAgain != 0 {
+		t.Fatalf("second upgrade = %d, %v; want idempotent 0", upgradedAgain, err)
+	}
+}

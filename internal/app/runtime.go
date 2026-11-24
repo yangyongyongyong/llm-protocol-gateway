@@ -266,6 +266,15 @@ func (rt *Runtime) Start(cfg Config) error {
 	// 内置连接器随二进制发布：每次启动都把最新定义合入状态，
 	// 这样升级后所有实例都能在「自定义连接器」目录里直接看到它。
 	gateway.EnsureBuiltinCustomProviders(&state)
+	if upgraded, err := gateway.UpgradeLegacyTencentCloudBaseProviders(&state); err != nil {
+		slog.Warn("legacy CloudBase provider migration failed", "error", err)
+	} else if upgraded > 0 {
+		if err := db.Save(state); err != nil {
+			slog.Warn("legacy CloudBase provider migration not persisted", "providers", upgraded, "error", err)
+		} else {
+			slog.Info("legacy CloudBase providers upgraded to built-in connector", "providers", upgraded)
+		}
+	}
 	router := gateway.NewRouter(state)
 	// The console compares its own build version against this one to offer the
 	// upgrade prompt, so it must be set before the first request is served.

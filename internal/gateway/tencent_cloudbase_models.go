@@ -19,6 +19,39 @@ import (
 // 比让用户手抄模型 ID 更可靠。目录是厂商级公开数据，不包含环境 Key。
 const tencentCloudBaseModelCatalogURL = "https://tcb.cloud.tencent.com/ai/ai-model/production/ap-shanghai/config.json"
 
+// tencentCloudBaseProxyPath 是 CloudBase 云函数 HTTP 入口。成长计划连接器使用
+// aiProxy 云函数转发 SDK 调用；它没有标准 GET /models，但 action=ping 会返回
+// 当前允许的模型和协议。识别到这条入口时不能把请求格式猜成 Responses。
+const tencentCloudBaseProxyFunction = "aiProxy"
+
+type tencentCloudBaseModelBudget struct {
+	contextLength   int
+	maxOutputTokens int
+}
+
+// 与 connectors/tencent-cloudbase-growth/adapter.py 的 MODELS 元数据保持一致。
+// ping 只返回模型 ID，这里补上控制台窗口和输出上限，避免所有模型都落成默认 128K。
+var tencentCloudBaseGrowthModelBudgets = map[string]tencentCloudBaseModelBudget{
+	"hy3":                      {contextLength: 256_000, maxOutputTokens: 16_384},
+	"hy3-preview":              {contextLength: 256_000, maxOutputTokens: 16_384},
+	"hy4-flash":                {contextLength: 1_000_000, maxOutputTokens: 64_000},
+	"hy4":                      {contextLength: 1_000_000, maxOutputTokens: 16_384},
+	"hy4-preview":              {contextLength: 1_000_000, maxOutputTokens: 16_384},
+	"deepseek-v4.1-flash":      {contextLength: 1_000_000, maxOutputTokens: 16_384},
+	"deepseek-v4.1-flash-1017": {contextLength: 1_000_000, maxOutputTokens: 16_384},
+}
+
+type tencentCloudBaseProxyPing struct {
+	OK        bool     `json:"ok"`
+	EnvID     string   `json:"envId"`
+	Models    []string `json:"models"`
+	Protocols []string `json:"protocols"`
+	Error     *struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
 // tencentCloudBaseCatalogModel 只声明模型发现需要的字段。modelSpec 里的窗口
 // 字段在 CloudBase 目录中可能是 "1M" / "960k" 文本，也可能是数字，因此先用
 // RawMessage 接住，交给 parseTencentCloudBaseTokenLimit 统一解释。
@@ -60,6 +93,132 @@ func tencentCloudBaseProviderGroup(provider domain.Provider) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// tencentCloudBaseProxyFunctionURL 识别 CloudBase HTTP 云函数入口：
+// https://<env>.api.tcloudbasegateway.com/v1/functions/aiProxy。
+// 只认 aiProxy 这个自有函数契约，不去猜其它 CloudBase 函数的模型接口。
+func tencentCloudBaseProxyFunctionURL(provider domain.Provider) (string, bool) {
+	parsed, err := url.Parse(strings.TrimSpace(provider.BaseURL))
+	if err != nil || parsed.Host == "" {
+		return "", false
+	}
+	if parsed.Scheme != "https" && parsed.Scheme != "http" {
+		return "", false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host != "api.tcloudbasegateway.com" && !strings.HasSuffix(host, ".api.tcloudbasegateway.com") {
+		return "", false
+	}
+	segments := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(segments) < 3 ||
+		!strings.EqualFold(segments[len(segments)-3], "v1") ||
+		!strings.EqualFold(segments[len(segments)-2], "functions") ||
+		!strings.EqualFold(segments[len(segments)-1], tencentCloudBaseProxyFunction) {
+		return "", false
+	}
+	parsed.Path = "/" + strings.Join(segments, "/")
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String(), true
+}
+
+// normalizeTencentCloudBaseProxyProvider 修正直连 aiProxy 的协议声明。云函数
+// 的 event 契约是 Chat（model + messages），不是 Responses；声明错会导致请求
+// 带着 input 进入函数后得到 "messages is required"。Gateway 负责把 Responses /
+// Claude 请求转换成这条 Chat 上游可接收的形状。
+func normalizeTencentCloudBaseProxyProvider(provider *domain.Provider) {
+	if provider == nil || provider.ProviderScript != nil || provider.CustomProviderID != "" {
+		return
+	}
+	if provider.AuthType != "" && provider.AuthType != domain.AuthTypeAPIKey {
+		return
+	}
+	if _, ok := tencentCloudBaseProxyFunctionURL(*provider); !ok {
+		return
+	}
+	provider.Protocol = domain.ProtocolOpenAIChat
+	for index := range provider.Models {
+		provider.Models[index].ProviderID = provider.ID
+		provider.Models[index].Protocol = provider.Protocol
+	}
+}
+
+// fetchTencentCloudBaseProxyModels 用云函数自带的无额度 ping 动作读取模型目录。
+// functionURL 独立传入，方便测试用 httptest 校验请求方法、鉴权和返回解析。
+func fetchTencentCloudBaseProxyModels(ctx context.Context, provider domain.Provider, functionURL string) ([]domain.Model, []string, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, functionURL, strings.NewReader(`{"action":"ping"}`))
+	if err != nil {
+		return nil, nil, err
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Content-Type", "application/json")
+	applyRequestAdapterHeaders(request, provider, "")
+	applyProviderAuth(request, provider, "")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 1024*1024))
+	if err != nil {
+		return nil, nil, err
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, nil, fmt.Errorf("aiProxy ping returned HTTP %d: %s", response.StatusCode, compactResponsePreview(body))
+	}
+	var ping tencentCloudBaseProxyPing
+	if err := json.Unmarshal(body, &ping); err != nil {
+		return nil, nil, fmt.Errorf("decode aiProxy ping: %w", err)
+	}
+	if ping.Error != nil {
+		code := strings.TrimSpace(ping.Error.Code)
+		message := strings.TrimSpace(ping.Error.Message)
+		if code == "" {
+			code = "UPSTREAM_ERROR"
+		}
+		if message == "" {
+			message = "aiProxy ping failed"
+		}
+		return nil, ping.Protocols, fmt.Errorf("%s: %s", code, message)
+	}
+	if !ping.OK {
+		return nil, ping.Protocols, fmt.Errorf("aiProxy ping did not report ok=true")
+	}
+
+	seen := make(map[string]bool)
+	models := make([]domain.Model, 0, len(ping.Models))
+	for _, rawID := range ping.Models {
+		id := strings.TrimSpace(rawID)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		budget := tencentCloudBaseGrowthModelBudgets[strings.ToLower(id)]
+		models = append(models, domain.Model{
+			ID:              id,
+			ProviderID:      provider.ID,
+			Protocol:        provider.Protocol,
+			ContextLength:   resolveModelContextLength(id, budget.contextLength),
+			MaxOutputTokens: budget.maxOutputTokens,
+			InMenu:          true,
+		})
+	}
+	if len(models) == 0 {
+		return nil, ping.Protocols, fmt.Errorf("aiProxy ping returned no model ids")
+	}
+	return models, ping.Protocols, nil
+}
+
+func compactResponsePreview(body []byte) string {
+	preview := strings.TrimSpace(strings.ReplaceAll(string(body), "\n", " "))
+	preview = strings.ReplaceAll(preview, "\r", " ")
+	if len(preview) > 300 {
+		return preview[:300]
+	}
+	return preview
 }
 
 // fetchTencentCloudBaseModels 读取 CloudBase 官方目录并按 Base URL 的 provider
