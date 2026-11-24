@@ -7,9 +7,8 @@
  * “云开发 SDK 通道”调用成长计划模型。公网只负责函数调用，不直接访问
  * /v1/ai/*；提交给云函数的是标准 Chat 请求、工具定义和 providerHints。
  *
- * 关键点：generateText 默认会自动执行 FunctionTool；这里把 maxSteps 固定为 1，
- * 并把工具定义作为 ModelTool 传入，让模型只返回 tool_calls，由客户端执行工具后
- * 再发下一轮，符合 OpenAI/Anthropic 客户端的工具调用语义。
+ * 工具定义作为 ModelTool 传入，模型返回 tool_calls 后由客户端执行并继续下一轮。
+ * maxSteps 默认不设上限；如需限制可用 event.maxSteps 或 AI_PROXY_MAX_STEPS。
  */
 
 const tcb = require('@cloudbase/node-sdk')
@@ -37,9 +36,15 @@ function envId() {
   return String(process.env.TCB_ENV || process.env.ENV_ID || '').trim()
 }
 
+function configuredModels() {
+  /** 只有显式设置 AI_PROXY_ALLOWED_MODELS 才限制模型；默认不拦截。 */
+  const raw = String(process.env.AI_PROXY_ALLOWED_MODELS || '').trim()
+  return raw ? new Set(splitList(raw)) : null
+}
+
 function allowedModels() {
-  /** 模型白名单可由环境变量覆盖，避免部署后任意模型名都透传。 */
-  return new Set(splitList(process.env.AI_PROXY_ALLOWED_MODELS || DEFAULT_MODELS.join(',')))
+  /** 给 /ping 展示用的模型列表；未配置白名单时给出默认模型名。 */
+  return [...(configuredModels() || DEFAULT_MODELS)]
 }
 
 function providerCandidates(event, model) {
@@ -65,18 +70,12 @@ function errorMessage(error) {
 }
 
 function validateMessages(messages) {
-  /** 按插件约定限制消息体量，防止公网函数被大请求拖死。 */
+  /** 只校验结构，不限制消息条数或正文长度。 */
   if (!Array.isArray(messages) || messages.length === 0) return 'messages is required'
-  if (messages.length > 200) return 'too many messages'
-  let total = 0
   for (const message of messages) {
     if (!message || typeof message !== 'object') return 'message must be an object'
     if (typeof message.role !== 'string' || !message.role) return 'message.role is required'
-    const text = typeof message.content === 'string' ? message.content : JSON.stringify(message.content || '')
-    if (text.length > 500000) return 'a message is too large'
-    total += text.length
   }
-  if (total > 2000000) return 'messages are too large'
   return ''
 }
 
@@ -142,7 +141,8 @@ exports.main = async (event = {}) => {
 
   const model = String(event.model || '').trim()
   if (!model) return { error: { code: 'INVALID_REQUEST', message: 'model is required' } }
-  if (!allowedModels().has(model)) {
+  const allowed = configuredModels()
+  if (allowed && !allowed.has(model)) {
     return { error: { code: 'MODEL_NOT_ALLOWED', message: `model ${model} is not allowed by AI_PROXY_ALLOWED_MODELS` } }
   }
   const messages = event.messages
@@ -160,7 +160,10 @@ exports.main = async (event = {}) => {
   const tools = normalizeTools(event.tools)
   const toolChoice = normalizeToolChoice(event.tool_choice)
 
-  const input = { model, messages, maxSteps: 1 }
+  const input = { model, messages }
+  // 默认不限制 step 数；只有显式配置才透传上限给 SDK。
+  const maxSteps = Number(event.maxSteps || process.env.AI_PROXY_MAX_STEPS || 0)
+  if (maxSteps > 0) input.maxSteps = maxSteps
   if (tools.length) input.tools = tools
   if (toolChoice) input.tool_choice = toolChoice
   if (typeof event.temperature === 'number') input.temperature = event.temperature

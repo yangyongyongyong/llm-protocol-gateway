@@ -33,11 +33,6 @@ UPSTREAM_AUTH_HEADER = (os.environ.get("UPSTREAM_AUTH_HEADER", "Authorization") 
 MAX_CONCURRENCY = max(0, int(os.environ.get("PROVIDER_SCRIPT_MAX_CONCURRENCY", "0") or 0))
 REQUEST_TIMEOUT = max(0, int(os.environ.get("PROVIDER_SCRIPT_REQUEST_TIMEOUT_SEC", "0") or 0))
 DEFAULT_TIMEOUT = REQUEST_TIMEOUT or 150
-# Codex 的 Responses 历史会带较大的工具输出；4 MiB 足够覆盖当前 1M 上下文请求，
-# 同时仍给本地 adapter 留一个明确的防拖死边界。
-MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024
-MAX_MESSAGE_JSON_CHARS = 500_000
-MAX_TOTAL_MESSAGE_JSON_CHARS = 2_000_000
 SLOTS = threading.BoundedSemaphore(MAX_CONCURRENCY) if MAX_CONCURRENCY > 0 else None
 LOG_LOCK = threading.Lock()
 HEALTH_LOCK = threading.Lock()
@@ -315,17 +310,10 @@ def normalize_messages(messages: Any) -> list[dict[str, Any]]:
     """校验并浅拷贝 Chat messages，避免修改调用方对象。"""
     if not isinstance(messages, list) or not messages:
         raise ValueError("messages is required")
-    if len(messages) > 200:
-        raise ValueError("too many messages")
     out: list[dict[str, Any]] = []
-    total = 0
     for message in messages:
         if not isinstance(message, dict) or not str(message.get("role") or "").strip():
             raise ValueError("message.role is required")
-        text = json.dumps(message.get("content") or "", ensure_ascii=False)
-        total += len(text)
-        if len(text) > MAX_MESSAGE_JSON_CHARS or total > MAX_TOTAL_MESSAGE_JSON_CHARS:
-            raise ValueError("messages are too large")
         out.append(dict(message))
     return out
 
@@ -741,7 +729,6 @@ class CloudBaseHandler(BaseHTTPRequestHandler):
         transfer_encoding = (self.headers.get("Transfer-Encoding", "") or "").lower()
         if "chunked" in transfer_encoding:
             chunks: list[bytes] = []
-            total = 0
             while True:
                 size_line = self.rfile.readline(65537)
                 if not size_line:
@@ -757,9 +744,6 @@ class CloudBaseHandler(BaseHTTPRequestHandler):
                         if trailer in (b"\r\n", b"\n", b""):
                             break
                     break
-                total += size
-                if total > MAX_REQUEST_BODY_BYTES:
-                    raise ValueError("request body too large")
                 chunk = self.rfile.read(size)
                 if len(chunk) != size:
                     raise ValueError("incomplete chunked request body")
@@ -770,8 +754,8 @@ class CloudBaseHandler(BaseHTTPRequestHandler):
             return b"".join(chunks)
 
         length = int(self.headers.get("Content-Length", "0") or 0)
-        if length < 0 or length > MAX_REQUEST_BODY_BYTES:
-            raise ValueError("request body too large")
+        if length < 0:
+            raise ValueError("invalid Content-Length")
         return self.rfile.read(length) if length else b""
 
     def begin_sse(self) -> None:

@@ -263,11 +263,18 @@ func (rt *Runtime) Start(cfg Config) error {
 	}
 
 	state.WebExposed = rt.webExposed
+	// 内置连接器随二进制发布：每次启动都把最新定义合入状态，
+	// 这样升级后所有实例都能在「自定义连接器」目录里直接看到它。
+	gateway.EnsureBuiltinCustomProviders(&state)
 	router := gateway.NewRouter(state)
 	// The console compares its own build version against this one to offer the
 	// upgrade prompt, so it must be set before the first request is served.
 	gateway.SetBuildVersion(cfg.Version)
 	server := gateway.NewServer(router, logs, db)
+	// 内置脚本每次启动从二进制刷新，保证新版本适配器（例如 chunked 支持）真正生效。
+	if err := gateway.SyncBuiltinCustomProviderScripts(); err != nil {
+		slog.Warn("builtin connector script sync failed", "error", err)
+	}
 	server.RestoreSleepPrevention()
 	// 脚本 Provider 的转换进程不随网关重启自动保留，启动后统一恢复。
 	server.StartProviderScripts()

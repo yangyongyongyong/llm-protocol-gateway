@@ -41,6 +41,22 @@ func cloneCustomProvider(provider domain.CustomProvider) domain.CustomProvider {
 	return provider
 }
 
+func isBuiltinCustomProviderID(id string) bool {
+	for _, builtin := range builtinCustomProviders() {
+		if builtin.ID == strings.TrimSpace(id) {
+			return true
+		}
+	}
+	return false
+}
+
+func ensureNotBuiltin(provider domain.CustomProvider) error {
+	if provider.Builtin || isBuiltinCustomProviderID(provider.ID) {
+		return fmt.Errorf("custom provider %q is built in and cannot be modified", provider.ID)
+	}
+	return nil
+}
+
 // CustomProviders 返回模板快照，调用方不能直接修改 Router 内部状态。
 func (r *Router) CustomProviders() []domain.CustomProvider {
 	r.mu.RLock()
@@ -67,6 +83,9 @@ func (r *Router) AddCustomProvider(provider domain.CustomProvider) (domain.Custo
 	provider = normalizeCustomProvider(provider)
 	if provider.Name == "" {
 		return domain.CustomProvider{}, fmt.Errorf("custom provider name is required")
+	}
+	if err := ensureNotBuiltin(provider); err != nil {
+		return domain.CustomProvider{}, err
 	}
 	for _, item := range r.state.CustomProviders {
 		if strings.EqualFold(item.Name, provider.Name) {
@@ -115,8 +134,12 @@ func (r *Router) UpdateCustomProvider(id string, incoming domain.CustomProvider)
 				return domain.CustomProvider{}, fmt.Errorf("custom provider name %q already exists", incoming.Name)
 			}
 		}
+		if err := ensureNotBuiltin(r.state.CustomProviders[index]); err != nil {
+			return domain.CustomProvider{}, err
+		}
 		updated := incoming
 		updated.ID = id
+		updated.Builtin = r.state.CustomProviders[index].Builtin
 		updated.CreatedAt = r.state.CustomProviders[index].CreatedAt
 		updated.UpdatedAt = nowRFC3339()
 		r.state.CustomProviders[index] = updated
@@ -136,6 +159,9 @@ func (r *Router) DeleteCustomProvider(id string) error {
 	}
 	for index := range r.state.CustomProviders {
 		if r.state.CustomProviders[index].ID == id {
+			if err := ensureNotBuiltin(r.state.CustomProviders[index]); err != nil {
+				return err
+			}
 			r.state.CustomProviders = append(r.state.CustomProviders[:index], r.state.CustomProviders[index+1:]...)
 			return nil
 		}

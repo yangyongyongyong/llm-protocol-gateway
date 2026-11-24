@@ -663,6 +663,7 @@ export type CustomProvider = {
   defaultModel?: string;
   script: ProviderScript;
   scriptDir?: string;
+  builtin?: boolean;
   createdAt?: string;
   updatedAt?: string;
 };

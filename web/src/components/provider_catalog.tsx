@@ -93,9 +93,10 @@ export function ProviderCatalogDialog({
         >
           <BrandIcon icon={preset.icon} name={preset.name} className="provider-tile-icon" />
           <span className="provider-tile-name">{preset.name}</span>
+          {custom.builtin ? <span className="provider-tile-builtin">内置</span> : null}
           {added > 0 ? <span className="provider-tile-count">{added}</span> : null}
         </button>
-        {onDeleteCustomProvider ? (
+        {onDeleteCustomProvider && !custom.builtin ? (
           <button
             type="button"
             className="provider-custom-menu-trigger"
@@ -110,7 +111,7 @@ export function ProviderCatalogDialog({
         {menuOpen ? (
           <div className="provider-custom-menu-popover" role="menu">
             {onExportCustomProvider ? <button type="button" role="menuitem" onClick={() => { setOpenCustomMenuID(''); onExportCustomProvider(custom); }}>导出连接器</button> : null}
-            {onDeleteCustomProvider ? <button type="button" role="menuitem" className="danger" onClick={() => { setOpenCustomMenuID(''); onDeleteCustomProvider(custom); }}>删除连接器</button> : null}
+            {onDeleteCustomProvider && !custom.builtin ? <button type="button" role="menuitem" className="danger" onClick={() => { setOpenCustomMenuID(''); onDeleteCustomProvider(custom); }}>删除连接器</button> : null}
           </div>
         ) : null}
       </div>

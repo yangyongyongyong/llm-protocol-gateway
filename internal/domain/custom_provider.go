@@ -22,6 +22,9 @@ type CustomProvider struct {
 	Script ProviderScript `json:"script"`
 	// ScriptDir 是脚本在 App 数据目录中的实际落盘位置（运行时展示字段）。
 	ScriptDir string `json:"scriptDir,omitempty"`
+	// Builtin 标记随程序一起发布的连接器模板。内置定义每次启动都会用二进制
+	// 内的脚本刷新，不能删除或修改，避免升级后仍跑旧脚本。
+	Builtin   bool   `json:"builtin,omitempty"`
 	CreatedAt string `json:"createdAt,omitempty"`
 	UpdatedAt string `json:"updatedAt,omitempty"`
 }

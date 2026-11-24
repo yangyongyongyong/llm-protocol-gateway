@@ -7696,6 +7696,15 @@ html[data-theme="dark"] .pivot-entity-card:hover {
   font-size: var(--fs-xs);
   color: var(--accent-strong);
 }
+.provider-tile-builtin {
+  flex: 0 0 auto;
+  font-size: var(--fs-xs);
+  line-height: 1.4;
+  padding: 0 5px;
+  border: 1px solid var(--accent-border);
+  border-radius: 999px;
+  color: var(--accent-strong);
+}
 /* 品牌图标（BrandIcon）：彩色版按 <img> 显示；单色版（currentColor）走 mask 才
    跟着主题着色。尺寸由组件的行内 style 给，这里只管着色与占位。 */
 .brand-icon {

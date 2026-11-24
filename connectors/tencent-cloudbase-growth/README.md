@@ -63,9 +63,9 @@ npx -y -p @cloudbase/cli@latest tcb fn deploy aiProxy \
 - `{"action":"ping"}` 健康检查，不消耗模型额度
 - OpenAI Chat 请求字段 `model` / `messages` / `tools` / `tool_choice`
 - `providerHints`，默认对混元模型先试 `hunyuan-v3`，再试 `cloudbase`
-- `AI_PROXY_ALLOWED_MODELS` 模型白名单
+- `AI_PROXY_ALLOWED_MODELS` 模型白名单（仅显式设置时生效，默认不限制模型）
 - `AI_PROXY_PROVIDERS` provider 顺序覆盖
-- `maxSteps: 1`，工具调用只返回给客户端执行，不在云函数内自动执行
+- `AI_PROXY_MAX_STEPS` / `event.maxSteps` 步数上限（默认不限制）
 
 ## 导入连接器
 
@@ -94,7 +94,7 @@ tencent-cloudbase-growth.custom-connector.json
 
 ## 限制
 
-- adapter 兼容 `Content-Length` 与 `Transfer-Encoding: chunked` 请求体；单次请求体上限 4 MiB，单消息 500k 字符、消息总计 2M 字符（云函数同步使用同一口径）。
+- adapter 兼容 `Content-Length` 与 `Transfer-Encoding: chunked` 请求体；不对消息条数、消息长度或请求体大小做数量拦截，由上游/云函数自身决定可接受范围。
 - 云函数 HTTP 入口不支持真流式；客户端看到的是 adapter 按协议合成的 SSE，首字延迟约等于完整生成时间。
 - `@cloudbase/ai` 的 `generateText` 当前没有可靠的 `max_tokens` 入参，网关传入的输出上限不会严格限制云端生成长度；云函数 120 秒超时是最终硬边界。
 - Responses 的 `previous_response_id` 只保存在 adapter 内存中，TTL 24 小时、最多 128 条；adapter 重启后需要客户端重新发送完整历史。
