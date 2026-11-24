@@ -33,6 +33,11 @@ UPSTREAM_AUTH_HEADER = (os.environ.get("UPSTREAM_AUTH_HEADER", "Authorization") 
 MAX_CONCURRENCY = max(0, int(os.environ.get("PROVIDER_SCRIPT_MAX_CONCURRENCY", "0") or 0))
 REQUEST_TIMEOUT = max(0, int(os.environ.get("PROVIDER_SCRIPT_REQUEST_TIMEOUT_SEC", "0") or 0))
 DEFAULT_TIMEOUT = REQUEST_TIMEOUT or 150
+# Codex 的 Responses 历史会带较大的工具输出；4 MiB 足够覆盖当前 1M 上下文请求，
+# 同时仍给本地 adapter 留一个明确的防拖死边界。
+MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024
+MAX_MESSAGE_JSON_CHARS = 500_000
+MAX_TOTAL_MESSAGE_JSON_CHARS = 2_000_000
 SLOTS = threading.BoundedSemaphore(MAX_CONCURRENCY) if MAX_CONCURRENCY > 0 else None
 LOG_LOCK = threading.Lock()
 HEALTH_LOCK = threading.Lock()
@@ -319,7 +324,7 @@ def normalize_messages(messages: Any) -> list[dict[str, Any]]:
             raise ValueError("message.role is required")
         text = json.dumps(message.get("content") or "", ensure_ascii=False)
         total += len(text)
-        if len(text) > 100_000 or total > 400_000:
+        if len(text) > MAX_MESSAGE_JSON_CHARS or total > MAX_TOTAL_MESSAGE_JSON_CHARS:
             raise ValueError("messages are too large")
         out.append(dict(message))
     return out
@@ -732,9 +737,40 @@ class CloudBaseHandler(BaseHTTPRequestHandler):
             SLOTS.release()
 
     def read_body(self) -> bytes:
-        """读取并限制请求体大小。"""
+        """读取请求体，兼容网关转发时使用的 HTTP chunked 编码。"""
+        transfer_encoding = (self.headers.get("Transfer-Encoding", "") or "").lower()
+        if "chunked" in transfer_encoding:
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                size_line = self.rfile.readline(65537)
+                if not size_line:
+                    raise ValueError("incomplete chunked request body")
+                try:
+                    size = int(size_line.split(b";", 1)[0].strip(), 16)
+                except ValueError as exc:
+                    raise ValueError("invalid chunked request body") from exc
+                if size == 0:
+                    # 消费 trailer；标准客户端这里通常只剩一个空行。
+                    while True:
+                        trailer = self.rfile.readline(65537)
+                        if trailer in (b"\r\n", b"\n", b""):
+                            break
+                    break
+                total += size
+                if total > MAX_REQUEST_BODY_BYTES:
+                    raise ValueError("request body too large")
+                chunk = self.rfile.read(size)
+                if len(chunk) != size:
+                    raise ValueError("incomplete chunked request body")
+                chunks.append(chunk)
+                ending = self.rfile.read(2)
+                if ending not in (b"\r\n", b"\n"):
+                    raise ValueError("invalid chunk terminator")
+            return b"".join(chunks)
+
         length = int(self.headers.get("Content-Length", "0") or 0)
-        if length < 0 or length > 512 * 1024:
+        if length < 0 or length > MAX_REQUEST_BODY_BYTES:
             raise ValueError("request body too large")
         return self.rfile.read(length) if length else b""
 

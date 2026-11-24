@@ -73,10 +73,10 @@ function validateMessages(messages) {
     if (!message || typeof message !== 'object') return 'message must be an object'
     if (typeof message.role !== 'string' || !message.role) return 'message.role is required'
     const text = typeof message.content === 'string' ? message.content : JSON.stringify(message.content || '')
-    if (text.length > 100000) return 'a message is too large'
+    if (text.length > 500000) return 'a message is too large'
     total += text.length
   }
-  if (total > 400000) return 'messages are too large'
+  if (total > 2000000) return 'messages are too large'
   return ''
 }
 
