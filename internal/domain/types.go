@@ -1002,8 +1002,15 @@ type APIKey struct {
 	// switch like ModelOverride; ignored on every other provider type.
 	CodexForceFast bool `json:"codexForceFast,omitempty"`
 	// FallbackProviderIDs is an ordered list of backup input providers after the
-	// preferred provider on the bound route. Higher priority comes first.
+	// preferred provider on the bound route. Higher priority comes first. The
+	// same provider may appear more than once: each occurrence is a distinct
+	// chain row and may carry its own fixed model in FallbackModels.
 	FallbackProviderIDs []string `json:"fallbackProviderIds,omitempty"`
+	// FallbackModels is aligned with FallbackProviderIDs by index. It is the
+	// authoritative per-row model override for the fallback chain and is what
+	// lets two rows use the same provider with different models. An empty slot
+	// means this row inherits the request model / provider default.
+	FallbackModels []string `json:"fallbackModels,omitempty"`
 	// ScheduleMode decides which provider of the chain (preferred + fallbacks)
 	// answers a request. Empty and "order" keep the historical behavior: the
 	// preferred provider first, then the chain in the order the administrator
@@ -1014,9 +1021,11 @@ type APIKey struct {
 	// panels; accounts without a readable quota sit in the middle). "spread"
 	// balances conversations rather than load: a new conversation goes to the
 	// account holding the fewest live ones and stays there for two hours, so
-	// separate conversations run on separate accounts in parallel. A
-	// conversation's session pin still wins over all of them, so prompt caches
-	// survive; every mode still skips providers that are unavailable, disabled,
+	// separate conversations run on separate accounts in parallel.
+	// "provider_index" reserves the client model aliases p1/p2/... (and their
+	// [1m] spellings) for exact chain-row binding: p3 always uses the third row,
+	// even when duplicate provider ids occupy earlier rows, and bypasses session
+	// pins. Every mode still skips providers that are unavailable, disabled,
 	// revoked from the key's owner, or cross-protocol without a locked model.
 	ScheduleMode string `json:"scheduleMode,omitempty"`
 	// FallbackModelOverrides maps each fallback provider id to a required fixed
@@ -1064,6 +1073,7 @@ type KeyProfile struct {
 	ThinkingDepthOverride  string            `json:"thinkingDepthOverride,omitempty"`
 	MaxOutputTokens        int               `json:"maxOutputTokens,omitempty"`
 	FallbackProviderIDs    []string          `json:"fallbackProviderIds,omitempty"`
+	FallbackModels         []string          `json:"fallbackModels,omitempty"`
 	FallbackModelOverrides map[string]string `json:"fallbackModelOverrides,omitempty"`
 	StreamEnabled          bool              `json:"streamEnabled"`
 	// ScheduleMode mirrors APIKey.ScheduleMode: switching a scheme switches the

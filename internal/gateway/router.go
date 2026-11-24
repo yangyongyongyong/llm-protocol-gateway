@@ -1046,8 +1046,13 @@ func (r *Router) AddAPIKey(key domain.APIKey) (domain.APIKey, error) {
 	if route, ok := r.routeLocked(key.RouteID); ok {
 		preferredProviderID = route.ProviderID
 	}
-	key.FallbackProviderIDs = normalizeFallbackProviderIDs(key.FallbackProviderIDs, "")
-	key.FallbackModelOverrides = normalizeFallbackModelOverrides(key.FallbackProviderIDs, key.FallbackModelOverrides)
+	key.FallbackProviderIDs = normalizeFallbackProviderIDs(key.FallbackProviderIDs)
+	if key.FallbackModels == nil {
+		key.FallbackModels = fallbackModelsFromOverrides(key.FallbackProviderIDs, key.FallbackModelOverrides)
+	} else {
+		key.FallbackModels = normalizeFallbackModels(key.FallbackProviderIDs, key.FallbackModels)
+	}
+	key.FallbackModelOverrides = fallbackOverridesFromModels(key.FallbackProviderIDs, key.FallbackModels)
 	if err := r.validateFallbackModelOverridesLocked(preferredProviderID, key.FallbackProviderIDs, key.FallbackModelOverrides); err != nil {
 		return domain.APIKey{}, err
 	}
@@ -1228,26 +1233,27 @@ func (r *Router) UpdateAPIKey(keyID string, patch domain.APIKey) (domain.APIKey,
 		if route, ok := r.routeLocked(updated.RouteID); ok {
 			preferredProviderID = route.ProviderID
 		}
+		oldFallbackIDs := append([]string(nil), updated.FallbackProviderIDs...)
+		oldFallbackModels := append([]string(nil), updated.FallbackModels...)
+		oldFallbackOverrides := cloneStringMap(updated.FallbackModelOverrides)
 		if patch.FallbackProviderIDs != nil {
-			updated.FallbackProviderIDs = normalizeFallbackProviderIDs(patch.FallbackProviderIDs, preferredProviderID)
-			if patch.FallbackModelOverrides != nil {
-				updated.FallbackModelOverrides = normalizeFallbackModelOverrides(updated.FallbackProviderIDs, patch.FallbackModelOverrides)
-			} else {
-				updated.FallbackModelOverrides = normalizeFallbackModelOverrides(updated.FallbackProviderIDs, updated.FallbackModelOverrides)
-			}
-			if err := r.validateFallbackModelOverridesLocked(preferredProviderID, updated.FallbackProviderIDs, updated.FallbackModelOverrides); err != nil {
-				return domain.APIKey{}, err
-			}
+			updated.FallbackProviderIDs = normalizeFallbackProviderIDs(patch.FallbackProviderIDs)
 		} else {
-			updated.FallbackProviderIDs = normalizeFallbackProviderIDs(updated.FallbackProviderIDs, preferredProviderID)
-			if patch.FallbackModelOverrides != nil {
-				updated.FallbackModelOverrides = normalizeFallbackModelOverrides(updated.FallbackProviderIDs, patch.FallbackModelOverrides)
-				if err := r.validateFallbackModelOverridesLocked(preferredProviderID, updated.FallbackProviderIDs, updated.FallbackModelOverrides); err != nil {
-					return domain.APIKey{}, err
-				}
-			} else {
-				updated.FallbackModelOverrides = normalizeFallbackModelOverrides(updated.FallbackProviderIDs, updated.FallbackModelOverrides)
-			}
+			updated.FallbackProviderIDs = normalizeFallbackProviderIDs(updated.FallbackProviderIDs)
+		}
+		switch {
+		case patch.FallbackModels != nil:
+			updated.FallbackModels = normalizeFallbackModels(updated.FallbackProviderIDs, patch.FallbackModels)
+		case patch.FallbackModelOverrides != nil:
+			updated.FallbackModels = fallbackModelsFromOverrides(updated.FallbackProviderIDs, patch.FallbackModelOverrides)
+		case patch.FallbackProviderIDs != nil:
+			updated.FallbackModels = normalizeFallbackModels(updated.FallbackProviderIDs, reconcileFallbackModels(updated.FallbackProviderIDs, oldFallbackIDs, oldFallbackModels, oldFallbackOverrides))
+		default:
+			updated.FallbackModels = normalizeFallbackModels(updated.FallbackProviderIDs, oldFallbackModels)
+		}
+		updated.FallbackModelOverrides = fallbackOverridesFromModels(updated.FallbackProviderIDs, updated.FallbackModels)
+		if err := r.validateFallbackModelOverridesLocked(preferredProviderID, updated.FallbackProviderIDs, updated.FallbackModelOverrides); err != nil {
+			return domain.APIKey{}, err
 		}
 		updated.ActiveProviderID = sanitizeActiveProviderID(updated.ActiveProviderID, preferredProviderID, updated.FallbackProviderIDs)
 		// 首选 Provider 真的换了时清掉 Key 级粘滞位。旧值即便还留在备选链里，
@@ -1303,6 +1309,7 @@ func keyProfileFromKey(key domain.APIKey, id, name string) domain.KeyProfile {
 		ThinkingDepthOverride:  key.ThinkingDepthOverride,
 		MaxOutputTokens:        key.MaxOutputTokens,
 		FallbackProviderIDs:    cloneStringSlice(key.FallbackProviderIDs),
+		FallbackModels:         cloneStringSlice(key.FallbackModels),
 		FallbackModelOverrides: cloneStringMap(key.FallbackModelOverrides),
 		StreamEnabled:          key.StreamEnabled,
 		ScheduleMode:           key.ScheduleMode,
@@ -1409,6 +1416,7 @@ func (r *Router) UpdateKeyProfile(keyID, profileID string, profile domain.KeyPro
 		merged.ThinkingDepthOverride = profile.ThinkingDepthOverride
 		merged.MaxOutputTokens = profile.MaxOutputTokens
 		merged.FallbackProviderIDs = profile.FallbackProviderIDs
+		merged.FallbackModels = profile.FallbackModels
 		merged.FallbackModelOverrides = profile.FallbackModelOverrides
 		merged.StreamEnabled = profile.StreamEnabled
 		merged = r.normalizeProfileLocked(merged)
@@ -1474,12 +1482,13 @@ func (r *Router) normalizeProfileLocked(profile domain.KeyProfile) domain.KeyPro
 	profile.ModelAliases = normalizeModelAliases(profile.ModelAliases)
 	profile.ThinkingDepthOverride = strings.TrimSpace(profile.ThinkingDepthOverride)
 	profile.MaxOutputTokens = normalizeMaxOutputTokens(profile.MaxOutputTokens)
-	preferredProviderID := ""
-	if route, ok := r.routeLocked(profile.RouteID); ok {
-		preferredProviderID = route.ProviderID
+	profile.FallbackProviderIDs = normalizeFallbackProviderIDs(profile.FallbackProviderIDs)
+	if profile.FallbackModels == nil {
+		profile.FallbackModels = fallbackModelsFromOverrides(profile.FallbackProviderIDs, profile.FallbackModelOverrides)
+	} else {
+		profile.FallbackModels = normalizeFallbackModels(profile.FallbackProviderIDs, profile.FallbackModels)
 	}
-	profile.FallbackProviderIDs = normalizeFallbackProviderIDs(profile.FallbackProviderIDs, preferredProviderID)
-	profile.FallbackModelOverrides = normalizeFallbackModelOverrides(profile.FallbackProviderIDs, profile.FallbackModelOverrides)
+	profile.FallbackModelOverrides = fallbackOverridesFromModels(profile.FallbackProviderIDs, profile.FallbackModels)
 	if mode, err := normalizeScheduleMode(profile.ScheduleMode); err == nil {
 		profile.ScheduleMode = mode
 	}
@@ -1499,12 +1508,13 @@ func (r *Router) activateProfileLocked(key *domain.APIKey, profileID string) {
 	key.ModelAliases = normalizeModelAliases(profile.ModelAliases)
 	key.ThinkingDepthOverride = strings.TrimSpace(profile.ThinkingDepthOverride)
 	key.MaxOutputTokens = normalizeMaxOutputTokens(profile.MaxOutputTokens)
-	preferredProviderID := ""
-	if route, ok := r.routeLocked(key.RouteID); ok {
-		preferredProviderID = route.ProviderID
+	key.FallbackProviderIDs = normalizeFallbackProviderIDs(profile.FallbackProviderIDs)
+	if profile.FallbackModels == nil {
+		key.FallbackModels = fallbackModelsFromOverrides(key.FallbackProviderIDs, profile.FallbackModelOverrides)
+	} else {
+		key.FallbackModels = normalizeFallbackModels(key.FallbackProviderIDs, profile.FallbackModels)
 	}
-	key.FallbackProviderIDs = normalizeFallbackProviderIDs(profile.FallbackProviderIDs, preferredProviderID)
-	key.FallbackModelOverrides = normalizeFallbackModelOverrides(key.FallbackProviderIDs, profile.FallbackModelOverrides)
+	key.FallbackModelOverrides = fallbackOverridesFromModels(key.FallbackProviderIDs, key.FallbackModels)
 	key.StreamEnabled = profile.StreamEnabled
 	// A profile with a mode the key-level form would have rejected degrades to
 	// the default order rather than breaking routing: normalizeProfileLocked is
@@ -1546,40 +1556,117 @@ func (r *Router) SnapshotKeyProfile(keyID, name string, activate bool) (domain.A
 	return domain.APIKey{}, fmt.Errorf("api key %q not found", keyID)
 }
 
-func normalizeFallbackProviderIDs(ids []string, preferredProviderID string) []string {
-	preferredProviderID = strings.TrimSpace(preferredProviderID)
+func normalizeFallbackProviderIDs(ids []string) []string {
 	out := make([]string, 0, len(ids))
-	seen := map[string]struct{}{}
-	if preferredProviderID != "" {
-		seen[preferredProviderID] = struct{}{}
-	}
 	for _, id := range ids {
+		if id = strings.TrimSpace(id); id != "" {
+			// Duplicates are intentional. Two rows may point at the same
+			// provider and pin different models; provider_index distinguishes
+			// the rows by position, not by provider id.
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// normalizeFallbackModels keeps the list index-aligned with fallbackIDs. Empty
+// slots are meaningful ("inherit request model"), so they must not be dropped.
+func normalizeFallbackModels(fallbackIDs, models []string) []string {
+	if len(fallbackIDs) == 0 {
+		return nil
+	}
+	out := make([]string, len(fallbackIDs))
+	for i := range fallbackIDs {
+		if i < len(models) {
+			out[i] = strings.TrimSpace(models[i])
+		}
+	}
+	return out
+}
+
+func fallbackModelsFromOverrides(fallbackIDs []string, overrides map[string]string) []string {
+	if len(fallbackIDs) == 0 {
+		return nil
+	}
+	out := make([]string, len(fallbackIDs))
+	for i, id := range fallbackIDs {
+		if overrides != nil {
+			out[i] = strings.TrimSpace(overrides[strings.TrimSpace(id)])
+		}
+	}
+	return out
+}
+
+// fallbackOverridesFromModels keeps the legacy provider-id map in sync for old
+// clients. The aligned FallbackModels slice remains authoritative for duplicate
+// rows; the map can only carry the first occurrence of a provider.
+func fallbackOverridesFromModels(fallbackIDs, models []string) map[string]string {
+	if len(fallbackIDs) == 0 || len(models) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(models))
+	seen := make(map[string]bool, len(models))
+	for i, id := range fallbackIDs {
 		id = strings.TrimSpace(id)
-		if id == "" {
+		if id == "" || seen[id] || i >= len(models) {
 			continue
 		}
-		if _, ok := seen[id]; ok {
-			continue
+		seen[id] = true
+		if model := strings.TrimSpace(models[i]); model != "" {
+			out[id] = model
 		}
-		seen[id] = struct{}{}
-		out = append(out, id)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func reconcileFallbackModels(nextIDs, oldIDs, oldModels []string, oldOverrides map[string]string) []string {
+	if len(nextIDs) == 0 {
+		return nil
+	}
+	// The aligned model list is authoritative when it exists. For legacy keys
+	// without it, fall back to the provider-id map.
+	if len(oldModels) == 0 && len(oldOverrides) > 0 {
+		oldModels = fallbackModelsFromOverrides(oldIDs, oldOverrides)
+	}
+	used := make([]bool, len(oldIDs))
+	out := make([]string, len(nextIDs))
+	for i, id := range nextIDs {
+		for oldIndex, oldID := range oldIDs {
+			if used[oldIndex] || oldID != id {
+				continue
+			}
+			used[oldIndex] = true
+			if oldIndex < len(oldModels) {
+				out[i] = strings.TrimSpace(oldModels[oldIndex])
+			}
+			break
+		}
+		if out[i] == "" && oldOverrides != nil {
+			out[i] = strings.TrimSpace(oldOverrides[id])
+		}
 	}
 	return out
 }
 
 func normalizeFallbackModelOverrides(fallbackIDs []string, overrides map[string]string) map[string]string {
-	if len(fallbackIDs) == 0 {
+	if len(fallbackIDs) == 0 || len(overrides) == 0 {
 		return nil
 	}
-	out := make(map[string]string, len(fallbackIDs))
+	allowed := make(map[string]bool, len(fallbackIDs))
 	for _, id := range fallbackIDs {
-		model := ""
-		if overrides != nil {
-			model = strings.TrimSpace(overrides[id])
+		allowed[strings.TrimSpace(id)] = true
+	}
+	out := make(map[string]string, len(fallbackIDs))
+	for id, model := range overrides {
+		id = strings.TrimSpace(id)
+		model = strings.TrimSpace(model)
+		if !allowed[id] || model == "" {
+			continue
 		}
-		if model != "" {
-			out[id] = model
-		}
+		out[id] = model
 	}
 	if len(out) == 0 {
 		return nil
@@ -1633,6 +1720,72 @@ func apiKeyProviderChain(preferredProviderID string, fallbacks []string) []strin
 		chain = append(chain, id)
 	}
 	return chain
+}
+
+// providerChainEntry is one configured row. ProviderID may repeat across rows;
+// ModelOverride is resolved per row and is what makes duplicate providers
+// useful (same account, different default/locked model).
+type providerChainEntry struct {
+	ProviderID    string
+	ModelOverride string
+}
+
+func apiKeyProviderEntries(preferredProviderID string, key domain.APIKey) []providerChainEntry {
+	entries := make([]providerChainEntry, 0, 1+len(key.FallbackProviderIDs))
+	if id := strings.TrimSpace(preferredProviderID); id != "" {
+		entries = append(entries, providerChainEntry{ProviderID: id, ModelOverride: strings.TrimSpace(key.ModelOverride)})
+	}
+	models := key.FallbackModels
+	if models == nil {
+		models = fallbackModelsFromOverrides(key.FallbackProviderIDs, key.FallbackModelOverrides)
+	}
+	for i, id := range key.FallbackProviderIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		model := ""
+		if i < len(models) {
+			model = strings.TrimSpace(models[i])
+		}
+		entries = append(entries, providerChainEntry{ProviderID: id, ModelOverride: model})
+	}
+	return entries
+}
+
+func providerIndexEntryForKey(route domain.Route, key domain.APIKey, requestModel string) (providerChainEntry, error) {
+	index, ok := providerIndexAliasIndex(requestModel)
+	if !ok {
+		return providerChainEntry{}, nil
+	}
+	entries := apiKeyProviderEntries(route.ProviderID, key)
+	if index > len(entries) {
+		return providerChainEntry{}, fmt.Errorf("%w: p%d requested but the key has %d provider rows", errProviderIndexOutOfRange, index, len(entries))
+	}
+	return entries[index-1], nil
+}
+
+func apiKeyFallbackModel(key domain.APIKey, fallbackIndex int, providerID string) string {
+	if fallbackIndex >= 0 {
+		if key.FallbackModels != nil {
+			if fallbackIndex < len(key.FallbackModels) {
+				return strings.TrimSpace(key.FallbackModels[fallbackIndex])
+			}
+			return ""
+		}
+		return strings.TrimSpace(key.FallbackModelOverrides[strings.TrimSpace(providerID)])
+	}
+	return ""
+}
+
+func apiKeyFallbackModelForProvider(key domain.APIKey, providerID string) string {
+	providerID = strings.TrimSpace(providerID)
+	for i, id := range key.FallbackProviderIDs {
+		if strings.TrimSpace(id) == providerID {
+			return apiKeyFallbackModel(key, i, providerID)
+		}
+	}
+	return ""
 }
 
 func apiKeyEffectiveProviderIndex(activeID string, chain []string) int {
@@ -1748,14 +1901,26 @@ func (r *Router) DeleteProvider(providerID string) error {
 		if strings.TrimSpace(key.ActiveProviderID) == providerID {
 			key.ActiveProviderID = ""
 		}
-		cleaned := key.FallbackProviderIDs[:0]
-		for _, fallbackID := range key.FallbackProviderIDs {
-			if fallbackID != providerID {
-				cleaned = append(cleaned, fallbackID)
+		keptIDs := make([]string, 0, len(key.FallbackProviderIDs))
+		keptModels := make([]string, 0, len(key.FallbackProviderIDs))
+		for i, fallbackID := range key.FallbackProviderIDs {
+			if strings.TrimSpace(fallbackID) == providerID {
+				continue
+			}
+			keptIDs = append(keptIDs, fallbackID)
+			if key.FallbackModels != nil {
+				model := ""
+				if i < len(key.FallbackModels) {
+					model = key.FallbackModels[i]
+				}
+				keptModels = append(keptModels, model)
 			}
 		}
-		key.FallbackProviderIDs = cleaned
-		if key.FallbackModelOverrides != nil {
+		key.FallbackProviderIDs = keptIDs
+		if key.FallbackModels != nil {
+			key.FallbackModels = normalizeFallbackModels(keptIDs, keptModels)
+			key.FallbackModelOverrides = fallbackOverridesFromModels(key.FallbackProviderIDs, key.FallbackModels)
+		} else if key.FallbackModelOverrides != nil {
 			delete(key.FallbackModelOverrides, providerID)
 		}
 	}

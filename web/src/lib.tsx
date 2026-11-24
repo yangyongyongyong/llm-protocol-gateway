@@ -2315,7 +2315,11 @@ export function buildApiKeyPatchBody(key: APIKey, patch: Partial<APIKey> = {}) {
     codexForceFast: patch.codexForceFast ?? key.codexForceFast ?? false,
     enabled: patch.enabled ?? key.enabled,
     fallbackProviderIds: patch.fallbackProviderIds ?? key.fallbackProviderIds ?? [],
-    fallbackModelOverrides: patch.fallbackModelOverrides ?? key.fallbackModelOverrides ?? {},
+    fallbackModels: patch.fallbackModels ?? fallbackModelsForKey(key),
+    fallbackModelOverrides: patch.fallbackModelOverrides ?? fallbackModelOverridesFromModels(
+      patch.fallbackProviderIds ?? key.fallbackProviderIds ?? [],
+      patch.fallbackModels ?? fallbackModelsForKey(key),
+    ),
     scheduleMode: patch.scheduleMode ?? key.scheduleMode ?? '',
     // 额度三件套必须一起重发：后端把「没带字段」当成「保留原值」，但控制台走的是
     // 全量重发，这里漏一个就等于把别的字段顺手抹掉。
@@ -2345,6 +2349,7 @@ export const ScheduleModeOptions: { value: string; label: string; hint: string }
   { value: 'least_used', label: '最空闲优先（least_used）', hint: '按近几分钟各账号实际处理的 token 量排序，缓存命中不计入。' },
   { value: 'quota', label: '额度最多优先（quota）', hint: '读额度面板已缓存的窗口余量，剩得多的先用；读不到额度的账号排在中位。' },
   { value: 'spread', label: '会话分散（spread）', hint: '按每个账号当前挂着的活跃会话数排序：新会话落到会话最少的账号，之后钉在该账号两小时（Prompt Cache 最省）。不同会话并行在不同账号上。' },
+  { value: 'provider_index', label: 'Provider 序号绑定（provider_index）', hint: '客户端模型 p1/p2/...（以及 p1[1m]/p2[1m]）固定命中链路第 1/2/... 行；每行可重复同一 Provider 并锁定不同模型。该绑定优先于会话粘性和普通调度。' },
 ];
 
 export function scheduleModeLabel(mode?: string) {
@@ -2382,16 +2387,102 @@ export function apiKeyReferencesProvider(key: APIKey, routes: Route[], providerI
   return false;
 }
 
+type FallbackModelSource = {
+  fallbackProviderIds?: string[];
+  fallbackModels?: string[];
+  fallbackModelOverrides?: Record<string, string>;
+};
+
+/** 返回与 fallbackProviderIds 等长的模型数组；兼容旧版按 Provider ID 的映射。 */
+export function fallbackModelsForKey(key: FallbackModelSource): string[] {
+  const ids = key.fallbackProviderIds || [];
+  if (Array.isArray(key.fallbackModels)) {
+    return ids.map((_, index) => (key.fallbackModels?.[index] || '').trim());
+  }
+  return ids.map((id) => (key.fallbackModelOverrides?.[id] || '').trim());
+}
+
+/** 旧后端的 fallbackModelOverrides 只能表达每个 Provider 的第一次出现。 */
+export function fallbackModelOverridesFromModels(ids: string[], models: string[]): Record<string, string> {
+  const overrides: Record<string, string> = {};
+  const seen = new Set<string>();
+  for (let index = 0; index < ids.length; index += 1) {
+    const id = (ids[index] || '').trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const model = (models[index] || '').trim();
+    if (model) overrides[id] = model;
+  }
+  return overrides;
+}
+
 /**
- * fallbackAdd 把一批 Provider 追加到备选链末尾；已经在链上的跳过。
- * 备选链是有序的（先试的在前），新增一律排在末尾，不改动已有位次。
+ * 在链增删/重排后按「同一 Provider 的第 N 次出现」搬运固定模型。
+ * 这样重复行仍各带自己的模型，移动一行不会把模型错给下一行。
+ */
+export function reconcileFallbackModels(nextIds: string[], oldIds: string[], oldModels: string[]): string[] {
+  const used = new Array(oldIds.length).fill(false);
+  return nextIds.map((id) => {
+    for (let index = 0; index < oldIds.length; index += 1) {
+      if (used[index] || oldIds[index] !== id) continue;
+      used[index] = true;
+      return (oldModels[index] || '').trim();
+    }
+    return '';
+  });
+}
+
+/** 以行号移动一条链路（支持重复 Provider），模型数组同步搬运。 */
+export function moveFallbackRow(
+  ids: string[],
+  models: string[],
+  fromIndex: number,
+  toIndex: number,
+  after: boolean,
+): {ids: string[]; models: string[]} {
+  if (fromIndex < 0 || fromIndex >= ids.length || toIndex < 0 || toIndex >= ids.length || fromIndex === toIndex) {
+    return {ids, models};
+  }
+  const rows = ids.map((id, index) => ({id, model: models[index] || ''}));
+  const [row] = rows.splice(fromIndex, 1);
+  let target = toIndex;
+  if (fromIndex < toIndex) target -= 1;
+  rows.splice(after ? target + 1 : target, 0, row);
+  return {ids: rows.map((item) => item.id), models: rows.map((item) => item.model)};
+}
+
+/**
+ * 删除指定行号。返回新数组；调用方用引用相等判断是否真的变了。
+ */
+export function removeFallbackRows(ids: string[], models: string[], indexes: number[]): {ids: string[]; models: string[]} {
+  const drop = new Set(indexes);
+  if (drop.size === 0) return {ids, models};
+  return {
+    ids: ids.filter((_, index) => !drop.has(index)),
+    models: models.filter((_, index) => !drop.has(index)),
+  };
+}
+
+/** 清理指向已删除 Provider 的行，模型按同一行号一起保留。 */
+export function pruneFallbackRows(ids: string[], models: string[], validIds: Set<string>): {ids: string[]; models: string[]} {
+  const nextIds: string[] = [];
+  const nextModels: string[] = [];
+  ids.forEach((id, index) => {
+    if (!validIds.has(id)) return;
+    nextIds.push(id);
+    nextModels.push(models[index] || '');
+  });
+  return {ids: nextIds, models: nextModels};
+}
+
+/**
+ * fallbackAdd 把一批 Provider 追加到备选链末尾。同一 Provider 允许重复：
+ * provider_index 模式会把每一行当成独立的 pN 节点，可以锁不同模型。
  */
 export function fallbackAdd(ids: string[], add: string[]): string[] {
-  const have = new Set(ids);
   const next = ids.slice();
   for (const id of add) {
-    if (!id || have.has(id)) continue;
-    have.add(id);
+    if (!id) continue;
     next.push(id);
   }
   return next;
@@ -2545,6 +2636,45 @@ export function promoteApiKeyProvider(
     modelOverride: promotedModelOverride,
     fallbackProviderIds: ids,
     fallbackModelOverrides: overrides,
+  };
+}
+
+/**
+ * provider_index 版「设为首选」：按备选行号提升，不按 Provider ID。重复
+ * Provider 的不同行可以各自锁不同模型，按 ID 会拿错行。
+ */
+export function promoteApiKeyProviderAt(
+  promoteIndex: number,
+  fallbacks: {providerIds: string[]; models: string[]},
+  currentPrimaryProviderId: string,
+  currentPrimaryModelOverride = '',
+): {providerId: string; modelOverride: string; fallbackProviderIds: string[]; fallbackModels: string[]; fallbackModelOverrides: Record<string, string>} {
+  const ids = fallbacks.providerIds.slice();
+  const models = fallbacks.models.slice();
+  if (promoteIndex < 0 || promoteIndex >= ids.length) {
+    return {
+      providerId: currentPrimaryProviderId,
+      modelOverride: (currentPrimaryModelOverride || '').trim(),
+      fallbackProviderIds: ids,
+      fallbackModels: models,
+      fallbackModelOverrides: fallbackModelOverridesFromModels(ids, models),
+    };
+  }
+  const promotedId = ids[promoteIndex];
+  const promotedModel = (models[promoteIndex] || '').trim();
+  if (currentPrimaryProviderId.trim()) {
+    ids[promoteIndex] = currentPrimaryProviderId;
+    models[promoteIndex] = (currentPrimaryModelOverride || '').trim();
+  } else {
+    ids.splice(promoteIndex, 1);
+    models.splice(promoteIndex, 1);
+  }
+  return {
+    providerId: promotedId,
+    modelOverride: promotedModel,
+    fallbackProviderIds: ids,
+    fallbackModels: models,
+    fallbackModelOverrides: fallbackModelOverridesFromModels(ids, models),
   };
 }
 
@@ -2772,6 +2902,8 @@ export function buildApiKeyCodexModelCatalogJSON(key: APIKey, provider?: Provide
             : 'Extra high reasoning depth for complex problems',
   }));
   const defaultEffort = resolveCodexReasoningEffort(key);
+  const providerIndexEntries = codexProviderIndexReservedAliases(key);
+  const reservedAliasCount = CODEX_RESERVED_ALIASES.length + providerIndexEntries.length;
 
   const models = [...slugs].map((slug, index) => codexCatalogEntry({
     slug,
@@ -2780,7 +2912,7 @@ export function buildApiKeyCodexModelCatalogJSON(key: APIKey, provider?: Provide
     context: openCodeModelLimit(slug, provider, aliases).context,
     effort: defaultEffort,
     reasoningLevels,
-    priority: CODEX_RESERVED_ALIASES.length + index,
+    priority: reservedAliasCount + index,
   }));
   // 两个固定别名，和 Claude 侧同一套做法：客户端只认 default / default[1m]，
   // 真正用哪个模型由网关按这把 Key 的配置解析（ModelOverride → 默认模型）。
@@ -2790,10 +2922,11 @@ export function buildApiKeyCodexModelCatalogJSON(key: APIKey, provider?: Provide
   // 两者的差别只在窗口：default 报普通窗口，default[1m] 报 1M。Codex 按
   // context_window 决定什么时候压缩上下文，所以「要 1M 就用 default[1m]」在
   // 客户端侧就是一次模型切换。优先级排在最前，客户端菜单里一眼就能选到。
-  const reserved = CODEX_RESERVED_ALIASES.map((entry, index) => codexCatalogEntry({
+  const reservedEntries = [...CODEX_RESERVED_ALIASES, ...providerIndexEntries];
+  const reserved = reservedEntries.map((entry, index) => codexCatalogEntry({
     slug: entry.slug,
     displayName: entry.label,
-    description: `${entry.label} — 模型与 provider 在网关上切换`,
+    description: entry.description,
     context: entry.window,
     effort: defaultEffort,
     reasoningLevels,
@@ -2809,10 +2942,31 @@ export function buildApiKeyCodexModelCatalogJSON(key: APIKey, provider?: Provide
  * 配置解析成真实模型。窗口写死在目录里，因为 Codex 是按 context_window 决定
  * 何时压缩上下文的——「1M」这件事必须由客户端自己看见。
  */
-export const CODEX_RESERVED_ALIASES: ReadonlyArray<{slug: string; window: number; label: string}> = [
-  {slug: 'default', window: 128_000, label: 'Platform default'},
-  {slug: 'default[1m]', window: 1_000_000, label: 'Platform default (1M context)'},
+export const CODEX_RESERVED_ALIASES: ReadonlyArray<{slug: string; window: number; label: string; description: string}> = [
+  {slug: 'default', window: 128_000, label: 'Platform default', description: 'Platform default — 模型与 provider 在网关上切换'},
+  {slug: 'default[1m]', window: 1_000_000, label: 'Platform default (1M context)', description: 'Platform default (1M) — 模型与 provider 在网关上切换'},
 ];
+
+/** Codex 模型菜单最多公布 5 个 pN 槽位；后端本身支持任意正整数 pN。 */
+export const PROVIDER_INDEX_MODEL_LIMIT = 5;
+
+/**
+ * provider_index 模式下给 Codex 的 p1/p1[1m]… 菜单。只有该模式才发布：
+ * 普通调度里 pN 不是保留名，列出会让人误以为切了 provider。
+ */
+export function codexProviderIndexReservedAliases(key: Pick<APIKey, 'scheduleMode' | 'fallbackProviderIds'>): Array<{slug: string; window: number; label: string; description: string}> {
+  if ((key.scheduleMode || '') !== 'provider_index') return [];
+  const count = Math.min(PROVIDER_INDEX_MODEL_LIMIT, 1 + (key.fallbackProviderIds?.length || 0));
+  const out: Array<{slug: string; window: number; label: string; description: string}> = [];
+  for (let index = 1; index <= count; index += 1) {
+    const base = `p${index}`;
+    out.push(
+      {slug: base, window: 128_000, label: `${base} · row ${index}`, description: `Provider row ${index} (128K context)`},
+      {slug: `${base}[1m]`, window: 1_000_000, label: `${base}[1m] · row ${index}`, description: `Provider row ${index} (1M context)`},
+    );
+  }
+  return out;
+}
 
 /** codexCatalogEntry 拼一条 Codex 模型目录项，两个来源（固定别名、真实模型）共用。 */
 function codexCatalogEntry(input: {

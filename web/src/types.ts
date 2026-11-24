@@ -804,13 +804,16 @@ export type APIKey = {
   /** 强制该 Key 命中 ChatGPT OAuth(Codex) Provider 时开启 fast 档(service_tier=priority,消耗 2~2.5x)。默认关闭。 */
   codexForceFast?: boolean;
   fallbackProviderIds?: string[];
+  /** 与 fallbackProviderIds 按位置对齐；同一 Provider 重复出现时各自锁定不同模型。 */
+  fallbackModels?: string[];
+  /** 旧版按 Provider ID 记录的固定模型；新界面优先使用 fallbackModels。 */
   fallbackModelOverrides?: Record<string, string>;
   activeProviderId?: string;
   /** 运行期：最近一次真正返回响应的 Provider（「在服务」看它，而不是 activeProviderId）。 */
   servingProviderId?: string;
   /** 运行期：最近 10 分钟内真正返回过响应的全部 Provider（会话分散下它们同时「在服务」）。 */
   servingProviderIds?: string[];
-  /** 调度模式：'' / order 按链路顺序，rotate 轮流，least_used 挑近几分钟干活最少的，quota 挑额度剩得最多的，spread 把不同会话分到不同账号（每会话独占一个账号两小时）。会话粘性始终优先。 */
+  /** 调度模式：'' / order 按链路顺序，rotate 轮流，least_used 挑近几分钟干活最少的，quota 挑额度剩得最多的，spread 把不同会话分到不同账号（每会话独占一个账号两小时），provider_index 按客户端 pN 固定到第 N 行。会话粘性优先，但 provider_index 的 pN 绑定优先于会话粘性。 */
   scheduleMode?: string;
   /** 额度窗口：'' 不限 / 'day' 每天（网关本机时区 0 点重置）/ 'month' 每月 1 号 0 点。 */
   quotaWindow?: string;
@@ -835,6 +838,7 @@ export type KeyProfile = {
   thinkingDepthOverride?: string;
   maxOutputTokens?: number;
   fallbackProviderIds?: string[];
+  fallbackModels?: string[];
   fallbackModelOverrides?: Record<string, string>;
   streamEnabled?: boolean;
   scheduleMode?: string;

@@ -4720,14 +4720,18 @@ func (s *Server) handleUpdateAPIKey(w http.ResponseWriter, r *http.Request) {
 	}
 	if !jsonHasKey(body, "fallbackProviderIds") {
 		patch.FallbackProviderIDs = nil
+	} else if patch.FallbackProviderIDs == nil {
+		patch.FallbackProviderIDs = []string{}
+	}
+	if !jsonHasKey(body, "fallbackModels") {
+		patch.FallbackModels = nil
+	} else if patch.FallbackModels == nil {
+		patch.FallbackModels = []string{}
 	}
 	// A key never changes hands except through the admin-only ownerUserId
 	// patch below; dropping the field here stops a stale client payload from
 	// silently reassigning ownership back to "" (i.e. the administrator).
 	patch.OwnerUserID = ""
-	if patch.FallbackProviderIDs == nil {
-		patch.FallbackProviderIDs = []string{}
-	}
 	if !jsonHasKey(body, "fallbackModelOverrides") {
 		patch.FallbackModelOverrides = nil
 	} else if patch.FallbackModelOverrides == nil {
@@ -5015,16 +5019,9 @@ func (s *Server) modelsForRequest(r *http.Request) []domain.Model {
 	if !hasKey {
 		return models
 	}
-	// 覆盖模型与别名也要出现在 /models，避免客户端只认目录里的 slug。
-	extras := make([]string, 0, 1+len(matchedKey.ModelAliases))
-	if override := strings.TrimSpace(matchedKey.ModelOverride); override != "" {
-		extras = append(extras, override)
-	}
-	for alias := range matchedKey.ModelAliases {
-		if trimmed := strings.TrimSpace(alias); trimmed != "" {
-			extras = append(extras, trimmed)
-		}
-	}
+	// 保留别名、pN、Key 固定模型、映射别名两端以及每一行的固定模型，
+	// 都必须出现在 /models；这些名字只存在于 Key 配置里，上游目录不会提供。
+	extras := apiKeyCatalogModelIDs(matchedKey)
 	for _, id := range extras {
 		key := strings.ToLower(strings.TrimSpace(id))
 		if key == "" || seen[key] {
@@ -5032,6 +5029,9 @@ func (s *Server) modelsForRequest(r *http.Request) []domain.Model {
 		}
 		seen[key] = true
 		contextLen := 0
+		if strings.HasSuffix(strings.ToLower(id), claudeContextTag1M) {
+			contextLen = contextLength1M
+		}
 		pid := providerID
 		for _, model := range state.Models {
 			if strings.EqualFold(strings.TrimSpace(model.ID), id) {
@@ -5123,11 +5123,11 @@ func (s *Server) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	requestModel, _ := req["model"].(string)
 	if gatewayKeyMatched {
-		decision = s.decisionForAPIKeyProtocol(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID, route.ProviderID, matchedKey.ScheduleMode, matchedKey.FallbackProviderIDs...), domain.ProtocolOpenAIChat)
+		decision = s.decisionForAPIKeyProtocolRequest(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID, route.ProviderID, matchedKey.ScheduleMode, matchedKey.FallbackProviderIDs...), domain.ProtocolOpenAIChat, requestModel)
 	}
 
-	requestModel, _ := req["model"].(string)
 	model, logModel := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
 	r = attachAPIKeyMaxOutputTokens(r, matchedKey, gatewayKeyMatched)
 	thinkingOverride := ""
@@ -5247,11 +5247,11 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": err.Error(), "type": "gateway_error"}})
 		return
 	}
+	requestModel, _ := req["model"].(string)
 	if gatewayKeyMatched {
-		decision = s.decisionForAPIKeyProtocol(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID, route.ProviderID, matchedKey.ScheduleMode, matchedKey.FallbackProviderIDs...), domain.ProtocolOpenAIResponses)
+		decision = s.decisionForAPIKeyProtocolRequest(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID, route.ProviderID, matchedKey.ScheduleMode, matchedKey.FallbackProviderIDs...), domain.ProtocolOpenAIResponses, requestModel)
 	}
 
-	requestModel, _ := req["model"].(string)
 	model, logModel := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
 	r = attachAPIKeyMaxOutputTokens(r, matchedKey, gatewayKeyMatched)
 	thinkingOverride := ""
@@ -5745,11 +5745,11 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	requestModel, _ := req["model"].(string)
 	if gatewayKeyMatched {
-		decision = s.decisionForAPIKeyProtocol(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID, route.ProviderID, matchedKey.ScheduleMode, matchedKey.FallbackProviderIDs...), domain.ProtocolClaude)
+		decision = s.decisionForAPIKeyProtocolRequest(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID, route.ProviderID, matchedKey.ScheduleMode, matchedKey.FallbackProviderIDs...), domain.ProtocolClaude, requestModel)
 	}
 
-	requestModel, _ := req["model"].(string)
 	model, logModel := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
 	r = attachAPIKeyMaxOutputTokens(r, matchedKey, gatewayKeyMatched)
 	// 自助注册的上游是用户自己的服务：它要什么思考档位，客户端的请求已经说清楚
@@ -5830,6 +5830,7 @@ func (s *Server) handleClaudeCountTokens(w http.ResponseWriter, r *http.Request)
 		writeClaudeError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
+	requestModel, _ := req["model"].(string)
 	decision, err := s.router.DecideForProtocol(route.ID, domain.ProtocolClaude)
 	if err != nil {
 		writeClaudeError(w, http.StatusBadGateway, err.Error())
@@ -5840,7 +5841,7 @@ func (s *Server) handleClaudeCountTokens(w http.ResponseWriter, r *http.Request)
 	// 旧 Key 仍然能拿 token 计数（以及上游账号的额度）。这里补上同一条判定，
 	// 并把 decision 收窄到仍被授权的 Provider。
 	if gatewayKeyMatched {
-		decision = s.decisionForAPIKeyProtocol(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID, route.ProviderID, matchedKey.ScheduleMode, matchedKey.FallbackProviderIDs...), domain.ProtocolClaude)
+		decision = s.decisionForAPIKeyProtocolRequest(route, matchedKey, decision, sessionAffinityKey(r, req, matchedKey.ID, route.ProviderID, matchedKey.ScheduleMode, matchedKey.FallbackProviderIDs...), domain.ProtocolClaude, requestModel)
 		if decision.ProviderID == route.ProviderID && !s.providerAllowedForKeyOwner(matchedKey, decision.ProviderID) {
 			if strings.TrimSpace(matchedKey.OwnerUserID) == "" {
 				writeClaudeError(w, http.StatusServiceUnavailable, "no enabled provider on the key's provider chain")
@@ -5851,8 +5852,30 @@ func (s *Server) handleClaudeCountTokens(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	requestModel, _ := req["model"].(string)
 	model, logModel := resolveConsumerModel(s.router, route, matchedKey, gatewayKeyMatched, requestModel)
+	if gatewayKeyMatched && isScheduleModeProviderIndex(matchedKey.ScheduleMode) {
+		if _, ok := providerIndexAliasIndex(requestModel); ok {
+			entry, entryErr := providerIndexEntryForKey(route, matchedKey, requestModel)
+			if entryErr != nil {
+				writeClaudeError(w, http.StatusBadRequest, entryErr.Error())
+				return
+			}
+			provider, providerErr := s.router.ProviderByID(entry.ProviderID)
+			if providerErr != nil {
+				writeClaudeError(w, http.StatusBadGateway, providerErr.Error())
+				return
+			}
+			model = strings.TrimSpace(entry.ModelOverride)
+			if model == "" {
+				model = strings.TrimSpace(provider.DefaultModel)
+			}
+			if model == "" {
+				writeClaudeError(w, http.StatusBadRequest, fmt.Sprintf("provider index row %s has no model configured", entry.ProviderID))
+				return
+			}
+			logModel = finalizeRequestLogModel(logModel, model, model)
+		}
+	}
 	if model == "" || model == "request-model-not-set" {
 		writeClaudeError(w, http.StatusBadRequest, "model is required")
 		return

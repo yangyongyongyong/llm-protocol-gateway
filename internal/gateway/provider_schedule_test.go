@@ -60,7 +60,7 @@ func TestFailoverAttemptOrderMovesUnavailableLast(t *testing.T) {
 
 func TestNormalizeScheduleMode(t *testing.T) {
 	t.Parallel()
-	for _, accepted := range []string{"", "order", "rotate", "least_used", "quota", "spread", " Quota ", "ORDER", " Spread "} {
+	for _, accepted := range []string{"", "order", "rotate", "least_used", "quota", "spread", "provider_index", " Quota ", "ORDER", " Spread ", " Provider_Index "} {
 		mode, err := normalizeScheduleMode(accepted)
 		if err != nil {
 			t.Fatalf("%q rejected: %v", accepted, err)

@@ -1401,6 +1401,9 @@ var errProviderNotAssigned = errors.New("permission denied")
 // Retry-After instead of treating the model as a permanent 502.
 var errModelUnavailable = errors.New("model temporarily unavailable")
 
+var errProviderIndexOutOfRange = errors.New("provider index out of range")
+var errProviderIndexModelMissing = errors.New("provider index row has no model")
+
 type modelUnavailableError struct {
 	providerID string
 	model      string
@@ -1423,6 +1426,9 @@ func upstreamErrorStatus(err error) int {
 	}
 	if errors.Is(err, errModelUnavailable) {
 		return http.StatusTooManyRequests
+	}
+	if errors.Is(err, errProviderIndexOutOfRange) || errors.Is(err, errProviderIndexModelMissing) {
+		return http.StatusBadRequest
 	}
 	if errors.Is(err, errProviderSaturated) {
 		return http.StatusTooManyRequests
@@ -1484,7 +1490,27 @@ func (s *Server) executeProtocolFlowWithFailover(
 		return status, usage, body, decision, model, err
 	}
 
+	var providerIndexBinding providerChainEntry
+	providerIndexNumber := 0
+	providerIndexBound := false
+	if isScheduleModeProviderIndex(matchedKey.ScheduleMode) {
+		if number, ok := providerIndexAliasIndex(model); ok {
+			entry, err := providerIndexEntryForKey(route, matchedKey, model)
+			if err != nil {
+				return http.StatusBadRequest, TokenUsage{}, nil, decision, model, err
+			}
+			providerIndexBinding = entry
+			providerIndexNumber = number
+			providerIndexBound = true
+		}
+	}
 	chain := apiKeyProviderChain(route.ProviderID, matchedKey.FallbackProviderIDs)
+	if providerIndexBound {
+		// pN is a hard binding: exactly one row is attempted. The normal
+		// scheduler/failover chain must not turn p3 into p4 or collapse duplicate
+		// provider ids into a single candidate.
+		chain = []string{providerIndexBinding.ProviderID}
+	}
 	if len(chain) == 0 {
 		timer := startAttempt()
 		status, usage, body, err := s.executeProtocolFlow(w, r, route, decision, model, req, clientProtocol, skipIncomingAuth)
@@ -1532,16 +1558,24 @@ func (s *Server) executeProtocolFlowWithFailover(
 	}
 	// A conversation stays on the account that has its prompt cache, even when
 	// another conversation on this same key has moved the key-level sticky
-	// provider somewhere else.
-	sessionKey := sessionAffinityKey(r, req, matchedKey.ID, route.ProviderID, matchedKey.ScheduleMode, matchedKey.FallbackProviderIDs...)
-	attempts := s.failoverAttemptOrder(scheduleInput{
-		chain:   chain,
-		active:  matchedKey.ActiveProviderID,
-		mode:    matchedKey.ScheduleMode,
-		keyID:   matchedKey.ID,
-		advance: true,
-	})
-	attempts, pinnedProviderID := s.applySessionPin(sessionKey, attempts)
+	// provider somewhere else. provider_index intentionally bypasses both:
+	// the client's pN choice is the binding, not a scheduling preference.
+	sessionKey := ""
+	attempts := []string(nil)
+	pinnedProviderID := ""
+	if providerIndexBound {
+		attempts = []string{providerIndexBinding.ProviderID}
+	} else {
+		sessionKey = sessionAffinityKey(r, req, matchedKey.ID, route.ProviderID, matchedKey.ScheduleMode, matchedKey.FallbackProviderIDs...)
+		attempts = s.failoverAttemptOrder(scheduleInput{
+			chain:   chain,
+			active:  matchedKey.ActiveProviderID,
+			mode:    matchedKey.ScheduleMode,
+			keyID:   matchedKey.ID,
+			advance: true,
+		})
+		attempts, pinnedProviderID = s.applySessionPin(sessionKey, attempts)
+	}
 	// Provider 顺序完全由 Key 的调度规则决定；不为了协议直通重排候选。
 	// spread mode decides a conversation's account here, before the request is
 	// sent: two conversations that start at the same moment would both read an
@@ -1549,7 +1583,7 @@ func (s *Server) executeProtocolFlowWithFailover(
 	// candidate skipped, or the whole chain failing) must not leave the
 	// conversation anchored to an account that never answered it.
 	reservedProviderID := ""
-	if isScheduleModeSpread(matchedKey.ScheduleMode) && sessionKey != "" && pinnedProviderID == "" && len(attempts) > 0 {
+	if !providerIndexBound && isScheduleModeSpread(matchedKey.ScheduleMode) && sessionKey != "" && pinnedProviderID == "" && len(attempts) > 0 {
 		reservedProviderID = attempts[0]
 		s.setSessionPinFor(sessionKey, reservedProviderID, spreadSessionAffinityTTL)
 	}
@@ -1597,11 +1631,20 @@ func (s *Server) executeProtocolFlowWithFailover(
 		attemptModel := model
 		attemptKey := matchedKey
 		attemptProvider, _ := s.router.ProviderByID(providerID)
-		if providerID != strings.TrimSpace(route.ProviderID) {
-			override := ""
-			if matchedKey.FallbackModelOverrides != nil {
-				override = strings.TrimSpace(matchedKey.FallbackModelOverrides[providerID])
+		if providerIndexBound {
+			override := strings.TrimSpace(providerIndexBinding.ModelOverride)
+			if override == "" {
+				override = strings.TrimSpace(attemptProvider.DefaultModel)
 			}
+			if override == "" {
+				lastStatus = http.StatusBadRequest
+				lastErr = fmt.Errorf("%w: %s row %d (%s); lock a model on that row or set the provider default", errProviderIndexModelMissing, model, providerIndexNumber, providerID)
+				noteScheduleAttempt(r.Context(), monitor.RequestAttempt{ProviderID: providerID, Reason: attemptReasonUndecidable, Error: truncateReason(lastErr.Error()), Skipped: true})
+				continue
+			}
+			attemptKey.ModelOverride = override
+		} else if providerID != strings.TrimSpace(route.ProviderID) {
+			override := apiKeyFallbackModelForProvider(matchedKey, providerID)
 			// 跨协议备选不再强制要求锁定模型：模型解析会按备选自己的目录兜底
 			// （见 applyProviderModelFallback）。但转换器本身仍然要看两端：这条
 			// 链路真的要走转换、而对应的转换器没实现时，发出去只会换来一句 400，
@@ -1886,12 +1929,12 @@ func (s *Server) executeProtocolFlowWithFailover(
 		if providerID != strings.TrimSpace(route.ProviderID) {
 			desiredActive = providerID
 		}
-		pinnedThisTurn := pinnedProviderID != "" && providerID == pinnedProviderID
+		pinnedThisTurn := providerIndexBound || (pinnedProviderID != "" && providerID == pinnedProviderID)
 		// Spread mode is per conversation by definition: every conversation on
 		// this key sits somewhere else, so letting each of them write the
 		// key-level sticky provider would make it flip on every request (one
 		// row write each) and the value would mean nothing.
-		if isScheduleModeSpread(matchedKey.ScheduleMode) && sessionKey != "" {
+		if !providerIndexBound && isScheduleModeSpread(matchedKey.ScheduleMode) && sessionKey != "" {
 			pinnedThisTurn = true
 		}
 		if !pinnedThisTurn && strings.TrimSpace(matchedKey.ActiveProviderID) != desiredActive {
@@ -1909,7 +1952,9 @@ func (s *Server) executeProtocolFlowWithFailover(
 		// not an answer: pinning the conversation to it would keep sending the
 		// next turns to an account that just refused this one.
 		if !attemptFailoverWorthy {
-			s.setSessionPinFor(sessionKey, providerID, s.sessionPinTTL(matchedKey.ScheduleMode))
+			if !providerIndexBound {
+				s.setSessionPinFor(sessionKey, providerID, s.sessionPinTTL(matchedKey.ScheduleMode))
+			}
 			served = true
 			// An account answered this turn, so the refusals that came before it
 			// really were those accounts' own.
@@ -2190,6 +2235,22 @@ func (s *Server) decisionForAPIKey(route domain.Route, key domain.APIKey, fallba
 // 协议必须一路传到底：这里重算的那份 decision 决定了日志归属，也决定了
 // pass_through 还是 convert。用不带协议的老调用会把 route 上的 OutputProtocol
 // 又捡回来，等于把「一把 Key 多种协议」在临门一脚处废掉。
+func (s *Server) decisionForAPIKeyProtocolRequest(route domain.Route, key domain.APIKey, fallback domain.RouteDecision, sessionKey string, clientProtocol domain.Protocol, requestModel string) domain.RouteDecision {
+	if isScheduleModeProviderIndex(key.ScheduleMode) {
+		if _, ok := providerIndexAliasIndex(requestModel); ok {
+			entry, err := providerIndexEntryForKey(route, key, requestModel)
+			if err != nil || !s.providerAllowedForKeyOwner(key, entry.ProviderID) {
+				return fallback
+			}
+			if decision, err := s.router.DecideForProviderProtocol(route.ID, entry.ProviderID, clientProtocol); err == nil {
+				return decision
+			}
+			return fallback
+		}
+	}
+	return s.decisionForAPIKeyProtocol(route, key, fallback, sessionKey, clientProtocol)
+}
+
 func (s *Server) decisionForAPIKeyProtocol(route domain.Route, key domain.APIKey, fallback domain.RouteDecision, sessionKey string, clientProtocol domain.Protocol) domain.RouteDecision {
 	chain := apiKeyProviderChain(route.ProviderID, key.FallbackProviderIDs)
 	// Mirror the request-time authorization filter in

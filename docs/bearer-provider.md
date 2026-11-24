@@ -160,8 +160,10 @@ IP 被 GFW 识别，和请求频率无关。如需降频，可调大 `providerFa
   多协议上游会在当前 Provider 内先尝试同协议直通。直通失败且尚未向客户端提交内容时，才回退
   到该 Provider 的声明协议做转换。
 - **当前 Provider 不支持客户端协议**：网关自动做协议转换，不要求用户锁定模型。
-  `fallbackModelOverrides` 是可选项，仅在希望该备选始终使用某个模型时配置；未配置时仍按
-  “请求模型 → 备选目录 → 备选默认模型”的顺序自动解析。
+  `fallbackModels` 与 `fallbackProviderIds` 按位置对齐，是每个链路行的固定模型（旧客户端仍可发送
+  `fallbackModelOverrides`，读取时会按 Provider 首次出现归一化）；未配置时仍按
+  “请求模型 → 备选目录 → 备选默认模型”的顺序自动解析。同一 Provider 可以重复出现在不同行，
+  每行保留自己的固定模型。
 
 ### 6.1 尝试顺序：整条链都可以回头试
 一次请求先把链路过滤成**候选集**（`failoverAttemptOrder`，`internal/gateway/provider_schedule.go`）：
@@ -191,7 +193,8 @@ Provider 的使用顺序完全由 Key 的调度规则决定：首选、备选、
   顺序都会生成新的命名空间，旧 pin 不会继续压过新配置；空的默认模式与显式 `order`
   共用同一命名空间。`spread` 模式下窗口放宽到 2 小时，并在请求发出前先占位，避免两个
   同时开场的新会话都读到空表而挤到同一个账号。
-- 优先级：**会话 pin > 调度模式 > Key 粘滞**。pin 生效的那一轮不回写 `activeProviderId`，
+- 优先级：**会话 pin > 调度模式 > Key 粘滞**；`provider_index` 的 `pN` 行绑定例外，它优先于
+  会话 pin 与 Key 粘滞。pin 生效的那一轮不回写 `activeProviderId`，
   否则两个会话会把 Key 级粘滞来回抖动、每请求一次落库写。
 - 没带任何会话标识的请求行为不变，仍走 Key 级粘滞。
 
@@ -205,6 +208,9 @@ Key 级（也可存进"方案" `KeyProfile`，切方案一起切），空 = 现�
 | `least_used` | 在飞请求数最少的先用，其次看近 6 分钟实际处理过的 token（**缓存命中不计**） |
 | `quota` | 额度余量多的先用，数据来自额度面板已缓存的快照（Claude / ChatGPT / Cursor / 智谱 / DeepSeek / OpenCode Go），读不到的排在中位，**绝不在请求路径上打上游** |
 | `spread` | **会话分散**：新会话落到「当前挂着的活跃会话数最少」的账号，同数再按在飞/近 6 分钟负载、最后按链路顺序；定下后由会话 pin 钉住，两小时滑动。两个会话两个账号就各占一个，失败照常沿链漂移并改钉到新账号 |
+| `provider_index` | **按行绑定**：客户端模型 `p1`/`p2`/…（以及 `p1[1m]`/`p2[1m]`）固定命中链路第 1/2/… 行，只在那一行发送，不参与普通轮换或故障转移。Codex 一键模型目录按链路行数发布 `p1`～`p5`（每行普通/1M 两种）；同一 Provider 可重复成多行并各锁不同模型。行号超出当前链路返回 400。`/v1/models`、`/openai/v1/models`、`/anthropic/v1/models` 同时注入 `default`/`default[1m]`、`pN`/`pN[1m]`、Key 固定模型、模型别名键与目标、`fallbackModels` 中各行的固定模型 |
+
+模型目录注入只影响客户端发现，不会把上游真实目录删掉；上游真实模型仍按原规则列出。
 
 非法取值在保存时被拒绝（`normalizeScheduleMode`），不会静默退化成 `order`。
 

@@ -16,24 +16,25 @@ import (
 // Scheduling modes a key can choose. An empty mode is today's behavior, so a
 // key that was never touched keeps exactly the routing it has now.
 const (
-	scheduleModeOrder     = "order"
-	scheduleModeRotate    = "rotate"
-	scheduleModeLeastUsed = "least_used"
-	scheduleModeQuota     = "quota"
-	scheduleModeSpread    = "spread"
+	scheduleModeOrder         = "order"
+	scheduleModeRotate        = "rotate"
+	scheduleModeLeastUsed     = "least_used"
+	scheduleModeQuota         = "quota"
+	scheduleModeSpread        = "spread"
+	scheduleModeProviderIndex = "provider_index"
 )
 
 // ScheduleModes are the values the console may set ("" is accepted and means
 // the same as "order").
-var ScheduleModes = []string{"", scheduleModeOrder, scheduleModeRotate, scheduleModeLeastUsed, scheduleModeQuota, scheduleModeSpread}
+var ScheduleModes = []string{"", scheduleModeOrder, scheduleModeRotate, scheduleModeLeastUsed, scheduleModeQuota, scheduleModeSpread, scheduleModeProviderIndex}
 
 func normalizeScheduleMode(mode string) (string, error) {
 	trimmed := strings.ToLower(strings.TrimSpace(mode))
 	switch trimmed {
-	case "", scheduleModeOrder, scheduleModeRotate, scheduleModeLeastUsed, scheduleModeQuota, scheduleModeSpread:
+	case "", scheduleModeOrder, scheduleModeRotate, scheduleModeLeastUsed, scheduleModeQuota, scheduleModeSpread, scheduleModeProviderIndex:
 		return trimmed, nil
 	default:
-		return "", fmt.Errorf("unknown schedule mode %q (expected order, rotate, least_used, quota or spread)", mode)
+		return "", fmt.Errorf("unknown schedule mode %q (expected order, rotate, least_used, quota, spread or provider_index)", mode)
 	}
 }
 
@@ -41,6 +42,13 @@ func normalizeScheduleMode(mode string) (string, error) {
 // across accounts instead of picking by account-level load.
 func isScheduleModeSpread(mode string) bool {
 	return strings.EqualFold(strings.TrimSpace(mode), scheduleModeSpread)
+}
+
+// isScheduleModeProviderIndex reserves p1/p2/... for direct chain-row
+// selection. In this mode a request naming pN is bound to exactly that row;
+// the normal scheduler is not allowed to move it to another row.
+func isScheduleModeProviderIndex(mode string) bool {
+	return strings.EqualFold(strings.TrimSpace(mode), scheduleModeProviderIndex)
 }
 
 // sessionPinTTL is how long a conversation keeps its account under mode. The
@@ -97,6 +105,8 @@ func (s *Server) failoverAttemptOrder(input scheduleInput) []string {
 		ordered = s.quotaHeadroomChain(chain)
 	case scheduleModeSpread:
 		ordered = s.spreadChain(chain)
+	case scheduleModeProviderIndex:
+		ordered = append([]string(nil), chain...)
 	default:
 		ordered = rotateChainAt(chain, input.active)
 	}

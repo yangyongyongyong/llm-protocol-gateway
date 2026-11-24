@@ -104,7 +104,8 @@ import {
     normalizeRequestStats,
     parseSSEStreamContent,
     pickCustomDomainRoot,
-    promoteApiKeyProvider,
+    fallbackModelsForKey,
+    promoteApiKeyProviderAt,
     protocolFromLabel,
     protocolIcon,
     protocolLabel,
@@ -4978,24 +4979,18 @@ function App() {
     }
   }
 
-  // promoteApiKeyFallback 是「设为首选」：一次 PATCH 同时交绑定与备选列表。
-  //
-  // 以前这个按钮只改 routeId，后端随后把新首选从备选里剔掉（normalizeFallback
-  // ProviderIDs），旧首选又不补回来 —— 每点一次就少一个节点。现在按「交换」
-  // 提交：旧首选回到被提升者原来的位次，其余备选顺序不变。
-  //
-  // 输出协议保持首选接线原样：客户端手里的协议不因为换了一台上游就变，母语协议
-  // 不同时由网关转换。固定模型跟着 Provider 走，由 promoteApiKeyProvider 搬。
-  async function promoteApiKeyFallback(key: APIKey, promoteProviderId: string) {
+  // promoteApiKeyFallback 按「备选行号」提升，不按 Provider ID：同一
+  // Provider 可以重复出现，每行锁不同模型；按 ID 会拿错被提升的那一行。
+  async function promoteApiKeyFallback(key: APIKey, promoteIndex: number) {
     const currentRoute = state.routes.find((item) => item.id === key.routeId);
     const currentPrimaryId = currentRoute?.providerId || '';
-    if (promoteProviderId === currentPrimaryId) return;
-    const swap = promoteApiKeyProvider(
-      promoteProviderId,
-      {
-        providerIds: key.fallbackProviderIds || [],
-        modelOverrides: key.fallbackModelOverrides || {},
-      },
+    const fallbackIds = key.fallbackProviderIds || [];
+    if (promoteIndex < 0 || promoteIndex >= fallbackIds.length) return;
+    const promoteProviderId = fallbackIds[promoteIndex];
+    if (!promoteProviderId || promoteProviderId === currentPrimaryId) return;
+    const swap = promoteApiKeyProviderAt(
+      promoteIndex,
+      {providerIds: fallbackIds, models: fallbackModelsForKey(key)},
       currentPrimaryId,
       key.modelOverride || '',
     );
@@ -5011,6 +5006,7 @@ function App() {
           // 旧首选带着原主模型进入备选，两边都不会被清空。
           modelOverride: swap.modelOverride,
           fallbackProviderIds: swap.fallbackProviderIds,
+          fallbackModels: swap.fallbackModels,
           fallbackModelOverrides: swap.fallbackModelOverrides,
         })),
       });
@@ -5034,13 +5030,13 @@ function App() {
     await fetchProviderModels(provider.id, providerName || provider.name);
   }
 
-  async function updateApiKeyFallbacks(key: APIKey, fallbackProviderIds: string[], fallbackModelOverrides: Record<string, string>) {
+  async function updateApiKeyFallbacks(key: APIKey, fallbackProviderIds: string[], fallbackModels: string[]) {
     setSaving(true);
     try {
       const response = await fetch(`${API_BASE}/__apikeys/${encodeURIComponent(key.id)}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(buildApiKeyPatchBody(key, { fallbackProviderIds, fallbackModelOverrides })),
+        body: JSON.stringify(buildApiKeyPatchBody(key, {fallbackProviderIds, fallbackModels})),
       });
       if (!response.ok) throw new Error(await response.text());
       showToast(`已更新备选 Provider：${key.name}`);

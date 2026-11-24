@@ -16,6 +16,8 @@ import {
     clientConfigTitle,
     copyToClipboard,
     formatCostMicros,
+    fallbackModelOverridesFromModels,
+    fallbackModelsForKey,
     formatTokenCount,
     getApiKeyBinding,
     localGatewayRoot,
@@ -23,6 +25,7 @@ import {
     protocolFromLabel,
     protocolLabel,
     QuotaWindowOptions,
+    reconcileFallbackModels,
     scheduleModeLabel,
     ScheduleModeOptions,
     thinkingDepthSelectOptions,
@@ -148,9 +151,9 @@ export function ApiKeyDetailPanel({
   onUpdateField: (key: APIKey, field: ApiKeyEditableField, value: string | boolean | number) => Promise<void>;
   onUpdateBinding: (key: APIKey, providerId: string, outputProtocol: Protocol) => Promise<void>;
   // 备选「设为首选」：绑定与备选列表一次提交（交换，不删节点）。
-  onPromoteFallback: (key: APIKey, providerId: string) => Promise<void>;
+  onPromoteFallback: (key: APIKey, fallbackIndex: number) => Promise<void>;
   onUpdateModelAliases: (key: APIKey, modelAliases: Record<string, string>) => Promise<void>;
-  onUpdateFallbacks: (key: APIKey, fallbackProviderIds: string[], fallbackModelOverrides: Record<string, string>) => Promise<void>;
+  onUpdateFallbacks: (key: APIKey, fallbackProviderIds: string[], fallbackModels: string[]) => Promise<void>;
   onDelete: (key: APIKey) => Promise<void>;
   onClone: (key: APIKey) => void;
   onRefreshModels: (providerId: string, providerName: string) => Promise<void>;
@@ -177,7 +180,7 @@ export function ApiKeyDetailPanel({
   const activeProfile = profiles.find((item) => item.id === activeProfileId);
   const primaryProvider = providers.find((item) => item.id === binding.providerId);
   const fallbackIds = keyItem.fallbackProviderIds || [];
-  const fallbackModelOverrides = keyItem.fallbackModelOverrides || {};
+  const fallbackModels = fallbackModelsForKey(keyItem);
   const activeProviderId = keyItem.activeProviderId || binding.providerId;
   const activeProvider = providers.find((item) => item.id === activeProviderId);
   const usingFallback = Boolean(keyItem.activeProviderId && keyItem.activeProviderId !== binding.providerId);
@@ -186,7 +189,8 @@ export function ApiKeyDetailPanel({
   const servingIds = keyItem.servingProviderIds?.length
     ? keyItem.servingProviderIds
     : [keyItem.servingProviderId || activeProviderId].filter(Boolean);
-  const activeFallbackModel = usingFallback ? (fallbackModelOverrides[keyItem.activeProviderId || ''] || '') : '';
+  const activeFallbackIndex = usingFallback ? fallbackIds.indexOf(keyItem.activeProviderId || '') : -1;
+  const activeFallbackModel = activeFallbackIndex >= 0 ? (fallbackModels[activeFallbackIndex] || '') : '';
   // 备选没有固定模型时由网关自动解析：优先沿用请求模型，模型不在备选目录时用
   // 备选自己的默认模型；协议不同则由网关负责转换，不需要用户额外锁定模型。
   const activeFallbackUsesAutoModel = usingFallback && !activeFallbackModel;
@@ -206,7 +210,8 @@ export function ApiKeyDetailPanel({
       thinkingDepthOverride: keyItem.thinkingDepthOverride,
       maxOutputTokens: keyItem.maxOutputTokens && keyItem.maxOutputTokens > 0 ? keyItem.maxOutputTokens : 0,
       fallbackProviderIds: [...(keyItem.fallbackProviderIds || [])],
-      fallbackModelOverrides: { ...(keyItem.fallbackModelOverrides || {}) },
+      fallbackModels: fallbackModelsForKey(keyItem),
+      fallbackModelOverrides: fallbackModelOverridesFromModels(keyItem.fallbackProviderIds || [], fallbackModelsForKey(keyItem)),
       streamEnabled: keyItem.streamEnabled !== false,
       scheduleMode: keyItem.scheduleMode || '',
     };
@@ -437,7 +442,7 @@ export function ApiKeyDetailPanel({
           <div className="detail-section">
             <div className="detail-section-head">
               <div className="detail-section-title">备选与故障转移</div>
-              <button className="mini-btn" type="button" disabled={saving || !binding.providerId || providers.length < 2} onClick={() => setFallbackModalOpen(true)}>
+              <button className="mini-btn" type="button" disabled={saving || !binding.providerId || providers.length === 0} onClick={() => setFallbackModalOpen(true)}>
                 配置备选
               </button>
             </div>
@@ -447,7 +452,7 @@ export function ApiKeyDetailPanel({
                 而不是只看粘滞位。 */}
             <div className="fallback-chain">
               <FallbackChainRow
-                rank="首选"
+                rank={(keyItem.scheduleMode || '') === 'provider_index' ? 'p1' : '首选'}
                 provider={primaryProvider}
                 missingLabel="未绑定"
                 modelLabel={keyItem.modelOverride || '按客户端模型'}
@@ -457,12 +462,12 @@ export function ApiKeyDetailPanel({
               {fallbackIds.map((id, index) => {
                 const serving = servingIds.includes(id);
                 const fallbackProvider = providers.find((item) => item.id === id);
-                const modelOverride = fallbackModelOverrides[id];
+                const modelOverride = fallbackModels[index] || '';
                 const inheritsModel = !modelOverride && sameProtocolAsPrimary(fallbackProvider);
                 return (
                   <FallbackChainRow
-                    key={id}
-                    rank={`备选 ${index + 1}`}
+                    key={`${id}:${index}`}
+                    rank={(keyItem.scheduleMode || '') === 'provider_index' ? `p${index + 2}` : `备选 ${index + 1}`}
                     provider={fallbackProvider}
                     missingLabel={id}
                     modelLabel={modelOverride || (fallbackProvider ? (inheritsModel ? '按请求模型' : '自动解析模型') : '未锁定模型')}
@@ -500,7 +505,11 @@ export function ApiKeyDetailPanel({
                     <option key={option.value} value={option.value}>{option.label}</option>
                   ))}
                 </select>
-                <div className="hint-text">同一段对话仍然钉在它已建好缓存的账号上（会话粘性优先于调度模式）；被标记「异常」的候选永远排在最后，但不会被跳过。</div>
+                <div className="hint-text">{
+                  (keyItem.scheduleMode || '') === 'provider_index'
+                    ? 'Codex 选 p1/p2/... 时固定命中对应行；[1m] 只切换客户端上下文窗口。该绑定优先于会话粘性，请按行配置好固定模型。'
+                    : '同一段对话仍然钉在它已建好缓存的账号上（会话粘性优先于调度模式）；被标记「异常」的候选永远排在最后，但不会被跳过。'
+                }</div>
               </div>
             ) : null}
             {/* 额度也是「这把 Key 能干什么」的治理项，和调度放同一节。 */}
@@ -588,13 +597,13 @@ export function ApiKeyDetailPanel({
           providerGroups={providerGroups}
           models={models}
           selectedIds={fallbackIds}
-          modelOverrides={fallbackModelOverrides}
+          modelValues={fallbackModels}
           saving={saving}
           testingProviderID={testingProviderID}
           onRefreshModels={onRefreshModels}
           onClose={() => setFallbackModalOpen(false)}
-          onSave={async (ids, overrides) => {
-            await onUpdateFallbacks(keyItem, ids, overrides);
+          onSave={async (ids, rowModels) => {
+            await onUpdateFallbacks(keyItem, ids, rowModels);
             setFallbackModalOpen(false);
           }}
         />
@@ -635,7 +644,7 @@ export function ApiKeyFallbackProvidersModal({
   providerGroups = [],
   models,
   selectedIds,
-  modelOverrides,
+  modelValues,
   saving,
   testingProviderID,
   onRefreshModels,
@@ -648,7 +657,8 @@ export function ApiKeyFallbackProvidersModal({
   providerGroups?: ProviderGroup[];
   models: Model[];
   selectedIds: string[];
-  modelOverrides: Record<string, string>;
+  /** 与 selectedIds 按位置对齐；重复 Provider 的每一行可各锁不同模型。 */
+  modelValues: string[];
   // 备选里指向已删除 Provider 的条数：它们不在 selectedIds 里，保存时会被一并清掉。
   // 只在提示里说明数量，不必把每个孤儿 id 都列出来。
   staleCount?: number;
@@ -656,64 +666,50 @@ export function ApiKeyFallbackProvidersModal({
   testingProviderID: string;
   onRefreshModels: (providerId: string, providerName: string) => Promise<void>;
   onClose: () => void;
-  onSave: (ids: string[], overrides: Record<string, string>) => Promise<void>;
+  onSave: (ids: string[], models: string[]) => Promise<void>;
 }) {
-  const candidates = providers.filter((item) => item.id !== preferredProviderId);
+  // 首选 Provider 也留在候选里：它可以在后面的行再次出现并锁定另一个模型。
+  const candidates = providers;
   const primaryProvider = providers.find((item) => item.id === preferredProviderId);
   // 同协议 = 上游说同一种 API 方言；跨协议由网关自动转换。两种备选都不要求
   // 用户锁定模型，固定模型只用于明确希望该节点始终使用某个模型时。
   const sameProtocol = (provider: Provider) => Boolean(primaryProvider && provider.protocol === primaryProvider.protocol);
-  // 备选链就是一个有序 id 列表；增删、排序都只改它，保存时再落盘。
-  const [orderedIds, setOrderedIds] = useState<string[]>(() => (
-    selectedIds.filter((id) => id !== preferredProviderId && providers.some((item) => item.id === id))
-  ));
-  const [overrides, setOverrides] = useState<Record<string, string>>(() => {
-    const next: Record<string, string> = {};
-    for (const id of selectedIds) {
-      const model = (modelOverrides[id] || '').trim();
-      if (model) next[id] = model;
-    }
-    return next;
-  });
+  const initialRows = selectedIds
+    .map((id, index) => ({id, model: (modelValues[index] || '').trim()}))
+    .filter((row) => providers.some((item) => item.id === row.id));
+  const [orderedIds, setOrderedIds] = useState<string[]>(() => initialRows.map((row) => row.id));
+  const [rowModels, setRowModels] = useState<string[]>(() => initialRows.map((row) => row.model));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const selectedProviders = orderedIds
-    .map((id) => candidates.find((item) => item.id === id))
-    .filter((item): item is Provider => Boolean(item));
-  const crossProtocolProviders = selectedProviders.filter((item) => !sameProtocol(item));
+  const selectedProviders = orderedIds.map((id) => candidates.find((item) => item.id === id));
+  const crossProtocolProviders = selectedProviders.filter((item): item is Provider => item !== undefined && !sameProtocol(item));
 
-  // 链变短时顺手清掉被移除 Provider 的模型覆盖，免得它下次被加回来时带着旧值。
+  // 增删/重排后按 Provider 的第 N 次出现搬运模型。不能按 id 建 map，否则
+  // 同一 Provider 的第二行会把第一行的模型覆盖掉。
   const applyChain = (next: string[]) => {
     setError('');
+    setRowModels((current) => reconcileFallbackModels(next, orderedIds, current));
     setOrderedIds(next);
-    setOverrides((current) => {
-      const kept: Record<string, string> = {};
-      for (const id of next) {
-        const model = (current[id] || '').trim();
-        if (model) kept[id] = model;
-      }
-      return kept;
-    });
   };
 
-  function setProviderModel(id: string, model: string) {
+  function setProviderModel(index: number, model: string) {
     setError('');
-    setOverrides((current) => ({ ...current, [id]: model }));
+    setRowModels((current) => {
+      const next = current.slice();
+      while (next.length < orderedIds.length) next.push('');
+      next[index] = model;
+      return next;
+    });
   }
 
-  // 批量设置固定模型。
-  //
-  // 这块以前只能一个个点：备选一多（同一家的多个账号就是 N 行），要设成同一个模型就得
-  // 点 N 次下拉、每次还要在同一个清单里翻一遍。下面这条批量栏把「选一次，落一片」做掉：
-  //   · 候选模型取所选备选清单的并集（同厂商多账号共用一个清单，这是最常见的情况）；
-  //   · 应用时只写给「模型清单里确实有它」的 Provider，跳过的条数如实报出来 ——
-  //     写一个该 Provider 不认的模型，等于把那一跳彻底弄坏，比不设更糟。
+  // 批量设置固定模型。按行遍历而不是按唯一 Provider，重复行才有机会分别保留。
   const [batchModel, setBatchModel] = useState('');
   const [batchNotice, setBatchNotice] = useState('');
   const batchModels = (() => {
     const seen = new Set<string>();
     const out: Model[] = [];
     for (const provider of selectedProviders) {
+      if (!provider) continue;
       for (const model of models.filter((item) => item.providerId === provider.id)) {
         const id = (model.id || '').trim();
         if (!id || seen.has(id)) continue;
@@ -733,36 +729,38 @@ export function ApiKeyFallbackProvidersModal({
     setError('');
     let applied = 0;
     const skipped: string[] = [];
-    setOverrides((current) => {
-      const next = { ...current };
-      for (const provider of selectedProviders) {
-        const has = models.some((model) => model.providerId === provider.id && (model.id || '').trim() === target);
+    setRowModels((current) => {
+      const next = current.slice();
+      while (next.length < orderedIds.length) next.push('');
+      orderedIds.forEach((id, index) => {
+        const has = models.some((model) => model.providerId === id && (model.id || '').trim() === target);
         if (has) {
-          next[provider.id] = target;
+          next[index] = target;
           applied += 1;
         } else {
-          skipped.push(provider.name);
+          const provider = providers.find((item) => item.id === id);
+          skipped.push(provider?.name || id);
         }
-      }
+      });
       return next;
     });
     setBatchNotice(
       skipped.length === 0
-        ? `已把 ${applied} 个备选设为 ${target}`
-        : `已设置 ${applied} 个；${skipped.length} 个没有该模型，已跳过（${skipped.slice(0, 3).join('、')}${skipped.length > 3 ? '…' : ''}）`,
+        ? `已把 ${applied} 个候选行设为 ${target}`
+        : `已设置 ${applied} 行；${skipped.length} 行没有该模型，已跳过（${skipped.slice(0, 3).join('、')}${skipped.length > 3 ? '…' : ''}）`,
     );
   };
 
   const clearAllOverrides = () => {
     setError('');
-    setOverrides({});
-    setBatchNotice('已清空全部固定模型：每个备选都沿用请求模型或各自默认模型。');
+    setRowModels(orderedIds.map(() => ''));
+    setBatchNotice('已清空全部固定模型：每一行都沿用请求模型或各自默认模型。');
   };
 
   return (
     <Modal
       title="配置备选 Provider"
-      description="左侧挑选要串进降级链的 Provider（#1 最先试），中间是当前顺序，右侧给每个备选固定模型（可选）。同协议直接转发，跨协议由网关自动转换；固定模型留空时自动沿用请求模型或该 Provider 的默认模型。"
+      description="左侧挑选要串进链路的 Provider（#1 最先试）。同一 Provider 可以重复添加，右侧按行给每一次出现锁定不同模型；provider_index 模式下客户端 pN 会固定命中第 N 行。"
       onClose={onClose}
       size="xwide"
     >
@@ -773,100 +771,98 @@ export function ApiKeyFallbackProvidersModal({
           </div>
         ) : null}
         {candidates.length === 0 ? (
-          <div className="empty-state compact">没有可配置的备选 Provider，请先添加更多输入 Provider。</div>
+          <div className="empty-state compact">没有可配置的 Provider，请先添加输入 Provider。</div>
         ) : (
-          <>
-            <FallbackProviderPicker
-              providers={candidates}
-              providerGroups={providerGroups}
-              selectedIds={orderedIds}
-              sameProtocol={sameProtocol}
-              onChange={applyChain}
-              thirdColumn={selectedProviders.length > 0 ? (
-                // 固定模型替换作为第三列，和「可选 / 备选链」并排。
-                // 它原来是双栏下面另起的一段（还带折叠 + 自己的滚动），于是页面上出现
-                // 两个上下堆着的大下拉，再加第二个滚轮。并排之后：同一行读「选谁 →
-                // 谁先 → 每台用哪个模型」，是同一件事的三个面，不用来回上下找。
-                <section className="fpp-col" aria-label="固定模型替换">
-                  <header className="fpp-col-head">
-                    <span className="fpp-col-title">固定模型替换</span>
-                    <span className="fpp-col-count">{selectedProviders.length}</span>
-                    <span className="api-key-fallback-models-note">
-                      {crossProtocolProviders.length > 0
-                        ? `${crossProtocolProviders.length} 个跨协议会自动转换`
-                        : '留空 = 自动'}
-                    </span>
-                  </header>
-                  {selectedProviders.length > 1 ? (
-                    <div className="api-key-fallback-models-bulk">
-                      <SearchableModelSelect
-                        value={batchModel}
-                        models={batchModels}
-                        disabled={busy || saving}
-                        emptyLabel="批量设为…"
-                        onChange={(value) => { setBatchModel(value); setBatchNotice(''); }}
-                      />
-                      <button
-                        className="mini-btn"
-                        type="button"
-                        disabled={busy || saving || !batchModel.trim()}
-                        onClick={applyBatchModel}
-                        title="把选中的模型写给每一个有此模型的备选"
-                      >
-                        应用到全部
-                      </button>
-                      <button
-                        className="mini-btn"
-                        type="button"
-                        disabled={busy || saving}
-                        onClick={clearAllOverrides}
-                        title="清掉所有固定模型，全部改为自动"
-                      >
-                        留空
-                      </button>
-                    </div>
-                  ) : null}
-                  {batchNotice ? <div className="api-key-fallback-models-notice">{batchNotice}</div> : null}
-                  <div className="api-key-fallback-models-list">
-                    {selectedProviders.map((provider, index) => {
-                      const providerModels = models.filter((model) => model.providerId === provider.id);
-                      const crossProtocol = !sameProtocol(provider);
-                      const chosen = (overrides[provider.id] || '').trim();
-                      const rowHint = crossProtocol
-                        ? (chosen ? '跨协议备选：网关会自动转换协议' : '跨协议备选：不固定模型时使用请求模型或该 Provider 默认模型（网关自动转换协议）')
-                        : (chosen ? `固定使用 ${chosen}` : '留空时沿用请求模型或该 Provider 默认模型');
+          <FallbackProviderPicker
+            providers={candidates}
+            providerGroups={providerGroups}
+            selectedIds={orderedIds}
+            sameProtocol={sameProtocol}
+            onChange={applyChain}
+            thirdColumn={selectedProviders.length > 0 ? (
+              <section className="fpp-col" aria-label="固定模型替换">
+                <header className="fpp-col-head">
+                  <span className="fpp-col-title">按行固定模型</span>
+                  <span className="fpp-col-count">{selectedProviders.length}</span>
+                  <span className="api-key-fallback-models-note">
+                    {crossProtocolProviders.length > 0
+                      ? `${crossProtocolProviders.length} 行跨协议会自动转换`
+                      : '留空 = 自动'}
+                  </span>
+                </header>
+                {selectedProviders.length > 1 ? (
+                  <div className="api-key-fallback-models-bulk">
+                    <SearchableModelSelect
+                      value={batchModel}
+                      models={batchModels}
+                      disabled={busy || saving}
+                      emptyLabel="批量设为…"
+                      onChange={(value) => { setBatchModel(value); setBatchNotice(''); }}
+                    />
+                    <button
+                      className="mini-btn"
+                      type="button"
+                      disabled={busy || saving || !batchModel.trim()}
+                      onClick={applyBatchModel}
+                      title="把选中的模型写给每一个有此模型的候选行"
+                    >
+                      应用到全部
+                    </button>
+                    <button
+                      className="mini-btn"
+                      type="button"
+                      disabled={busy || saving}
+                      onClick={clearAllOverrides}
+                      title="清掉所有固定模型，全部改为自动"
+                    >
+                      留空
+                    </button>
+                  </div>
+                ) : null}
+                {batchNotice ? <div className="api-key-fallback-models-notice">{batchNotice}</div> : null}
+                <div className="api-key-fallback-models-list">
+                  {selectedProviders.map((provider, index) => {
+                    if (!provider) {
                       return (
-                        <div className="api-key-fallback-models-row" key={provider.id} title={`#${index + 1} ${provider.name} — ${rowHint}`}>
-                          {/* 用编号当这一列的行标识，而不是重复 Provider 名：
-                              名字在左边的「备选链」列已经写着，两列靠 #N 对齐即可。
-                              267px 的列宽里如果既放名字又放下拉，两者都会被压成省略号
-                              （实测：名字只剩「Qoder 账…」、下拉只剩「Qwen」）。 */}
-                          <span className="fpp-rank" title={provider.name}>#{index + 1}</span>
-                          <SearchableModelSelect
-                            value={overrides[provider.id] || ''}
-                            models={providerModels}
-                            disabled={busy || saving}
-                            emptyLabel="自动"
-                            onChange={(value) => setProviderModel(provider.id, value)}
-                          />
-                          <button
-                            className="icon-btn"
-                            type="button"
-                            disabled={busy || saving || testingProviderID === provider.id}
-                            onClick={() => void onRefreshModels(provider.id, provider.name)}
-                            title="刷新该 Provider 的模型列表"
-                            aria-label="刷新该 Provider 的模型列表"
-                          >
-                            {testingProviderID === provider.id ? '…' : '↻'}
-                          </button>
+                        <div className="api-key-fallback-models-row" key={`missing:${index}`} title={`#${index + 1} Provider 不存在`}>
+                          <span className="fpp-rank">#{index + 1}</span>
+                          <span className="hint-line error">Provider 不存在</span>
                         </div>
                       );
-                    })}
-                  </div>
-                </section>
-              ) : null}
-            />
-          </>
+                    }
+                    const providerModels = models.filter((model) => model.providerId === provider.id);
+                    const crossProtocol = !sameProtocol(provider);
+                    const chosen = (rowModels[index] || '').trim();
+                    const rowHint = crossProtocol
+                      ? (chosen ? '跨协议行：网关会自动转换协议' : '跨协议行：不固定模型时使用请求模型或该 Provider 默认模型')
+                      : (chosen ? `固定使用 ${chosen}` : '留空时沿用请求模型或该 Provider 默认模型');
+                    return (
+                      <div className="api-key-fallback-models-row" key={`${provider.id}:${index}`} title={`#${index + 1} ${provider.name} — ${rowHint}`}>
+                        <span className="fpp-rank" title={provider.name}>#{index + 1}</span>
+                        <SearchableModelSelect
+                          value={rowModels[index] || ''}
+                          models={providerModels}
+                          disabled={busy || saving}
+                          emptyLabel="自动"
+                          onChange={(value) => setProviderModel(index, value)}
+                        />
+                        <button
+                          className="icon-btn"
+                          type="button"
+                          disabled={busy || saving || testingProviderID === provider.id}
+                          onClick={() => void onRefreshModels(provider.id, provider.name)}
+                          title="刷新该 Provider 的模型列表"
+                          aria-label="刷新该 Provider 的模型列表"
+                        >
+                          {testingProviderID === provider.id ? '…' : '↻'}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+            ) : null}
+          />
         )}
         {error ? <div className="hint-line error">{error}</div> : null}
       </div>
@@ -874,7 +870,7 @@ export function ApiKeyFallbackProvidersModal({
         <span className="api-key-fallback-summary-text">
           {orderedIds.length === 0
             ? '未配置备选：首选额度耗尽后，这个密钥不会自动换到别的 Provider'
-            : `共 ${orderedIds.length} 个备选`}
+            : `共 ${orderedIds.length} 行；可重复同一 Provider`}
         </span>
         <button className="btn" type="button" disabled={busy || saving} onClick={onClose}>取消</button>
         <button
@@ -882,11 +878,7 @@ export function ApiKeyFallbackProvidersModal({
           type="button"
           disabled={busy || saving}
           onClick={() => {
-            const cleaned: Record<string, string> = {};
-            for (const id of orderedIds) {
-              const model = (overrides[id] || '').trim();
-              if (model) cleaned[id] = model;
-            }
+            const cleaned = orderedIds.map((_, index) => (rowModels[index] || '').trim());
             setBusy(true);
             void onSave(orderedIds, cleaned).finally(() => setBusy(false));
           }}

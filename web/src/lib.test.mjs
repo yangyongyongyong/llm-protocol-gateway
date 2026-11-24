@@ -569,11 +569,37 @@ test('promoteApiKeyProvider：不是备选就原样交回，别拆掉别人的�
 });
 
 // 双栏选择器的列表操作（R39 用户报告「配置备选界面很难用」后的重做）。
-test('fallbackAdd：追加到链尾，重复与已存在的跳过', () => {
+test('fallbackAdd：追加到链尾，同一 Provider 允许重复成不同 pN 行', () => {
   assert.deepEqual(lib.fallbackAdd(['a'], ['b', 'c']), ['a', 'b', 'c'], '新加的一律排在末尾，不改已有位次');
-  assert.deepEqual(lib.fallbackAdd(['a', 'b'], ['b', 'c']), ['a', 'b', 'c'], '已在链上的不重复加');
+  assert.deepEqual(lib.fallbackAdd(['a', 'b'], ['b', 'c']), ['a', 'b', 'b', 'c'], '同一 Provider 可重复加入');
   assert.deepEqual(lib.fallbackAdd(['a'], []), ['a']);
-  assert.deepEqual(lib.fallbackAdd([], ['x', 'x', '']), ['x'], '空 id 与批内重复都要挡掉');
+  assert.deepEqual(lib.fallbackAdd([], ['x', 'x', '']), ['x', 'x'], '只挡空 id；重复行保留');
+});
+
+test('重复 Provider 的每行模型按行号搬运，不按 Provider ID 覆盖', () => {
+  assert.deepEqual(
+    lib.reconcileFallbackModels(['shared', 'other', 'shared'], ['shared', 'shared', 'other'], ['m1', 'm2', 'm3']),
+    ['m1', 'm3', 'm2'],
+    '同一 Provider 的第 N 次出现继续带自己的模型',
+  );
+  const moved = lib.moveFallbackRow(['a', 'b', 'b'], ['ma', 'mb1', 'mb2'], 2, 0, false);
+  assert.deepEqual(moved.ids, ['b', 'a', 'b']);
+  assert.deepEqual(moved.models, ['mb2', 'ma', 'mb1']);
+  const pruned = lib.pruneFallbackRows(['a', 'gone', 'b'], ['ma', 'mx', 'mb'], new Set(['a', 'b']));
+  assert.deepEqual(pruned, {ids: ['a', 'b'], models: ['ma', 'mb']});
+});
+
+test('promoteApiKeyProviderAt：按行提升重复 Provider，不拿错模型', () => {
+  const swap = lib.promoteApiKeyProviderAt(
+    2,
+    {providerIds: ['shared', 'other', 'shared'], models: ['m-second', 'm-other', 'm-third']},
+    'shared',
+    'm-first',
+  );
+  assert.equal(swap.providerId, 'shared');
+  assert.equal(swap.modelOverride, 'm-third', '提升的是第三行，不能被第一行同名 Provider 干扰');
+  assert.deepEqual(swap.fallbackProviderIds, ['shared', 'other', 'shared']);
+  assert.deepEqual(swap.fallbackModels, ['m-second', 'm-other', 'm-first']);
 });
 
 test('fallbackRemove：批量移除，其余顺序不变', () => {
@@ -843,6 +869,29 @@ test('Codex 模型目录：固定列出 default 与 default[1m]，窗口一普�
 
   // 真实模型仍在目录里，且窗口跟着声明值走。
   assert.equal(bySlug['deepseek-v4.1-flash'].context_window, 128000);
+});
+
+test('Codex 模型目录：provider_index 模式发布 p1..p5 两种上下文，普通模式不发布', () => {
+  const key = {
+    name: 'k', key: 'sk-gw-x', modelOverride: 'm1', scheduleMode: 'provider_index',
+    fallbackProviderIds: ['shared', 'shared', 'b', 'c', 'd', 'e'],
+    fallbackModels: ['m2', 'm3', 'm4', 'm5', 'm6', 'm7'],
+  };
+  const provider = {id: 'shared', name: 'Shared', models: []};
+  const catalog = JSON.parse(lib.buildApiKeyCodexModelCatalogJSON(key, provider));
+  const slugs = new Set(catalog.models.map((model) => model.slug));
+  for (let index = 1; index <= 5; index += 1) {
+    assert.ok(slugs.has(`p${index}`), `缺少 p${index}`);
+    assert.ok(slugs.has(`p${index}[1m]`), `缺少 p${index}[1m]`);
+  }
+  assert.ok(!slugs.has('p6'), '菜单上限按当前需求固定为 p1..p5');
+  const p3 = catalog.models.find((model) => model.slug === 'p3');
+  const p3m = catalog.models.find((model) => model.slug === 'p3[1m]');
+  assert.equal(p3.context_window, 128000);
+  assert.equal(p3m.context_window, 1000000);
+
+  const normal = JSON.parse(lib.buildApiKeyCodexModelCatalogJSON({...key, scheduleMode: 'rotate'}, provider));
+  assert.ok(!normal.models.some((model) => model.slug.startsWith('p1')), '普通调度不能误导用户以为 pN 生效');
 });
 
 test('Codex 模型目录：手填的 contextOverride 压过上游报的窗口', () => {

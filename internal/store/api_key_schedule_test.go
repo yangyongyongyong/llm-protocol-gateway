@@ -110,3 +110,42 @@ func TestAPIKeyQuotaRoundTrip(t *testing.T) {
 		t.Fatalf("UpdateAPIKey lost the quota: %+v", got)
 	}
 }
+
+// Provider rows may repeat, and their model locks are positional. Losing
+// FallbackModels on restart would silently collapse a p1/p2/p3 menu back to
+// "same provider, same model" even though the ids still look intact.
+func TestAPIKeyProviderRowsAndModelsRoundTrip(t *testing.T) {
+	t.Parallel()
+	store, err := Open(filepath.Join(t.TempDir(), "gateway.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	key := domain.APIKey{
+		ID: "kp", Name: "kp", Key: "sk-kp", RouteID: "r1", Enabled: true,
+		FallbackProviderIDs: []string{"shared", "shared", "other"},
+		FallbackModels:      []string{"model-a", "", "model-c"},
+		ScheduleMode:        "provider_index",
+	}
+	if err := store.CreateAPIKey(key); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.APIKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("expected one key, got %d", len(loaded))
+	}
+	got := loaded[0]
+	if len(got.FallbackProviderIDs) != 3 || got.FallbackProviderIDs[0] != "shared" || got.FallbackProviderIDs[1] != "shared" || got.FallbackProviderIDs[2] != "other" {
+		t.Fatalf("duplicate rows lost: %v", got.FallbackProviderIDs)
+	}
+	if len(got.FallbackModels) != 3 || got.FallbackModels[0] != "model-a" || got.FallbackModels[1] != "" || got.FallbackModels[2] != "model-c" {
+		t.Fatalf("positional models lost: %v", got.FallbackModels)
+	}
+	if got.ScheduleMode != "provider_index" {
+		t.Fatalf("schedule mode = %q", got.ScheduleMode)
+	}
+}

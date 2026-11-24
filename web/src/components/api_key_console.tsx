@@ -29,7 +29,11 @@ import {
   clientConfigsForProtocol,
   codexCatalogPathForHome,
   copyToClipboard,
+  fallbackModelOverridesFromModels,
+  fallbackModelsForKey,
   localAgentGatewayRoot,
+  moveFallbackRow,
+  pruneFallbackRows,
   localGatewayLoopbackRoot,
   protocolLabel,
   protocolFromLabel,
@@ -162,7 +166,8 @@ export function snapshotActiveProfile(keyItem: APIKey, name: string): Partial<Ke
     thinkingDepthOverride: keyItem.thinkingDepthOverride,
     maxOutputTokens: keyItem.maxOutputTokens && keyItem.maxOutputTokens > 0 ? keyItem.maxOutputTokens : 0,
     fallbackProviderIds: [...(keyItem.fallbackProviderIds || [])],
-    fallbackModelOverrides: {...(keyItem.fallbackModelOverrides || {})},
+    fallbackModels: fallbackModelsForKey(keyItem),
+    fallbackModelOverrides: fallbackModelOverridesFromModels(keyItem.fallbackProviderIds || [], fallbackModelsForKey(keyItem)),
     streamEnabled: keyItem.streamEnabled !== false,
     scheduleMode: keyItem.scheduleMode || '',
   };
@@ -697,8 +702,14 @@ export function ApiKeyDetailWorkspace(props: ApiKeyWorkspaceProps) {
   const profiles = keyItem.profiles || [];
   const activeProfile = profiles.find((item) => item.id === (keyItem.activeProfileId || ''));
   const fallbackIds = keyItem.fallbackProviderIds || [];
-  // 弹窗里只列还存在的 Provider；悬空引用在保存时顺带清掉。
-  const validFallbackIds = fallbackIds.filter((id) => providers.some((item) => item.id === id));
+  // 弹窗里只列还存在的 Provider；模型按行一起搬运，悬空引用在保存时顺带清掉。
+  const validFallbackRows = pruneFallbackRows(
+    fallbackIds,
+    fallbackModelsForKey(keyItem),
+    new Set(providers.map((item) => item.id)),
+  );
+  const validFallbackIds = validFallbackRows.ids;
+  const validFallbackModels = validFallbackRows.models;
   const staleFallbackCount = fallbackIds.length - validFallbackIds.length;
   const publicAvailable = Boolean(props.publicBase);
 
@@ -949,14 +960,14 @@ export function ApiKeyDetailWorkspace(props: ApiKeyWorkspaceProps) {
           providerGroups={providerGroups}
           models={models}
           selectedIds={validFallbackIds}
-          modelOverrides={keyItem.fallbackModelOverrides || {}}
+          modelValues={validFallbackModels}
           staleCount={staleFallbackCount}
           saving={saving}
           testingProviderID={testingProviderID}
           onRefreshModels={panel.onRefreshModels}
           onClose={() => setFallbackModalOpen(false)}
-          onSave={async (ids, overrides) => {
-            await panel.onUpdateFallbacks(keyItem, ids, overrides);
+          onSave={async (ids, rowModels) => {
+            await panel.onUpdateFallbacks(keyItem, ids, rowModels);
             setFallbackModalOpen(false);
           }}
         />
@@ -992,61 +1003,67 @@ function RoutingTab({
   const profiles = keyItem.profiles || [];
   const activeProfileId = keyItem.activeProfileId || '';
   const activeProfile = profiles.find((item) => item.id === activeProfileId);
+  const providerIndexMode = (keyItem.scheduleMode || '') === 'provider_index';
   // Provider 是软删除（可回收站恢复），删掉后 Key 上的备选引用会被故意保留。
-  // 但在这条链路上它们永远不可能被尝试到（没有 Provider 可取），所以不能当成
-  // 正常节点排进流水线：占位、可拖、还能「设为首选」，只会误导人。
+  // 但在这条链路上它们永远不可能被尝试到，所以不排进流水线。
   const fallbackRefs = keyItem.fallbackProviderIds || [];
-  const fallbackIds = fallbackRefs.filter((id) => providers.some((item) => item.id === id));
-  // 悬空引用只在「打开配置备选」时随保存一起清理，不在打开页面时自动写回：
-  // 万一 Provider 刚从回收站恢复，自动清理会把用户的备选链改坏。
-  const staleFallbackCount = fallbackRefs.length - fallbackIds.length;
-  const overrides = keyItem.fallbackModelOverrides || {};
+  const fallbackModels = fallbackModelsForKey(keyItem);
+  const allFallbackRows = fallbackRefs.map((id, index) => ({
+    id,
+    token: `row:${index}:${id}`,
+    model: fallbackModels[index] || '',
+    provider: providers.find((item) => item.id === id),
+  }));
+  const fallbackRows = allFallbackRows.filter((row) => row.provider);
+  const fallbackIds = fallbackRows.map((row) => row.id);
+  const fallbackRowModels = fallbackRows.map((row) => row.model);
+  const staleFallbackCount = allFallbackRows.length - fallbackRows.length;
   const primary = providers.find((item) => item.id === primaryProviderId);
-  // 「在服务」= 后端记录的真实服务节点。会话分散下多台同时服务是正常的：最近
-  // 10 分钟内答过请求的每一台都算，只标一台会把其余几台显示成「待命」，看起来
-  // 像分散没生效。老后端没有这个字段时退回粘滞位，再退回首选。
   const servingProviderIds = keyItem.servingProviderIds?.length
     ? keyItem.servingProviderIds
     : [keyItem.servingProviderId || keyItem.activeProviderId || primaryProviderId];
   const isServing = (id: string) => Boolean(id) && servingProviderIds.includes(id);
   const [dragState, setDragState] = React.useState<RowDragState>({draggingId: '', overId: '', after: false});
+
+  const updateRows = (ids: string[], rowModels: string[]) => {
+    void panel.onUpdateFallbacks(keyItem, ids, rowModels);
+  };
+
   const drag: RowDragBinding = {
     state: dragState,
-    onPointerDown: (event, id) => {
+    onPointerDown: (event, token) => {
       const list = event.currentTarget.closest('.akc-chain-list');
       if (!list) return;
       const startY = event.clientY;
       let active = false;
       const state: RowDragState = {draggingId: '', overId: '', after: false};
-
-      // 命中哪一行、落在该行上半还是下半：用列表里每一行的中线判断，比逐行绑
-      // pointerenter 稳（快速拖动时指针可能跳过整行）。
-      const updateTarget = (clientY: number, targetId: string) => {
+      const updateTarget = (clientY: number) => {
         const rows = [...list.querySelectorAll<HTMLElement>('.akc-chain-row.draggable')];
         for (const row of rows) {
           const rect = row.getBoundingClientRect();
           if (clientY < rect.top || clientY > rect.bottom) continue;
-          const rowId = row.dataset.fallbackId || '';
-          if (!rowId || rowId === targetId) { state.overId = ''; return; }
-          state.overId = rowId;
+          const rowToken = row.dataset.fallbackToken || '';
+          if (!rowToken || rowToken === token) {
+            state.overId = '';
+            return;
+          }
+          state.overId = rowToken;
           state.after = clientY > rect.top + rect.height / 2;
           return;
         }
         state.overId = '';
       };
-
       const onMove = (moveEvent: PointerEvent) => {
         if (!active) {
           if (Math.abs(moveEvent.clientY - startY) < 4) return;
           active = true;
-          state.draggingId = id;
+          state.draggingId = token;
           document.body.classList.add('akc-dragging');
         }
         moveEvent.preventDefault();
-        updateTarget(moveEvent.clientY, id);
+        updateTarget(moveEvent.clientY);
         setDragState({...state});
       };
-
       const finish = () => {
         window.removeEventListener('pointermove', onMove);
         window.removeEventListener('pointerup', onUp);
@@ -1056,29 +1073,28 @@ function RoutingTab({
         const {overId: over, after} = state;
         setDragState({draggingId: '', overId: '', after: false});
         if (!over) return;
-        const next = moveFallbackId(fallbackIds, id, over, after);
-        if (next === fallbackIds) return;
-        void panel.onUpdateFallbacks(keyItem, next, pruneOverrides(overrides, next));
+        const fromIndex = fallbackRows.findIndex((row) => row.token === token);
+        const toIndex = fallbackRows.findIndex((row) => row.token === over);
+        if (fromIndex < 0 || toIndex < 0) return;
+        const moved = moveFallbackRow(fallbackIds, fallbackRowModels, fromIndex, toIndex, after);
+        if (moved.ids !== fallbackIds) updateRows(moved.ids, moved.models);
       };
       const onUp = () => finish();
       const onCancel = () => {
-        state.overId = '';
-        active = active ? active : false;
         window.removeEventListener('pointermove', onMove);
         window.removeEventListener('pointerup', onUp);
         window.removeEventListener('pointercancel', onCancel);
         document.body.classList.remove('akc-dragging');
         setDragState({draggingId: '', overId: '', after: false});
       };
-
       window.addEventListener('pointermove', onMove, {passive: false});
       window.addEventListener('pointerup', onUp);
       window.addEventListener('pointercancel', onCancel);
     },
   };
+
   return (
     <div className="akc-stack">
-      {/* 方案切换条：一行放完，右侧是新建 / 重命名 / 删除 */}
       <div className="akc-bar">
         <div className="akc-bar-main">
           <span className="akc-bar-label">转发方案：</span>
@@ -1117,7 +1133,6 @@ function RoutingTab({
         </div>
       </div>
 
-      {/* 调度模式：分段控件，一行 */}
       <div className="akc-bar">
         <div className="akc-bar-main">
           <span className="akc-bar-label">
@@ -1141,27 +1156,33 @@ function RoutingTab({
           </div>
         </div>
         <span className="akc-bar-hint">
-          <InfoTip text="同一段对话仍然钉在它已建好缓存的账号上（会话粘性优先于调度模式）；被标记「异常」的候选永远排在最后，但不会被跳过。" />
-          {fallbackIds.length === 0 ? '配置备选后才能切换调度模式' : '会话粘性优先于调度模式（命中 Prompt Cache）'}
+          <InfoTip text={providerIndexMode
+            ? 'provider_index 模式给每一行一个固定编号 p1/p2/...；Codex 选 pN（以及 pN[1m]）时只打第 N 行，不会按会话粘性或普通调度改道。'
+            : '同一段对话仍然钉在它已建好缓存的账号上（会话粘性优先于调度模式）；被标记「异常」的候选永远排在最后，但不会被跳过。'} />
+          {fallbackIds.length === 0
+            ? '配置至少一行后切换调度模式'
+            : providerIndexMode
+              ? 'p1 = 首选；p2 起按下面备选行递增'
+              : '会话粘性优先于调度模式（命中 Prompt Cache）'}
         </span>
       </div>
 
-      {/* 首选 + 备选流水线 */}
       <div className="akc-chain">
         <div className="akc-chain-head">
           <span className="akc-chain-title">
             <Icon path={ICONS.shield} size={13} className="green" />
             首选节点与备选降级流水线（共 {1 + fallbackIds.length} 个节点{staleFallbackCount > 0 ? ` · 另有 ${staleFallbackCount} 个已删除` : ''}）
           </span>
-          <span className="akc-chain-hint">支持一键切换首选、独立锁定模型与探测</span>
+          <span className="akc-chain-hint">{providerIndexMode ? 'p1/p2/... 行号固定，可重复同一 Provider' : '支持一键切换首选、独立锁定模型与探测'}</span>
         </div>
 
         <div className="akc-chain-list">
           <PipelineRow
             primary
-            rank="首选"
+            rank={providerIndexMode ? 'p1' : '首选'}
             provider={primary}
             fallbackProviderId={primaryProviderId}
+            fallbackToken="primary"
             model={keyItem.modelOverride || primary?.defaultModel || ''}
             modelMuted={!keyItem.modelOverride}
             models={primary ? models.filter((model) => model.providerId === primary.id) : []}
@@ -1175,32 +1196,38 @@ function RoutingTab({
             onRemove={() => undefined}
             onPromote={() => undefined}
           />
-          {fallbackIds.map((id, index) => {
-            const provider = providers.find((item) => item.id === id);
-            const override = overrides[id] || '';
+          {fallbackRows.map((row, index) => {
+            const provider = row.provider;
+            const override = row.model;
             const inherits = !override && Boolean(primary && provider && provider.protocol === primary.protocol);
+            const setModelAt = (model: string) => {
+              const next = fallbackRowModels.slice();
+              next[index] = model;
+              updateRows(fallbackIds, next);
+            };
+            const removeAt = () => updateRows(
+              fallbackIds.filter((_, rowIndex) => rowIndex !== index),
+              fallbackRowModels.filter((_, rowIndex) => rowIndex !== index),
+            );
             return (
               <PipelineRow
-                key={id}
-                rank={`备选 ${index + 1}`}
+                key={row.token}
+                rank={providerIndexMode ? `p${index + 2}` : `备选 ${index + 1}`}
                 provider={provider}
-                fallbackProviderId={id}
+                fallbackProviderId={row.id}
+                fallbackToken={row.token}
                 model={override || (inherits ? '请求模型' : '')}
                 modelMuted={!override}
                 models={provider ? models.filter((model) => model.providerId === provider.id) : []}
-                onPickModel={(model) => void panel.onUpdateFallbacks(
-                  keyItem, fallbackIds, {...overrides, [id]: model},
-                )}
-                onClearModel={() => void panel.onUpdateFallbacks(
-                  keyItem, fallbackIds, removeKey(overrides, id),
-                )}
-                serving={isServing(id)}
+                onPickModel={setModelAt}
+                onClearModel={() => setModelAt('')}
+                serving={isServing(row.id)}
                 saving={saving}
                 testingProviderID={testingProviderID}
                 drag={drag}
                 onRefreshModels={panel.onRefreshModels}
-                onRemove={() => void panel.onUpdateFallbacks(keyItem, fallbackIds.filter((item) => item !== id), removeKey(overrides, id))}
-                onPromote={() => void panel.onPromoteFallback(keyItem, id)}
+                onRemove={removeAt}
+                onPromote={() => void panel.onPromoteFallback(keyItem, index)}
               />
             );
           })}
@@ -1210,9 +1237,7 @@ function RoutingTab({
           <button
             type="button"
             className="akc-soft-btn"
-            // 首选还在时要两台以上才有「备选」可选；首选已被删除时只要还有一台
-            // 就能选——那时候这一台既是备选也是把这个密钥救回来的唯一办法。
-            disabled={saving || providers.length === 0 || (!!primaryProviderId && providers.length < 2)}
+            disabled={saving || providers.length === 0 || !primaryProviderId}
             onClick={onOpenFallbackModal}
           >
             <Icon path={ICONS.plus} size={13} />
@@ -1226,7 +1251,7 @@ function RoutingTab({
                   type="button"
                   className="akc-link"
                   disabled={saving}
-                  onClick={() => void panel.onUpdateFallbacks(keyItem, fallbackIds, pruneOverrides(overrides, fallbackIds))}
+                  onClick={() => updateRows(fallbackIds, fallbackRowModels)}
                 >
                   清理掉
                 </button>
@@ -1234,12 +1259,12 @@ function RoutingTab({
             ) : null}
             {!primaryProviderId ? (
               <span className="akc-chain-foot-stale">
-                首选 Provider 已不存在：这个密钥当前没有首选节点，流量会落到下面的备选或直接失败。点「配置备选 Provider」选一台，再用「设为首选」把它提上来。
+                首选 Provider 已不存在：这个密钥当前没有首选节点，流量会落到下面的备选或直接失败。
               </span>
             ) : fallbackIds.length === 0 ? (
               '未配置备选：首选额度耗尽后，这个密钥不会自动换到别的 Provider。'
             ) : (
-              '按住备选行拖动即可调整顺序，松手后保存；「设为首选」会交换绑定，其余备选顺序不变。'
+              '按住备选行拖动调整顺序；同一 Provider 可以重复出现，每行可锁不同模型。'
             )}
           </span>
         </div>
@@ -1248,27 +1273,12 @@ function RoutingTab({
   );
 }
 
-/** 只保留仍有效备选的模型覆写，避免给已删除的 Provider 留着垃圾键。 */
-function pruneOverrides(overrides: Record<string, string>, ids: string[]) {
-  const next: Record<string, string> = {};
-  for (const id of ids) {
-    if (overrides[id]) next[id] = overrides[id];
-  }
-  return next;
-}
-
-function removeKey(source: Record<string, string>, key: string) {
-  const next = {...source};
-  delete next[key];
-  return next;
-}
-
-
 function PipelineRow({
   rank,
   primary,
   provider,
   fallbackProviderId,
+  fallbackToken,
   model,
   modelMuted,
   models,
@@ -1287,6 +1297,8 @@ function PipelineRow({
   primary?: boolean;
   provider?: Provider;
   fallbackProviderId: string;
+  /** row:<原链行号>:<provider> —— 同一 Provider 重复出现时 React 与拖拽的唯一身份。 */
+  fallbackToken: string;
   model: string;
   modelMuted?: boolean;
   /** 该节点自己的模型目录：备选行的模型下拉就从这里取，不用跑去弹窗里配。 */
@@ -1311,8 +1323,8 @@ function PipelineRow({
     serving ? ' serving' : '',
     unhealthy ? ' unhealthy' : '',
     drag ? ' draggable' : '',
-    drag?.state.draggingId === fallbackProviderId ? ' dragging' : '',
-    drag?.state.overId === fallbackProviderId ? (drag.state.after ? ' drop-after' : ' drop-before') : '',
+    drag?.state.draggingId === fallbackToken ? ' dragging' : '',
+    drag?.state.overId === fallbackToken ? (drag.state.after ? ' drop-after' : ' drop-before') : '',
   ].filter(Boolean).join(' ');
   // 指针拖拽：鼠标与触屏同一套事件。按住行内任意位置都可拖，但按钮和文字选择不
   // 抢手势；按下后没有移动 4px 就当作普通点击，不会误触发排序。
@@ -1321,11 +1333,11 @@ function PipelineRow({
       if (saving || event.button !== 0) return;
       // 点模型下拉是在配置这一行，不是在排序；交给下拉自己处理。
       if ((event.target as HTMLElement).closest('button, input, .searchable-select')) return;
-      drag.onPointerDown(event, fallbackProviderId);
+      drag.onPointerDown(event, fallbackToken);
     },
   } : {};
   return (
-    <div className={className} data-fallback-id={drag ? fallbackProviderId : undefined} {...dragProps}>
+    <div className={className} data-fallback-token={drag ? fallbackToken : undefined} {...dragProps}>
       {drag ? (
         <span className="akc-drag-handle" aria-hidden="true" title="按住拖动可调整备选顺序">
           <Icon path={ICONS.grip} size={13} />

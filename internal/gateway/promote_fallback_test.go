@@ -61,8 +61,9 @@ func TestAPIKeyPromoteKeepsEveryChainNode(t *testing.T) {
 		}
 	}
 
-	// 对照：只改 routeId 的旧写法（不提备选列表）会把原首选挤丢——这正是
-	// 「设为首选少一个节点」的复现，归一化只认新首选、不替我们补回旧的。
+	// 对照：只改 routeId 时，旧首选仍可能留在备选里。这是有意保留的：
+	// 同一 Provider 可以作为不同行重复出现（每行可锁不同模型），归一化不能
+	// 再按 provider id 去重，否则 provider_index 的 pN 行号会被悄悄改掉。
 	router = newPromoteRouter(t)
 	key, err = router.AddAPIKey(domain.APIKey{
 		Name: "chain", RouteID: "r-a",
@@ -75,9 +76,8 @@ func TestAPIKeyPromoteKeepsEveryChainNode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("route-only patch: %v", err)
 	}
-	if len(stale.FallbackProviderIDs) != 3 {
-		t.Fatalf("the old route-only patch left %d fallbacks, want 3 — if this changed, revisit the console fix: %v",
-			len(stale.FallbackProviderIDs), stale.FallbackProviderIDs)
+	if len(stale.FallbackProviderIDs) != 4 {
+		t.Fatalf("route-only patch must preserve all configured rows, got %v", stale.FallbackProviderIDs)
 	}
 }
 

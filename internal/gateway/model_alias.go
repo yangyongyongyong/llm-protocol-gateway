@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/luca/llm-protocol-gateway/internal/domain"
@@ -105,10 +107,113 @@ func stripClaudeContextTag(model string) string {
 	return trimmed
 }
 
+// providerIndexAliasIndex parses the reserved p1/p2/... spellings used by
+// provider_index mode. Claude's [1m] context tag is ignored for the row
+// lookup; it remains a client-side window hint and never reaches upstream.
+func providerIndexAliasIndex(raw string) (int, bool) {
+	base := strings.ToLower(stripClaudeContextTag(raw))
+	if len(base) < 2 || base[0] != 'p' {
+		return 0, false
+	}
+	if strings.TrimLeft(base[1:], "0123456789") != "" {
+		return 0, false
+	}
+	index, err := strconv.Atoi(base[1:])
+	if err != nil || index < 1 {
+		return 0, false
+	}
+	return index, true
+}
+
+const providerIndexCatalogLimit = 5
+
+// providerIndexModelAliases returns the p1/p1[1m] menu entries exposed for a
+// key in provider_index mode. The backend accepts any positive pN, but the
+// generated client catalog is intentionally capped to the current use case.
+func providerIndexModelAliases(key domain.APIKey, limit int) []string {
+	if !isScheduleModeProviderIndex(key.ScheduleMode) {
+		return nil
+	}
+	count := 1 + len(key.FallbackProviderIDs)
+	if count > limit {
+		count = limit
+	}
+	out := make([]string, 0, count*2)
+	for i := 1; i <= count; i++ {
+		alias := "p" + strconv.Itoa(i)
+		out = append(out, alias, alias+claudeContextTag1M)
+	}
+	return out
+}
+
+// apiKeyCatalogModelIDs is the stable set of synthetic and per-key model names
+// that every gateway model-discovery endpoint must publish. Upstream catalogs
+// only know real model ids; default aliases, provider-index rows, model alias
+// targets and per-row fixed models exist only because this API key configured
+// them, so omitting them here makes Codex/Claude/OpenAI pickers silently lose
+// the custom entries.
+func apiKeyCatalogModelIDs(key domain.APIKey) []string {
+	out := make([]string, 0, 4+len(key.FallbackModels)+len(key.ModelAliases)*2)
+	seen := map[string]bool{}
+	appendID := func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
+		}
+		normalized := strings.ToLower(id)
+		if seen[normalized] {
+			return
+		}
+		seen[normalized] = true
+		out = append(out, id)
+	}
+
+	appendID(defaultModelAlias)
+	appendID(defaultModelAlias + claudeContextTag1M)
+	for _, id := range providerIndexModelAliases(key, providerIndexCatalogLimit) {
+		appendID(id)
+	}
+	appendID(key.ModelOverride)
+
+	aliasKeys := make([]string, 0, len(key.ModelAliases))
+	for alias := range key.ModelAliases {
+		aliasKeys = append(aliasKeys, alias)
+	}
+	sort.Strings(aliasKeys)
+	for _, alias := range aliasKeys {
+		appendID(alias)
+		appendID(key.ModelAliases[alias])
+	}
+
+	models := key.FallbackModels
+	if models == nil {
+		models = fallbackModelsFromOverrides(key.FallbackProviderIDs, key.FallbackModelOverrides)
+	}
+	for _, model := range models {
+		appendID(model)
+	}
+	return out
+}
+
 func resolveConsumerModel(router *Router, route domain.Route, key domain.APIKey, gatewayKeyMatched bool, rawRequestModel string) (model string, logModel string) {
 	provider, err := router.ProviderForRoute(route)
 	if err != nil {
 		provider = domain.Provider{}
+	}
+	// provider_index aliases must survive this pre-flight resolver: the actual
+	// row is selected in executeProtocolFlowWithFailover, where the chain row's
+	// own model override is known. Resolving here against the route's preferred
+	// provider would collapse p3 onto the wrong provider/model before dispatch.
+	// Desktop may spell pN as its anthropic/gw- hash alias, so reverse that
+	// first using the same candidate set /models published.
+	if gatewayKeyMatched && isScheduleModeProviderIndex(key.ScheduleMode) {
+		candidate := strings.TrimSpace(rawRequestModel)
+		if resolved := desktopModelForAlias(candidate, desktopAliasCandidates(provider, key, true)); resolved != candidate {
+			candidate = resolved
+		}
+		if _, ok := providerIndexAliasIndex(candidate); ok {
+			return candidate, candidate
+		}
 	}
 	return resolveConsumerModelOnProvider(provider, key, gatewayKeyMatched, rawRequestModel)
 }

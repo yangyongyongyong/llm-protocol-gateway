@@ -93,25 +93,19 @@ func desktopModelAlias(modelID string) string {
 //
 // 反查只认这份集合：已删除或撤销授权的模型不会因为别名被别人猜中就重新可达。
 func desktopAliasCandidates(provider domain.Provider, key domain.APIKey, gatewayKeyMatched bool) []string {
-	ids := make([]string, 0, len(provider.Models)+2+len(key.ModelAliases))
+	ids := make([]string, 0, len(provider.Models)+4+len(key.ModelAliases)*2+len(key.FallbackModels))
 	for _, model := range provider.Models {
 		if id := strings.TrimSpace(model.ID); id != "" {
 			ids = append(ids, id)
 		}
 	}
-	// 保留别名 default / default[1m] 也作为两行列给 Desktop
-	// （desktopReservedDefaultCatalog），所以反查必须认得它们：否则用户选中那两行，
-	// 上游收到的是一串 anthropic/gw- 哈希。
-	ids = append(ids, defaultModelAlias, defaultModelAlias+claudeContextTag1M)
 	if gatewayKeyMatched {
-		if override := strings.TrimSpace(key.ModelOverride); override != "" {
-			ids = append(ids, override)
-		}
-		for alias := range key.ModelAliases {
-			if trimmed := strings.TrimSpace(alias); trimmed != "" {
-				ids = append(ids, trimmed)
-			}
-		}
+		// The same synthetic/custom set /v1/models publishes: default aliases,
+		// provider-index pN, alias keys and targets, and per-row fixed models.
+		ids = append(ids, apiKeyCatalogModelIDs(key)...)
+	} else {
+		// Reserved default aliases are published even without a matched Key.
+		ids = append(ids, defaultModelAlias, defaultModelAlias+claudeContextTag1M)
 	}
 	return ids
 }

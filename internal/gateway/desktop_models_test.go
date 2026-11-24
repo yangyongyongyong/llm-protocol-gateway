@@ -57,17 +57,20 @@ func getModels(t *testing.T, server *Server, token, userAgent string) []map[stri
 	return payload.Data
 }
 
-// 只提供 m1/m2 的网关，普通 OpenAI 客户端看到的仍是真实 id——别名只是
-// Desktop 那一侧的投影，不能污染别人的模型目录。
-func TestOpenAIModelsKeepsRealIDsForOtherClients(t *testing.T) {
+// 普通 OpenAI 客户端既要知道上游真实 id，也要看到网关保留的 default
+// 别名；否则 Codex/OpenAI picker 里会缺掉一键配置写入的名字。
+func TestOpenAIModelsPublishesRealAndReservedIDs(t *testing.T) {
 	server, token := desktopCatalogServer(t)
 	data := getModels(t, server, token, "curl/8.7.1")
-	var ids []string
+	ids := make(map[string]bool, len(data))
 	for _, entry := range data {
-		ids = append(ids, entry["id"].(string))
+		id, _ := entry["id"].(string)
+		ids[id] = true
 	}
-	if len(ids) != 2 || ids[0] != "m1" || ids[1] != "m2" {
-		t.Fatalf("ids = %v, want the real m1/m2", ids)
+	for _, want := range []string{"m1", "m2", "default", "default[1m]"} {
+		if !ids[want] {
+			t.Fatalf("id %q missing from %v", want, ids)
+		}
 	}
 	for _, entry := range data {
 		if _, ok := entry["display_name"]; ok {
@@ -146,10 +149,13 @@ func TestDesktopAliasResolvesToTheRealModel(t *testing.T) {
 // 反查必须认得出它们，否则用户选中的「映射别名」会被当成上游模型名发出去。
 func TestDesktopAliasResolvesKeyLevelModels(t *testing.T) {
 	provider := domain.Provider{ID: "p1", Models: []domain.Model{{ID: "m1"}}}
-	key := domain.APIKey{ModelOverride: "m2", ModelAliases: map[string]string{"fast": "m1"}}
+	key := domain.APIKey{
+		ModelOverride: "m2", ModelAliases: map[string]string{"fast": "m1"},
+		FallbackProviderIDs: []string{"p2"}, FallbackModels: []string{"m3"},
+	}
 	candidates := desktopAliasCandidates(provider, key, true)
 
-	for _, want := range []string{"m1", "m2", "fast"} {
+	for _, want := range []string{"m1", "m2", "fast", "m3"} {
 		if got := desktopModelForAlias(desktopModelAlias(want), candidates); got != want {
 			t.Fatalf("alias for %q resolved to %q", want, got)
 		}

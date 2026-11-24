@@ -82,12 +82,20 @@ func TestModelContextOverrideReachesEveryCatalog(t *testing.T) {
 		t.Fatalf("max output = %d, want the 1M budget", got)
 	}
 
-	// OpenAI 形态：普通客户端看 context_length。
+	// OpenAI 形态：普通客户端看 context_length。目录同时会带 default 别名，
+	// 所以按 m1 这一条取窗口，不把别名数量写死。
 	data := getModels(t, server, "sk-gw", "curl/8.7.1")
-	if len(data) != 1 {
-		t.Fatalf("catalog = %v, want one entry", data)
+	var m1Entry map[string]any
+	for _, entry := range data {
+		if entry["id"] == "m1" {
+			m1Entry = entry
+			break
+		}
 	}
-	if got, _ := data[0]["context_length"].(float64); got != contextLength1M {
+	if m1Entry == nil {
+		t.Fatalf("m1 missing from catalog: %v", data)
+	}
+	if got, _ := m1Entry["context_length"].(float64); got != contextLength1M {
 		t.Fatalf("context_length = %v, want %d", got, contextLength1M)
 	}
 
