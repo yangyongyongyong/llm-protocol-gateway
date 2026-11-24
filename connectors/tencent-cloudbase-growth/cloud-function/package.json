@@ -1,0 +1,10 @@
+{
+  "name": "aiProxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Tencent CloudBase growth-plan model proxy for llm-protocol-gateway",
+  "main": "index.js",
+  "dependencies": {
+    "@cloudbase/node-sdk": "^3.18.3"
+  }
+}

@@ -32,7 +32,7 @@ Responses / Claude 之一。
 3. 弹窗只提供一段完整的 AI Prompt，不提供手填表单；点击“复制给 AI”。
 4. AI 通过 `GET/POST/PATCH/DELETE /__custom-providers` 查询、新建、编辑、删除连接器，并调用脚本校验、实例创建和测试 API 完成验收。
 5. 连接器创建完成后，目录会自动出现对应磁贴；选择磁贴只填写该实例的上游 URL 和 Key。
-6. 连接器磁贴右侧三点菜单提供“导出连接器”和“删除连接器”；编辑连接器统一交给 AI/API。
+6. 连接器磁贴右侧三点菜单提供“导出连接器”和“删除连接器”；编辑连接器统一交给 AI/API。桌面 App 导出时会弹系统原生“另存为”对话框，浏览器模式才回退到浏览器下载目录。
 7. 保存实例后网关会启动脚本、做健康检查，并自动请求 `/v1/models` 回填模型目录。
 
 Provider 实例对客户端暴露的 Base URL 自动设为：
@@ -115,6 +115,11 @@ POST /v1/messages             Provider.Protocol=claude
 
 至少实现与 Provider 选定协议对应的一个推理入口。最省事的选择是
 `openai_chat`：网关会让现有转换器承接 Responses / Claude 客户端到 Chat 的转换。
+
+一个脚本也可以同时实现多个入口（例如 CloudBase 成长计划连接器同时提供
+`/v1/chat/completions`、`/v1/responses`、`/v1/messages`）。网关保存脚本后会后台探测
+这些路径：非 404/405 的响应会写入 Provider 的 `protocolSupport`，后续 Route 的输出协议
+与其中一项匹配时优先走同协议直通；声明的 `Protocol` 仍用于默认模型发现和健康测试。
 
 `GET /v1/models` 返回 OpenAI 风格目录：
 
@@ -206,6 +211,7 @@ DELETE /__custom-providers/{id}
 - 连接器更新会同步所有引用实例，保留各实例自己的 URL、Key、模型和分组；
 - 仍有实例引用时禁止删除连接器；
 - 导出连接器只包含模板和脚本，不包含任何实例 URL、Key、OAuth token 或用量数据；
+- 导出走桌面桥 `POST /__desktop/save-text-file`：桌面 App 由 Wails 弹原生保存框，headless / 浏览器返回 409 后前端降级为普通下载；
 - 导入连接器默认不覆盖同 ID 连接器；需要覆盖时调用 `POST /__custom-providers/import?replace=true`；
 - 普通用户可以在目录中看到连接器并创建实例，但只有管理员能查看/修改脚本正文。
 - “添加自定义连接器”弹窗只展示 AI Prompt；连接器的新增和编辑通过 API 完成。

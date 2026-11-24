@@ -240,6 +240,11 @@ type Server struct {
 	// Wails WebView blocks window.open, so desktop actions go back through the
 	// native process instead.
 	externalURLOpener func(string) error
+	// desktopSaveTextFile opens the desktop shell's native Save As dialog. The
+	// console page is served by the local gateway, not by Wails' asset server,
+	// so window.go bindings are not available there. Nil means headless/browser
+	// mode and the frontend falls back to a normal download.
+	desktopSaveTextFile func(defaultFilename, content string) (saved bool, path string, err error)
 	// desktopAutostart is the macOS login-time record behind the Settings row.
 	// It is an interface so handlers can be tested without touching the real
 	// ~/Library/LaunchAgents. The system record remains the source of truth.
@@ -508,6 +513,12 @@ func (s *Server) SetExternalURLOpener(fn func(string) error) {
 	s.externalURLOpener = fn
 }
 
+// SetDesktopSaveTextFile lets the desktop shell provide a native Save As dialog
+// to the gateway-served console. Headless gateways leave it nil.
+func (s *Server) SetDesktopSaveTextFile(fn func(defaultFilename, content string) (saved bool, path string, err error)) {
+	s.desktopSaveTextFile = fn
+}
+
 // SaveState persists the current router state (including webExposed).
 func (s *Server) SaveState() error {
 	return s.saveState()
@@ -541,6 +552,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /__desktop/sleep-prevention", s.handleSleepPrevention)
 	mux.HandleFunc("PATCH /__desktop/sleep-prevention", s.handleSetSleepPrevention)
 	mux.HandleFunc("POST /__desktop/open-url", s.handleDesktopOpenExternalURL)
+	mux.HandleFunc("POST /__desktop/save-text-file", s.handleDesktopSaveTextFile)
 	mux.HandleFunc("GET /__desktop/update", s.handleDesktopUpdate)
 	mux.HandleFunc("POST /__desktop/update/check", s.handleDesktopUpdateCheck)
 	mux.HandleFunc("POST /__desktop/update/download", s.handleDesktopUpdateDownload)
@@ -6010,6 +6022,34 @@ func (s *Server) fetchProviderModels(r *http.Request, provider domain.Provider, 
 				Models:    models,
 				Preview:   "Base URL 使用 {model} 模板，沿用已配置的模型目录",
 			}
+		}
+	}
+	// 腾讯云 CloudBase 只开放对话端点，没有标准 GET /models。通用推导会请求
+	// /v1/ai/<provider>/models，上游统一返回 AI_MODEL_NOT_SUPPORTED。这里改用
+	// CloudBase 控制台展示的公开模型目录，再按 Base URL 的 provider 组过滤。
+	if group, ok := tencentCloudBaseProviderGroup(provider); ok {
+		models, fetchErr := fetchTencentCloudBaseModels(r.Context(), provider, tencentCloudBaseModelCatalogURL)
+		if fetchErr != nil {
+			return providerTestResult{
+				Success:   false,
+				Provider:  provider.ID,
+				ModelsURL: tencentCloudBaseModelCatalogURL,
+				LatencyMs: time.Since(started).Milliseconds(),
+				Error:     "腾讯云 CloudBase 不提供标准 /models 接口，读取官方模型目录失败：" + fetchErr.Error(),
+				Models:    []domain.Model{},
+			}
+		}
+		return providerTestResult{
+			Success:   true,
+			Provider:  provider.ID,
+			ModelsURL: tencentCloudBaseModelCatalogURL,
+			Status:    http.StatusOK,
+			LatencyMs: time.Since(started).Milliseconds(),
+			Models:    models,
+			Preview: fmt.Sprintf(
+				"腾讯云 CloudBase %s 组官方模型目录，共 %d 个文本模型。模型需在控制台 AI → 生文模型启用；若返回 AI_CHANNEL_NOT_ALLOWED，说明当前 Key/套餐只允许小程序或云开发 SDK 调用。",
+				group, len(models),
+			),
 		}
 	}
 	if provider.AuthType == domain.AuthTypeCursorOAuth {

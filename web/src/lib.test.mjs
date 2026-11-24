@@ -1021,3 +1021,47 @@ test('API Key 复制根地址跟随三种公网方式的唯一 API 域名', () =
   assert.equal(lib.activePublicBaseURL(uiOnly, false), '');
   assert.equal(lib.apiKeyGatewayRoot(endpoints, lib.activePublicBaseURL(uiOnly, false)), 'http://127.0.0.1:18093');
 });
+
+test('Provider 预设 hostSuffix：CloudBase 环境子域也能匹配品牌', () => {
+  const preset = {
+    id: 'tencent-cloudbase',
+    name: '腾讯云 CloudBase AI',
+    section: 'vendor',
+    authType: 'api_key',
+    protocol: 'openai_chat',
+    baseUrl: 'https://YOUR-ENV-ID.api.tcloudbasegateway.com/v1/ai/cloudbase',
+    hostSuffix: 'api.tcloudbasegateway.com',
+  };
+  const provider = {
+    id: '腾讯云',
+    name: '腾讯云',
+    protocol: 'openai_responses',
+    baseUrl: 'https://dev-d5gze50axaadb179e.api.tcloudbasegateway.com/v1/ai/cloudbase',
+    authType: 'api_key',
+  };
+  assert.equal(lib.presetMatchesProvider(preset, provider), true);
+  assert.equal(lib.presetMatchesProvider(preset, {
+    ...provider,
+    baseUrl: 'https://api.tcloudbasegateway.com.evil.example/v1/ai/cloudbase',
+  }), false);
+});
+
+test('CloudBase 官方额度入口只从自定义连接器的环境域名推导', () => {
+  const provider = {
+    id: '腾讯云',
+    name: '腾讯云 CloudBase AI',
+    protocol: 'openai_chat',
+    baseUrl: 'http://127.0.0.1:19792/v1',
+    authType: 'api_key',
+    customProviderId: 'tencent-cloudbase-growth',
+    providerScript: {
+      upstreamBaseUrl: 'https://dev-d5gze50axaadb179e.api.tcloudbasegateway.com/v1/functions/aiProxy',
+    },
+  };
+  assert.equal(
+    lib.providerOfficialUsageURL(provider),
+    'https://tcb.cloud.tencent.com/dev?envId=dev-d5gze50axaadb179e#/ai?tab=model-usage',
+  );
+  assert.equal(lib.providerOfficialUsageURL({...provider, customProviderId: 'other'}), '');
+  assert.equal(lib.providerOfficialUsageURL({...provider, providerScript: {upstreamBaseUrl: 'https://example.com/aiProxy'}}), '');
+});

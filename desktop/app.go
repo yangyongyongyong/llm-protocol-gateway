@@ -311,6 +311,9 @@ func (a *App) startDesktopUpdater() {
 		runtime.BrowserOpenURL(a.ctx, raw)
 		return nil
 	})
+	// 控制台页面由本地网关提供，拿不到 Wails 的 window.go 绑定；把原生保存
+	// 对话框挂到网关桥，导出连接器 / Provider 才能在桌面端真正选择目录。
+	a.rt.Server().SetDesktopSaveTextFile(a.saveTextFile)
 	updater.SetIdleCheck(func() bool {
 		server := a.rt.Server()
 		return server == nil || server.CurrentInFlight() == 0
@@ -509,8 +512,18 @@ func (a *App) OpenDataDirectory() {
 // 要直接保存到项目/云盘目录。这里用 Wails 原生 SaveFileDialog 做桌面端路径选择；
 // 返回空 path 表示用户取消，不视为错误。
 func (a *App) SaveTextFile(defaultFilename string, content string) (map[string]any, error) {
+	saved, path, err := a.saveTextFile(defaultFilename, content)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"saved": saved, "cancelled": !saved, "path": path}, nil
+}
+
+// saveTextFile 是网关桌面桥和 Wails 绑定共用的实现；返回值保持纯 Go 形状，
+// 便于 HTTP handler 直接把 saved/path 回给前端。
+func (a *App) saveTextFile(defaultFilename string, content string) (bool, string, error) {
 	if a.ctx == nil {
-		return map[string]any{"saved": false, "cancelled": true}, nil
+		return false, "", nil
 	}
 	filename := strings.TrimSpace(defaultFilename)
 	if filename == "" {
@@ -526,16 +539,16 @@ func (a *App) SaveTextFile(defaultFilename string, content string) (map[string]a
 		}},
 	})
 	if err != nil {
-		return nil, err
+		return false, "", err
 	}
 	path = strings.TrimSpace(path)
 	if path == "" {
-		return map[string]any{"saved": false, "cancelled": true}, nil
+		return false, "", nil
 	}
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		return nil, err
+		return false, "", err
 	}
-	return map[string]any{"saved": true, "path": path}, nil
+	return true, path, nil
 }
 
 // StopLaunchAgent boots out the headless LaunchAgent so the App can own the port.

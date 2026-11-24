@@ -11,7 +11,7 @@ import (
 
 // handleDesktopOpenExternalURL opens a small allowlist of trusted HTTPS pages
 // through the native desktop shell. The Wails WKWebView blocks window.open, so
-// login pages and release pages must go through the OS browser instead.
+// login, release, and vendor-console pages must go through the OS browser instead.
 func (s *Server) handleDesktopOpenExternalURL(w http.ResponseWriter, r *http.Request) {
 	if !isLocalAdminBypass(r) {
 		writeOpenAIError(w, http.StatusForbidden, "外部链接只能在本机 App 中打开")
@@ -39,8 +39,13 @@ func (s *Server) handleDesktopOpenExternalURL(w http.ResponseWriter, r *http.Req
 	if host == "github.com" && strings.HasPrefix(u.Path, "/"+desktopupdate.DefaultRepo+"/releases/") {
 		allowed = true
 	}
+	// CloudBase 控制台没有可用的环境 API Key 额度接口，Provider 卡片只提供
+	// 官方用量页快捷入口；该页面必须由系统浏览器打开。
+	if host == "tcb.cloud.tencent.com" && strings.HasPrefix(u.Path, "/dev") {
+		allowed = true
+	}
 	if !allowed {
-		writeOpenAIError(w, http.StatusBadRequest, "外部链接不属于允许的 Cloudflare / GitHub 页面")
+		writeOpenAIError(w, http.StatusBadRequest, "外部链接不属于允许的 Cloudflare / GitHub / CloudBase 页面")
 		return
 	}
 	if err := s.externalURLOpener(raw); err != nil {

@@ -20,6 +20,7 @@ func TestDesktopOpenExternalURLAllowsCloudflareAndProjectRelease(t *testing.T) {
 	for _, target := range []string{
 		"https://dash.cloudflare.com/argotunnel?callback=abc",
 		"https://github.com/yangyongyongyong/llm-protocol-gateway/releases/tag/v1.0.23",
+		"https://tcb.cloud.tencent.com/dev?envId=dev-example#/ai?tab=model-usage",
 	} {
 		opened = ""
 		req := httptest.NewRequest(http.MethodPost, "/__desktop/open-url", strings.NewReader(`{"url":"`+target+`"}`))

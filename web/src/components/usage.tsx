@@ -27,6 +27,7 @@ import {ContextAnalysisPanel, type LogFilters, RequestAnalysisPanel, useUsageAna
 import {PerformanceAnalysisPanel} from './usage_performance';
 import {PriceTablePanel} from './pricing';
 import {ProviderRefLabel} from './provider_label';
+import {UsageDateRangePicker} from './date_range_picker';
 
 /** 概览份额图按哪个口径切：Token、请求次数，或已计价成本。 */
 type Metric = 'tokens' | 'requests' | 'cost';
@@ -407,7 +408,7 @@ export function UsagePage({ stats, providers, models, isNormalUser, from, to, se
         const active = from === formatLocalISODate(start) && to === today;
         return <button key={item.days} type="button" className={active ? 'active' : ''} onClick={() => preset(item.days)}>{item.label}</button>;
       })}</div>
-      <div className="usage-date-inputs"><input type="date" aria-label="用量开始日期" value={from} max={to} onChange={e => { if (e.target.value) onRangeChange(e.target.value, to); }} /><span>至</span><input type="date" aria-label="用量结束日期" value={to} min={from} max={today} onChange={e => { if (e.target.value) onRangeChange(from, e.target.value); }} /></div>
+      <UsageDateRangePicker from={from} to={to} max={today} onChange={onRangeChange} />
       <div className="usage-toolbar-spacer" />
     </div>}
     {error && <p className="usage-error" role="alert">{error}</p>}

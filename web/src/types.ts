@@ -1576,6 +1576,8 @@ export type ProviderPreset = {
   authType: ProviderConnectKind;
   protocol?: Protocol;
   baseUrl?: string;
+  /** 多租户厂商的可变主机后缀；匹配已有 Provider 时用它认品牌，不写死某个环境域名。 */
+  hostSuffix?: string;
   /** 厂商控制台/取密钥入口，sheet 里作为次级信息展示。 */
   keysUrl?: string;
   website?: string;

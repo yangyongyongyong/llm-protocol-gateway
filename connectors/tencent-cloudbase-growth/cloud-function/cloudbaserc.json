@@ -1,0 +1,16 @@
+{
+  "$schema": "https://static.cloudbase.net/cli/cloudbaserc.schema.json",
+  "envId": "dev-d5gze50axaadb179e",
+  "functionRoot": ".",
+  "functions": [
+    {
+      "name": "aiProxy",
+      "timeout": 120,
+      "runtime": "Nodejs20.19",
+      "handler": "index.main",
+      "memorySize": 512,
+      "installDependency": true,
+      "dir": "."
+    }
+  ]
+}

@@ -117,6 +117,7 @@ import {
     providerConnectLabel,
     providerDisplayLabel,
     providerOptionLabel,
+    providerOfficialUsageURL,
     providerShortLabel,
     peerProviderMemberName,
     peerUpstreamGroupLabel,
@@ -1219,6 +1220,7 @@ function App() {
     // 上游成员也显示完整 Provider 名（「上游名 · 成员名」），与本地 Provider 平铺
     // 在同一列表里；账号位只放继承下来的人工可读标签，没有就不重复写上游名。
     const peer = providerConnectKind(provider) === 'peer';
+    const officialUsageURL = providerOfficialUsageURL(provider);
     return (
       <ProviderCard
         key={provider.id}
@@ -1270,6 +1272,9 @@ function App() {
         }}
         onTest={canDo('providers.test') ? () => void fetchProviderModels(provider.id, provider.name, true) : undefined}
         onChatTest={canDo('providers.test') ? () => openChatTestForProvider(provider) : undefined}
+        onOpenOfficialUsage={isAdminUser && officialUsageURL ? () => {
+          void openExternalURL(officialUsageURL).catch((error) => showToast(`打开官方额度失败：${String(error)}`));
+        } : undefined}
         onConformance={canDo('providers.test') ? () => void runProviderConformance(provider) : undefined}
         onEdit={canDo('providers.edit') ? () => openEditProviderModal(provider) : undefined}
         onClone={canDo('providers.create') ? () => openCloneProviderModal(provider) : undefined}
@@ -3835,7 +3840,7 @@ function App() {
         showToast('已取消导出连接器');
         return;
       }
-      showToast(saved.path ? `已导出自定义连接器：${saved.path}` : `已导出自定义连接器：${provider.name}`);
+      showToast(saved.path ? `已导出自定义连接器：${saved.path}` : saved.fallback ? `已下载自定义连接器：${provider.name}（浏览器下载目录）` : `已导出自定义连接器：${provider.name}`);
     } catch (error) {
       showToast(`导出连接器失败：${String(error)}`);
     }
@@ -4777,6 +4782,23 @@ function App() {
 
   async function saveJSONFile(filename: string, payload: unknown): Promise<{saved: boolean; path?: string; fallback?: boolean}> {
     const text = `${JSON.stringify(payload, null, 2)}\n`;
+    // 桌面 App 的主界面实际由本地网关提供，而不是 Wails 自带的资源页；
+    // 因此这里不能只依赖 window.go 注入。先走网关的桌面桥，由 Go 侧
+    // 调 Wails 原生 SaveFileDialog；浏览器/无桌面运行时返回 409 后再降级。
+    const response = await fetch(`${API_BASE}/__desktop/save-text-file`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({defaultFilename: filename, content: text}),
+    });
+    if (response.ok) {
+      const result = await response.json() as {saved?: boolean; cancelled?: boolean; path?: string};
+      return result?.saved ? {saved: true, path: result.path} : {saved: false};
+    }
+    // 409 = 当前是 headless / 浏览器模式；404 = 老版本网关没有这个桥。
+    if (response.status !== 409 && response.status !== 404) throw new Error(await response.text());
+
+    // 兼容 Wails 直接加载资产页的旧模式，以及非桌面浏览器的普通下载。
     const saveTextFile = (window as any)?.go?.main?.App?.SaveTextFile;
     if (typeof saveTextFile === 'function') {
       const result = await saveTextFile(filename, text) as {saved?: boolean; cancelled?: boolean; path?: string};
@@ -4807,9 +4829,14 @@ function App() {
         showToast('没有可导出的 Provider');
         return;
       }
-      downloadJSONFile(providersExportFilename(), bundle);
+      const saved = await saveJSONFile(providersExportFilename(), bundle);
+      if (!saved.saved) {
+        showToast('已取消导出 Provider');
+        return;
+      }
       const errorHint = bundle.errors?.length ? `，${bundle.errors.length} 个 ID 未找到` : '';
-      showToast(`已导出 ${count} 个 Provider${errorHint}`);
+      const location = saved.path ? `：${saved.path}` : saved.fallback ? '（浏览器下载目录）' : '';
+      showToast(`已导出 ${count} 个 Provider${errorHint}${location}`);
     } catch (error) {
       showToast(`导出失败：${String(error)}`);
     } finally {
@@ -9096,7 +9123,7 @@ function App() {
       })()}
 
       {providerModelsOpen && (
-        <Modal size="wide" title={`获取模型 · ${providerModelsName}`} description="从 Provider 上游 /models 接口拉取可用模型列表，并更新健康状态。" onClose={() => setProviderModelsOpen(false)}>
+        <Modal size="wide" title={`获取模型 · ${providerModelsName}`} description="从 Provider 上游或厂商公开模型目录拉取可用模型列表，并更新健康状态。" onClose={() => setProviderModelsOpen(false)}>
           {providerModelsLoading ? (
             <div className="empty-state">正在从上游获取模型列表…</div>
           ) : !providerModelsResult ? (
@@ -9170,7 +9197,7 @@ function App() {
                   </div>
                 </>;
               })() : (
-                <div className="empty-state">未获取到模型。可检查 Provider Base URL、鉴权或上游 /models 接口。</div>
+                <div className="empty-state">未获取到模型。可检查 Provider Base URL、鉴权、上游 /models 或厂商模型目录。</div>
               )}
             </>
           )}

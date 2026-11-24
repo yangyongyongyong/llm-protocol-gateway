@@ -1957,6 +1957,30 @@ export function providerAccountDetail(provider: Provider): string {
   return parts.join(' · ');
 }
 
+/**
+ * 腾讯云 CloudBase 成长计划的官方用量入口。
+ *
+ * 实例的 BaseURL 是本地适配器，真正的 CloudBase 环境 ID 藏在自定义脚本的
+ * upstreamBaseUrl 里（例如 https://dev-xxx.api.tcloudbasegateway.com/...）。
+ * 控制台当前没有向环境 API Key 开放额度查询接口，所以卡片只能提供官方入口，
+ * 不能伪造一个本地余额数字。
+ */
+export function providerOfficialUsageURL(provider: Provider): string {
+  if ((provider.customProviderId || '').trim() !== 'tencent-cloudbase-growth') return '';
+  const upstream = (provider.providerScript?.upstreamBaseUrl || '').trim();
+  if (!upstream) return '';
+  try {
+    const host = new URL(upstream).hostname.toLowerCase();
+    const suffix = '.api.tcloudbasegateway.com';
+    if (!host.endsWith(suffix)) return '';
+    const envId = host.slice(0, -suffix.length).trim();
+    if (!envId) return '';
+    return `https://tcb.cloud.tencent.com/dev?envId=${encodeURIComponent(envId)}#/ai?tab=model-usage`;
+  } catch {
+    return '';
+  }
+}
+
 /** 管理员分组优先；找不到对应分组时让调用方退回原有品牌分组。 */
 export function providerSelectionGroup(provider: Provider, groups: ProviderGroup[]): {id: string; key: string; title: string} | null {
   const id = (provider.groupId || '').trim();
@@ -2190,8 +2214,15 @@ export function presetMatchesProvider(preset: ProviderPreset, provider: Provider
   }
   if (preset.authType === 'api_key') {
     if (providerConnectKind(provider) !== 'api_key') return false;
+    const providerHost = urlHost(provider.baseUrl);
+    // CloudBase 这类多租户厂商每家一个环境子域，固定 baseUrl 永远对不上；
+    // hostSuffix 让同目录磁贴仍能认出已有 Provider，并复用品牌图标。
+    if (preset.hostSuffix) {
+      const suffix = preset.hostSuffix.toLowerCase();
+      return providerHost === suffix || providerHost.endsWith(`.${suffix}`);
+    }
     const presetHost = urlHost(preset.baseUrl);
-    return presetHost !== '' && presetHost === urlHost(provider.baseUrl);
+    return presetHost !== '' && presetHost === providerHost;
   }
   return providerConnectKind(provider) === preset.authType;
 }

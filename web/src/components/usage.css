@@ -37,8 +37,91 @@ html[data-theme="dark"] .usage-page {
 .usage-segments button { border: 0; padding: 5px 11px; background: transparent; color: var(--muted); border-radius: 5px; font: inherit; font-size: 11px; font-weight: 500; cursor: pointer; white-space: nowrap; }
 .usage-segments button:hover { color: var(--text); }
 .usage-segments button.active { background: var(--surface); color: var(--text); box-shadow: 0 1px 3px #00000012; }
-.usage-date-inputs { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 11px; }
-.usage-date-inputs input { width: 132px; height: var(--control-h-sm); padding: 0 8px; border: 1px solid var(--border); background: var(--surface); border-radius: 6px; color: var(--text); font: inherit; font-size: 11px; }
+.usage-date-range { position: relative; flex: 0 0 auto; }
+.usage-date-range-trigger {
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  height: var(--control-h-sm); padding: 0 9px;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--surface); color: var(--text);
+  font: inherit; font-size: 11px; font-weight: 600;
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+  cursor: pointer; transition: border-color .13s ease, box-shadow .13s ease, color .13s ease;
+}
+.usage-date-range-trigger:hover,
+.usage-date-range-trigger.open { border-color: var(--accent-border); color: var(--accent-strong); }
+.usage-date-range-trigger > svg { flex: none; opacity: .78; }
+.usage-date-range-trigger .usage-date-range-caret { margin-left: 1px; opacity: .58; transition: transform .15s ease; }
+.usage-date-range-trigger.open .usage-date-range-caret { transform: rotate(180deg); }
+.usage-date-range-arrow { color: var(--subtle); font-weight: 500; }
+.usage-range-picker-pop {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: var(--z-dropdown);
+  width: min(620px, calc(100vw - 32px)); padding: 14px;
+  border: 1px solid var(--border); border-radius: var(--r-lg);
+  background: var(--surface); box-shadow: var(--shadow-pop);
+  animation: usage-range-pop-in .14s ease-out;
+}
+@keyframes usage-range-pop-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.usage-range-nav { display: grid; grid-template-columns: 28px minmax(0, 1fr) 28px; align-items: center; gap: 8px; margin-bottom: 10px; }
+.usage-range-nav-btn {
+  display: grid; place-items: center; width: 28px; height: 28px; padding: 0;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--surface-soft); color: var(--muted); cursor: pointer;
+  transition: border-color .13s ease, color .13s ease, background .13s ease;
+}
+.usage-range-nav-btn:hover { border-color: var(--accent-border); background: var(--hover); color: var(--accent-strong); }
+.usage-range-month-titles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; text-align: center; }
+.usage-range-month-titles span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-strong); font-size: var(--fs-md); font-weight: 700; }
+.usage-range-calendars { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.usage-range-month { min-width: 0; }
+.usage-range-weekdays,
+.usage-range-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); }
+.usage-range-weekdays span { padding: 2px 0 6px; color: var(--subtle); font-size: var(--fs-xs); font-weight: 600; text-align: center; }
+.usage-range-grid { row-gap: 1px; }
+.usage-range-day {
+  position: relative; height: 32px; padding: 0; border: 0;
+  background: transparent; color: var(--text); font: inherit; font-size: var(--fs-base);
+  font-variant-numeric: tabular-nums; cursor: pointer;
+}
+.usage-range-day::before { content: ""; position: absolute; inset: 2px 0; background: transparent; pointer-events: none; }
+.usage-range-day.is-in-range::before { background: var(--accent-soft); }
+.usage-range-day.is-range-start::before { left: 50%; }
+.usage-range-day.is-range-end::before { right: 50%; }
+.usage-range-day.is-range-start.is-range-end::before { display: none; }
+.usage-range-day.is-preview::before { opacity: .72; }
+.usage-range-day > span {
+  position: relative; z-index: 1; display: grid; place-items: center;
+  width: 28px; height: 28px; margin: 2px auto;
+  border-radius: 50%; transition: background .12s ease, color .12s ease, box-shadow .12s ease;
+}
+.usage-range-day.is-outside > span { color: var(--subtle); }
+.usage-range-day.is-in-range > span { color: var(--accent-strong); font-weight: 600; }
+.usage-range-day.is-range-start > span,
+.usage-range-day.is-range-end > span { background: var(--accent); color: #fff; font-weight: 700; box-shadow: none; }
+.usage-range-day.is-today > span { box-shadow: inset 0 0 0 1px var(--accent-border); }
+.usage-range-day:hover:not(:disabled):not(.is-range-start):not(.is-range-end) > span { background: var(--hover); }
+.usage-range-day.is-in-range:hover:not(:disabled):not(.is-range-start):not(.is-range-end) > span { background: var(--active-surface); }
+.usage-range-day:disabled { opacity: .35; cursor: not-allowed; }
+.usage-range-day:focus-visible { outline: none; }
+.usage-range-day:focus-visible > span { box-shadow: 0 0 0 3px var(--accent-ring); }
+.usage-range-footer {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border);
+  color: var(--muted); font-size: var(--fs-xs); line-height: 1.5;
+}
+.usage-range-footer > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.usage-range-footer-actions { display: flex; flex: none; gap: 6px; }
+html[data-theme="dark"] .usage-range-day.is-range-start > span,
+html[data-theme="dark"] .usage-range-day.is-range-end > span { color: #111827; }
+@media (max-width: 680px) {
+  .usage-range-picker-pop { width: min(332px, calc(100vw - 32px)); padding: 12px; }
+  .usage-range-month-titles,
+  .usage-range-calendars { grid-template-columns: minmax(0, 1fr); }
+  .usage-range-month-titles .is-secondary,
+  .usage-range-month.is-secondary { display: none; }
+}
 .usage-metric-switch { flex-wrap: wrap; }
 
 /* 口径切换条：贴着受它影响的份额与排行分区，点下去立刻能看到变化 */
@@ -114,7 +197,7 @@ html[data-theme="dark"] .usage-page {
 .usage-provider-select { flex: 0 1 190px; min-width: 150px; }
 .usage-provider-select .icon-select-trigger { height: var(--control-h-sm); padding-left: 9px; background-position: right 9px center; font-size: 11px; }
 .usage-export-btn { margin-left: auto; }
-.usage-filter-row select:focus-visible, .usage-search:focus-visible, .usage-date-inputs input:focus-visible, .usage-page .mini-btn:focus-visible, .usage-page-tabs button:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-ring); }
+.usage-filter-row select:focus-visible, .usage-search:focus-visible, .usage-date-range-trigger:focus-visible, .usage-range-nav-btn:focus-visible, .usage-page .mini-btn:focus-visible, .usage-page-tabs button:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--accent-ring); }
 .usage-scope-note { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; padding: 12px 15px; border-left: 3px solid var(--accent); background: color-mix(in srgb, var(--accent) 6%, transparent); border-radius: 0 var(--r-md) var(--r-md) 0; margin-bottom: 20px; color: var(--muted); font-size: 11px; line-height: 1.7; }
 .usage-scope-note b { color: var(--text); font-weight: 600; }
 .usage-scope-note small { color: var(--subtle); font-size: 10px; }
@@ -343,8 +426,8 @@ html[data-theme="dark"] .perf-rate.is-bad { color: #fda4af; }
   .usage-stats-strip > .usage-stat:last-child:nth-child(odd) { grid-column: 1 / -1; }
   .usage-toolbar { gap: 10px; }
   .usage-toolbar-spacer { display: none; }
-  .usage-date-inputs { order: 3; width: 100%; }
-  .usage-date-inputs input { flex: 1; min-width: 0; width: 120px; }
+  .usage-date-range { order: 3; width: 100%; }
+  .usage-date-range-trigger { width: 100%; }
   .usage-metric-switch { width: 100%; justify-content: flex-start; }
   .usage-stats-strip, .usage-stats-strip--five { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px 14px; }
   .usage-stat { padding-left: 12px; }
