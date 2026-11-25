@@ -111,11 +111,14 @@ func (g *claudeEmptyTurnGuard) close() {
 // frameEnd is the offset just past the blank line that ends the first whole SSE
 // frame in b, or -1 when b holds no whole frame yet.
 func frameEnd(b []byte) int {
-	if i := bytes.Index(b, []byte("\n\n")); i >= 0 {
-		return i + 2
+	// SSE 允许 LF 与 CRLF；混用时取最先出现的完整帧，而不是固定优先 LF。
+	lf := bytes.Index(b, []byte("\n\n"))
+	crlf := bytes.Index(b, []byte("\r\n\r\n"))
+	if crlf >= 0 && (lf < 0 || crlf < lf) {
+		return crlf + 4
 	}
-	if i := bytes.Index(b, []byte("\r\n\r\n")); i >= 0 {
-		return i + 4
+	if lf >= 0 {
+		return lf + 2
 	}
 	return -1
 }

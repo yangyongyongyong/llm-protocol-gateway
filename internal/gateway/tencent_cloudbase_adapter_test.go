@@ -1,12 +1,55 @@
 package gateway
 
 import (
+	"bytes"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// 保证源码、Go 内置脚本和可导入的连接器始终一致。
+func TestCloudBaseConnectorArtifactsMatch(t *testing.T) {
+	root := filepath.Join("..", "..", "connectors", "tencent-cloudbase-growth")
+	source, err := os.ReadFile(filepath.Join(root, "adapter.py"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(source, mustReadBuiltinCloudBaseAdapter(t)) {
+		t.Fatal("CloudBase adapter source differs from builtin copy")
+	}
+	bundle, err := os.ReadFile(filepath.Join(root, "tencent-cloudbase-growth.custom-connector.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var artifact struct {
+		CustomProvider struct {
+			Script struct{ Source string }
+		}
+	}
+	if err := json.Unmarshal(bundle, &artifact); err != nil {
+		t.Fatal(err)
+	}
+	if string(source) != artifact.CustomProvider.Script.Source {
+		t.Fatal("CloudBase adapter source differs from import bundle")
+	}
+}
+
+// 通过回环假 aiProxy 验证实际内置 adapter 的 HTTP 和 SSE 工具续轮。
+func TestBuiltinCloudBaseAdapterToolRoundTrip(t *testing.T) {
+	python := findPython(t)
+	path := filepath.Join(t.TempDir(), "adapter.py")
+	if err := writeTestFile(path, mustReadBuiltinCloudBaseAdapter(t)); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(python, "-B", filepath.Join("testdata", "tencent_cloudbase_adapter_roundtrip.py"), path)
+	cmd.Env = append(cmd.Environ(), "PROVIDER_SCRIPT_PORT=0", "PROVIDER_SCRIPT_MAX_CONCURRENCY=0", "UPSTREAM_API_KEY=mock-key", "NO_PROXY=127.0.0.1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("CloudBase adapter HTTP regression failed: %v\n%s", err, out)
+	}
+}
 
 // 内置适配器必须能读取上游各种缓存字段，并把它们写进 Responses / Claude 的
 // usage。CloudBase SDK 的字段名不固定，丢掉任何一个都会让统计长期显示 0。
@@ -31,6 +74,7 @@ spec.loader.exec_module(m)
 usage = {"prompt_tokens": 500, "completion_tokens": 7, "total_tokens": 507, "prompt_cache_hit_tokens": 400, "cache_creation_input_tokens": 20}
 tool_call = {"id":"call_1","type":"function","function":{"name":"shell","arguments":json.dumps({"cmd":"pwd"})}}
 completion = {"id":"c1","model":"m","choices":[{"message":{"role":"assistant","content":"checking","tool_calls":[tool_call]},"finish_reason":"tool_calls"}],"usage":usage}
+completion = m.normalize_completion(completion, "m")
 responses = m.completion_to_response(completion, "m", {"max_output_tokens":64,"input":"hi","store":False}, [{"role":"user","content":"hi"}])
 claude = m.completion_to_claude(completion, "m")
 print(json.dumps({"responses_usage":responses["usage"],"claude_usage":claude["usage"],"phases":[x.get("phase") for x in responses["output"]]}))
@@ -59,6 +103,7 @@ print(json.dumps({"responses_usage":responses["usage"],"claude_usage":claude["us
 	}
 }
 
+// 读取生产构建会嵌入的 CloudBase 适配脚本。
 func mustReadBuiltinCloudBaseAdapter(t *testing.T) []byte {
 	t.Helper()
 	providers := builtinCustomProviders()
@@ -81,6 +126,7 @@ func findPython(t *testing.T) string {
 	return ""
 }
 
+// 将嵌入脚本写到具有最小权限的测试临时目录。
 func writeTestFile(path string, body []byte) error {
 	return os.WriteFile(path, body, 0o600)
 }

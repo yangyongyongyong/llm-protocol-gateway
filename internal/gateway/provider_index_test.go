@@ -109,15 +109,34 @@ func TestProviderIndexRoutesPNAndPN1MToExactRow(t *testing.T) {
 	if rec := call("p3[1m]"); rec.Code != http.StatusOK {
 		t.Fatalf("p3[1m] status=%d body=%s", rec.Code, rec.Body.String())
 	}
+	// provider_index 模式下 default/default[1m] 与 p1/p1[1m] 等价，固定命中第 1 行。
+	if rec := call("default"); rec.Code != http.StatusOK {
+		t.Fatalf("default status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := call("default[1m]"); rec.Code != http.StatusOK {
+		t.Fatalf("default[1m] status=%d body=%s", rec.Code, rec.Body.String())
+	}
 	mu.Lock()
 	gotModels := append([]string(nil), models...)
 	mu.Unlock()
-	if len(gotModels) != 3 || gotModels[0] != "primary-model" || gotModels[1] != "second-model" || gotModels[2] != "third-model" {
+	if len(gotModels) != 5 || gotModels[0] != "primary-model" || gotModels[1] != "second-model" || gotModels[2] != "third-model" || gotModels[3] != "primary-model" || gotModels[4] != "primary-model" {
 		t.Fatalf("upstream models = %v", gotModels)
 	}
 
 	if rec := call("p4"); rec.Code != http.StatusBadRequest {
 		t.Fatalf("p4 status=%d body=%s, want 400", rec.Code, rec.Body.String())
+	}
+}
+
+func TestProviderIndexDefaultAliasesBindToFirstRow(t *testing.T) {
+	t.Parallel()
+	for _, model := range []string{"default", "default[1m]"} {
+		if index, ok := providerIndexAliasIndex(model); !ok || index != 1 {
+			t.Fatalf("%s index=%d ok=%v, want row 1", model, index, ok)
+		}
+	}
+	if index, ok := providerIndexAliasIndex("p3[1m]"); !ok || index != 3 {
+		t.Fatalf("p3[1m] index=%d ok=%v, want row 3", index, ok)
 	}
 }
 
@@ -131,6 +150,14 @@ func TestProviderIndexModelAliasesAreGeneratedForFiveRows(t *testing.T) {
 	want := []string{"p1", "p1[1m]", "p2", "p2[1m]", "p3", "p3[1m]", "p4", "p4[1m]", "p5", "p5[1m]"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("aliases=%v want=%v", got, want)
+	}
+	// 链路不足 5 行时也必须固定发布 p1..p5，不截断成 p1/p2。
+	twoRows := domain.APIKey{
+		ScheduleMode:        scheduleModeProviderIndex,
+		FallbackProviderIDs: []string{"a"},
+	}
+	if gotTwo := providerIndexModelAliases(twoRows, providerIndexCatalogLimit); strings.Join(gotTwo, ",") != strings.Join(want, ",") {
+		t.Fatalf("two-row aliases=%v want=%v", gotTwo, want)
 	}
 	key.ScheduleMode = scheduleModeOrder
 	if got := providerIndexModelAliases(key, providerIndexCatalogLimit); len(got) != 0 {

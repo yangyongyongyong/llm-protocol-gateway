@@ -8,7 +8,7 @@
  * /v1/ai/*；提交给云函数的是标准 Chat 请求、工具定义和 providerHints。
  *
  * 工具定义作为 ModelTool 传入，模型返回 tool_calls 后由客户端执行并继续下一轮。
- * maxSteps 默认不设上限；如需限制可用 event.maxSteps 或 AI_PROXY_MAX_STEPS。
+ * 每个 HTTP 请求只生成一步（maxSteps=1），工具由客户端执行；这不是整段对话的步数上限。
  */
 
 const tcb = require('@cloudbase/node-sdk')
@@ -108,23 +108,55 @@ function normalizeToolChoice(value) {
   return undefined
 }
 
-function completion(model, text, usage, toolCalls) {
-  /** 把 Node SDK 的 generateText 结果包装成 OpenAI Chat completion。 */
-  const prompt = Number(usage?.prompt_tokens || usage?.input_tokens || 0)
-  const completionTokens = Number(usage?.completion_tokens || usage?.output_tokens || 0)
+function chatUsage(raw, sdk) {
+  /** SDK 汇总只保留三项计数；以原始响应的计数为准，包括混元的 TitleCase 字段。 */
+  const count = (...values) => {
+    /** 取第一个有效的上游 token 计数，保留显式的零。 */
+    for (const value of values) {
+      if (value == null || value === '') continue
+      const number = Number(value)
+      if (Number.isSafeInteger(number) && number >= 0) return number
+    }
+    return 0
+  }
+  const prompt = count(raw.prompt_tokens, raw.PromptTokens, raw.input_tokens, raw.InputTokens, sdk?.prompt_tokens)
+  const output = count(raw.completion_tokens, raw.CompletionTokens, raw.output_tokens, raw.OutputTokens, sdk?.completion_tokens)
   // 不同模型 / provider 可能给 OpenAI 风格、Responses 风格或 Claude 风格的
   // 缓存字段。这里保留原始计数，让本地 adapter 归一到各协议的 usage。
-  const cacheRead = Number(
-    usage?.cache_read_input_tokens ||
-    usage?.prompt_cache_hit_tokens ||
-    usage?.prompt_tokens_details?.cached_tokens ||
-    usage?.input_tokens_details?.cached_tokens ||
-    0,
+  const cacheRead = count(
+    raw.cache_read_input_tokens, raw.CacheReadInputTokens,
+    raw.prompt_cache_hit_tokens, raw.PromptCacheHitTokens,
+    raw.prompt_tokens_details?.cached_tokens, raw.PromptTokensDetails?.CachedTokens,
+    raw.input_tokens_details?.cached_tokens, raw.InputTokensDetails?.CachedTokens,
+    raw.CachedTokens, sdk?.cache_read_input_tokens, sdk?.prompt_cache_hit_tokens,
+    sdk?.prompt_tokens_details?.cached_tokens, sdk?.input_tokens_details?.cached_tokens,
   )
-  const cacheCreation = Number(usage?.cache_creation_input_tokens || 0)
-  const calls = Array.isArray(toolCalls) ? toolCalls : []
+  const cacheCreation = count(
+    raw.cache_creation_input_tokens, raw.CacheCreationInputTokens,
+    raw.cache_write_input_tokens, raw.CacheWriteInputTokens,
+    sdk?.cache_creation_input_tokens, sdk?.cache_write_input_tokens,
+  )
+  const reasoning = count(raw.reasoning_tokens, raw.ReasoningTokens,
+    raw.completion_tokens_details?.reasoning_tokens, raw.CompletionTokensDetails?.ReasoningTokens,
+    raw.output_tokens_details?.reasoning_tokens, raw.OutputTokensDetails?.ReasoningTokens)
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: output,
+    total_tokens: count(raw.total_tokens, raw.TotalTokens, sdk?.total_tokens, prompt + output),
+    prompt_cache_hit_tokens: cacheRead,
+    cache_read_input_tokens: cacheRead,
+    cache_creation_input_tokens: cacheCreation,
+    prompt_tokens_details: { cached_tokens: cacheRead },
+    input_tokens_details: { cached_tokens: cacheRead },
+    ...(reasoning ? { reasoning_tokens: reasoning, completion_tokens_details: { reasoning_tokens: reasoning } } : {}),
+  }
+}
+
+function completion(model, text, usage, toolCalls, finishReason, reasoning) {
+  /** 把已经校验的本轮结果包装成 OpenAI Chat completion。 */
   const message = { role: 'assistant', content: String(text || '') }
-  if (calls.length) message.tool_calls = calls
+  if (toolCalls.length) message.tool_calls = toolCalls
+  if (typeof reasoning === 'string' && reasoning) message.reasoning_content = reasoning
   return {
     id: `chatcmpl-cloudbase-${Date.now()}`,
     object: 'chat.completion',
@@ -133,19 +165,85 @@ function completion(model, text, usage, toolCalls) {
     choices: [{
       index: 0,
       message,
-      finish_reason: calls.length ? 'tool_calls' : 'stop',
+      finish_reason: finishReason,
     }],
-    usage: {
-      prompt_tokens: prompt,
-      completion_tokens: completionTokens,
-      total_tokens: Number(usage?.total_tokens || prompt + completionTokens),
-      prompt_cache_hit_tokens: cacheRead,
-      cache_read_input_tokens: cacheRead,
-      cache_creation_input_tokens: cacheCreation,
-      prompt_tokens_details: { cached_tokens: cacheRead },
-      input_tokens_details: { cached_tokens: cacheRead },
-    },
+    usage,
   }
+}
+
+function invalidResponse(message) {
+  /** 结构不合法不是模型正常结束，也不应触发另一个 provider 再生成一次。 */
+  throw Object.assign(new Error(message), { code: 'INVALID_UPSTREAM_RESPONSE' })
+}
+
+function normalizedFinishReason(value) {
+  /** 统一 Chat 和混元的结束原因；保留未知值，交给调用方判错。 */
+  const reason = String(value || '').trim().toLowerCase()
+  if (['max_tokens', 'max_output_tokens'].includes(reason)) return 'length'
+  if (reason === 'sensitive') return 'content_filter'
+  if (['tool_call', 'function_call'].includes(reason)) return 'tool_calls'
+  return reason
+}
+
+function appendedAssistant(messages, historyLength) {
+  /** 只从 SDK 本次追加的消息恢复，绝不把请求里的上一条 assistant 当成本次输出。 */
+  if (!Array.isArray(messages) || messages.length <= historyLength) return null
+  const last = messages[messages.length - 1]
+  return last?.role === 'assistant' ? last : null
+}
+
+function normalizedCalls(message) {
+  /** 接受两种工具字段名并保留完整并行列表；缺 ID 由 adapter 统一补齐。 */
+  const list = message?.tool_calls ?? message?.ToolCalls ?? []
+  if (!Array.isArray(list)) invalidResponse('model returned an invalid tool_calls list')
+  return list.map((call) => {
+    const fn = call?.function ?? call?.Function
+    const name = fn?.name ?? fn?.Name
+    const args = fn?.arguments ?? fn?.Arguments
+    if (typeof name !== 'string' || !name.trim() || (args != null && typeof args !== 'string' &&
+      (typeof args !== 'object' || Array.isArray(args)))) {
+      invalidResponse('model returned an invalid tool call')
+    }
+    const id = call.id ?? call.Id ?? call.ID
+    return {
+      ...(typeof id === 'string' && id.trim() ? { id } : {}),
+      type: 'function',
+      function: { name: name.trim(), arguments: typeof args === 'string' ? args : JSON.stringify(args ?? {}) },
+    }
+  })
+}
+
+function generationCompletion(model, result, step, historyLength) {
+  /** 从 SDK 原始响应恢复结束原因、工具和缓存；SDK 汇总 usage 会丢弃缓存字段。 */
+  const raws = Array.isArray(result?.rawResponses) ? result.rawResponses : []
+  const raw = raws.length ? raws[raws.length - 1] : null
+  const envelope = raw?.Response || raw || {}
+  if (envelope.error || envelope.Error) invalidResponse('model returned an error instead of a completion')
+  const choice = (envelope.choices || envelope.Choices || [])[0] || {}
+  const rawMessage = choice.message || choice.Message
+  const assistant = appendedAssistant(result?.messages, historyLength) || appendedAssistant(step?.messages, historyLength)
+  const role = rawMessage?.role ?? rawMessage?.Role
+  if (rawMessage != null && (typeof rawMessage !== 'object' || Array.isArray(rawMessage) ||
+    (role != null && role !== 'assistant'))) {
+    invalidResponse('model returned an invalid assistant message')
+  }
+  let reason = normalizedFinishReason(choice.finish_reason || choice.FinishReason || step?.finishReason)
+  const incomplete = reason === 'length' || reason === 'content_filter'
+  if (reason && !incomplete && reason !== 'stop' && reason !== 'tool_calls') {
+    invalidResponse('model returned an unsupported finish reason')
+  }
+  // 部分输出的工具参数可能不完整，不允许客户端执行。SDK 的 step.toolCall 只有首项，不能用来恢复并行调用。
+  let calls = incomplete ? [] : normalizedCalls(rawMessage)
+  if (!incomplete && !calls.length) calls = normalizedCalls(assistant)
+  if (calls.length) reason = 'tool_calls'
+  if (reason === 'tool_calls' && !calls.length) invalidResponse('model requested tool execution but returned no tool_calls')
+  const text = rawMessage?.content ?? rawMessage?.Content ?? assistant?.content ?? result?.text ?? ''
+  if (typeof text !== 'string' || !reason || (reason === 'stop' && !text)) {
+    invalidResponse('model returned no complete assistant output or finish reason')
+  }
+  const usage = chatUsage(envelope.usage || envelope.Usage || {}, result?.usage || step?.stepUsage)
+  const reasoning = rawMessage?.reasoning_content ?? rawMessage?.ReasoningContent ?? assistant?.reasoning_content
+  return completion(model, text, usage, calls, reason, reasoning)
 }
 
 exports.main = async (event = {}) => {
@@ -175,10 +273,9 @@ exports.main = async (event = {}) => {
   const tools = normalizeTools(event.tools)
   const toolChoice = normalizeToolChoice(event.tool_choice)
 
-  const input = { model, messages }
-  // 默认不限制 step 数；只有显式配置才透传上限给 SDK。
-  const maxSteps = Number(event.maxSteps || process.env.AI_PROXY_MAX_STEPS || 0)
-  if (maxSteps > 0) input.maxSteps = maxSteps
+  // SDK 默认会尝试执行工具（最多 10 步），但本函数没有客户端工具的 fn。
+  // 必须只生成当前一步，把全部 tool_calls 交还 Codex，而不是在云函数里续跑。
+  const input = { model, messages, maxSteps: 1 }
   if (tools.length) input.tools = tools
   if (toolChoice) input.tool_choice = toolChoice
   if (typeof event.temperature === 'number') input.temperature = event.temperature
@@ -187,15 +284,21 @@ exports.main = async (event = {}) => {
 
   for (const provider of providerCandidates(event, model)) {
     try {
-      const result = await ai.createModel(provider).generateText(input)
+      let step
+      const historyLength = messages.length
+      const result = await ai.createModel(provider).generateText({
+        ...input,
+        messages: [...messages],
+        onStepFinish: (value) => {
+          /** 记录 SDK 归一化后的结束原因，不记录正文或凭据。 */
+          step = value
+        },
+      })
       if (result?.error) throw result.error
-      const resultMessages = Array.isArray(result?.messages) ? result.messages : []
-      const last = resultMessages.length ? resultMessages[resultMessages.length - 1] : null
-      const toolCalls = Array.isArray(last?.tool_calls) ? last.tool_calls : []
-      const text = String(result?.text || last?.content || '')
-      return completion(model, text, result?.usage || {}, toolCalls)
+      return generationCompletion(model, result, step, historyLength)
     } catch (error) {
       lastError = error
+      if (errorCode(error) === 'INVALID_UPSTREAM_RESPONSE') break
     }
   }
 

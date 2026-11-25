@@ -121,6 +121,30 @@ memories = true
 	}
 }
 
+// 裸 [model_providers] 表同样会与块内的 model_providers.<id> 点号键冲突。
+// 这是用户真实遇到的 duplicate key：第 38 行只有一个空表头。
+func TestStripForeignProviderTablesRemovesBareParent(t *testing.T) {
+	input := `model_providers.lpg = { name = "lpg" }
+
+[projects."/tmp/a"]
+trust_level = "trusted"
+
+[model_providers]
+
+[projects."/tmp/b"]
+trust_level = "trusted"
+`
+	got := stripForeignProviderTables(input)
+	if strings.Contains(got, "\n[model_providers]") || strings.HasPrefix(strings.TrimSpace(got), "[model_providers]") {
+		t.Fatalf("裸 model_providers 父表没删掉:\n%s", got)
+	}
+	for _, keep := range []string{`model_providers.lpg = { name = "lpg" }`, `[projects."/tmp/a"]`, `[projects."/tmp/b"]`} {
+		if !strings.Contains(got, keep) {
+			t.Fatalf("无关内容被误删 %q:\n%s", keep, got)
+		}
+	}
+}
+
 // 表外的顶层键不属于 provider，绝不能顺手删掉——那可能是用户自己的选择。
 func TestStripForeignProviderTablesKeepsTopLevelKeys(t *testing.T) {
 	input := `model_verbosity = "high"

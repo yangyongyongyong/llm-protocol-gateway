@@ -108,10 +108,16 @@ func stripClaudeContextTag(model string) string {
 }
 
 // providerIndexAliasIndex parses the reserved p1/p2/... spellings used by
-// provider_index mode. Claude's [1m] context tag is ignored for the row
-// lookup; it remains a client-side window hint and never reaches upstream.
+// provider_index mode. In this mode default/default[1m] are aliases of
+// p1/p1[1m]: selecting the platform default still means the first chain row,
+// not ordinary session/sticky scheduling. Claude's [1m] context tag is ignored
+// for the row lookup; it remains a client-side window hint and never reaches
+// upstream.
 func providerIndexAliasIndex(raw string) (int, bool) {
 	base := strings.ToLower(stripClaudeContextTag(raw))
+	if base == defaultModelAlias {
+		return 1, true
+	}
 	if len(base) < 2 || base[0] != 'p' {
 		return 0, false
 	}
@@ -134,12 +140,12 @@ func providerIndexModelAliases(key domain.APIKey, limit int) []string {
 	if !isScheduleModeProviderIndex(key.ScheduleMode) {
 		return nil
 	}
-	count := 1 + len(key.FallbackProviderIDs)
-	if count > limit {
-		count = limit
+	if limit <= 0 {
+		return nil
 	}
-	out := make([]string, 0, count*2)
-	for i := 1; i <= count; i++ {
+	// 固定发布 p1..p5（含 [1m]），不按当前 FallbackProviderIDs 数量截断。
+	out := make([]string, 0, limit*2)
+	for i := 1; i <= limit; i++ {
 		alias := "p" + strconv.Itoa(i)
 		out = append(out, alias, alias+claudeContextTag1M)
 	}
@@ -204,6 +210,8 @@ func resolveConsumerModel(router *Router, route domain.Route, key domain.APIKey,
 	// row is selected in executeProtocolFlowWithFailover, where the chain row's
 	// own model override is known. Resolving here against the route's preferred
 	// provider would collapse p3 onto the wrong provider/model before dispatch.
+	// default/default[1m] are included in providerIndexAliasIndex and therefore
+	// bind to row 1 exactly like p1/p1[1m].
 	// Desktop may spell pN as its anthropic/gw- hash alias, so reverse that
 	// first using the same candidate set /models published.
 	if gatewayKeyMatched && isScheduleModeProviderIndex(key.ScheduleMode) {

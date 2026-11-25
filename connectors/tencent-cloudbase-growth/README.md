@@ -38,7 +38,7 @@ Agent → Gateway → 本地 adapter.py → aiProxy 云函数 → @cloudbase/nod
 | 协议 | 本地入口 | 说明 |
 | --- | --- | --- |
 | OpenAI Chat Completions | `POST /v1/chat/completions` | 文本、SSE、工具调用 |
-| OpenAI Responses | `POST /v1/responses` | 文本、SSE、function_call；支持本地缓存的 `previous_response_id` |
+| OpenAI Responses | `POST /v1/responses` | 文本、SSE、并行工具、namespace、客户端工具搜索和 custom 工具；支持本地缓存的 `previous_response_id` |
 | Anthropic Messages | `POST /v1/messages` | 文本、SSE、tool_use / tool_result；本地提供 `count_tokens` 估算 |
 
 网关创建 Route 时把输出协议设为 `Claude` 或 `OpenAI Responses`，并选择这个 Provider，
@@ -65,7 +65,10 @@ npx -y -p @cloudbase/cli@latest tcb fn deploy aiProxy \
 - `providerHints`，默认对混元模型先试 `hunyuan-v3`，再试 `cloudbase`
 - `AI_PROXY_ALLOWED_MODELS` 模型白名单（仅显式设置时生效，默认不限制模型）
 - `AI_PROXY_PROVIDERS` provider 顺序覆盖
-- `AI_PROXY_MAX_STEPS` / `event.maxSteps` 步数上限（默认不限制）
+
+每次云函数请求固定用 `maxSteps: 1`，只生成当前一步，由 Codex 等客户端执行模型返回的全部工具，再带结果发起下一轮。它不限制对话轮数、消息条数或并行工具数量。
+
+升级 Codex 工具续轮兼容性时，需配套更新云端 `aiProxy` 和本地 adapter；仅替换其中一端无法修复另一端丢失的工具调用或事件。内置 adapter 随网关版本更新，自定义导入则使用重新生成的 JSON。不要在有活跃会话时替换正在使用的连接器进程。
 
 ## 导入连接器
 
@@ -91,6 +94,13 @@ tencent-cloudbase-growth.custom-connector.json
 - Claude：非流式响应、标准事件流、工具调用输出
 - `previous_response_id` 可在 adapter 进程存活期间续接历史
 - 成长计划额度面板会随着真实调用增加已用 Token
+
+工具续轮的离线回归使用假 aiProxy 和模拟 SDK，不消耗额度：工具前的文字是 `commentary`；所有工具项发完后才结束当前 SSE 响应；工具结果可通过完整历史或 `previous_response_id` 回传。上游报告截断时返回 `response.incomplete` 或非流式 `status: incomplete`，不把残缺工具调用交给客户端执行。
+
+```bash
+node --test connectors/tencent-cloudbase-growth/cloud-function/index.test.js
+go test ./internal/gateway -run 'Test(CloudBaseConnectorArtifactsMatch|BuiltinCloudBaseAdapter)'
+```
 
 ## 限制
 

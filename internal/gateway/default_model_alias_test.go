@@ -312,6 +312,9 @@ func TestClaudeModelsListsReservedDefaultAlias(t *testing.T) {
 	if _, ok := byID["default"]; !ok {
 		t.Fatalf("model list must include the reserved alias, got %v", byID)
 	}
+	if got := byID["default"]; got != contextLength272K {
+		t.Fatalf("default max_input_tokens = %d, want %d", got, contextLength272K)
+	}
 	if got := byID["default[1m]"]; got != contextLength1M {
 		t.Fatalf("default[1m] max_input_tokens = %d, want %d", got, contextLength1M)
 	}

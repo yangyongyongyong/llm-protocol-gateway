@@ -244,12 +244,13 @@ func desktopModelRows(entries []desktopModelEntry) []map[string]any {
 }
 
 // desktopReservedDefaultCatalog 发布稳定的 default / default[1m] 菜单项。
-// 普通项用通用短窗口，显式 1M 项固定报 1M；都不依赖目录的窗口推断。
+// 普通项按 Codex 对 OpenAI 模型的默认 272K，显式 1M 项固定报 1M；都不依赖
+// 目录的窗口推断，避免控制台把 default 显示成 121.6K（128K × Codex 的 95%）。
 // 请求反查后沿用现有默认模型解析，平台换默认模型不需要客户端重新选。
 // 默认模型仍是可选配置，API key 的 ModelOverride 优先级不变。
 func desktopReservedDefaultCatalog() []domain.Model {
 	return []domain.Model{
-		{ID: defaultModelAlias, Name: defaultModelAlias, ProviderID: "gateway", ContextLength: contextLengthDefault, InMenu: true},
+		{ID: defaultModelAlias, Name: defaultModelAlias, ProviderID: "gateway", ContextLength: contextLength272K, InMenu: true},
 		{ID: defaultModelAlias + claudeContextTag1M, Name: defaultModelAlias + claudeContextTag1M, ProviderID: "gateway", ContextLength: contextLength1M, InMenu: true},
 	}
 }

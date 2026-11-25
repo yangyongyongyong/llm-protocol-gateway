@@ -60,8 +60,8 @@ func TestModelDiscoveryInjectsEveryKeyCustomModelName(t *testing.T) {
 			t.Fatalf("OpenAI model discovery missing %q; got %v", id, openaiByID)
 		}
 	}
-	if got, _ := openaiByID["default"]["context_length"].(float64); got != contextLengthDefault {
-		t.Fatalf("default context_length=%v want %d", got, contextLengthDefault)
+	if got, _ := openaiByID["default"]["context_length"].(float64); got != contextLength272K {
+		t.Fatalf("default context_length=%v want %d", got, contextLength272K)
 	}
 	if got, _ := openaiByID["default[1m]"]["context_length"].(float64); got != contextLength1M {
 		t.Fatalf("default[1m] context_length=%v want %d", got, contextLength1M)

@@ -99,3 +99,27 @@ JSON 正文也被判成截断，客户端拿到 502。
 
 **修复**（`64d8ab1`）：转换流路径区分两者——空回答按「同 Provider 重试」的语义交给空流
 重试与兜底链，兜底账号的完整 JSON 正文不再参与事件流的截断判定。
+
+## 6. Gemini Responses 空回复及工具调用续聊
+
+**现象**：2026-11-25 14:29:05，`pod` Provider 的 `gemini-4-hydrogen` 返回 HTTP 200、
+`output_tokens=538`，但 Responses 输出为空、Codex 会话结束。14:59:41 则返回
+`response.incomplete`，原因是 `empty_visible_output`。
+
+**证据边界**：这两条日志只保存了转换后的 Responses 流，并未保存 Gemini 原始响应，
+不能断言上游一定只返回思考内容，也不能将这两次问题直接归因到某一个已确认的解析错误。
+
+**代码差异与修复**：对照 Magpie 的 Gemini 解码器、Responses 输出及空回复处理：
+- `oceanPodProxy` 生成的 Responses 事件补全递增 `sequence_number`、进行中的工具 item、
+  `function_call_arguments.delta/done`，并将工具前的助手文字标记为 `commentary`，
+  确保 Codex 继续执行工具而非把中间消息视为最终回答。
+- Gemini 的 STOP 空回复（含无候选但有用量）在代理中最多重试两次，优先同 key；各次费用
+  按实际 key 和区域分别记账。连续为空返回明确的 `empty_response` 错误，不再返回
+  `empty_visible_output` 的 incomplete。MAX_TOKENS、安全过滤、429 不按空回复重试。
+- Responses 直通空回复保护在判断前检查终态的 `output` / `output_text`，保留 refusal、
+  usage；心跳不插入半帧，混合 LF/CRLF 按最早帧边界解析，避免把已有正文误判为空。
+- 回归测试覆盖文本与工具同时输出、真实签名回传、空签名尾帧、重试记账、过滤和长度终态；
+  附隔离的真实 Codex CLI → 网关 → 模拟 Gemini 工具调用 → 工具结果 → 下一轮测试。
+
+**部署状态**：源码修复需重新构建并替换系统 App，代理改动需在不影响当前会话时重启
+PyCharm 管理的进程后生效；不要把磁盘代码与正在运行的版本混为一谈。

@@ -208,9 +208,11 @@ Key 级（也可存进"方案" `KeyProfile`，切方案一起切），空 = 现�
 | `least_used` | 在飞请求数最少的先用，其次看近 6 分钟实际处理过的 token（**缓存命中不计**） |
 | `quota` | 额度余量多的先用，数据来自额度面板已缓存的快照（Claude / ChatGPT / Cursor / 智谱 / DeepSeek / OpenCode Go），读不到的排在中位，**绝不在请求路径上打上游** |
 | `spread` | **会话分散**：新会话落到「当前挂着的活跃会话数最少」的账号，同数再按在飞/近 6 分钟负载、最后按链路顺序；定下后由会话 pin 钉住，两小时滑动。两个会话两个账号就各占一个，失败照常沿链漂移并改钉到新账号 |
-| `provider_index` | **按行绑定**：客户端模型 `p1`/`p2`/…（以及 `p1[1m]`/`p2[1m]`）固定命中链路第 1/2/… 行，只在那一行发送，不参与普通轮换或故障转移。Codex 一键模型目录按链路行数发布 `p1`～`p5`（每行普通/1M 两种）；同一 Provider 可重复成多行并各锁不同模型。行号超出当前链路返回 400。`/v1/models`、`/openai/v1/models`、`/anthropic/v1/models` 同时注入 `default`/`default[1m]`、`pN`/`pN[1m]`、Key 固定模型、模型别名键与目标、`fallbackModels` 中各行的固定模型 |
+| `provider_index` | **按行绑定**：客户端模型 `p1`/`p2`/…（以及 `p1[1m]`/`p2[1m]`）固定命中链路第 1/2/… 行，只在那一行发送，不参与普通轮换或故障转移；`default`/`default[1m]` 在该模式下分别等价于 `p1`/`p1[1m]`，同样固定命中第 1 行。Codex 一键模型目录与 `/models` 接口固定发布 `p1`～`p5`（每行普通/1M 两种，普通项按 Codex 的 272K 窗口，`[1m]` 项按 1M），不按当前备选行数截断；同一 Provider 可重复成多行并各锁不同模型。行号超出当前链路返回 400。`/v1/models`、`/openai/v1/models`、`/anthropic/v1/models` 同时注入 `default`/`default[1m]`、`pN`/`pN[1m]`、Key 固定模型、模型别名键与目标、`fallbackModels` 中各行的固定模型 |
 
 模型目录注入只影响客户端发现，不会把上游真实目录删掉；上游真实模型仍按原规则列出。
+普通 `gpt-*` 在厂商或上游没有给出更大窗口时按 272K 发布，`gpt-5.5`、`gpt-5.6` 等有明确更大规格的模型仍保留其声明窗口。
+切换调度模式或调整备选链路后再次点击「一键写入本机（Codex CLI + Desktop）」，即便 `config.toml` 本身未变化，也会同步对比并刷新 `lpg-model-catalog.json` 与 `auth.json`。
 
 非法取值在保存时被拒绝（`normalizeScheduleMode`），不会静默退化成 `order`。
 

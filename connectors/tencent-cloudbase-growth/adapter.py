@@ -14,8 +14,10 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import signal
 import sys
 import threading
@@ -70,7 +72,11 @@ STATUS_BY_CODE = {
     "AI_CHANNEL_NOT_ALLOWED": 502,
     "TCB_ENV_MISSING": 500,
     "UPSTREAM_ERROR": 502,
+    "INVALID_UPSTREAM_RESPONSE": 502,
 }
+INCOMPLETE_REASONS = {"length": "max_output_tokens", "content_filter": "content_filter"}
+TOOL_SEARCH_KEY = ("tool_search", "", "tool_search")
+ResponsesToolKey = tuple[str, str, str]
 
 
 def log(message: str) -> None:
@@ -214,60 +220,110 @@ def tool_output_text(content: Any) -> str:
         return str(content or "")
 
 
-def normalize_completion(data: dict[str, Any], model: str) -> dict[str, Any]:
-    """补全云函数返回的 OpenAI Chat completion，容忍外层 result 包装。"""
+def normalize_completion(data: dict[str, Any], model: str, history_length: int = 0) -> dict[str, Any]:
+    """在读取云函数响应时校验工具形状、补齐调用 ID；各协议随后只读。"""
     if isinstance(data.get("result"), dict):
         data = data["result"]
     if isinstance(data.get("error"), dict):
         return data
     choices = data.get("choices")
-    if not isinstance(choices, list) or not choices:
-        message = data.get("text") if isinstance(data.get("text"), str) else ""
-        data = {
-            "id": data.get("id") or new_id("chatcmpl-cloudbase-"),
-            "object": "chat.completion",
-            "created": data.get("created") or int(time.time()),
-            "model": data.get("model") or model,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": message}, "finish_reason": "stop"}],
-            "usage": data.get("usage") or {},
-        }
-    data["model"] = data.get("model") or model
-    return data
+    if choices is None:
+        # 容忍直接返回 SDK 结果的 aiProxy，但不能把无有效输出的响应伪装成成功。
+        raws = data.get("rawResponses")
+        raw = raws[-1] if isinstance(raws, list) and raws and isinstance(raws[-1], dict) else {}
+        sdk_usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        raw_usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
+        # 裸 SDK 结果只能从已知的请求历史边界之后取 assistant，避免重发历史工具调用。
+        if "choices" in raw:
+            data = {**raw, "usage": {**sdk_usage, **raw_usage}}
+        else:
+            messages = data.get("messages")
+            last = messages[-1] if isinstance(messages, list) and len(messages) > history_length else None
+            message = dict(last) if isinstance(last, dict) and last.get("role") == "assistant" else {"role": "assistant"}
+            if message.get("content") is None and isinstance(data.get("text"), str):
+                message["content"] = data["text"]
+            data = {**data, "choices": [{"index": 0, "message": message, "finish_reason": data.get("finish_reason")}]}
+    if not isinstance(data.get("choices"), list) or not data["choices"]:
+        return error_payload("UPSTREAM_ERROR", "aiProxy returned an invalid completion choices list")
+    choice = data["choices"][0]
+    if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+        return error_payload("UPSTREAM_ERROR", "aiProxy returned a completion without an assistant message")
+    message = dict(choice["message"])
+    content = message.get("content")
+    if message.get("role", "assistant") != "assistant" or (content is not None and not isinstance(content, (str, list))):
+        return error_payload("UPSTREAM_ERROR", "aiProxy returned an invalid assistant message")
+    finish_reason = str(choice.get("finish_reason") or "").strip().lower()
+    finish_reason = {
+        "max_tokens": "length", "max_output_tokens": "length", "sensitive": "content_filter",
+        "function_call": "tool_calls", "tool_call": "tool_calls",
+    }.get(finish_reason, finish_reason)
+    if finish_reason not in ("", "stop", "tool_calls", *INCOMPLETE_REASONS):
+        return error_payload("UPSTREAM_ERROR", "aiProxy returned an unsupported finish reason")
+    try:
+        # 截断的工具参数可能不是完整 JSON，不向任何协议交付可执行的调用。
+        calls = [] if finish_reason in INCOMPLETE_REASONS else normalize_completion_calls(message.get("tool_calls"))
+    except ValueError as exc:
+        return error_payload("UPSTREAM_ERROR", str(exc))
+    if calls:
+        finish_reason = "tool_calls"
+        message["tool_calls"] = calls
+    else:
+        message.pop("tool_calls", None)
+        if finish_reason == "tool_calls":
+            return error_payload("UPSTREAM_ERROR", "aiProxy reported a tool call without a callable tool")
+        if finish_reason not in INCOMPLETE_REASONS and not content_text(content):
+            return error_payload("UPSTREAM_ERROR", "aiProxy returned no assistant text or tool calls")
+    message["role"] = "assistant"
+    return {
+        **data, "id": data.get("id") or new_id("chatcmpl-cloudbase-"), "object": "chat.completion",
+        "created": data.get("created") or int(time.time()), "model": data.get("model") or model,
+        "choices": [{**choice, "index": 0, "message": message, "finish_reason": finish_reason or "stop"}],
+    }
+
+
+def normalize_completion_calls(value: Any) -> list[dict[str, Any]]:
+    """保留完整的并行工具调用，拒绝不合法的条目而不是悄悄少发工具。"""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("aiProxy returned an invalid tool_calls list")
+    calls = []
+    seen: set[str] = set()
+    for item in value:
+        function = item.get("function") if isinstance(item, dict) else None
+        name = function.get("name") if isinstance(function, dict) else None
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("aiProxy returned a tool call without a valid name")
+        arguments = function.get("arguments")
+        if arguments is not None and not isinstance(arguments, (str, dict)):
+            raise ValueError("aiProxy returned invalid tool call arguments")
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments or {}, ensure_ascii=False, separators=(",", ":"))
+        call_id = item.get("id")
+        if not isinstance(call_id, str) or not call_id.strip():
+            call_id = new_id("call_")
+        if call_id in seen:
+            raise ValueError("aiProxy returned duplicate tool call IDs")
+        seen.add(call_id)
+        calls.append({"id": call_id, "type": "function", "function": {"name": name.strip(), "arguments": arguments or "{}"}})
+    return calls
 
 
 def completion_details(completion: dict[str, Any]) -> tuple[str, list[dict[str, Any]], str, dict[str, Any]]:
-    """从 Chat completion 提取文本、工具调用、结束原因和 usage。"""
-    choice = (completion.get("choices") or [{}])[0] or {}
-    message = choice.get("message") or {}
-    text = content_text(message.get("content"))
-    tool_calls: list[dict[str, Any]] = []
-    for index, item in enumerate(message.get("tool_calls") or []):
-        if not isinstance(item, dict):
-            continue
-        function = item.get("function") or {}
-        name = str(function.get("name") or "").strip()
-        if not name:
-            continue
-        arguments = function.get("arguments")
-        if not isinstance(arguments, str):
-            arguments = json.dumps(arguments or {}, ensure_ascii=False, separators=(",", ":"))
-        tool_calls.append({
-            "id": str(item.get("id") or f"call_{int(time.time() * 1000)}_{index}"),
-            "type": "function",
-            "function": {"name": name, "arguments": arguments},
-        })
-    finish_reason = str(choice.get("finish_reason") or ("tool_calls" if tool_calls else "stop"))
+    """从已归一的 Chat completion 读取正文、工具状态和 usage，不重新生成 ID。"""
+    choice = completion["choices"][0]
+    message = choice["message"]
     usage = completion.get("usage") if isinstance(completion.get("usage"), dict) else {}
-    return text, tool_calls, finish_reason, usage
+    return content_text(message.get("content")), message.get("tool_calls") or [], choice["finish_reason"], usage
 
 
 def apply_responses_output_phases(output: list[dict[str, Any]], done: bool) -> None:
-    """按 Magpie / OpenAI Responses 的语义给 assistant message 标注 phase。
+    """按 OpenAI Responses 的语义给 assistant message 标注 phase。
 
     Codex 会把没有 phase 的 assistant message 当成最终答复；工具调用前的说明
     因此会让回合看起来“已经说完”。工具调用前或另一个非 reasoning 输出前的
     message 是 commentary，只有正常结束时的最后一个非 reasoning item 才是
-    final_answer。上游若已给出 phase 则原样保留。
+    final_answer。截断内容仍是 commentary；上游若已给出 phase 则原样保留。
     """
     if not isinstance(output, list):
         return
@@ -282,9 +338,9 @@ def apply_responses_output_phases(output: list[dict[str, Any]], done: bool) -> N
             continue
         if item.get("phase"):
             continue
-        if index < last:
+        if index < last or not done:
             item["phase"] = "commentary"
-        elif index == last and done:
+        elif index == last:
             item["phase"] = "final_answer"
 
 
@@ -413,7 +469,7 @@ def call_cloudbase_chat(
         code = str(error.get("code") or "UPSTREAM_ERROR")
         message = str(error.get("message") or f"aiProxy returned HTTP {status}")
         return None, (status, code, message)
-    completion = normalize_completion(data, model)
+    completion = normalize_completion(data, model, len(messages))
     if isinstance(completion.get("error"), dict):
         error = completion["error"]
         code = str(error.get("code") or "UPSTREAM_ERROR")
@@ -431,93 +487,195 @@ def is_probe_request(payload: dict[str, Any]) -> bool:
     return False
 
 
-def remember_response(response_id: str, messages: list[dict[str, Any]]) -> None:
-    """保存 Responses 的上一轮消息，供 previous_response_id 续接。"""
+def remember_response(response_id: str, messages: list[dict[str, Any]], tools: ResponsesTools | None) -> None:
+    """保存 Responses 的上一轮消息和工具名映射，供 previous_response_id 续接。"""
     now = time.time()
     with RESPONSE_STORE_LOCK:
         expired = [key for key, value in RESPONSE_STORE.items() if now - float(value.get("at", 0)) > RESPONSE_STORE_TTL_SEC]
         for key in expired:
             RESPONSE_STORE.pop(key, None)
-        RESPONSE_STORE[response_id] = {"messages": messages, "at": now}
+        RESPONSE_STORE[response_id] = {"messages": messages, "tools": tools, "at": now}
         while len(RESPONSE_STORE) > RESPONSE_STORE_LIMIT:
             RESPONSE_STORE.pop(next(iter(RESPONSE_STORE)))
 
 
-def recall_response(response_id: str) -> list[dict[str, Any]]:
-    """读取 previous_response_id 对应的历史消息；过期或不存在时返回空列表。"""
+def recall_response(response_id: str) -> tuple[list[dict[str, Any]], ResponsesTools | None]:
+    """读取 previous_response_id 的历史与别名；过期或不存在时返回空结果。"""
     if not response_id:
-        return []
+        return [], None
     with RESPONSE_STORE_LOCK:
         item = RESPONSE_STORE.get(response_id)
         if not item:
-            return []
+            return [], None
         if time.time() - float(item.get("at", 0)) > RESPONSE_STORE_TTL_SEC:
             RESPONSE_STORE.pop(response_id, None)
-            return []
-        return [dict(message) for message in item.get("messages", []) if isinstance(message, dict)]
+            return [], None
+        return list(item["messages"]), item["tools"]
 
 
-def responses_input_to_chat(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    """把 OpenAI Responses 的 input 转成 Chat messages。"""
-    messages = recall_response(str(payload.get("previous_response_id") or ""))
+class ResponsesTools:
+    """在 Chat 的扁平工具名和 Codex 的原始工具身份间双向转换。"""
+
+    def __init__(self, declared: Any, items: list[Any], previous: ResponsesTools | None) -> None:
+        """收集显式和动态加载的工具；优先保留普通函数的合法原名。"""
+        self.aliases = dict(previous.aliases) if previous else {}
+        self.keys = {alias: key for key, alias in self.aliases.items()}
+        definitions: dict[ResponsesToolKey, dict[str, Any]] = {}
+        self.collect(declared, definitions)
+        for item in items:
+            if isinstance(item, dict) and item.get("type") in ("additional_tools", "tool_search_output"):
+                self.collect(item.get("tools"), definitions)
+        for key in sorted(definitions, key=lambda key: (key[0] != "function" or bool(key[1]), key)):
+            self.alias_for(key)
+        self.chat_tools = [
+            {"type": "function", "function": {**definition, "name": self.aliases[key]}}
+            for key, definition in definitions.items()
+        ]
+
+    def collect(self, tools: Any, definitions: dict[ResponsesToolKey, dict[str, Any]], namespace: str = "") -> None:
+        """展开 namespace，把 custom 的原始字符串放到单一 input 属性。"""
+        if not isinstance(tools, list):
+            return
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            kind = tool.get("type") or "function"
+            nested = tool.get("function")
+            definition = nested if isinstance(nested, dict) else tool
+            name = str(definition.get("name") or "").strip()
+            if kind == "namespace" and name and not namespace:
+                self.collect(tool.get("tools") or tool.get("children"), definitions, name)
+            if kind == "tool_search" and not namespace and tool.get("execution") != "server":
+                definitions.setdefault(TOOL_SEARCH_KEY, {
+                    "description": "Search and load tools for the current task.",
+                    "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]},
+                })
+            if not name or kind not in ("function", "custom"):
+                continue
+            description = str(definition.get("description") or "")
+            parameters = definition.get("parameters")
+            if kind == "custom":
+                description += "\nPass the original tool's raw input as a string, preserving whitespace."
+                if tool.get("format") is not None:
+                    description += " Input format: " + json.dumps(tool["format"], ensure_ascii=False)
+                parameters = {"type": "object", "properties": {"input": {"type": "string"}}, "required": ["input"], "additionalProperties": False}
+            if not isinstance(parameters, dict):
+                parameters = {"type": "object", "properties": {}}
+            definitions.setdefault((kind, namespace, name), {"description": description, "parameters": parameters})
+
+    def alias_for(self, key: ResponsesToolKey) -> str:
+        """分配不超过 64 字符的合法 Chat 别名，避免同名或截断碰撞。"""
+        if key in self.aliases:
+            return self.aliases[key]
+        _, namespace, name = key
+        label = f"{namespace}__{name}" if namespace else name
+        alias = label
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", alias) or alias in self.keys:
+            prefix = re.sub(r"[^A-Za-z0-9_-]", "_", label)[:46]
+            identity = json.dumps(key, ensure_ascii=False).encode("utf-8")
+            index = 0
+            while True:
+                suffix = hashlib.sha256(identity + b":" + str(index).encode()).hexdigest()[:16]
+                alias = f"{prefix}__{suffix}"
+                if alias not in self.keys:
+                    break
+                index += 1
+        self.aliases[key] = alias
+        self.keys[alias] = key
+        return alias
+
+
+def responses_input_to_chat(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], ResponsesTools]:
+    """把 Responses 历史和工具定义拆开，并保留前言与工具调用的配对。"""
+    messages, previous_tools = recall_response(str(payload.get("previous_response_id") or ""))
     instructions = content_text(payload.get("instructions"))
     if instructions:
         messages.append({"role": "system", "content": instructions})
 
     raw_input = payload.get("input")
     if isinstance(raw_input, str):
-        messages.append({"role": "user", "content": raw_input})
-        return messages
-    if isinstance(raw_input, dict):
+        raw_input = [{"role": "user", "content": raw_input}]
+    elif isinstance(raw_input, dict):
         raw_input = [raw_input]
-    if not isinstance(raw_input, list):
-        return messages
-
-    pending_calls: list[dict[str, Any]] = []
+    items = raw_input if isinstance(raw_input, list) else []
+    tools = ResponsesTools(payload.get("tools"), items, previous_tools)
+    search_ids = {
+        call["id"] for message in messages for call in message.get("tool_calls", [])
+        if tools.keys.get(call["function"]["name"]) == TOOL_SEARCH_KEY
+    }
+    pending: dict[str, Any] | None = None
 
     def flush_calls() -> None:
-        """把连续出现的 Responses function_call 合并成一条 assistant 消息。"""
-        nonlocal pending_calls
-        if pending_calls:
-            messages.append({"role": "assistant", "tool_calls": pending_calls})
-            pending_calls = []
+        """把前言及连续的并行调用作为一条 assistant 消息提交。"""
+        nonlocal pending
+        if pending is not None:
+            messages.append(pending)
+            pending = None
 
-    for item in raw_input:
+    for item in items:
         if not isinstance(item, dict):
             continue
         item_type = str(item.get("type") or "")
-        if item_type in ("function_call", "custom_tool_call"):
+        if item_type in ("function_call", "custom_tool_call", "tool_search_call"):
+            if item.get("status") in ("incomplete", "in_progress"):
+                continue
             call_id = str(item.get("call_id") or item.get("id") or new_id("call_"))
-            name = str(item.get("name") or "")
             arguments = item.get("arguments")
+            if item_type == "tool_search_call":
+                if item.get("execution") == "server":
+                    continue
+                key = TOOL_SEARCH_KEY
+                search_ids.add(call_id)
+            else:
+                name = str(item.get("name") or "").strip()
+                if not name:
+                    raise ValueError("tool call name is required")
+                kind = "custom" if item_type == "custom_tool_call" else "function"
+                key = (kind, str(item.get("namespace") or "").strip(), name)
+                if kind == "custom":
+                    arguments = {"input": item.get("input", "")}
             if not isinstance(arguments, str):
                 arguments = json.dumps(arguments or {}, ensure_ascii=False, separators=(",", ":"))
-            pending_calls.append({
+            if pending is None:
+                pending = {"role": "assistant"}
+            pending.setdefault("tool_calls", []).append({
                 "id": call_id,
                 "type": "function",
-                "function": {"name": name, "arguments": arguments},
+                "function": {"name": tools.alias_for(key), "arguments": arguments or "{}"},
             })
             continue
-        if item_type in ("function_call_output", "custom_tool_call_output"):
+        if item_type in ("function_call_output", "custom_tool_call_output", "tool_search_output"):
+            call_id = str(item.get("call_id") or item.get("id") or "")
+            # 仅携带定义的 tool_search_output 不生成孤立的 tool message。
+            if item_type == "tool_search_output" and call_id not in search_ids:
+                continue
             flush_calls()
+            result = item.get("output", item.get("tools") if item_type == "tool_search_output" else None)
             messages.append({
                 "role": "tool",
-                "tool_call_id": str(item.get("call_id") or item.get("id") or ""),
-                "content": tool_output_text(item.get("output")),
+                "tool_call_id": call_id,
+                "content": tool_output_text(result),
             })
             continue
         if item_type in ("message", "") and item.get("role"):
             flush_calls()
             role = "system" if item.get("role") == "developer" else str(item.get("role"))
-            messages.append({"role": role, "content": content_text(item.get("content"))})
+            message = {"role": role, "content": content_text(item.get("content"))}
+            if role == "assistant" and item.get("phase") != "final_answer":
+                pending = message
+            else:
+                messages.append(message)
     flush_calls()
-    return messages
+    return messages, tools
 
 
 def chat_message_from_completion(completion: dict[str, Any]) -> dict[str, Any]:
     """把 Chat completion 的 assistant message 还原成可再次发送的 Chat message。"""
     text, tool_calls, _, _ = completion_details(completion)
     message: dict[str, Any] = {"role": "assistant"}
+    reasoning = completion["choices"][0]["message"].get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning:
+        message["reasoning_content"] = reasoning
     if text:
         message["content"] = text
     if tool_calls:
@@ -527,8 +685,8 @@ def chat_message_from_completion(completion: dict[str, Any]) -> dict[str, Any]:
     return message
 
 
-def response_output_items(text: str, tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """把 Chat completion 转成 Responses output 数组。"""
+def response_output_items(text: str, tool_calls: list[dict[str, Any]], tools: ResponsesTools | None) -> list[dict[str, Any]]:
+    """恢复 Responses 工具类型、名称和 namespace，原样返回 custom 工具的字符串。"""
     output: list[dict[str, Any]] = []
     if text:
         output.append({
@@ -539,15 +697,29 @@ def response_output_items(text: str, tool_calls: list[dict[str, Any]]) -> list[d
             "content": [{"type": "output_text", "text": text, "annotations": []}],
         })
     for call in tool_calls:
-        function = call.get("function") or {}
-        output.append({
-            "id": new_id("fc_"),
-            "type": "function_call",
-            "status": "completed",
-            "call_id": call.get("id") or new_id("call_"),
-            "name": function.get("name") or "",
-            "arguments": function.get("arguments") or "{}",
-        })
+        function = call["function"]
+        alias = function["name"]
+        kind, namespace, name = tools.keys.get(alias, ("function", "", alias)) if tools else ("function", "", alias)
+        arguments = function["arguments"]
+        item = {"id": new_id("fc_"), "status": "completed", "call_id": call["id"]}
+        if kind in ("custom", "tool_search"):
+            try:
+                args = json.loads(arguments)
+            except ValueError as exc:
+                raise ValueError("aiProxy returned invalid arguments for a Responses client tool") from exc
+            if not isinstance(args, dict):
+                raise ValueError("aiProxy returned non-object arguments for a Responses client tool")
+            if kind == "custom":
+                if not isinstance(args.get("input"), str):
+                    raise ValueError("aiProxy returned a custom tool without string input")
+                item.update(type="custom_tool_call", name=name, input=args["input"])
+            else:
+                item.update(type="tool_search_call", execution="client", arguments=args)
+        else:
+            item.update(type="function_call", name=name, arguments=arguments)
+        if namespace:
+            item["namespace"] = namespace
+        output.append(item)
     return output
 
 
@@ -556,14 +728,20 @@ def completion_to_response(
     model: str,
     payload: dict[str, Any],
     conversation_messages: list[dict[str, Any]],
+    tools: ResponsesTools | None = None,
 ) -> dict[str, Any]:
     """把 Chat completion 包装成 OpenAI Responses 响应。"""
     text, tool_calls, finish_reason, usage = completion_details(completion)
     prompt, output_tokens, total_tokens = usage_numbers(usage)
     cache_read = cache_read_tokens(usage)
     response_id = new_id("resp_")
-    status = "incomplete" if finish_reason in ("length", "max_tokens") else "completed"
-    output = response_output_items(text, tool_calls)
+    incomplete_reason = INCOMPLETE_REASONS.get(finish_reason)
+    status = "incomplete" if incomplete_reason else "completed"
+    # 输出截断时参数可能是不完整的 JSON，不向客户端暴露可执行的调用项。
+    output = response_output_items(text, [] if incomplete_reason else tool_calls, tools)
+    if incomplete_reason:
+        for item in output:
+            item["status"] = "incomplete"
     apply_responses_output_phases(output, status == "completed")
     response = {
         "id": response_id,
@@ -571,7 +749,7 @@ def completion_to_response(
         "created_at": int(time.time()),
         "status": status,
         "error": None,
-        "incomplete_details": {"reason": "max_output_tokens"} if status == "incomplete" else None,
+        "incomplete_details": {"reason": incomplete_reason} if incomplete_reason else None,
         "instructions": payload.get("instructions"),
         "max_output_tokens": payload.get("max_output_tokens"),
         "model": model,
@@ -596,7 +774,9 @@ def completion_to_response(
         "output_text": text,
     }
     if bool(payload.get("store", True)):
-        remember_response(response_id, conversation_messages + [chat_message_from_completion(completion)])
+        assistant = chat_message_from_completion(completion) if not incomplete_reason else {"role": "assistant", "content": text}
+        history = conversation_messages + [assistant] if not incomplete_reason or text else conversation_messages
+        remember_response(response_id, history, tools)
     return response
 
 
@@ -682,7 +862,7 @@ def completion_to_claude(completion: dict[str, Any], model: str) -> dict[str, An
     content: list[dict[str, Any]] = []
     if text:
         content.append({"type": "text", "text": text})
-    for call in tool_calls:
+    for call in tool_calls if finish_reason not in ("length", "content_filter") else []:
         function = call.get("function") or {}
         try:
             tool_input = json.loads(function.get("arguments") or "{}")
@@ -696,7 +876,7 @@ def completion_to_claude(completion: dict[str, Any], model: str) -> dict[str, An
         })
     if not content:
         content.append({"type": "text", "text": ""})
-    stop_reason = "tool_use" if tool_calls else ("max_tokens" if finish_reason in ("length", "max_tokens") else "end_turn")
+    stop_reason = {"length": "max_tokens", "content_filter": "refusal", "tool_calls": "tool_use"}.get(finish_reason, "end_turn")
     result = {
         "id": new_id("msg_"),
         "type": "message",
@@ -981,14 +1161,13 @@ class CloudBaseHandler(BaseHTTPRequestHandler):
 
     def handle_responses(self, payload: dict[str, Any], model: str) -> int:
         """处理 OpenAI Responses。"""
-        messages = responses_input_to_chat(payload)
+        messages, tools = responses_input_to_chat(payload)
         if not messages:
             raise ValueError("input is required")
-        tools = normalize_chat_tools(payload.get("tools"))
         completion, error = call_cloudbase_chat(
             messages,
             model,
-            tools=tools,
+            tools=tools.chat_tools,
             tool_choice=normalize_tool_choice(payload.get("tool_choice")),
             temperature=payload.get("temperature"),
             top_p=payload.get("top_p"),
@@ -998,7 +1177,11 @@ class CloudBaseHandler(BaseHTTPRequestHandler):
             self.send_protocol_error(error[0], "responses", error[1], error[2])
             return error[0]
         assert completion is not None
-        response = completion_to_response(completion, model, payload, messages)
+        try:
+            response = completion_to_response(completion, model, payload, messages, tools)
+        except ValueError as exc:
+            self.send_protocol_error(502, "responses", "UPSTREAM_ERROR", str(exc))
+            return 502
         if not payload.get("stream"):
             self.send_json(200, response)
             return 200
@@ -1008,13 +1191,10 @@ class CloudBaseHandler(BaseHTTPRequestHandler):
 
     def stream_responses(self, response: dict[str, Any]) -> None:
         """按 Responses 事件协议合成 SSE。"""
-        text = str(response.get("output_text") or "")
-        output = response.get("output") if isinstance(response.get("output"), list) else []
-        message_items = [item for item in output if isinstance(item, dict) and item.get("type") == "message"]
-        call_items = [item for item in output if isinstance(item, dict) and item.get("type") == "function_call"]
         sequence = 0
 
         def emit(name: str, payload: dict[str, Any]) -> None:
+            """保持 SSE 类型与事件名一致，并递增序号。"""
             nonlocal sequence
             body = {"type": name, "sequence_number": sequence, **payload}
             self.write_sse_event(name, body)
@@ -1024,38 +1204,45 @@ class CloudBaseHandler(BaseHTTPRequestHandler):
         created["status"] = "in_progress"
         created["output"] = []
         created["output_text"] = ""
+        created["usage"] = None
+        created["incomplete_details"] = None
         emit("response.created", {"response": created})
         emit("response.in_progress", {"response": created})
 
-        output_index = 0
-        if text and message_items:
-            item = message_items[0]
-            part = {"type": "output_text", "text": "", "annotations": []}
-            added_item = dict(item)
-            added_item["content"] = []
-            added_item["status"] = "in_progress"
-            emit("response.output_item.added", {"output_index": output_index, "item": added_item})
-            emit("response.content_part.added", {"item_id": item.get("id"), "output_index": output_index, "content_index": 0, "part": part})
-            for piece in chunk_text(text):
-                if piece:
-                    emit("response.output_text.delta", {"item_id": item.get("id"), "output_index": output_index, "content_index": 0, "delta": piece, "logprobs": []})
-            emit("response.output_text.done", {"item_id": item.get("id"), "output_index": output_index, "content_index": 0, "text": text, "logprobs": []})
-            emit("response.content_part.done", {"item_id": item.get("id"), "output_index": output_index, "content_index": 0, "part": {"type": "output_text", "text": text, "annotations": []}})
-            emit("response.output_item.done", {"output_index": output_index, "item": item})
-            output_index += 1
-
-        for item in call_items:
-            arguments = str(item.get("arguments") or "{}")
-            added = dict(item)
-            added["arguments"] = ""
-            added["status"] = "in_progress"
+        for output_index, item in enumerate(response["output"]):
+            kind = item["type"]
+            added = {**item, "status": "in_progress"}
+            fields = {"item_id": item["id"], "output_index": output_index}
+            if kind == "message":
+                added["content"] = []
+            elif kind == "custom_tool_call":
+                added["input"] = ""
+            else:
+                added["arguments"] = {} if kind == "tool_search_call" else ""
             emit("response.output_item.added", {"output_index": output_index, "item": added})
-            emit("response.function_call_arguments.delta", {"item_id": item.get("id"), "output_index": output_index, "delta": arguments})
-            emit("response.function_call_arguments.done", {"item_id": item.get("id"), "output_index": output_index, "arguments": arguments})
+            if kind == "message":
+                for content_index, part in enumerate(item["content"]):
+                    content_fields = {**fields, "content_index": content_index}
+                    text = part["text"]
+                    emit("response.content_part.added", {**content_fields, "part": {**part, "text": ""}})
+                    for piece in chunk_text(text):
+                        emit("response.output_text.delta", {**content_fields, "delta": piece, "logprobs": []})
+                    emit("response.output_text.done", {**content_fields, "text": text, "logprobs": []})
+                    emit("response.content_part.done", {**content_fields, "part": part})
+            elif kind == "custom_tool_call":
+                # custom 工具必须用 input 事件，不改写自由文本或补默认 JSON。
+                for piece in chunk_text(item["input"]):
+                    if piece:
+                        emit("response.custom_tool_call_input.delta", {**fields, "delta": piece})
+                emit("response.custom_tool_call_input.done", {**fields, "input": item["input"]})
+            elif kind == "function_call":
+                arguments = item["arguments"]
+                emit("response.function_call_arguments.delta", {**fields, "delta": arguments})
+                emit("response.function_call_arguments.done", {**fields, "name": item["name"], "arguments": arguments})
             emit("response.output_item.done", {"output_index": output_index, "item": item})
-            output_index += 1
 
-        emit("response.completed", {"response": response})
+        terminal = "response.incomplete" if response.get("status") == "incomplete" else "response.completed"
+        emit(terminal, {"response": response})
         self.end_chunked()
 
     def handle_messages(self, payload: dict[str, Any], model: str) -> int:
@@ -1091,7 +1278,7 @@ class CloudBaseHandler(BaseHTTPRequestHandler):
         message["content"] = []
         message["stop_reason"] = None
         message["stop_sequence"] = None
-        message["usage"] = {"input_tokens": safe_int(usage.get("input_tokens")), "output_tokens": 0}
+        message["usage"] = {**usage, "output_tokens": 0}
         self.begin_sse()
         self.write_sse_event("message_start", {"type": "message_start", "message": message})
         blocks = response.get("content") if isinstance(response.get("content"), list) else []

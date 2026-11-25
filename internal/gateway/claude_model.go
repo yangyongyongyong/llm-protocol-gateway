@@ -43,7 +43,7 @@ func isClaudeOpusModel(model string) bool {
 // will land on, and over-reporting capacity would let a client skip compaction
 // it still needs.
 func reservedDefaultModelEntries() []map[string]any {
-	contextLen := contextLengthDefault
+	contextLen := resolveModelContextLength(defaultModelAlias, 0)
 	return []map[string]any{
 		{
 			"id":               defaultModelAlias,

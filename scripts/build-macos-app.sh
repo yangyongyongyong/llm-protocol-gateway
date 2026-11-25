@@ -4,6 +4,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 ARCH="${ARCH:-arm64}"
+# 图标防回归：Wails 在 build/appicon.png 缺失时会静默复制模板默认图标（黑白 W），
+# 以前的临时构建副本就因此产出过错误图标。这里同时校验 PNG 源和最终 icns，
+# 任一处不符合品牌图标就失败，避免“构建成功但图标悄悄换了”。
+APP_ICON_SOURCE="$ROOT/desktop/build/appicon.png"
+APP_ICON_SOURCE_SHA256="051f668eaa79a79a05fef535801e19ebfa232bb09ec1ac965f00af77b36fb363"
+APP_ICON_BUNDLE_SHA256="882a3a0aede300502bfa7dc0b686c9f2a0458deb44e78a0741383dfb95dcb990"
+WAILS_DEFAULT_ICON_SHA256="28332a3b130d1970d208e40b7ab2c84f9ead10199f8c058e08e07fe21fe7ea49"
 # 版本号：CI 从 tag 传进来，本地构建时取 CURRENT_APP_VERSION 或退回 0.0.0-dev。
 # 前端与二进制都要带同一个值，否则控制台的升级判断会错位（release.yml 会校验）。
 APP_VERSION="${GATEWAY_APP_VERSION:-${CURRENT_APP_VERSION:-0.0.0-dev}}"
@@ -28,6 +35,20 @@ if [[ -z "$WAILS_BIN" ]]; then
 fi
 
 echo "==> building web UI"
+if [[ ! -f "$APP_ICON_SOURCE" ]]; then
+  echo "缺少品牌图标：$APP_ICON_SOURCE；Wails 会回退到默认 W 图标，构建终止" >&2
+  exit 1
+fi
+ACTUAL_APP_ICON_SHA256="$(shasum -a 256 "$APP_ICON_SOURCE" | awk '{print $1}')"
+if [[ "$ACTUAL_APP_ICON_SHA256" == "$WAILS_DEFAULT_ICON_SHA256" ]]; then
+  echo "检测到 Wails 默认图标，拒绝构建：$APP_ICON_SOURCE" >&2
+  exit 1
+fi
+if [[ "$ACTUAL_APP_ICON_SHA256" != "$APP_ICON_SOURCE_SHA256" ]]; then
+  echo "品牌图标哈希不一致：期望 $APP_ICON_SOURCE_SHA256，实际 $ACTUAL_APP_ICON_SHA256" >&2
+  echo "若这是有意更换图标，请同步更新 scripts/build-macos-app.sh 中的哈希" >&2
+  exit 1
+fi
 (
   cd "$ROOT/web"
   npm run build
@@ -67,6 +88,18 @@ fi
 if [[ -z "${APP_PATH:-}" || ! -d "$APP_PATH" ]]; then
   echo "build finished but .app not found under desktop/build/bin" >&2
   ls -la "$ROOT/desktop/build/bin" || true
+  exit 1
+fi
+
+BUILT_ICON="$APP_PATH/Contents/Resources/iconfile.icns"
+if [[ ! -f "$BUILT_ICON" ]]; then
+  echo "构建产物缺少 iconfile.icns：$BUILT_ICON" >&2
+  exit 1
+fi
+ACTUAL_BUILT_ICON_SHA256="$(shasum -a 256 "$BUILT_ICON" | awk '{print $1}')"
+if [[ "$ACTUAL_BUILT_ICON_SHA256" != "$APP_ICON_BUNDLE_SHA256" ]]; then
+  echo "构建产物图标哈希不一致：期望 $APP_ICON_BUNDLE_SHA256，实际 $ACTUAL_BUILT_ICON_SHA256" >&2
+  echo "需要检查 desktop/build/appicon.png 是否被临时副本或 Wails 默认模板覆盖" >&2
   exit 1
 fi
 

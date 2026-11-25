@@ -553,3 +553,74 @@ model = "keep-me"
 		t.Fatalf("表内同名键必须原样保留，实际 %q", got)
 	}
 }
+
+// 切调度模式（例如切到 provider_index）或增减备选行时，config.toml 里的
+// model = "default[1m]" 和 model_catalog_json 路径往往一字未变；再次一键写入
+// 必须仍把新版模型目录（含 p1/p2/p3[1m]）写进磁盘，不能因为 config.toml 未变就跳过。
+func TestApplyCodexUpdatesModelCatalogWhenConfigUnchanged(t *testing.T) {
+	home := withHome(t)
+	e := codexEndpoint()
+	e.Model = "default[1m]"
+	e.ModelCatalogPath = ".codex/lpg-model-catalog.json"
+	e.ModelCatalog = `{"models":[{"slug":"default"},{"slug":"default[1m]"}]}`
+	first, err := ApplyCodex(e)
+	if err != nil {
+		t.Fatalf("first ApplyCodex: %v", err)
+	}
+	if !first.Changed || first.Unchanged {
+		t.Fatalf("first run status unexpected: %+v", first)
+	}
+
+	e.ModelCatalog = `{"models":[{"slug":"default"},{"slug":"default[1m]"},{"slug":"p1"},{"slug":"p1[1m]"},{"slug":"p2"},{"slug":"p2[1m]"},{"slug":"p3"},{"slug":"p3[1m]"}]}`
+	second, err := ApplyCodex(e)
+	if err != nil {
+		t.Fatalf("second ApplyCodex: %v", err)
+	}
+	if !second.Changed || second.Unchanged {
+		t.Fatalf("catalog 变化时不能判定为 unchanged: %+v", second)
+	}
+	if second.CatalogPath != filepath.Join(home, ".codex", "lpg-model-catalog.json") {
+		t.Fatalf("CatalogPath = %q", second.CatalogPath)
+	}
+	raw, err := os.ReadFile(second.CatalogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, slug := range []string{`"p1"`, `"p1[1m]"`, `"p2"`, `"p2[1m]"`, `"p3[1m]"`} {
+		if !strings.Contains(string(raw), slug) {
+			t.Fatalf("更新后的模型目录缺少 %s:\n%s", slug, raw)
+		}
+	}
+
+	third, err := ApplyCodex(e)
+	if err != nil {
+		t.Fatalf("third ApplyCodex: %v", err)
+	}
+	if third.Changed || !third.Unchanged {
+		t.Fatalf("三件套全都没变时应当幂等返回 Unchanged: %+v", third)
+	}
+}
+
+// config.toml 未变但 auth.json 被外部改回 chatgpt 时，再次一键写入仍需恢复 apikey。
+func TestApplyCodexUpdatesAuthWhenConfigUnchanged(t *testing.T) {
+	home := withHome(t)
+	e := codexEndpoint()
+	if _, err := ApplyCodex(e); err != nil {
+		t.Fatalf("first ApplyCodex: %v", err)
+	}
+	authPath := filepath.Join(home, ".codex", "auth.json")
+	if err := os.WriteFile(authPath, []byte(`{"auth_mode":"chatgpt","OPENAI_API_KEY":null}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := ApplyCodex(e)
+	if err != nil {
+		t.Fatalf("second ApplyCodex: %v", err)
+	}
+	if !second.AuthChanged || !second.Changed || second.Unchanged {
+		t.Fatalf("auth.json 恢复应当报改动: %+v", second)
+	}
+	auth := readJSON(t, authPath)
+	if auth["auth_mode"] != "apikey" || auth["OPENAI_API_KEY"] != "sk-gw-test" {
+		t.Fatalf("auth.json 未恢复: %v", auth)
+	}
+}

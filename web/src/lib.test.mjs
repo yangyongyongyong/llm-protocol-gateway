@@ -841,7 +841,7 @@ test('mergeModelsAcrossAccounts: 同名模型按宣称窗口取大的那个', ()
   assert.equal(swapped[0].contextOverride, 0, '换过来的账号没有手动值，不能留着上一个的');
 });
 
-test('Codex 模型目录：固定列出 default 与 default[1m]，窗口一普通 272K 一 1M', () => {
+test('Codex 模型目录：固定列出 default 与 default[1m]，普通 272K、1M 变体 1M', () => {
   const key = {
     name: 'k', key: 'sk-gw-x',
     modelOverride: 'deepseek-v4.1-flash',
@@ -860,14 +860,12 @@ test('Codex 模型目录：固定列出 default 与 default[1m]，窗口一普�
   assert.equal(bySlug['default'].priority, 0);
   assert.equal(bySlug['default[1m]'].priority, 1);
 
-  // 窗口：default 普通 272K，default[1m] 必须真的是 1M，否则 Codex 会按普通窗口
+  // 窗口：default 普通，default[1m] 必须真的是 1M，否则 Codex 会按普通窗口
   // 提前压缩上下文，「用 1M」就成了一句空话。
   assert.equal(bySlug['default'].context_window, 272000);
   assert.equal(bySlug['default'].max_context_window, 272000);
-  assert.equal(bySlug['default'].effective_context_window_percent, 100);
   assert.equal(bySlug['default[1m]'].context_window, 1000000);
   assert.equal(bySlug['default[1m]'].max_context_window, 1000000);
-  assert.equal(bySlug['default[1m]'].effective_context_window_percent, 100);
 
   // 真实模型仍在目录里，且窗口跟着声明值走。
   assert.equal(bySlug['deepseek-v4.1-flash'].context_window, 128000);
@@ -890,12 +888,27 @@ test('Codex 模型目录：provider_index 模式发布 p1..p5 两种上下文，
   const p3 = catalog.models.find((model) => model.slug === 'p3');
   const p3m = catalog.models.find((model) => model.slug === 'p3[1m]');
   assert.equal(p3.context_window, 272000);
-  assert.equal(p3.effective_context_window_percent, 100);
   assert.equal(p3m.context_window, 1000000);
-  assert.equal(p3m.effective_context_window_percent, 100);
 
   const normal = JSON.parse(lib.buildApiKeyCodexModelCatalogJSON({...key, scheduleMode: 'rotate'}, provider));
   assert.ok(!normal.models.some((model) => model.slug.startsWith('p1')), '普通调度不能误导用户以为 pN 生效');
+
+  // 即使当前只有 1 或 2 行，provider_index 仍固定发布完整的 p1..p5，不按链路行数截断。
+  const twoRows = JSON.parse(lib.buildApiKeyCodexModelCatalogJSON({
+    name: 'k', key: 'sk-gw-x', modelOverride: 'm1', scheduleMode: 'provider_index',
+    fallbackProviderIds: ['b'],
+  }, provider));
+  const twoRowSlugs = new Set(twoRows.models.map((model) => model.slug));
+  for (let index = 1; index <= 5; index += 1) {
+    assert.ok(twoRowSlugs.has(`p${index}`), `两行链路也应发布 p${index}`);
+    assert.ok(twoRowSlugs.has(`p${index}[1m]`), `两行链路也应发布 p${index}[1m]`);
+  }
+});
+
+test('Codex 目录：gpt-* 没有声明窗口时按 272K，而不是只覆盖 gpt-5.x', () => {
+  assert.equal(lib.openCodeModelLimit('gpt-4o', undefined).context, 272000);
+  assert.equal(lib.openCodeModelLimit('relay/gpt-5.2', undefined).context, 272000);
+  assert.equal(lib.openCodeModelLimit('gpt-5.5', undefined).context, 272000, '只有实际声明值才抬到更大的窗口');
 });
 
 test('Codex 模型目录：手填的 contextOverride 压过上游报的窗口', () => {

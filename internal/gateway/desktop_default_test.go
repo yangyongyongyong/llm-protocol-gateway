@@ -44,7 +44,7 @@ func TestDesktopReservedDefaultsHaveStableWindows(t *testing.T) {
 			}
 			for _, name := range []string{"default", "default[1m]"} {
 				entry := desktopEntryByName(t, data, name)
-				wantWindow := contextLengthDefault
+				wantWindow := contextLength272K
 				wantID := desktopModelAlias(name)
 				wantDescription := ""
 				if name == "default[1m]" {

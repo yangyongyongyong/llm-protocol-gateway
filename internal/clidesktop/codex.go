@@ -147,25 +147,51 @@ func ApplyCodex(e CodexEndpoint) (CodexResult, error) {
 	// 读到直接拒绝启动，只报「duplicate key」却不说是哪一行。
 	remainder = stripCodexConflictingTopLevelKeys(remainder)
 	merged := block + "\n" + remainder
-	if existing != "" && merged == existing {
-		res.Unchanged = true
-		return res, nil
+	if !strings.HasSuffix(merged, "\n") {
+		merged += "\n"
 	}
-	backup, err := writeTextFile(path, merged)
-	if err != nil {
-		return res, err
+	configChanged := existing == "" || merged != existing
+	if configChanged {
+		backup, err := writeTextFile(path, merged)
+		if err != nil {
+			return res, err
+		}
+		res.Changed = true
+		if backup != "" {
+			res.Backups = append(res.Backups, backup)
+		}
 	}
-	res.Changed = true
-	res.Backups = append(res.Backups, backup)
 
+	// config.toml 固定把 model 写为 default[1m]、model_catalog_json 指到同一路径，
+	// 切到 provider_index、增减备选行或改模型窗口时 config.toml 往往一字未动。
+	// 因此模型目录与 auth.json 必须各自按内容幂等校验，不能在 config.toml 未变化
+	// 时提前返回，否则新注入的 p1/p2/p3[1m] 永远写不进磁盘。
+	catalogChanged := false
 	if strings.TrimSpace(e.ModelCatalog) != "" && strings.TrimSpace(e.ModelCatalogPath) != "" {
-		catalogBackup, catalogErr := writeTextFile(e.ModelCatalogPath, e.ModelCatalog)
-		if catalogErr != nil {
+		wantCatalog := e.ModelCatalog
+		if !strings.HasSuffix(wantCatalog, "\n") {
+			wantCatalog += "\n"
+		}
+		existingCatalog, catalogReadErr := readTextFile(e.ModelCatalogPath)
+		switch {
+		case catalogReadErr != nil:
 			// 模型目录只是元数据，写不进去不影响转发：记一条说明，不算整体失败。
-			res.Notes = append(res.Notes, fmt.Sprintf("模型目录没写进去（%v），Codex 仍可用默认元数据", catalogErr))
-		} else {
+			res.Notes = append(res.Notes, fmt.Sprintf("模型目录没写进去（%v），Codex 仍可用默认元数据", catalogReadErr))
+		case existingCatalog == "" || existingCatalog != wantCatalog:
+			catalogBackup, catalogErr := writeTextFile(e.ModelCatalogPath, wantCatalog)
+			if catalogErr != nil {
+				// 模型目录只是元数据，写不进去不影响转发：记一条说明，不算整体失败。
+				res.Notes = append(res.Notes, fmt.Sprintf("模型目录没写进去（%v），Codex 仍可用默认元数据", catalogErr))
+			} else {
+				catalogChanged = true
+				res.Changed = true
+				res.CatalogPath = e.ModelCatalogPath
+				if catalogBackup != "" {
+					res.Backups = append(res.Backups, catalogBackup)
+				}
+			}
+		default:
 			res.CatalogPath = e.ModelCatalogPath
-			res.Backups = append(res.Backups, catalogBackup)
 		}
 	}
 	// 第三方 provider 下长会话自动压缩常报 compaction 相关错误，这是 Codex
@@ -188,6 +214,7 @@ func ApplyCodex(e CodexEndpoint) (CodexResult, error) {
 			return res, authErr
 		}
 		if authResult.changed {
+			res.Changed = true
 			res.Notes = append(res.Notes, "已把网关密钥写入 auth.json（auth_mode=apikey），Codex 启动时不会再要求登录。")
 			if hadLogin {
 				res.Notes = append(res.Notes, "注意：这里原本有一份可用的官方登录凭据，已被网关密钥取代（原文件已备份）。想保住它请勾选「保留官方登录」。")
@@ -196,6 +223,7 @@ func ApplyCodex(e CodexEndpoint) (CodexResult, error) {
 			res.Notes = append(res.Notes, "auth.json 里已经是这把网关密钥，未做改动。")
 		}
 	}
+	res.Unchanged = !configChanged && !catalogChanged && !res.AuthChanged
 	res.Notes = append(res.Notes, "Codex 只在启动时读配置，重开一次终端里的 codex 会话即可生效；Codex Desktop 需要完全退出后重开。")
 	return res, nil
 }
@@ -388,13 +416,15 @@ func stripCodexBlock(text string) string {
 	return result
 }
 
-// stripForeignProviderTables 摘掉所有 [model_providers.*] 表，只留我们自己那段。
+// stripForeignProviderTables 摘掉所有 [model_providers] / [model_providers.*] 表，
+// 只留我们自己那段。
 //
 // 一键写入的语义是「这台机器的 Codex 从此只认这个网关」。历史遗留的 provider
 // 定义（magpie 写过一堆指向 127.0.0.1:3425 的，还有各种手工加的）留在文件里只会
 // 制造困惑：`codex --profile` 还能选到已经连不上的那几项，报错也指向废弃地址。
 //
 // 边界很窄，只认两种行：
+//   - 空的父表：`[model_providers]`（它会和点号键定义撞成 duplicate key）
 //   - 表头本身：`[model_providers.<id>]`
 //   - 它的子表：`[model_providers.<id>.something]`（例如 .env、.http_headers）
 //
@@ -412,17 +442,26 @@ func stripForeignProviderTables(text string) string {
 	lines := strings.Split(text, "\n")
 	out := make([]string, 0, len(lines))
 	skipping := false
+	// 裸父表 [model_providers] 的键都挂在同一命名空间里。它只持续到下个表头，
+	// 所以不能把后面的 [features]、[projects] 等无关表一起跳过。
+	inParentTable := false
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(strings.TrimRight(line, "\r"))
 		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
-			// 任何表头都会结束上一张表的删除；只有 model_providers.* 重新开启。
+			parent := strings.TrimSpace(strings.Trim(trimmed, "[]")) == "model_providers"
+			inParentTable = parent
+			// 任何表头都会结束上一张表的删除；只有 provider 父表/具名表重新开启。
 			skipping = isModelProviderTableHeader(trimmed)
-			if skipping {
+			if parent || skipping {
 				continue
 			}
 		}
 		if skipping {
 			// 表内的键值行（含空行、注释）都属于这张表。
+			continue
+		}
+		if inParentTable {
+			// 裸父表的键同样属于旧 provider 定义。
 			continue
 		}
 		out = append(out, line)

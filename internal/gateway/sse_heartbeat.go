@@ -129,6 +129,11 @@ func (w *sseHeartbeatResponseWriter) Flush() {
 func (w *sseHeartbeatResponseWriter) WriteSSEHeartbeat() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	// 保持转发流的帧边界：支持该接口的下游可在半帧时跳过心跳，
+	// 防止 : ping 插进未完成的 JSON 事件并破坏响应。
+	if hb, ok := w.base.(sseHeartbeater); ok {
+		return hb.WriteSSEHeartbeat()
+	}
 	if _, err := w.base.Write(sseHeartbeatComment); err != nil {
 		return err
 	}

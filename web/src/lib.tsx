@@ -50,6 +50,9 @@ export const CODEX_MODEL_CATALOG_REL = '.codex/lpg-model-catalog.json';
 
 export const CODEX_MODEL_CATALOG_DISPLAY = `~/${CODEX_MODEL_CATALOG_REL}`;
 
+/** Codex 对普通 gpt-* 模型的默认上下文窗口；[1m] 仍单独声明 1M。 */
+export const CODEX_STANDARD_CONTEXT_WINDOW = 272_000;
+
 /**
  * 「一键写入本机」时模型目录的位置，相对主目录。
  *
@@ -2860,7 +2863,8 @@ export function openCodeModelLimit(modelID: string, provider?: Provider, aliases
   // contextLength，于是「给一个其实有 1M 的中转模型手填窗口」对 Codex/OpenCode
   // 完全不起作用：后端 /v1/models 已经按 override 报数，客户端拿到的还是旧值。
   // 两者都没有时按 1M 兜底（与 Claude 的 [1m] 一致，避免回落到 128k 过早压缩）。
-  const context = (listed ? declaredModelWindow(listed) : 0) || 1_000_000;
+  const fallbackContext = /(^|\/)gpt-/i.test(target) ? CODEX_STANDARD_CONTEXT_WINDOW : 1_000_000;
+  const context = (listed ? declaredModelWindow(listed) : 0) || fallbackContext;
   const output = context >= 1_000_000
     ? 128000
     : context >= 200000
@@ -2928,12 +2932,6 @@ export function buildApiKeyCodexModelCatalogJSON(key: APIKey, provider?: Provide
     displayName: entry.label,
     description: entry.description,
     context: entry.window,
-    // Reserved aliases are exact platform contracts: normal means the full
-    // advertised 272K window, and [1m] means the full 1M window. Leaving this
-    // unset makes Codex default to 95%, so a 128K normal alias appeared as 121K
-    // in the model picker. Real upstream models still use Codex's default
-    // headroom calculation.
-    effectiveContextPercent: 100,
     effort: defaultEffort,
     reasoningLevels,
     priority: index,
@@ -2949,7 +2947,7 @@ export function buildApiKeyCodexModelCatalogJSON(key: APIKey, provider?: Provide
  * 何时压缩上下文的——「1M」这件事必须由客户端自己看见。
  */
 export const CODEX_RESERVED_ALIASES: ReadonlyArray<{slug: string; window: number; label: string; description: string}> = [
-  {slug: 'default', window: 272_000, label: 'Platform default', description: 'Platform default — 模型与 provider 在网关上切换'},
+  {slug: 'default', window: CODEX_STANDARD_CONTEXT_WINDOW, label: 'Platform default', description: 'Platform default — 模型与 provider 在网关上切换'},
   {slug: 'default[1m]', window: 1_000_000, label: 'Platform default (1M context)', description: 'Platform default (1M) — 模型与 provider 在网关上切换'},
 ];
 
@@ -2960,14 +2958,14 @@ export const PROVIDER_INDEX_MODEL_LIMIT = 5;
  * provider_index 模式下给 Codex 的 p1/p1[1m]… 菜单。只有该模式才发布：
  * 普通调度里 pN 不是保留名，列出会让人误以为切了 provider。
  */
-export function codexProviderIndexReservedAliases(key: Pick<APIKey, 'scheduleMode' | 'fallbackProviderIds'>): Array<{slug: string; window: number; label: string; description: string}> {
+export function codexProviderIndexReservedAliases(key: Pick<APIKey, 'scheduleMode'>): Array<{slug: string; window: number; label: string; description: string}> {
   if ((key.scheduleMode || '') !== 'provider_index') return [];
-  const count = Math.min(PROVIDER_INDEX_MODEL_LIMIT, 1 + (key.fallbackProviderIds?.length || 0));
   const out: Array<{slug: string; window: number; label: string; description: string}> = [];
-  for (let index = 1; index <= count; index += 1) {
+  // 固定发布 p1..p5（含 [1m]），不按当前备选行数截断：增删链路行时客户端目录保持稳定。
+  for (let index = 1; index <= PROVIDER_INDEX_MODEL_LIMIT; index += 1) {
     const base = `p${index}`;
     out.push(
-      {slug: base, window: 272_000, label: `${base} · row ${index}`, description: `Provider row ${index} (272K context)`},
+      {slug: base, window: CODEX_STANDARD_CONTEXT_WINDOW, label: `${base} · row ${index}`, description: `Provider row ${index} (272K context)`},
       {slug: `${base}[1m]`, window: 1_000_000, label: `${base}[1m] · row ${index}`, description: `Provider row ${index} (1M context)`},
     );
   }
@@ -2980,7 +2978,6 @@ function codexCatalogEntry(input: {
   displayName: string;
   description: string;
   context: number;
-  effectiveContextPercent?: number;
   effort: string;
   reasoningLevels: Array<{ effort: string; description: string }>;
   priority: number;
@@ -2993,7 +2990,6 @@ function codexCatalogEntry(input: {
     supported_reasoning_levels: input.reasoningLevels,
     context_window: input.context,
     max_context_window: input.context,
-    effective_context_window_percent: input.effectiveContextPercent,
     shell_type: 'shell_command',
     visibility: 'list',
     supported_in_api: true,
@@ -3419,7 +3415,7 @@ export function buildApiKeyCodexConfigPatchScript(
     '# 找不到那段裸内容，于是新内容插到顶部，旧的裸内容原样留在文件后面——',
     '# provider id 由 key 名派生、不会变，两边表名/顶层键撞在一起，TOML 解析报',
     '# duplicate key。这里额外扫一遍 rest：摘掉不在任何 [section] 内、且恰好是',
-    '# 本工具管理的那些顶层键的裸赋值，以及表名等于本次要写 id 的裸表——只自愈',
+    '# 本工具管理的那些顶层键的裸赋值，以及空的 [model_providers] 父表——只自愈',
     '# 这一种已知冲突，不触碰其余任何用户自定义内容（含同名 [section] 之后的字段）。',
     '# approval_policy/sandbox_mode 很多用户自己也会手动设置成裸顶层键，纳入',
     '# managed_keys 避免和本工具这次写入的新值撞成 duplicate key。',
@@ -3437,6 +3433,11 @@ export function buildApiKeyCodexConfigPatchScript(
     '                skip_table = False',
     '            else:',
     '                continue',
+    '        if raw.startswith("[") and raw.strip() == "[model_providers]":',
+    '            # 父表会与块里的 model_providers.<id> 点号键撞成 duplicate key。',
+    '            skip_table = True',
+    '            seen_table = True',
+    '            continue',
     '        if raw.startswith("["):',
     '            seen_table = True',
     '            if raw == header:',

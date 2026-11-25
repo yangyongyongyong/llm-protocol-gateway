@@ -46,7 +46,7 @@
 
 同一个密钥可保存多套完整方案（首选 Provider、备选链、模型映射、思考深度），点选即时生效；右侧四个页签分别管理转发方案与容灾链路、绑定关系与模型覆写、客户端配置与调用示例、额度与用量治理。
 
-Codex 与 Claude Code 的一键配置默认使用保留别名 `default[1m]`：客户端按 1M 上下文计算，实际模型仍由网关按 API Key 的模型覆写或 Provider 默认模型解析；需要普通窗口时仍可显式选择 `default`。调度模式选 `provider_index` 后，Codex 模型目录还会发布 `p1`～`p5` 及对应的 `p1[1m]`～`p5[1m]`：客户端选 `pN` 就固定命中 Key 链路第 N 行，因此不同会话可以在同一把 Key 上并行使用不同 Provider；同一 Provider 也允许占多行并分别锁定不同模型。网关的 `/v1/models`、`/openai/v1/models`、`/anthropic/v1/models` 也会同步注入这些保留名，以及 Key 的固定模型、模型别名两端和每行固定模型。
+Codex 与 Claude Code 的一键配置默认使用保留别名 `default[1m]`：客户端按 1M 上下文计算，实际模型仍由网关按 API Key 的模型覆写或 Provider 默认模型解析；需要普通窗口时仍可显式选择 `default`（普通 `default`/`pN` 按 Codex 的 272K 口径发布，`[1m]` 变体固定 1M）。调度模式选 `provider_index` 后，Codex 模型目录还会发布 `p1`～`p5` 及对应的 `p1[1m]`～`p5[1m]`：客户端选 `pN` 就固定命中 Key 链路第 N 行，因此不同会话可以在同一把 Key 上并行使用不同 Provider；同一 Provider 也允许占多行并分别锁定不同模型。网关的 `/v1/models`、`/openai/v1/models`、`/anthropic/v1/models` 也会同步注入这些保留名，以及 Key 的固定模型、模型别名两端和每行固定模型。普通 `gpt-*` 模型未声明更大窗口时按 272K 处理，避免 Codex 显示成 128K × 95% 的 121.6K。
 
 ![API 密钥](docs/images/api-keys.png)
 

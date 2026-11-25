@@ -63,6 +63,8 @@ func codexForceFastFrom(ctx context.Context) bool {
 
 const (
 	contextLength1050K   = 1_050_000
+	contextLength500K    = 500_000
+	contextLength272K    = 272_000
 	contextLength1M      = 1_000_000
 	contextLength200K    = 200_000
 	contextLengthDefault = 128_000
@@ -156,6 +158,14 @@ func knownModelContextLength(modelID string) (int, bool) {
 	// Claude Code / gateway convention: "[1m]" always means a 1M window.
 	if strings.Contains(raw, "[1m]") {
 		return contextLength1M, true
+	}
+	// 普通保留别名（default / p1..pN）是 Codex 的入口名，窗口按 Codex 对
+	// OpenAI 模型的默认 272K 报；带 [1m] 的条目上面已经固定为 1M。
+	if isReservedDefaultModel(raw) {
+		return contextLength272K, true
+	}
+	if _, ok := providerIndexAliasIndex(raw); ok {
+		return contextLength272K, true
 	}
 	base := strings.TrimSpace(strings.Split(raw, "[")[0])
 	if n, ok := knownClaudeContextLength(base); ok {
@@ -281,12 +291,17 @@ func isGLM5BaseModelID(modelID string) bool {
 }
 
 // knownOpenAIContextLength maps OpenAI GPT family IDs to official context
-// windows. Per OpenAI docs (developers.openai.com/api/docs/models/gpt-5.6-*):
-// all tiers share a 1.05M context window; GPT-5.5 is ~1M.
+// windows. Codex's own bundled catalog holds ordinary GPT models at 272K;
+// newer/longer models keep their larger declared windows. The fallback is
+// intentionally family-wide (gpt-*), not only gpt-5.x: relays frequently
+// expose older GPT aliases without a /models context field.
 func knownOpenAIContextLength(modelID string) (int, bool) {
 	id := normalizeModelContextID(modelID)
 	if !strings.Contains(id, "gpt-") {
 		return 0, false
+	}
+	if strings.Contains(id, "gpt-6.1-terra") {
+		return contextLength500K, true
 	}
 	if strings.Contains(id, "gpt-5.6") {
 		return contextLength1050K, true
@@ -294,7 +309,7 @@ func knownOpenAIContextLength(modelID string) (int, bool) {
 	if strings.Contains(id, "gpt-5.5") {
 		return contextLength1M, true
 	}
-	return 0, false
+	return contextLength272K, true
 }
 
 // resolveModelMaxOutputTokens returns a reasonable max output token budget for

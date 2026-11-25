@@ -62,6 +62,11 @@ AI / 脚本可调用 App 内置 CLI：
 open "desktop/build/bin/LLM Protocol Gateway.app"
 ```
 
+构建脚本会校验 `desktop/build/appicon.png` 的品牌图标哈希，并在打包后核对
+`Contents/Resources/iconfile.icns`。如果临时构建副本缺少该 PNG，Wails 会回退到
+自带的黑白 W 模板图标；现在这种情况会直接让构建失败，不会再生成“图标被换掉”的 App。
+若确实要更换品牌图标，需要同步更新 `scripts/build-macos-app.sh` 中的两个图标哈希。
+
 ## Web 访问开关
 
 - **关闭（默认，新装 App）**：HTTP 只绑 `127.0.0.1`，局域网 / 穿透打不开管理页；本机 App / 浏览器仍可用。

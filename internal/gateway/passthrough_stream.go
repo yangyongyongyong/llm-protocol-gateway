@@ -688,6 +688,10 @@ func streamPassThroughResponse(w http.ResponseWriter, tee *streamTee, response *
 	// rewritten to an error frame here, so the client asks again instead of
 	// taking silence as the answer (see claudeEmptyTurnGuard).
 	out, emptyTurn := claudeEmptyTurnGuardFor(stream, end)
+	// A Responses upstream can also close with response.completed while it
+	// never sent text or a tool call. Rewriting that terminal event to
+	// response.failed keeps Codex from treating silence as a normal turn end.
+	out, emptyResponsesTurn := responsesEmptyTurnGuardFor(out, end)
 	hw := newSSEHeartbeatResponseWriter(out)
 	hw.WriteHeader(response.StatusCode)
 	stopHeartbeat := startSSEHeartbeat(hw, sseHeartbeatInterval)
@@ -706,6 +710,9 @@ func streamPassThroughResponse(w http.ResponseWriter, tee *streamTee, response *
 		// The upstream's last frame may not have ended on a blank line: write
 		// what is left so the closing rewrite below still happens.
 		emptyTurn.close()
+	}
+	if emptyResponsesTurn != nil {
+		emptyResponsesTurn.close()
 	}
 	usage.streamEndReader.settleTail()
 	cut := stream.cut(usage, parseUsage, tee.Bytes())
