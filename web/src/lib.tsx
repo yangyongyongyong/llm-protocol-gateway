@@ -2928,6 +2928,12 @@ export function buildApiKeyCodexModelCatalogJSON(key: APIKey, provider?: Provide
     displayName: entry.label,
     description: entry.description,
     context: entry.window,
+    // Reserved aliases are exact platform contracts: normal means the full
+    // advertised 272K window, and [1m] means the full 1M window. Leaving this
+    // unset makes Codex default to 95%, so a 128K normal alias appeared as 121K
+    // in the model picker. Real upstream models still use Codex's default
+    // headroom calculation.
+    effectiveContextPercent: 100,
     effort: defaultEffort,
     reasoningLevels,
     priority: index,
@@ -2943,7 +2949,7 @@ export function buildApiKeyCodexModelCatalogJSON(key: APIKey, provider?: Provide
  * 何时压缩上下文的——「1M」这件事必须由客户端自己看见。
  */
 export const CODEX_RESERVED_ALIASES: ReadonlyArray<{slug: string; window: number; label: string; description: string}> = [
-  {slug: 'default', window: 128_000, label: 'Platform default', description: 'Platform default — 模型与 provider 在网关上切换'},
+  {slug: 'default', window: 272_000, label: 'Platform default', description: 'Platform default — 模型与 provider 在网关上切换'},
   {slug: 'default[1m]', window: 1_000_000, label: 'Platform default (1M context)', description: 'Platform default (1M) — 模型与 provider 在网关上切换'},
 ];
 
@@ -2961,7 +2967,7 @@ export function codexProviderIndexReservedAliases(key: Pick<APIKey, 'scheduleMod
   for (let index = 1; index <= count; index += 1) {
     const base = `p${index}`;
     out.push(
-      {slug: base, window: 128_000, label: `${base} · row ${index}`, description: `Provider row ${index} (128K context)`},
+      {slug: base, window: 272_000, label: `${base} · row ${index}`, description: `Provider row ${index} (272K context)`},
       {slug: `${base}[1m]`, window: 1_000_000, label: `${base}[1m] · row ${index}`, description: `Provider row ${index} (1M context)`},
     );
   }
@@ -2974,6 +2980,7 @@ function codexCatalogEntry(input: {
   displayName: string;
   description: string;
   context: number;
+  effectiveContextPercent?: number;
   effort: string;
   reasoningLevels: Array<{ effort: string; description: string }>;
   priority: number;
@@ -2986,6 +2993,7 @@ function codexCatalogEntry(input: {
     supported_reasoning_levels: input.reasoningLevels,
     context_window: input.context,
     max_context_window: input.context,
+    effective_context_window_percent: input.effectiveContextPercent,
     shell_type: 'shell_command',
     visibility: 'list',
     supported_in_api: true,
