@@ -1,6 +1,14 @@
-import {useEffect, useMemo, useState} from 'react';
+import {useEffect, useMemo, useRef, useState} from 'react';
 import type {Model, ModelUSDPrice, Provider} from '../types';
-import {API_BASE, formatCostCoverage, providerUsageLabel} from '../lib';
+import {
+  API_BASE,
+  formatCostCoverage,
+  formatCostMicros,
+  formatLocalISODate,
+  formatUSDPerMTok,
+  providerUsageLabel,
+  upstreamModelForPricing,
+} from '../lib';
 import {providerAccountFace} from './provider_select';
 import {Modal} from './ui';
 import './usage.css';
@@ -27,22 +35,15 @@ const RATE_FIELDS: RateField[] = [
   { key: 'cacheWriteUsdPerMTok', label: '缓存写入', hint: '每百万缓存创建 Token 的美元价，一般比输入价略高。' },
 ];
 
+/** 把已有价格行中的某个单价转换成表单字符串，保留完整有效小数。 */
 function rateValue(price: ModelUSDPrice | null, field: RateField): string {
   if (!price) return EMPTY_RATE;
   const value = price[field.key];
-  return typeof value === 'number' && value !== 0 ? String(value) : EMPTY_RATE;
+  return typeof value === 'number' && value !== 0 ? formatUSDPerMTok(value) : EMPTY_RATE;
 }
 
-/** 日志里的模型可能是历史「别名 -> 上游模型」，上游才是被计价的 id。 */
-function upstreamModelForPricing(model: string): string {
-  const raw = model.trim();
-  const arrow = raw.indexOf('->');
-  if (arrow < 0) return raw;
-  const upstream = raw.slice(arrow + 2).trim();
-  return upstream || raw;
-}
-
-async function readPrices(): Promise<ModelUSDPrice[]> {
+/** 读取网关持久化的模型价格表。 */
+export async function readPrices(): Promise<ModelUSDPrice[]> {
   const response = await fetch(`${API_BASE}/__prices`, { credentials: 'same-origin' });
   if (!response.ok) throw new Error(`读取价格表失败：HTTP ${response.status}`);
   const data = (await response.json()) as { prices?: ModelUSDPrice[] };
@@ -50,35 +51,58 @@ async function readPrices(): Promise<ModelUSDPrice[]> {
 }
 
 /**
- * 价格表面板：网关成本账本的唯一录入入口。
+ * 价格表面板：网关成本账本的录入、精确展示与未计价历史补算面板。
  *
  * 这里的单价是运维按厂商价目表手工填的，网关不会替我们猜：猜错的价格会被悄悄加进
- * 总额，比留空（显示「未计价」）更危险。改价只影响之后的请求，历史成本已按当时的
- * 价格落库，不回算。
- *
- * 价格行分两个范围：Provider 专属行（覆盖）和全局行。查找顺序是「该 Provider 的
- * 精确模型 → 该 Provider 的默认（*）→ 全局精确模型 → 全局默认（*）」，所以同一套
- * 官方 Claude 价只需要在全局维护一次，多个 Claude 账号自动共用。
+ * 总额，比留空（显示「未计价」）更危险。改价只影响之后的请求，已计价历史不重写；
+ * 若此前存在 priced=0 的未计价请求，可通过面板底部的补算入口按当前价格补记成本。
  */
-export function PriceTablePanel({ providers, models, modelCoverage, onClose }: {
+export function PriceTablePanel({
+  providers,
+  models,
+  modelCoverage,
+  initialTarget,
+  defaultFrom,
+  defaultTo,
+  onBackfilled,
+  onPricesChanged,
+  onClose,
+}: {
   providers: Provider[];
   models: Model[];
   /** 区间内按模型汇总的请求数与已计价请求数，用来说「还有多少没设价」。 */
   modelCoverage: Array<{ model: string; requestCount: number; pricedCount: number }>;
+  /** 可选：从成本报表或模型列表点击设价时预填的目标 Provider 与模型。 */
+  initialTarget?: { providerId?: string; modelId: string } | null;
+  /** 可选：补算区间默认起始日期（YYYY-MM-DD）。 */
+  defaultFrom?: string;
+  /** 可选：补算区间默认结束日期（YYYY-MM-DD）。 */
+  defaultTo?: string;
+  /** 补算完成后触发外部刷新统计数据。 */
+  onBackfilled?: () => void;
+  /** 价格行新增/删除后通知外部同步刷新。 */
+  onPricesChanged?: () => void;
   onClose: () => void;
 }) {
   const [prices, setPrices] = useState<ModelUSDPrice[] | null>(null);
   const [error, setError] = useState('');
+  const todayISO = useMemo(() => formatLocalISODate(new Date()), []);
   // 默认落在第一个具体 Provider 上，而不是「全局 + *」：全局行是所有 Provider 的
-  // 最后一道兜底，一条全 0 的全局行会把整个账本的未计价模型都变成「已计价 $0」，
-  // 误伤面从一家扩大到全部。要设全局价必须自己切到「全局」再填真实单价。
+  // 最后一道兜底，误存全 0 的全局行会把整个账本未计价模型变成「已计价 $0」。
   const [providerId, setProviderId] = useState(() => providers[0]?.id || GLOBAL_SCOPE);
   const [modelId, setModelId] = useState('*');
   const [rates, setRates] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
-  // 正在编辑的行键（provider/model）；为空表示新增。删掉一条精确行后，该模型会
-  // 回落到范围内更宽的那一行（Provider 默认或全局价），这点要在界面上说清楚。
+  // 正在编辑的行键（provider/model）；为空表示新增。
   const [editingKey, setEditingKey] = useState('');
+
+  // 补算未计价请求状态
+  const [backfillFrom, setBackfillFrom] = useState(() => defaultFrom || todayISO);
+  const [backfillTo, setBackfillTo] = useState(() => defaultTo || todayISO);
+  const [backfilling, setBackfilling] = useState(false);
+  const [backfillMessage, setBackfillMessage] = useState('');
+  const [backfillError, setBackfillError] = useState('');
+  const appliedInitialRef = useRef(false);
 
   const reload = async () => {
     try {
@@ -92,6 +116,28 @@ export function PriceTablePanel({ providers, models, modelCoverage, onClose }: {
   useEffect(() => {
     void reload();
   }, []);
+
+  // 从外部跳入时，在首次加载价格表后智能回显已有覆盖行或预填目标模型。
+  useEffect(() => {
+    if (!prices || !initialTarget || appliedInitialRef.current) return;
+    appliedInitialRef.current = true;
+    const normalizedModel = upstreamModelForPricing(initialTarget.modelId);
+    const targetProvider = (initialTarget.providerId || '').trim();
+    const providerExact = targetProvider
+      ? prices.find(item => item.providerId === targetProvider && item.modelId === normalizedModel)
+      : undefined;
+    const globalExact = prices.find(item => item.providerId === GLOBAL_SCOPE && item.modelId === normalizedModel);
+    if (providerExact) {
+      loadIntoForm(providerExact);
+    } else if (globalExact) {
+      loadIntoForm(globalExact);
+    } else {
+      setProviderId(GLOBAL_SCOPE);
+      setModelId(normalizedModel || '*');
+      setRates({});
+      setEditingKey('');
+    }
+  }, [prices, initialTarget]);
 
   const scopeModels = useMemo(() => {
     if (providerId === GLOBAL_SCOPE) {
@@ -113,8 +159,7 @@ export function PriceTablePanel({ providers, models, modelCoverage, onClose }: {
     return a.modelId.localeCompare(b.modelId);
   }), [prices]);
 
-  // 未设价清单按「上游模型」聚合：别名和真名指同一个模型，不能各报一条；一个模型
-  // 只要还有请求没被计价，就值得去补一条全局价。
+  // 未设价清单按「上游模型」聚合：别名和真名指同一个模型，不能各报一条。
   const missing = useMemo(() => {
     const byModel = new Map<string, { model: string; requestCount: number; pricedCount: number }>();
     for (const item of modelCoverage) {
@@ -160,8 +205,6 @@ export function PriceTablePanel({ providers, models, modelCoverage, onClose }: {
   }
 
   const scoped = providerId === GLOBAL_SCOPE;
-  // 预检与后端同一条规则：全 0 的全局行会让所有未计价模型显示「已计价 $0」，
-  // 必须拒绝。提前拦下只是为了少一次往返；后端仍会独立校验。
   const globalZeroRow = scoped && RATE_FIELDS.every(field => Number(rates[field.key] || 0) === 0);
 
   async function save() {
@@ -197,6 +240,7 @@ export function PriceTablePanel({ providers, models, modelCoverage, onClose }: {
       if (!response.ok) throw new Error(`保存失败：${(await response.text()).slice(0, 160)}`);
       await reload();
       clearForm();
+      onPricesChanged?.();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -214,14 +258,50 @@ export function PriceTablePanel({ providers, models, modelCoverage, onClose }: {
       if (!response.ok) throw new Error(`删除失败：HTTP ${response.status}`);
       await reload();
       if (editingKey === `${price.providerId}/${price.modelId}`) clearForm();
+      onPricesChanged?.();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
   }
 
+  /** 按当前价格表补算指定日期区间内 priced=0 的历史请求。 */
+  async function runBackfill() {
+    setBackfillError('');
+    setBackfillMessage('');
+    if (!backfillFrom || !backfillTo || backfillFrom > backfillTo) {
+      setBackfillError('请选择有效的起止日期（开始日期不能晚于结束日期）。');
+      return;
+    }
+    setBackfilling(true);
+    try {
+      const response = await fetch(`${API_BASE}/__prices/backfill`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from: backfillFrom, to: backfillTo }),
+      });
+      if (!response.ok) {
+        throw new Error(`补算失败：${(await response.text()).slice(0, 200)}`);
+      }
+      const data = (await response.json()) as { updated?: number; costMicros?: number; from?: string; to?: string };
+      const updated = data.updated || 0;
+      const costText = formatCostMicros(data.costMicros || 0);
+      if (updated > 0) {
+        setBackfillMessage(`已按当前价格补算 ${updated.toLocaleString()} 次未计价请求，新增记账 ${costText}（已刷新统计）。`);
+        onBackfilled?.();
+      } else {
+        setBackfillMessage('所选区间内没有符合当前价格表的未计价（priced=0）请求。');
+      }
+    } catch (err) {
+      setBackfillError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBackfilling(false);
+    }
+  }
+
   return (
     <Modal title="价格表 · 成本账本" size="wide" onClose={onClose}
-      description="按厂商价目表填美元/百万 Token 单价。全局价对所有没有自己价格行的 Provider 生效，官方 Claude 的多个账号只需维护一套。没有价格行的 Provider 与模型一律显示「未计价」，不会算成 $0；订阅制（按积分计费）的上游建议留空。改价只影响之后的请求。">
+      description="按厂商价目表填美元/百万 Token 单价。全局价对所有没有自己价格行的 Provider 生效，官方 Claude 的多个账号只需维护一套。没有价格行的 Provider 与模型一律显示「未计价」，不会算成 $0；订阅制（按积分计费）的上游建议留空。改价只影响之后的请求，已计价历史不重写。">
       <div className="price-panel">
         {!!missing.length && (
           <div className="price-missing">
@@ -259,7 +339,7 @@ export function PriceTablePanel({ providers, models, modelCoverage, onClose }: {
           {RATE_FIELDS.map(field => (
             <div className="field" key={field.key}>
               <label>{field.label} USD/MTok</label>
-              <input type="number" min="0" step="0.01"
+              <input type="number" min="0" step="any"
                 value={rates[field.key] || EMPTY_RATE} title={field.hint}
                 onChange={event => setRates(current => ({ ...current, [field.key]: event.target.value }))} />
             </div>
@@ -289,7 +369,11 @@ export function PriceTablePanel({ providers, models, modelCoverage, onClose }: {
                   {scopeLabel(price.providerId)}
                 </span>
                 <span className="font-mono">{price.modelId === '*' ? '默认（*）' : price.modelId}</span>
-                {RATE_FIELDS.map(field => <span className="num" key={field.key}>{price[field.key] ? price[field.key].toFixed(2) : '—'}</span>)}
+                {RATE_FIELDS.map(field => (
+                  <span className="num" key={field.key} title={price[field.key] ? `${price[field.key]} USD/MTok` : undefined}>
+                    {formatUSDPerMTok(price[field.key])}
+                  </span>
+                ))}
                 <span className="price-row-actions">
                   {scopeKnown(price.providerId)
                     ? <button type="button" className="mini-btn" onClick={() => loadIntoForm(price)}>编辑</button>
@@ -298,6 +382,25 @@ export function PriceTablePanel({ providers, models, modelCoverage, onClose }: {
                 </span>
               </div>
             ))}
+        </div>
+
+        <div className="price-backfill-bar">
+          <div className="price-backfill-copy">
+            <strong>按当前价格补算未计价请求</strong>
+            <small>只补算保留日志里尚未计价（priced=0）的请求并同步刷新日聚合；已计价的历史请求保持不变。</small>
+          </div>
+          <div className="price-backfill-controls">
+            <input type="date" aria-label="补算开始日期" value={backfillFrom} max={todayISO}
+              onChange={event => setBackfillFrom(event.target.value)} />
+            <span>至</span>
+            <input type="date" aria-label="补算结束日期" value={backfillTo} max={todayISO}
+              onChange={event => setBackfillTo(event.target.value)} />
+            <button type="button" className="btn" disabled={backfilling} onClick={() => void runBackfill()}>
+              {backfilling ? '补算中…' : '补算区间未计价'}
+            </button>
+          </div>
+          {backfillMessage ? <div className="hint-line ok">{backfillMessage}</div> : null}
+          {backfillError ? <div className="hint-line error">{backfillError}</div> : null}
         </div>
 
         <p className="usage-note">

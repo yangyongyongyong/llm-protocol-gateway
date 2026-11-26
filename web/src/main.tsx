@@ -666,7 +666,7 @@ function App() {
   const [providerModelsOpen, setProviderModelsOpen] = useState(false);
   // 「模型上下文窗口」弹窗：一次只编一个模型（providerId + modelId），窗口是
   // 「这个上游的这个模型能装多少」，不能跨模型批量说。
-  const [modelContextTarget, setModelContextTarget] = useState<{providerId: string; modelId: string} | null>(null);
+  const [modelContextTarget, setModelContextTarget] = useState<{providerId: string; modelId: string; mergedCount?: number} | null>(null);
   const [modelContextSaving, setModelContextSaving] = useState(false);
   const [providerModelsLoading, setProviderModelsLoading] = useState(false);
   const [providerModelsResult, setProviderModelsResult] = useState<ProviderTestResult | null>(null);
@@ -4539,7 +4539,7 @@ function App() {
   //
   // 走专用接口而不是 Provider 全量保存：那条路径是增量 PATCH，int 的零值分不清
   // 「没传」和「清空」，而清空恰恰是这里必须能表达的一件事。
-  async function saveModelContext(providerID: string, modelId: string, contextLength: number) {
+  async function saveModelContext(providerID: string, modelId: string, contextLength: number): Promise<boolean> {
     setModelContextSaving(true);
     try {
       const response = await fetch(`${API_BASE}/__providers/${encodeURIComponent(providerID)}/model-context`, {
@@ -4552,10 +4552,11 @@ function App() {
       showToast(contextLength > 0
         ? `已把 ${modelId} 的上下文窗口设为 ${contextLength.toLocaleString()}`
         : `已把 ${modelId} 的上下文窗口改回自动`);
-      setModelContextTarget(null);
       await refreshState(false);
+      return true;
     } catch (error) {
       showToast(`保存上下文窗口失败：${String(error)}`);
+      return false;
     } finally {
       setModelContextSaving(false);
     }
@@ -7174,7 +7175,7 @@ function App() {
                             <td className="model-ctx-cell">
                               <ModelContextCell
                                 model={model}
-                                onEdit={canDo('providers.edit') ? () => setModelContextTarget({providerId: model.providerId, modelId: model.id}) : undefined}
+                                onEdit={canDo('providers.edit') ? () => setModelContextTarget({providerId: model.providerId, modelId: model.id, mergedCount: (model as MergedModel).providers?.length || 1}) : undefined}
                               />
                             </td>
                             <td>
@@ -7258,7 +7259,7 @@ function App() {
                             <span>
                               上下文 <ModelContextCell
                                 model={model}
-                                onEdit={canDo('providers.edit') ? () => setModelContextTarget({providerId: model.providerId, modelId: model.id}) : undefined}
+                                onEdit={canDo('providers.edit') ? () => setModelContextTarget({providerId: model.providerId, modelId: model.id, mergedCount: (model as MergedModel).providers?.length || 1}) : undefined}
                               />
                             </span>
                             <span>{protocolLabel(model.protocol)}</span>
@@ -7663,6 +7664,10 @@ function App() {
             <PeersPage
               canView={canDo('peers.view') || canDo('peers.manage')}
               canManage={canDo('peers.manage')}
+              endpoints={state.endpoints || []}
+              publicAccess={state.publicAccess || defaultPublicAccess}
+              webExposed={state.webExposed === true}
+              onOpenPublicAccess={() => goToPage('public-access')}
               onChanged={() => { void refreshState(false); }}
             />
           )}
@@ -9113,8 +9118,14 @@ function App() {
           <ModelContextDialog
             provider={state.providers.find((item) => item.id === modelContextTarget.providerId)}
             model={model}
+            isAdmin={!isNormalUser}
+            mergedCount={modelContextTarget.mergedCount || 1}
             busy={modelContextSaving}
-            onSave={(contextLength) => void saveModelContext(modelContextTarget.providerId, modelContextTarget.modelId, contextLength)}
+            onSave={(contextLength) => saveModelContext(modelContextTarget.providerId, modelContextTarget.modelId, contextLength)}
+            onPriceSaved={(message) => {
+              showToast(message);
+              void refreshRequestStats();
+            }}
             onClose={() => setModelContextTarget(null)}
           />
         );

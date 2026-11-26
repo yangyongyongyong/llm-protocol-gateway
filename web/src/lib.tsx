@@ -10,6 +10,8 @@ import {
   LegacyRequestStatsSnapshot,
   LogEntry,
   Model,
+  ModelUSDPrice,
+  ProviderModelDayStats,
   NavItemID,
   OutputEndpoint,
   Protocol,
@@ -3658,6 +3660,54 @@ export function buildApiKeyCallPayload(route: Route, model: string) {
   return { model, stream: false, messages: [{ role: 'user', content: '你好' }] };
 }
 
+/**
+ * 计算本机可供其他网关或局域网设备接入的局域网根地址。
+ * 仅当 webExposed 为 true 且探测到真实非回环网卡 IP 时返回 http://<host>:<port>，
+ * 否则返回空串，避免把 0.0.0.0 或 127.0.0.1 当作局域网地址复制给外部节点。
+ */
+export function lanGatewayAccessURL(endpoints: OutputEndpoint[], webExposed?: boolean): string {
+  if (!webExposed) return '';
+  const endpoint = endpoints[0];
+  const port = endpoint?.listenPort || 18093;
+  const rawHost = (endpoint?.listenHost || '').trim();
+  if (!rawHost || rawHost === '0.0.0.0' || rawHost === '127.0.0.1' || rawHost === 'localhost' || rawHost === '::1') {
+    return '';
+  }
+  const host = rawHost.includes(':') && !rawHost.startsWith('[') ? `[${rawHost}]` : rawHost;
+  return `http://${host}:${port}`;
+}
+
+/**
+ * 汇总本机作为上游网关时，可分发给下游网关注册与透传的根地址集合：
+ * - publicUrl：仅取 API 入口公网地址（隧道或自定义 API 域名），分离部署下绝不误给 UI 域名；
+ * - lanUrl：仅在开启局域网监听且具备真实网卡 IP 时提供；
+ * - loopbackUrl：同机多实例调试时的回环兜底地址。
+ */
+export function peerIngressEndpoints(
+  endpoints: OutputEndpoint[],
+  publicAccess: PublicAccessSettings,
+  webExposed?: boolean,
+): {
+  publicUrl: string;
+  lanUrl: string;
+  loopbackUrl: string;
+  lanEnabled: boolean;
+  publicUiOnly: boolean;
+} {
+  const tunnelRunning = publicAccess.tunnel?.status === 'running';
+  const publicUrl = activePublicBaseURL(publicAccess, tunnelRunning).replace(/\/$/, '');
+  const publicUiOnly = !publicUrl && Boolean(activeUIPublicBaseURL(publicAccess, tunnelRunning));
+  const lanUrl = lanGatewayAccessURL(endpoints, webExposed);
+  const port = endpoints[0]?.listenPort || 18093;
+  return {
+    publicUrl,
+    lanUrl,
+    loopbackUrl: `http://127.0.0.1:${port}`,
+    lanEnabled: Boolean(webExposed),
+    publicUiOnly,
+  };
+}
+
 export function localGatewayRoot(endpoints: OutputEndpoint[]) {
   const endpoint = endpoints[0];
   return endpoint ? `http://${endpoint.listenHost}:${endpoint.listenPort}` : 'http://127.0.0.1:18093';
@@ -4242,6 +4292,77 @@ export function formatCostMicros(micros: number | undefined): string {
  * 计价覆盖率。成本总额只累加了有价格行的请求，光看金额会把「大半没设价」读成
  * 「很便宜」，所以金额旁边必须跟着这个比例。
  */
+/**
+ * 格式化模型单价（USD / 百万 Token）：
+ * 0 或空值返回 "—"，非 0 最多保留 6 位有效小数并去掉末尾多余 0（极小非零值兜底 8 位），
+ * 避免 0.003、0.075 这类小额单价被两位小数截断成 0.00。
+ */
+export function formatUSDPerMTok(value: number | undefined | null): string {
+  if (value == null || !Number.isFinite(value) || value === 0) return '—';
+  const abs = Math.abs(value);
+  const digits = abs > 0 && abs < 0.000001 ? 8 : 6;
+  const fixed = value.toFixed(digits).replace(/\.?0+$/, '');
+  return fixed === '-0' ? '—' : fixed;
+}
+
+/**
+ * 格式化成本报表单元格金额（三态）：
+ * pricedCount <= 0 表示未计价，返回空串（由调用方留空或渲染 "—"）；
+ * pricedCount > 0 时即便金额为 0 也返回 "$0.0000"，代表明确按 $0 计价。
+ */
+export function formatCostCell(costMicros: number | undefined, pricedCount: number | undefined): string {
+  if (!pricedCount || pricedCount <= 0) return '';
+  return formatCostMicros(costMicros ?? 0);
+}
+
+/** 日志里的模型可能是历史「别名 -> 上游模型」，上游才是价格表匹配的 id。 */
+export function upstreamModelForPricing(model: string): string {
+  const raw = model.trim();
+  const arrow = raw.indexOf('->');
+  if (arrow < 0) return raw;
+  const upstream = raw.slice(arrow + 2).trim();
+  return upstream || raw;
+}
+
+export type EffectivePriceSource =
+  | 'provider_exact'
+  | 'provider_wildcard'
+  | 'global_exact'
+  | 'global_wildcard'
+  | 'none';
+
+/**
+ * 按后端 lookupPrice 完全一致的四级优先级解析当前模型生效的价格行及来源：
+ * 1) 当前 Provider 精确模型  2) 当前 Provider 默认(*)  3) 全局精确模型  4) 全局默认(*)
+ */
+export function resolveEffectiveModelPrice(
+  prices: ModelUSDPrice[],
+  providerId: string,
+  modelId: string,
+): { price: ModelUSDPrice | null; source: EffectivePriceSource } {
+  const normalizedModel = upstreamModelForPricing(modelId);
+  const byKey = new Map<string, ModelUSDPrice>();
+  for (const row of prices) {
+    byKey.set(`${row.providerId.trim()}\0${row.modelId.trim()}`, row);
+  }
+  const pid = providerId.trim();
+  if (pid) {
+    if (normalizedModel) {
+      const hit = byKey.get(`${pid}\0${normalizedModel}`);
+      if (hit) return { price: hit, source: 'provider_exact' };
+    }
+    const wild = byKey.get(`${pid}\0*`);
+    if (wild) return { price: wild, source: 'provider_wildcard' };
+  }
+  if (normalizedModel) {
+    const hit = byKey.get(`*\0${normalizedModel}`);
+    if (hit) return { price: hit, source: 'global_exact' };
+  }
+  const globalWild = byKey.get('*\0*');
+  if (globalWild) return { price: globalWild, source: 'global_wildcard' };
+  return { price: null, source: 'none' };
+}
+
 export function formatCostCoverage(pricedCount: number | undefined, requestCount: number): string {
   const priced = pricedCount || 0;
   if (!requestCount) return '暂无请求';
@@ -4569,3 +4690,105 @@ export function cloudflareAuthPollOutcome(input: { authorized: boolean; elapsedM
   return 'wait'
 }
 
+
+export type CostSortKey = 'cost' | 'tokens' | 'requests';
+
+export type CostProviderGroup = {
+  providerId: string;
+  requestCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheTokens: number;
+  cacheWriteTokens: number;
+  costMicros: number;
+  pricedCount: number;
+  models: ProviderModelDayStats[];
+};
+
+/** 比较两行统计指标的排序权重，保证未计价行在按费用排序时自动沉底。 */
+function compareCostRows(
+  a: { requestCount: number; inputTokens: number; outputTokens: number; costMicros?: number; pricedCount?: number },
+  b: { requestCount: number; inputTokens: number; outputTokens: number; costMicros?: number; pricedCount?: number },
+  sortBy: CostSortKey,
+): number {
+  const aTokens = (a.inputTokens || 0) + (a.outputTokens || 0);
+  const bTokens = (b.inputTokens || 0) + (b.outputTokens || 0);
+  if (sortBy === 'tokens') {
+    if (bTokens !== aTokens) return bTokens - aTokens;
+    if ((b.costMicros || 0) !== (a.costMicros || 0)) return (b.costMicros || 0) - (a.costMicros || 0);
+    return (b.requestCount || 0) - (a.requestCount || 0);
+  }
+  if (sortBy === 'requests') {
+    if ((b.requestCount || 0) !== (a.requestCount || 0)) return (b.requestCount || 0) - (a.requestCount || 0);
+    return (b.costMicros || 0) - (a.costMicros || 0);
+  }
+  const aPriced = (a.pricedCount || 0) > 0 ? 1 : 0;
+  const bPriced = (b.pricedCount || 0) > 0 ? 1 : 0;
+  if (bPriced !== aPriced) return bPriced - aPriced;
+  if ((b.costMicros || 0) !== (a.costMicros || 0)) return (b.costMicros || 0) - (a.costMicros || 0);
+  if (bTokens !== aTokens) return bTokens - aTokens;
+  return (b.requestCount || 0) - (a.requestCount || 0);
+}
+
+/**
+ * 把预聚合的 Provider×Model 列表整理为成本 BI 报表所需的一级 Provider 分组与二级模型明细，
+ * 同时支持关键词搜索、仅看已计价筛选以及多口径排序。
+ */
+export function buildCostReportGroups(
+  rows: ProviderModelDayStats[],
+  providers: Provider[],
+  options?: { query?: string; onlyPriced?: boolean; sortBy?: CostSortKey },
+): { groups: CostProviderGroup[]; flatRows: ProviderModelDayStats[] } {
+  const keyword = (options?.query || '').trim().toLowerCase();
+  const onlyPriced = Boolean(options?.onlyPriced);
+  const sortBy = options?.sortBy || 'cost';
+
+  const filtered = rows.filter((row) => {
+    if (onlyPriced && !(row.pricedCount && row.pricedCount > 0)) return false;
+    if (!keyword) return true;
+    const label = providerUsageLabel(row.providerId, providers).toLowerCase();
+    return (
+      row.providerId.toLowerCase().includes(keyword) ||
+      label.includes(keyword) ||
+      row.model.toLowerCase().includes(keyword)
+    );
+  });
+
+  const flatRows = [...filtered].sort((a, b) => compareCostRows(a, b, sortBy));
+
+  const groupMap = new Map<string, CostProviderGroup>();
+  for (const row of filtered) {
+    let group = groupMap.get(row.providerId);
+    if (!group) {
+      group = {
+        providerId: row.providerId,
+        requestCount: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheTokens: 0,
+        cacheWriteTokens: 0,
+        costMicros: 0,
+        pricedCount: 0,
+        models: [],
+      };
+      groupMap.set(row.providerId, group);
+    }
+    group.requestCount += row.requestCount || 0;
+    group.inputTokens += row.inputTokens || 0;
+    group.outputTokens += row.outputTokens || 0;
+    group.cacheTokens += row.cacheTokens || 0;
+    group.cacheWriteTokens += row.cacheWriteTokens || 0;
+    group.costMicros += row.costMicros || 0;
+    group.pricedCount += row.pricedCount || 0;
+    group.models.push(row);
+  }
+
+  const groups = [...groupMap.values()]
+    .map((group) => ({
+      ...group,
+      models: [...group.models].sort((a, b) => compareCostRows(a, b, sortBy)),
+    }))
+    .sort((a, b) => compareCostRows(a, b, sortBy));
+
+  return { groups, flatRows };
+}

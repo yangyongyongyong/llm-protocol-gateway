@@ -1252,6 +1252,22 @@ export type DownstreamGatewayDayStats = {
   pricedCount?: number;
 };
 
+/** 单个 Provider 下单个模型的日/区间统计，供成本 BI 报表分层展示。 */
+export type ProviderModelDayStats = {
+  providerId: string;
+  model: string;
+  requestCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheTokens: number;
+  /** 缓存写入 token（已含在 inputTokens 内，单价不同）。旧数据缺省。 */
+  cacheWriteTokens?: number;
+  /** 按网关价格表算出的成本（微美元）。旧数据与未计价一律缺省，不显示成 0。 */
+  costMicros?: number;
+  /** 有价格行的请求数：成本除以它才是覆盖率。 */
+  pricedCount?: number;
+};
+
 export type ModelDayStats = {
   model: string;
   requestCount: number;
@@ -1337,6 +1353,7 @@ export type RequestStatsSnapshot = {
     /** 当前登录用户名下 Key 按 Provider 的今日汇总；无所属用户的下游网关不计入。 */
     myByProvider?: ProviderDayStats[];
     byModel?: ModelDayStats[];
+    byProviderModel?: ProviderModelDayStats[];
     byDownstreamGateway?: DownstreamGatewayDayStats[];
     byUser?: UserDayStats[];
     byProtocol?: ProtocolDayStats[];
@@ -1347,6 +1364,7 @@ export type RequestStatsSnapshot = {
     byApiKey: APIKeyDayStats[];
     byProvider?: ProviderDayStats[];
     byModel?: ModelDayStats[];
+    byProviderModel?: ProviderModelDayStats[];
     byDownstreamGateway?: DownstreamGatewayDayStats[];
     byUser?: UserDayStats[];
     byProtocol?: ProtocolDayStats[];
@@ -1357,6 +1375,7 @@ export type RequestStatsSnapshot = {
     byApiKey: APIKeyDayStats[];
     byProvider?: ProviderDayStats[];
     byModel?: ModelDayStats[];
+    byProviderModel?: ProviderModelDayStats[];
     byDownstreamGateway?: DownstreamGatewayDayStats[];
     byUser?: UserDayStats[];
     byProtocol?: ProtocolDayStats[];

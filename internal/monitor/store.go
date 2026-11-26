@@ -242,6 +242,25 @@ type DownstreamGatewayDayStats struct {
 	PricedCount      int64  `json:"pricedCount,omitempty"`
 }
 
+// ProviderModelDayStats 按「Provider + 模型」联合维度聚合请求数、Token 与已计价成本，
+// 供「用量统计 -> 成本报表」直接读取预聚合结果，避免临时扫日志。
+type ProviderModelDayStats struct {
+	ProviderID       string `json:"providerId"`
+	Model            string `json:"model"`
+	RequestCount     int64  `json:"requestCount"`
+	InputTokens      int64  `json:"inputTokens"`
+	OutputTokens     int64  `json:"outputTokens"`
+	CacheTokens      int64  `json:"cacheTokens"`
+	CacheWriteTokens int64  `json:"cacheWriteTokens,omitempty"`
+	CostMicros       int64  `json:"costMicros,omitempty"`
+	PricedCount      int64  `json:"pricedCount,omitempty"`
+}
+
+// ProviderModelBucketKey 生成 Provider×Model 联合维度在内存与加载映射中的唯一键。
+func ProviderModelBucketKey(providerID, model string) string {
+	return strings.TrimSpace(providerID) + "\x00" + strings.TrimSpace(model)
+}
+
 // ModelDayStats aggregates request/token usage for one model id.
 type ModelDayStats struct {
 	Model            string `json:"model"`
@@ -278,6 +297,7 @@ type TodayStatsSnapshot struct {
 	// no owner are deliberately excluded from this personal view.
 	MyByProvider        []ProviderDayStats          `json:"myByProvider,omitempty"`
 	ByModel             []ModelDayStats             `json:"byModel"`
+	ByProviderModel     []ProviderModelDayStats     `json:"byProviderModel,omitempty"`
 	ByDownstreamGateway []DownstreamGatewayDayStats `json:"byDownstreamGateway,omitempty"`
 	ByUser              []UserDayStats              `json:"byUser,omitempty"`
 	ByProtocol          []ProtocolDayStats          `json:"byProtocol,omitempty"`
@@ -289,6 +309,7 @@ type PeriodStatsSnapshot struct {
 	ByAPIKey            []APIKeyDayStats            `json:"byApiKey"`
 	ByProvider          []ProviderDayStats          `json:"byProvider"`
 	ByModel             []ModelDayStats             `json:"byModel"`
+	ByProviderModel     []ProviderModelDayStats     `json:"byProviderModel,omitempty"`
 	ByDownstreamGateway []DownstreamGatewayDayStats `json:"byDownstreamGateway,omitempty"`
 	ByUser              []UserDayStats              `json:"byUser,omitempty"`
 	ByProtocol          []ProtocolDayStats          `json:"byProtocol,omitempty"`
@@ -360,6 +381,7 @@ type Store struct {
 	// Usage batching thresholds (0 = use defaults) and shutdown plumbing.
 	usageBatchMaxSize int
 	usageBatchMaxWait time.Duration
+	usageFlush        chan chan struct{}
 	usageStop         chan struct{}
 	usageStopped      chan struct{}
 	usageCloseOnce    sync.Once
@@ -422,6 +444,10 @@ func (s *Store) BootstrapUsageDays(days map[string]UsageDayBuckets, last *Reques
 		for id, stats := range buckets.ByDownstreamGateway {
 			copied := stats
 			day.byDownstream[id] = &copied
+		}
+		for id, stats := range buckets.ByProviderModel {
+			copied := stats
+			day.byProviderModel[id] = &copied
 		}
 		s.usageByDay[dayKey] = day
 	}
@@ -669,6 +695,97 @@ func MergeModelDayStats(items []ModelDayStats, canonical func(string) string) []
 	return sortModelDayStats(byModel)
 }
 
+// providerModelUsageTotalTokens 计算单行 Provider×Model 统计的输入+输出 Token 总量。
+func providerModelUsageTotalTokens(stats ProviderModelDayStats) int64 {
+	return stats.InputTokens + stats.OutputTokens
+}
+
+// sortProviderModelDayStats 对 Provider×Model 统计按累计成本降序排序，其次按总 Token、请求数与名称稳定排序。
+func sortProviderModelDayStats(byPM map[string]*ProviderModelDayStats) []ProviderModelDayStats {
+	out := make([]ProviderModelDayStats, 0, len(byPM))
+	for _, stats := range byPM {
+		out = append(out, *stats)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CostMicros != out[j].CostMicros {
+			return out[i].CostMicros > out[j].CostMicros
+		}
+		ti, tj := providerModelUsageTotalTokens(out[i]), providerModelUsageTotalTokens(out[j])
+		if ti != tj {
+			return ti > tj
+		}
+		if out[i].RequestCount != out[j].RequestCount {
+			return out[i].RequestCount > out[j].RequestCount
+		}
+		if out[i].ProviderID != out[j].ProviderID {
+			return out[i].ProviderID < out[j].ProviderID
+		}
+		return out[i].Model < out[j].Model
+	})
+	return out
+}
+
+// MergeProviderModelDayStats 在保持 Provider 边界不变的前提下，将同一 Provider 下的别名模型归并到标准模型 ID。
+func MergeProviderModelDayStats(items []ProviderModelDayStats, canonical func(string) string) []ProviderModelDayStats {
+	if canonical == nil || len(items) == 0 {
+		return items
+	}
+	byPM := make(map[string]*ProviderModelDayStats, len(items))
+	for _, item := range items {
+		providerID := normalizeProviderForStats(item.ProviderID)
+		model := canonical(item.Model)
+		if model == "" {
+			model = item.Model
+		}
+		key := ProviderModelBucketKey(providerID, model)
+		stats, ok := byPM[key]
+		if !ok {
+			stats = &ProviderModelDayStats{ProviderID: providerID, Model: model}
+			byPM[key] = stats
+		}
+		stats.RequestCount += item.RequestCount
+		stats.InputTokens += item.InputTokens
+		stats.OutputTokens += item.OutputTokens
+		stats.CacheTokens += item.CacheTokens
+		stats.CacheWriteTokens += item.CacheWriteTokens
+		stats.CostMicros += item.CostMicros
+		stats.PricedCount += item.PricedCount
+	}
+	return sortProviderModelDayStats(byPM)
+}
+
+// aggregateByProviderModel 从请求明细列表聚合 Provider×Model 维度统计，仅用于日志回退重算路径。
+func aggregateByProviderModel(logs []RequestLog, since time.Time) []ProviderModelDayStats {
+	byPM := make(map[string]*ProviderModelDayStats)
+	for index := range logs {
+		log := logs[index]
+		if !since.IsZero() && log.Time.Before(since) {
+			continue
+		}
+		model, ok := NormalizeModelForStats(log.Model)
+		if !ok {
+			continue
+		}
+		providerID := normalizeProviderForStats(log.ProviderID)
+		key := ProviderModelBucketKey(providerID, model)
+		stats, exists := byPM[key]
+		if !exists {
+			stats = &ProviderModelDayStats{ProviderID: providerID, Model: model}
+			byPM[key] = stats
+		}
+		stats.RequestCount++
+		stats.InputTokens += log.InputTokens
+		stats.OutputTokens += log.OutputTokens
+		stats.CacheTokens += log.CacheTokens
+		stats.CacheWriteTokens += log.CacheWriteTokens
+		stats.CostMicros += log.CostMicros
+		if log.Priced {
+			stats.PricedCount++
+		}
+	}
+	return sortProviderModelDayStats(byPM)
+}
+
 // OutputProtocolFromFlow extracts the client-facing (output) protocol from a
 // request log's protocol_flow.
 //
@@ -874,10 +991,12 @@ func aggregateLogsSince(logs []RequestLog, since time.Time, periodLabel string) 
 	})
 
 	return PeriodStatsSnapshot{
-		Period:     periodLabel,
-		Total:      total,
-		ByAPIKey:   byAPIKey,
-		ByProvider: aggregateByProvider(logs, since),
+		Period:          periodLabel,
+		Total:           total,
+		ByAPIKey:        byAPIKey,
+		ByProvider:      aggregateByProvider(logs, since),
+		ByModel:         aggregateByModel(logs, since),
+		ByProviderModel: aggregateByProviderModel(logs, since),
 	}
 }
 
@@ -963,6 +1082,7 @@ func (s *Store) UsageStatsRangeForKeys(now time.Time, from, to time.Time, keyIDs
 		ByAPIKey:            todayPeriod.ByAPIKey,
 		ByProvider:          todayPeriod.ByProvider,
 		ByModel:             todayPeriod.ByModel,
+		ByProviderModel:     todayPeriod.ByProviderModel,
 		ByDownstreamGateway: todayPeriod.ByDownstreamGateway,
 		ByUser:              todayPeriod.ByUser,
 		ByProtocol:          todayPeriod.ByProtocol,
@@ -1104,6 +1224,7 @@ func AggregateLogsInRange(logs []RequestLog, from, to time.Time, periodLabel str
 		ByAPIKey:            byAPIKey,
 		ByProvider:          aggregateByProvider(filtered, time.Time{}),
 		ByModel:             aggregateByModel(filtered, time.Time{}),
+		ByProviderModel:     aggregateByProviderModel(filtered, time.Time{}),
 		ByDownstreamGateway: aggregateDownstreamGatewayStats(filtered, time.Time{}, time.Time{}),
 		ByProtocol:          aggregateByProtocol(filtered, time.Time{}),
 	}

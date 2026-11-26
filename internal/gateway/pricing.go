@@ -3,13 +3,17 @@ package gateway
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"math"
 	"net/http"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/luca/llm-protocol-gateway/internal/domain"
+	"github.com/luca/llm-protocol-gateway/internal/monitor"
+	"github.com/luca/llm-protocol-gateway/internal/store"
 )
 
 // The gateway's own cost ledger.
@@ -30,6 +34,11 @@ type PriceStore interface {
 	LoadModelPrices() ([]domain.ModelPrice, error)
 	SaveModelPrice(domain.ModelPrice) error
 	DeleteModelPrice(providerID, modelID string) error
+}
+
+// CostBackfillStore 是 PriceStore 的可选扩展能力，用于在单一事务内补算历史未计价请求并同步更新日桶。
+type CostBackfillStore interface {
+	BackfillUnpricedCosts(from, to time.Time, resolve func(store.UnpricedRequestRow) store.PricedRequestResolution) (store.CostBackfillResult, error)
 }
 
 // priceTable is the lookup cache. One map read per request, never a query: the
@@ -351,4 +360,179 @@ func (s *Server) invalidatePrices() {
 	s.prices.loaded = false
 	s.prices.generation++
 	s.prices.mu.Unlock()
+}
+
+// costBackfillRequest 是 POST /__prices/backfill 的可选时间范围参数；缺省时按网关本地时区的「今天」补算。
+type costBackfillRequest struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+// parseCostBackfillRange 解析补算请求的时间范围，语义与 handleRequestStats 的 from/to 保持一致。
+func parseCostBackfillRange(fromRaw, toRaw string, now time.Time) (from, to, toInclusive time.Time, err error) {
+	localNow := now.Local()
+	loc := localNow.Location()
+	dayStart := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, loc)
+	from = dayStart
+	toInclusive = dayStart
+	to = dayStart.AddDate(0, 0, 1)
+
+	if raw := strings.TrimSpace(fromRaw); raw != "" {
+		if parsed, parseErr := time.Parse(time.RFC3339, raw); parseErr == nil {
+			from = parsed
+		} else if parsed, parseErr := time.ParseInLocation("2006-01-02", raw, loc); parseErr == nil {
+			from = parsed
+		} else {
+			return time.Time{}, time.Time{}, time.Time{}, errors.New("invalid from date; expected YYYY-MM-DD or RFC3339")
+		}
+	}
+	if raw := strings.TrimSpace(toRaw); raw != "" {
+		if parsed, parseErr := time.Parse(time.RFC3339, raw); parseErr == nil {
+			to = parsed
+			toInclusive = parsed
+			if strings.Contains(raw, "23:59:59") {
+				day := time.Date(parsed.Year(), parsed.Month(), parsed.Day(), 0, 0, 0, 0, parsed.Location())
+				toInclusive = day
+				to = day.AddDate(0, 0, 1)
+			}
+		} else if parsed, parseErr := time.ParseInLocation("2006-01-02", raw, loc); parseErr == nil {
+			toInclusive = parsed
+			to = parsed.AddDate(0, 0, 1)
+		} else {
+			return time.Time{}, time.Time{}, time.Time{}, errors.New("invalid to date; expected YYYY-MM-DD or RFC3339")
+		}
+	}
+	if !to.After(from) {
+		return time.Time{}, time.Time{}, time.Time{}, errors.New("to must be after from")
+	}
+	return from, to, toInclusive, nil
+}
+
+// handleBackfillPrices 按当前价格表补算指定时间区间内 priced=0 的历史请求，
+// 并实时刷新日聚合内存桶与统计接口缓存；已计价的历史请求绝不会被重写。
+func (s *Server) handleBackfillPrices(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requireAdmin(w, r); !ok {
+		return
+	}
+	if s.priceStore == nil {
+		writeOpenAIError(w, http.StatusConflict, "price table requires the SQLite store")
+		return
+	}
+	backfillStore, ok := s.priceStore.(CostBackfillStore)
+	if !ok {
+		writeOpenAIError(w, http.StatusConflict, "price backfill is not supported by current store")
+		return
+	}
+
+	var reqBody costBackfillRequest
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil && !errors.Is(err, io.EOF) {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid backfill json: "+err.Error())
+			return
+		}
+	}
+
+	from, to, toInclusive, err := parseCostBackfillRange(reqBody.From, reqBody.To, time.Now())
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// 先把内存中攒批中的请求日志与异步日桶队列刷盘，避免刚完成但尚未落盘的请求漏算或重复计价。
+	s.FlushRequestLogs()
+	if err := s.logs.FlushUsage(r.Context()); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to flush usage queue: "+err.Error())
+		return
+	}
+
+	state := s.router.State()
+	keysByID := make(map[string]domain.APIKey, len(state.APIKeys))
+	keysByName := make(map[string]domain.APIKey, len(state.APIKeys))
+	for _, key := range state.APIKeys {
+		keysByID[key.ID] = key
+		if name := strings.TrimSpace(key.Name); name != "" {
+			keysByName[strings.ToLower(name)] = key
+		}
+	}
+
+	result, err := backfillStore.BackfillUnpricedCosts(from, to, func(row store.UnpricedRequestRow) store.PricedRequestResolution {
+		logItem := monitor.RequestLog{
+			Time:             row.Time,
+			APIKeyID:         row.APIKeyID,
+			APIKeyName:       row.APIKeyName,
+			RouteID:          row.RouteID,
+			ProviderID:       row.ProviderID,
+			Model:            row.Model,
+			ProtocolFlow:     row.ProtocolFlow,
+			InputTokens:      row.InputTokens,
+			OutputTokens:     row.OutputTokens,
+			CacheTokens:      row.CacheTokens,
+			CacheWriteTokens: row.CacheWriteTokens,
+			PeerGatewayID:    row.PeerGatewayID,
+			PeerDirection:    row.PeerDirection,
+		}
+		resolvedModel := resolveRequestLogModelForUsage(s.router, logItem, keysByID, keysByName)
+		costMicros, priced := s.costOf(row.ProviderID, resolvedModel, TokenUsage{
+			InputTokens:      row.InputTokens,
+			OutputTokens:     row.OutputTokens,
+			CacheTokens:      row.CacheTokens,
+			CacheWriteTokens: row.CacheWriteTokens,
+		})
+		if !priced {
+			return store.PricedRequestResolution{Priced: false}
+		}
+
+		keyID := strings.TrimSpace(row.APIKeyID)
+		if keyID == "" {
+			keyID = "_anonymous"
+		}
+		userID := "_anonymous"
+		if key, matched := lookupLogAPIKey(logItem, keysByID, keysByName); matched {
+			uid := ownerUserIDForStats(key.OwnerUserID)
+			if uid != "" {
+				userID = uid
+			}
+		}
+		providerID := strings.TrimSpace(row.ProviderID)
+		if providerID == "" {
+			providerID = "_unknown"
+		}
+		modelBucket := ""
+		if m, ok := monitor.NormalizeModelForStats(resolvedModel); ok {
+			modelBucket = m
+		}
+		outputProtocol := strings.TrimSpace(monitor.OutputProtocolFromFlow(row.ProtocolFlow))
+		peerGatewayID := ""
+		if strings.EqualFold(strings.TrimSpace(row.PeerDirection), "ingress") {
+			peerGatewayID = strings.TrimSpace(row.PeerGatewayID)
+		}
+
+		return store.PricedRequestResolution{
+			Day:            row.Time.Local().Format("2006-01-02"),
+			KeyID:          keyID,
+			UserID:         userID,
+			ProviderID:     providerID,
+			ModelBucket:    modelBucket,
+			OutputProtocol: outputProtocol,
+			PeerGatewayID:  peerGatewayID,
+			CostMicros:     costMicros,
+			Priced:         true,
+		}
+	})
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "failed to backfill unpriced costs: "+err.Error())
+		return
+	}
+
+	if result.Updated > 0 {
+		s.RebuildUsageStats()
+		s.requestStatsCache.clear()
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"updated":    result.Updated,
+		"costMicros": result.CostMicros,
+		"from":       from.Local().Format("2006-01-02"),
+		"to":         toInclusive.Local().Format("2006-01-02"),
+	})
 }

@@ -37,9 +37,12 @@ func (s *Server) normalizeUsageModelIdentities(snapshot *monitor.UsageStatsSnaps
 		return model
 	}
 	snapshot.Today.ByModel = monitor.MergeModelDayStats(snapshot.Today.ByModel, canonical)
+	snapshot.Today.ByProviderModel = monitor.MergeProviderModelDayStats(snapshot.Today.ByProviderModel, canonical)
 	snapshot.Month.ByModel = monitor.MergeModelDayStats(snapshot.Month.ByModel, canonical)
+	snapshot.Month.ByProviderModel = monitor.MergeProviderModelDayStats(snapshot.Month.ByProviderModel, canonical)
 	if snapshot.Range != nil {
 		snapshot.Range.ByModel = monitor.MergeModelDayStats(snapshot.Range.ByModel, canonical)
+		snapshot.Range.ByProviderModel = monitor.MergeProviderModelDayStats(snapshot.Range.ByProviderModel, canonical)
 	}
 }
 

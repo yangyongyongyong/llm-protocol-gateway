@@ -13390,3 +13390,43 @@ html[data-theme="dark"] .wb-task-badge[data-tone="ok"] { color: #6ee7b7; border-
 @media (max-width: 560px) {
   .providers-attention-hint { display: none; }
 }
+
+/* ── 模型设置弹窗内的美元单价编辑区 ── */
+.model-price-section {
+  margin-top: 6px; padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.model-price-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+}
+.model-price-grid {
+  display: grid; gap: 10px; margin-top: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
+/* ── 网关互联：供下游接入的本机公网/局域网地址栏 ── */
+.peer-ingress-bar {
+  display: grid; gap: 8px;
+  margin-bottom: 14px; padding: 12px 14px;
+  border: 1px solid var(--border); border-radius: var(--r-md);
+  background: var(--surface-soft);
+}
+.peer-ingress-items {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px 20px;
+}
+.peer-ingress-item {
+  display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  min-width: 0;
+}
+.peer-ingress-label {
+  font-size: var(--fs-sm); font-weight: 600; color: var(--muted); white-space: nowrap;
+}
+.peer-ingress-url {
+  padding: 2px 8px; border-radius: var(--r-sm);
+  background: var(--surface); border: 1px solid var(--border);
+  font-family: var(--mono); font-size: var(--fs-sm); color: var(--text);
+  max-width: min(360px, 60vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.peer-ingress-foot {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px;
+}

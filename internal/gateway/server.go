@@ -658,6 +658,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /__prices", s.handleListPrices)
 	mux.HandleFunc("POST /__prices", s.handleSavePrice)
 	mux.HandleFunc("DELETE /__prices/{providerID}/{modelID}", s.handleDeletePrice)
+	mux.HandleFunc("POST /__prices/backfill", s.handleBackfillPrices)
 	mux.HandleFunc("POST /__providers/{id}/self-register-token", s.handleGenerateProviderSelfRegistrationToken)
 	mux.HandleFunc("POST /__providers/{id}/self-register-token/revoke", s.handleRevokeProviderSelfRegistration)
 	mux.HandleFunc("PATCH /__providers/{id}/self-register", s.handleProviderSelfRegister)
@@ -1610,7 +1611,7 @@ func (s *Server) loadRequestLogsForStatsForKeys(from, to time.Time, keyIDs []str
 // after upgrade, then the fast bucket-load path resumes on later startups.
 const (
 	usageBucketSchemaSettingKey = "usageDailyBucketSchema"
-	usageBucketSchemaVersion    = "4" // v4 adds downstream-gateway dimensions; v3 added per-key dimensions and timing/status
+	usageBucketSchemaVersion    = "5" // v5 adds provider_model and key_provider_model dimensions; v4 added downstream-gateway dimensions
 )
 
 // RebuildUsageStats loads persisted daily aggregates (kept permanently), or

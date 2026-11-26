@@ -103,39 +103,42 @@ type UsageEvent struct {
 }
 
 type usageDayStats struct {
-	total        APIKeyDayStats
-	byKey        map[string]*usageDayStats
-	byAPIKey     map[string]*APIKeyDayStats
-	byProvider   map[string]*ProviderDayStats
-	byModel      map[string]*ModelDayStats
-	byUser       map[string]*UserDayStats
-	byProtocol   map[string]*ProtocolDayStats
-	byDownstream map[string]*DownstreamGatewayDayStats
-	status2xx    int64
-	status4xx    int64
-	status5xx    int64
-	statusOther  int64
-	latencySum   int64
-	ttftSum      int64
-	ttftCount    int64
+	total           APIKeyDayStats
+	byKey           map[string]*usageDayStats
+	byAPIKey        map[string]*APIKeyDayStats
+	byProvider      map[string]*ProviderDayStats
+	byModel         map[string]*ModelDayStats
+	byProviderModel map[string]*ProviderModelDayStats
+	byUser          map[string]*UserDayStats
+	byProtocol      map[string]*ProtocolDayStats
+	byDownstream    map[string]*DownstreamGatewayDayStats
+	status2xx       int64
+	status4xx       int64
+	status5xx       int64
+	statusOther     int64
+	latencySum      int64
+	ttftSum         int64
+	ttftCount       int64
 }
 
 func newUsageDayStats() *usageDayStats {
 	return &usageDayStats{
-		total:        APIKeyDayStats{APIKeyName: "全部"},
-		byKey:        make(map[string]*usageDayStats),
-		byAPIKey:     make(map[string]*APIKeyDayStats),
-		byProvider:   make(map[string]*ProviderDayStats),
-		byModel:      make(map[string]*ModelDayStats),
-		byUser:       make(map[string]*UserDayStats),
-		byProtocol:   make(map[string]*ProtocolDayStats),
-		byDownstream: make(map[string]*DownstreamGatewayDayStats),
+		total:           APIKeyDayStats{APIKeyName: "全部"},
+		byKey:           make(map[string]*usageDayStats),
+		byAPIKey:        make(map[string]*APIKeyDayStats),
+		byProvider:      make(map[string]*ProviderDayStats),
+		byModel:         make(map[string]*ModelDayStats),
+		byProviderModel: make(map[string]*ProviderModelDayStats),
+		byUser:          make(map[string]*UserDayStats),
+		byProtocol:      make(map[string]*ProtocolDayStats),
+		byDownstream:    make(map[string]*DownstreamGatewayDayStats),
 	}
 }
 
 func (s *Store) startUsageWorker() {
 	s.usageOnce.Do(func() {
 		s.usageEvents = make(chan UsageEvent, usageEventBuffer)
+		s.usageFlush = make(chan chan struct{})
 		s.usageStop = make(chan struct{})
 		s.usageStopped = make(chan struct{})
 		go s.usageWorker()
@@ -158,6 +161,42 @@ func (s *Store) CloseUsageWorker() {
 // long maintenance statement can hold for minutes; shutting down must not wait
 // that out, or systemd SIGKILLs the process and the restart loses far more than
 // this batch.
+// FlushUsage 等待后台聚合协程把已入队的用量事件全部落入内存与 SQLite 日桶，
+// 确保补算或强制重建前不会遗漏刚完成请求的统计增量。
+func (s *Store) FlushUsage(ctx context.Context) error {
+	s.mu.RLock()
+	flushCh := s.usageFlush
+	stop := s.usageStop
+	stopped := s.usageStopped
+	s.mu.RUnlock()
+	if flushCh == nil || stop == nil {
+		return nil
+	}
+	ack := make(chan struct{})
+	select {
+	case flushCh <- ack:
+	case <-stop:
+		if stopped != nil {
+			select {
+			case <-stopped:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-ack:
+		return nil
+	case <-stopped:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (s *Store) CloseUsageWorkerContext(ctx context.Context) error {
 	s.mu.RLock()
 	stop := s.usageStop
@@ -190,6 +229,17 @@ func (s *Store) usageWorker() {
 		s.persistUsageDeltas(batch)
 		batch = batch[:0]
 	}
+	drainQueued := func() {
+		for {
+			select {
+			case event := <-s.usageEvents:
+				batch = append(batch, s.applyUsageEventLocked(event))
+			default:
+				flush()
+				return
+			}
+		}
+	}
 
 	for {
 		select {
@@ -202,17 +252,14 @@ func (s *Store) usageWorker() {
 		case <-timer.C:
 			flush()
 			timer.Reset(maxWait)
+		case ack := <-s.usageFlush:
+			drainQueued()
+			close(ack)
+			timer.Reset(maxWait)
 		case <-s.usageStop:
 			// Drain what producers already queued, then persist and exit.
-			for {
-				select {
-				case event := <-s.usageEvents:
-					batch = append(batch, s.applyUsageEventLocked(event))
-				default:
-					flush()
-					return
-				}
-			}
+			drainQueued()
+			return
 		}
 	}
 }
@@ -345,6 +392,23 @@ func (s *Store) applyUsageEventLocked(event UsageEvent) UsagePersistDelta {
 		modelStats.CostMicros += event.CostMicros
 		if event.Priced {
 			modelStats.PricedCount++
+		}
+	}
+	if model, ok := NormalizeModelForStats(event.Model); ok {
+		pmKey := ProviderModelBucketKey(providerID, model)
+		pmStats, ok := day.byProviderModel[pmKey]
+		if !ok {
+			pmStats = &ProviderModelDayStats{ProviderID: providerID, Model: model}
+			day.byProviderModel[pmKey] = pmStats
+		}
+		pmStats.RequestCount++
+		pmStats.InputTokens += inputTokens
+		pmStats.OutputTokens += event.OutputTokens
+		pmStats.CacheTokens += cacheTokens
+		pmStats.CacheWriteTokens += cacheWriteTokens
+		pmStats.CostMicros += event.CostMicros
+		if event.Priced {
+			pmStats.PricedCount++
 		}
 	}
 
@@ -551,6 +615,7 @@ func (s *Store) periodStatsSinceLocked(since time.Time, periodLabel string) Peri
 		ByAPIKey:            sortAPIKeyStats(byAPIKey),
 		ByProvider:          sortProviderStats(byProvider),
 		ByModel:             sortModelDayStats(byModel),
+		ByProviderModel:     sortProviderModelDayStats(mergeProviderModelDays(s.usageByDay, since, time.Time{})),
 		ByDownstreamGateway: sortDownstreamGatewayStats(mergeDownstreamGatewayDays(s.usageByDay, since, time.Time{})),
 		ByUser:              sortUserStats(byUser),
 		ByProtocol:          sortProtocolStats(mergeProtocolDays(s.usageByDay, since, time.Time{})),
@@ -571,6 +636,7 @@ func (s *Store) periodStatsInRangeLocked(from, to time.Time, periodLabel string)
 		ByAPIKey:            sortAPIKeyStats(byAPIKey),
 		ByProvider:          sortProviderStats(byProvider),
 		ByModel:             sortModelDayStats(byModel),
+		ByProviderModel:     sortProviderModelDayStats(mergeProviderModelDays(s.usageByDay, from, to)),
 		ByDownstreamGateway: sortDownstreamGatewayStats(mergeDownstreamGatewayDays(s.usageByDay, from, to)),
 		ByUser:              sortUserStats(byUser),
 		ByProtocol:          sortProtocolStats(mergeProtocolDays(s.usageByDay, from, to)),
@@ -599,6 +665,7 @@ func (s *Store) todayStatsFromCountersLocked(dayStart time.Time) TodayStatsSnaps
 		ByAPIKey:            sortAPIKeyStats(byAPIKey),
 		ByProvider:          sortProviderStats(byProvider),
 		ByModel:             sortModelDayStats(byModel),
+		ByProviderModel:     sortProviderModelDayStats(mergeProviderModelDays(s.usageByDay, dayStart, time.Time{})),
 		ByDownstreamGateway: sortDownstreamGatewayStats(mergeDownstreamGatewayDays(s.usageByDay, dayStart, time.Time{})),
 		ByUser:              sortUserStats(byUser),
 		ByProtocol:          sortProtocolStats(mergeProtocolDays(s.usageByDay, dayStart, time.Time{})),
@@ -695,6 +762,42 @@ func (s *Store) statusStatsInRangeLocked(from, to time.Time) []StatusBucketStats
 		out = append(out, StatusBucketStats{Class: class, RequestCount: buckets[class]})
 	}
 	return out
+}
+
+// mergeProviderModelDays 汇总指定时间窗内每一天的 Provider×Model 桶数据。
+func mergeProviderModelDays(byDay map[string]*usageDayStats, from, to time.Time) map[string]*ProviderModelDayStats {
+	loc := from.Location()
+	if to.IsZero() {
+		to = time.Date(9999, 1, 1, 0, 0, 0, 0, loc)
+	}
+	fromDay := time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, loc)
+	toDay := time.Date(to.Year(), to.Month(), to.Day(), 0, 0, 0, 0, loc)
+	if to.Hour() > 0 || to.Minute() > 0 || to.Second() > 0 || to.Nanosecond() > 0 {
+		toDay = toDay.AddDate(0, 0, 1)
+	}
+	byPM := make(map[string]*ProviderModelDayStats)
+	for dayKey, dayStats := range byDay {
+		day, err := time.ParseInLocation("2006-01-02", dayKey, loc)
+		if err != nil || day.Before(fromDay) || !day.Before(toDay) {
+			continue
+		}
+		for id, stats := range dayStats.byProviderModel {
+			out, ok := byPM[id]
+			if !ok {
+				copied := *stats
+				byPM[id] = &copied
+				continue
+			}
+			out.RequestCount += stats.RequestCount
+			out.InputTokens += stats.InputTokens
+			out.OutputTokens += stats.OutputTokens
+			out.CacheTokens += stats.CacheTokens
+			out.CacheWriteTokens += stats.CacheWriteTokens
+			out.CostMicros += stats.CostMicros
+			out.PricedCount += stats.PricedCount
+		}
+	}
+	return byPM
 }
 
 func mergeProtocolDays(byDay map[string]*usageDayStats, from, to time.Time) map[string]*ProtocolDayStats {

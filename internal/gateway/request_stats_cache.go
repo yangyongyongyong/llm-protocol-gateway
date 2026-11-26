@@ -52,3 +52,13 @@ func (c *requestStatsCache) set(key string, snapshot monitor.UsageStatsSnapshot)
 		expiresAt: time.Now().Add(requestStatsCacheTTL),
 	}
 }
+
+// clear 清空短时统计缓存，在补算历史费用或手工变更聚合后保证界面立即可见最新结果。
+func (c *requestStatsCache) clear() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	clear(c.entries)
+}

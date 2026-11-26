@@ -1131,3 +1131,94 @@ test('CloudBase 官方额度入口只从自定义连接器的环境域名推导'
   assert.equal(lib.providerOfficialUsageURL({...provider, customProviderId: 'other'}), '');
   assert.equal(lib.providerOfficialUsageURL({...provider, providerScript: {upstreamBaseUrl: 'https://example.com/aiProxy'}}), '');
 });
+
+test('单价格式化保留有效精度并去掉末尾多余 0', () => {
+  assert.equal(lib.formatUSDPerMTok(0), '—');
+  assert.equal(lib.formatUSDPerMTok(undefined), '—');
+  assert.equal(lib.formatUSDPerMTok(0.003), '0.003');
+  assert.equal(lib.formatUSDPerMTok(0.075), '0.075');
+  assert.equal(lib.formatUSDPerMTok(1.5), '1.5');
+  assert.equal(lib.formatUSDPerMTok(15), '15');
+  assert.equal(lib.formatUSDPerMTok(0.0000005), '0.0000005');
+});
+
+test('成本单元格三态展示区分未计价与零元计价', () => {
+  assert.equal(lib.formatCostCell(0, 0), '');
+  assert.equal(lib.formatCostCell(undefined, undefined), '');
+  assert.equal(lib.formatCostCell(0, 3), '$0.0000');
+  assert.equal(lib.formatCostCell(350_000, 2), '$0.3500');
+});
+
+test('模型生效单价按 Provider 精确 -> Provider 默认 -> 全局精确 -> 全局默认 匹配', () => {
+  const prices = [
+    {providerId: '*', modelId: '*', inputUsdPerMTok: 1, outputUsdPerMTok: 2, cacheReadUsdPerMTok: 0.1, cacheWriteUsdPerMTok: 0.2},
+    {providerId: '*', modelId: 'hy4-flash-free', inputUsdPerMTok: 0.075, outputUsdPerMTok: 0.3, cacheReadUsdPerMTok: 0.003, cacheWriteUsdPerMTok: 0.003},
+    {providerId: 'p1', modelId: '*', inputUsdPerMTok: 5, outputUsdPerMTok: 10, cacheReadUsdPerMTok: 0.5, cacheWriteUsdPerMTok: 1},
+    {providerId: 'p1', modelId: 'hy4-flash-free', inputUsdPerMTok: 0.01, outputUsdPerMTok: 0.02, cacheReadUsdPerMTok: 0, cacheWriteUsdPerMTok: 0},
+  ];
+  assert.equal(lib.resolveEffectiveModelPrice(prices, 'p1', 'hy4-flash-free').source, 'provider_exact');
+  assert.equal(lib.resolveEffectiveModelPrice(prices, 'p1', 'other-model').source, 'provider_wildcard');
+  assert.equal(lib.resolveEffectiveModelPrice(prices, 'p2', 'alias -> hy4-flash-free').source, 'global_exact');
+  assert.equal(lib.resolveEffectiveModelPrice(prices, 'p2', 'unknown').source, 'global_wildcard');
+  assert.equal(lib.resolveEffectiveModelPrice([], 'p2', 'unknown').source, 'none');
+});
+
+test('成本 BI 报表分组汇总、未计价沉底排序与仅看已计价过滤', () => {
+  const providers = [
+    {id: 'p1', name: '主力通道', protocol: 'openai_chat', baseUrl: '', apiKeySource: '', defaultModel: '', healthStatus: 'healthy'},
+    {id: 'p2', name: '备用通道', protocol: 'claude', baseUrl: '', apiKeySource: '', defaultModel: '', healthStatus: 'healthy'},
+  ];
+  const rows = [
+    {providerId: 'p2', model: 'unpriced-model', requestCount: 20, inputTokens: 10000, outputTokens: 2000, cacheTokens: 0, pricedCount: 0, costMicros: 0},
+    {providerId: 'p1', model: 'm-cheap', requestCount: 10, inputTokens: 1000, outputTokens: 500, cacheTokens: 100, pricedCount: 10, costMicros: 5000},
+    {providerId: 'p1', model: 'm-expensive', requestCount: 5, inputTokens: 2000, outputTokens: 1000, cacheTokens: 200, cacheWriteTokens: 50, pricedCount: 2, costMicros: 25000},
+  ];
+  const {groups, flatRows} = lib.buildCostReportGroups(rows, providers, {sortBy: 'cost'});
+  assert.equal(groups.length, 2);
+  assert.equal(groups[0].providerId, 'p1');
+  assert.equal(groups[0].costMicros, 30000);
+  assert.equal(groups[0].pricedCount, 12);
+  assert.equal(groups[0].requestCount, 15);
+  assert.equal(groups[0].models[0].model, 'm-expensive');
+  assert.equal(groups[1].providerId, 'p2');
+  assert.equal(flatRows[2].model, 'unpriced-model');
+
+  const onlyPriced = lib.buildCostReportGroups(rows, providers, {onlyPriced: true});
+  assert.equal(onlyPriced.groups.length, 1);
+  assert.equal(onlyPriced.flatRows.length, 2);
+});
+
+test('网关互联供下游接入的本机公网与局域网地址推导', () => {
+  const lanEndpoints = [{protocol: 'openai_chat', basePath: '/v1', listenHost: '192.168.10.20', listenPort: 18093}];
+  const wildcardEndpoints = [{protocol: 'openai_chat', basePath: '/v1', listenHost: '0.0.0.0', listenPort: 18093}];
+  const loopbackEndpoints = [{protocol: 'openai_chat', basePath: '/v1', listenHost: '127.0.0.1', listenPort: 18093}];
+
+  assert.equal(lib.lanGatewayAccessURL(lanEndpoints, false), '');
+  assert.equal(lib.lanGatewayAccessURL(lanEndpoints, true), 'http://192.168.10.20:18093');
+  assert.equal(lib.lanGatewayAccessURL(wildcardEndpoints, true), '');
+  assert.equal(lib.lanGatewayAccessURL(loopbackEndpoints, true), '');
+
+  const splitUiOnly = {
+    enabled: true, provider: 'external', mode: 'external_dns', exposeApi: false, exposeUi: true,
+    customDomain: '', uiDomain: 'console.example.com', expose: 'all',
+    status: 'external_dns_active', statusMessage: '',
+    publicBaseUrl: '', uiPublicBaseUrl: 'https://console.example.com',
+  };
+  const uiOnlyResult = lib.peerIngressEndpoints(lanEndpoints, splitUiOnly, true);
+  assert.equal(uiOnlyResult.publicUrl, '');
+  assert.equal(uiOnlyResult.publicUiOnly, true);
+  assert.equal(uiOnlyResult.lanUrl, 'http://192.168.10.20:18093');
+
+  const splitBoth = {
+    ...splitUiOnly,
+    exposeApi: true,
+    customDomain: 'api.example.com',
+    publicBaseUrl: 'https://api.example.com/',
+  };
+  const bothResult = lib.peerIngressEndpoints(lanEndpoints, splitBoth, false);
+  assert.equal(bothResult.publicUrl, 'https://api.example.com');
+  assert.equal(bothResult.publicUiOnly, false);
+  assert.equal(bothResult.lanUrl, '');
+  assert.equal(bothResult.lanEnabled, false);
+  assert.equal(bothResult.loopbackUrl, 'http://127.0.0.1:18093');
+});

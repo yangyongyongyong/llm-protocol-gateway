@@ -52,13 +52,15 @@ type UsageDayBuckets struct {
 	// ByDownstreamGateway 是 ingress 流量的下游网关维度；ByKey 里的同名字段
 	// 用于普通用户按自己名下的 Key 做隔离统计。
 	ByDownstreamGateway map[string]DownstreamGatewayDayStats
-	Status2xx           int64
-	Status4xx           int64
-	Status5xx           int64
-	StatusOther         int64
-	LatencySum          int64
-	TTFTSum             int64
-	TTFTCount           int64
+	// ByProviderModel 按「Provider + 模型」联合维度预聚合，供成本 BI 报表直接读取。
+	ByProviderModel map[string]ProviderModelDayStats
+	Status2xx       int64
+	Status4xx       int64
+	Status5xx       int64
+	StatusOther     int64
+	LatencySum      int64
+	TTFTSum         int64
+	TTFTCount       int64
 }
 
 // UsageDailyStore persists per-day usage aggregates to SQLite.

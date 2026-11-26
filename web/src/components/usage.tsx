@@ -26,6 +26,7 @@ import './usage.css';
 import {ContextAnalysisPanel, type LogFilters, RequestAnalysisPanel, useUsageAnalysis} from './usage_analysis';
 import {PerformanceAnalysisPanel} from './usage_performance';
 import {PriceTablePanel} from './pricing';
+import {CostReportPanel} from './cost_report';
 import {ProviderRefLabel} from './provider_label';
 import {UsageDateRangePicker} from './date_range_picker';
 
@@ -87,6 +88,12 @@ function exportUsage(stats: RequestStatsSnapshot, from: string, to: string) {
   ] as const) {
     lines.push([], [name, '请求数', '输入 Token（含缓存）', '输出 Token', '缓存读取 Token', '已计价成本 USD', '已计价请求数']);
     for (const r of rows) lines.push([r.name, r.requestCount, r.inputTokens, r.outputTokens, r.cacheTokens, usdOf(r.costMicros), r.pricedCount || 0]);
+  }
+  lines.push([], ['Provider × 模型成本', 'Provider', '模型', '请求数', '输入 Token（含缓存）', '输出 Token', '缓存读取 Token', '缓存写入 Token', '已计价成本 USD', '已计价请求数']);
+  for (const r of period?.byProviderModel || []) {
+    const priced = r.pricedCount || 0;
+    const costCell = priced > 0 ? ((r.costMicros || 0) / 1_000_000).toFixed(6) : '';
+    lines.push([r.providerId, r.providerId, r.model, r.requestCount, r.inputTokens, r.outputTokens, r.cacheTokens, r.cacheWriteTokens || 0, costCell, priced]);
   }
   downloadCSV(`gateway-usage-${from}-to-${to}.csv`, lines.map(row => row.map(csvCell).join(',')).join('\r\n'));
 }
@@ -348,7 +355,7 @@ function CompressionUsage({ stats, days, onDaysChange, providers }: { stats: RTK
   </section>;
 }
 
-type Tab = 'overview' | 'requests' | 'context' | 'performance' | 'rtk';
+type Tab = 'overview' | 'cost' | 'requests' | 'context' | 'performance' | 'rtk';
 
 export function UsagePage({ stats, providers, models, isNormalUser, from, to, serverTimeZone, loading, error, fetchedAt, onRangeChange, onRefresh, onNavigateLogs, onOpenLogs, rtkStats, rtkDays, onRTKDaysChange }: {
   stats: RequestStatsSnapshot | null; providers: Provider[]; models: Model[]; isNormalUser: boolean; from: string; to: string; serverTimeZone: string; loading: boolean; error: string; fetchedAt: Date | null;
@@ -358,6 +365,7 @@ export function UsagePage({ stats, providers, models, isNormalUser, from, to, se
   const [tab, setTab] = useState<Tab>('overview');
   const [metric, setMetric] = useState<Metric>('tokens');
   const [priceOpen, setPriceOpen] = useState(false);
+  const [priceTarget, setPriceTarget] = useState<{ providerId?: string; modelId: string } | null>(null);
   const today = formatDateInZone(new Date(), serverTimeZone);
   const analysisTab = tab === 'requests' || tab === 'context' || tab === 'performance';
   const analysis = useUsageAnalysis(from, to, analysisTab);
@@ -365,6 +373,7 @@ export function UsagePage({ stats, providers, models, isNormalUser, from, to, se
   const ready = !!stats && matchesRange;
   const tabs: { id: Tab; name: string; note: string }[] = [
     {id: 'overview', name: '概览', note: '总量、趋势与来源'},
+    {id: 'cost', name: '成本报表', note: 'Provider 与模型费用'},
     {id: 'requests', name: '请求', note: '调用明细与耗时'},
     {id: 'context', name: '上下文', note: '输入与缓存结构'},
     {id: 'performance', name: '性能', note: '模型与上游效率'},
@@ -379,9 +388,9 @@ export function UsagePage({ stats, providers, models, isNormalUser, from, to, se
     onRefresh();
     if (analysisTab) analysis.reload();
   }
-  const exportButton = ready && tab === 'overview' ? <button className="mini-btn" type="button" onClick={() => exportUsage(stats!, from, to)}>导出 CSV 报表</button> : null;
+  const exportButton = ready && (tab === 'overview' || tab === 'cost') ? <button className="mini-btn" type="button" onClick={() => exportUsage(stats!, from, to)}>导出 CSV 报表</button> : null;
   // 价格表只有管理员读得动（/__prices 走 requireAdmin），普通用户不显示入口。
-  const priceButton = !isNormalUser ? <button className="mini-btn" type="button" onClick={() => setPriceOpen(true)}>价格表</button> : null;
+  const priceButton = !isNormalUser ? <button className="mini-btn" type="button" onClick={() => { setPriceTarget(null); setPriceOpen(true); }}>价格表</button> : null;
   const priceCoverage = (stats?.range?.byModel || []).map(row => ({
     model: row.model,
     requestCount: row.requestCount || 0,
@@ -414,6 +423,7 @@ export function UsagePage({ stats, providers, models, isNormalUser, from, to, se
     {error && <p className="usage-error" role="alert">{error}</p>}
     {!ready ? <div className="usage-empty">{loading ? '正在读取所选区间…' : '所选区间暂无可用统计，请刷新重试。'}</div> : <div aria-busy={syncing} className="usage-content">
       {tab === 'overview' && <Overview stats={stats!} providers={providers} models={models} isNormalUser={isNormalUser} metric={metric} onMetricChange={setMetric} serverTimeZone={serverTimeZone} />}
+      {tab === 'cost' && <CostReportPanel stats={stats!} providers={providers} isNormalUser={isNormalUser} onEditPrice={!isNormalUser ? (target) => { setPriceTarget(target); setPriceOpen(true); } : undefined} />}
       {tab === 'rtk' && <div className="usage-rtk-tab"><CompressionUsage stats={rtkStats} days={rtkDays} onDaysChange={onRTKDaysChange} providers={providers} /></div>}
       {analysisTab && <>
         <div className="usage-scope-note">
@@ -426,6 +436,18 @@ export function UsagePage({ stats, providers, models, isNormalUser, from, to, se
       </>}
       <p className="usage-note">统计网关记录的请求。账户订阅额度在 Provider 页面查看；请求、上下文与性能明细受日志保留天数限制，升级前已过期日志的分类与状态可能不完整。RTK 压缩统计按自己的时间窗独立计算。成本按「价格表」里的美元单价逐请求算出，只增不改：改价之后的请求用新价，历史仍按当时价格记账。</p>
     </div>}
-    {priceOpen ? <PriceTablePanel providers={providers} models={models} modelCoverage={priceCoverage} onClose={() => setPriceOpen(false)} /> : null}
+    {priceOpen ? (
+      <PriceTablePanel
+        providers={providers}
+        models={models}
+        modelCoverage={priceCoverage}
+        initialTarget={priceTarget}
+        defaultFrom={from}
+        defaultTo={to}
+        onBackfilled={refreshAll}
+        onPricesChanged={refreshAll}
+        onClose={() => { setPriceOpen(false); setPriceTarget(null); }}
+      />
+    ) : null}
   </div></section>;
 }

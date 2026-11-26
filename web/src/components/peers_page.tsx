@@ -1,10 +1,10 @@
 import React, {useCallback, useEffect, useRef, useState} from 'react';
-import {API_BASE} from '../lib';
+import {API_BASE, defaultPublicAccess, peerIngressEndpoints} from '../lib';
 import {Badge, CopyButton, Field, InfoTip, Modal, Switch} from './ui';
 import {confirmDialog} from '../dialogs';
 import type {GrantTarget} from './rbac_types';
 import {ProviderGrantPicker} from './provider_grant_picker';
-import type {PeerGateway, PeerOwnerOption, PeerUpstream, PeerUpstreamsResponse, PeersResponse} from '../types';
+import type {OutputEndpoint, PeerGateway, PeerOwnerOption, PeerUpstream, PeerUpstreamsResponse, PeersResponse, PublicAccessSettings} from '../types';
 
 async function errorTextFrom(response: Response): Promise<string> {
   try {
@@ -100,13 +100,26 @@ const emptyUpstreamDraft: UpstreamDraft = {
 export function PeersPage({
   canView,
   canManage,
+  endpoints = [],
+  publicAccess = defaultPublicAccess,
+  webExposed = false,
+  onOpenPublicAccess,
   onChanged,
 }: {
   canView: boolean;
   canManage: boolean;
+  /** 当前网关输出端点列表，用于推导局域网与同机回环接入地址。 */
+  endpoints?: OutputEndpoint[];
+  /** 当前公网访问配置，用于推导供下游接入的 API 公网地址。 */
+  publicAccess?: PublicAccessSettings;
+  /** 是否已开启局域网监听（0.0.0.0）。 */
+  webExposed?: boolean;
+  /** 跳转到「公网访问」配置页，开启公网或局域网监听。 */
+  onOpenPublicAccess?: () => void;
   /** 上游注册会新建/改动 provider 与路由，通知外层刷新一次状态。 */
   onChanged?: () => void;
 }) {
+  const ingress = peerIngressEndpoints(endpoints, publicAccess, webExposed);
   const [upstreams, setUpstreams] = useState<PeerUpstream[]>([]);
   const [upstreamGatewayId, setUpstreamGatewayId] = useState('');
   const [localGatewayName, setLocalGatewayName] = useState('');
@@ -669,6 +682,62 @@ export function PeersPage({
                 下游用「本机地址 + 用户名 + 密码」注册上来，它的账号会自动出现在用户管理页里。
                 授权哪些 Provider 决定它能透传什么；吊销会立刻停掉它的流量，账号与授权保留。
               </p>
+            </div>
+          </div>
+
+          <div className="peer-ingress-bar" aria-label="供下游接入的本机地址">
+            <div className="peer-ingress-items">
+              <div className="peer-ingress-item">
+                <span className="peer-ingress-label">公网接入地址</span>
+                {ingress.publicUrl ? (
+                  <>
+                    <code className="peer-ingress-url" title={ingress.publicUrl}>{ingress.publicUrl}</code>
+                    <CopyButton
+                      value={ingress.publicUrl}
+                      label="复制公网地址"
+                      toastContent={`已复制公网地址：${ingress.publicUrl}`}
+                    />
+                  </>
+                ) : (
+                  <>
+                    <span className="hint-text">
+                      {ingress.publicUiOnly ? '仅开启了管理页公网，API 公网入口未开启' : '未启用 API 公网入口'}
+                    </span>
+                    {onOpenPublicAccess ? (
+                      <button type="button" className="mini-btn" onClick={onOpenPublicAccess}>去公网访问开启</button>
+                    ) : null}
+                  </>
+                )}
+              </div>
+
+              <div className="peer-ingress-item">
+                <span className="peer-ingress-label">局域网接入地址</span>
+                {ingress.lanUrl ? (
+                  <>
+                    <code className="peer-ingress-url" title={ingress.lanUrl}>{ingress.lanUrl}</code>
+                    <CopyButton
+                      value={ingress.lanUrl}
+                      label="复制局域网地址"
+                      toastContent={`已复制局域网地址：${ingress.lanUrl}`}
+                    />
+                  </>
+                ) : ingress.lanEnabled ? (
+                  <span className="hint-text">已开启局域网监听（端口 :{endpoints[0]?.listenPort || 18093}），请使用本机局域网 IP 访问</span>
+                ) : (
+                  <>
+                    <span className="hint-text">未开启（仅同机 {ingress.loopbackUrl} 可达）</span>
+                    {onOpenPublicAccess ? (
+                      <button type="button" className="mini-btn" onClick={onOpenPublicAccess}>去开启</button>
+                    ) : null}
+                  </>
+                )}
+              </div>
+            </div>
+            <div className="peer-ingress-foot">
+              <span className="hint-text">
+                下游在「连接到上游网关」填写上述根地址即可自动完成注册与透传（同机测试可用 <code>{ingress.loopbackUrl}</code>）。
+              </span>
+              {!registrationOpen ? <Badge tone="amber">已限制注册来源网段</Badge> : null}
             </div>
           </div>
 

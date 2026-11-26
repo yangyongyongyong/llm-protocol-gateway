@@ -511,3 +511,67 @@ html[data-theme="dark"] .perf-rate.is-bad { color: #fda4af; }
   .price-row .num, .price-row-actions { justify-self: start; text-align: left; }
   .price-row-head { display: none; }
 }
+
+/* ── 价格表补算区 ── */
+.price-backfill-bar {
+  display: grid; gap: 10px;
+  padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--r-lg);
+  background: var(--surface-soft);
+}
+.price-backfill-copy { display: grid; gap: 2px; }
+.price-backfill-copy strong { font-size: 13px; color: var(--text); }
+.price-backfill-copy small { font-size: 12px; color: var(--muted); }
+.price-backfill-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.price-backfill-controls input[type="date"] {
+  height: var(--control-h); padding: 0 10px;
+  border: 1px solid var(--border); border-radius: var(--r-md);
+  background: var(--surface); color: var(--text); font-size: 13px;
+}
+.price-backfill-bar .hint-line.ok { color: var(--green, #16a34a); font-size: 12px; }
+
+/* ── 成本 BI 报表 ── */
+.cost-report { display: grid; gap: 16px; }
+.cost-kpi-grid {
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+}
+.cost-toolbar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--r-lg);
+  background: var(--surface-soft);
+}
+.cost-search {
+  flex: 1 1 200px; min-width: 180px; height: var(--control-h);
+  padding: 0 10px; border: 1px solid var(--border); border-radius: var(--r-md);
+  background: var(--surface); color: var(--text); font-size: 13px;
+}
+.cost-filter-check {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 13px; color: var(--text); cursor: pointer; user-select: none;
+}
+.cost-table th.num, .cost-table td.num { text-align: right; }
+.cost-group-row {
+  background: var(--surface-soft); cursor: pointer; font-weight: 600;
+}
+.cost-group-row:hover { background: var(--surface-hover, rgba(148, 163, 184, .12)); }
+.cost-group-cell { display: flex; align-items: center; gap: 8px; }
+.cost-caret {
+  display: inline-block; width: 14px; text-align: center;
+  color: var(--muted); transition: transform .15s ease;
+}
+.cost-caret.is-open { transform: rotate(90deg); }
+.cost-model-count {
+  font-size: 11px; font-weight: 500; color: var(--muted);
+  padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border);
+}
+.cost-child-model { display: flex; align-items: center; gap: 8px; padding-left: 18px; }
+.cost-tree-branch { color: var(--muted); font-family: var(--mono); }
+.cost-amount-value { font-weight: 600; color: var(--text); }
+.cost-amount-empty { color: var(--muted); }
+.cost-badge {
+  display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 999px;
+  font-size: 11px; font-weight: 600; white-space: nowrap;
+}
+.cost-badge.full { background: rgba(16, 185, 129, .14); color: #059669; }
+.cost-badge.partial { background: rgba(245, 158, 11, .16); color: #b45309; }
+.cost-badge.unpriced { background: rgba(148, 163, 184, .16); color: var(--muted); }

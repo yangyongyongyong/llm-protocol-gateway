@@ -131,7 +131,7 @@ func (s *Store) BackfillUsageKeyDimensions(since time.Time, deltas []monitor.Usa
 		if day < sinceDay {
 			continue
 		}
-		if _, err := tx.Exec(`DELETE FROM usage_daily_buckets WHERE day = ? AND bucket_type IN ('key_provider', 'key_model', 'key_protocol', 'key_downstream_gateway', 'downstream_gateway')`, day); err != nil {
+		if _, err := tx.Exec(`DELETE FROM usage_daily_buckets WHERE day = ? AND bucket_type IN ('key_provider', 'key_model', 'key_provider_model', 'key_protocol', 'key_downstream_gateway', 'downstream_gateway', 'provider_model')`, day); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(`UPDATE usage_daily_buckets SET status_2xx=0, status_4xx=0, status_5xx=0, status_other=0, latency_sum=0, ttft_sum=0, ttft_count=0 WHERE day = ? AND bucket_type='api_key'`, day); err != nil {
@@ -152,6 +152,9 @@ func (s *Store) BackfillUsageKeyDimensions(since time.Time, deltas []monitor.Usa
 			return err
 		}
 		if err := upsertUsageDownstreamTx(tx, delta); err != nil {
+			return err
+		}
+		if err := upsertUsageProviderModelTx(tx, delta); err != nil {
 			return err
 		}
 		var s2, s4, s5, other, ttftCount int64
@@ -198,6 +201,9 @@ func applyUsageDeltaTx(tx *sql.Tx, delta monitor.UsagePersistDelta) error {
 			return err
 		}
 	}
+	if err := upsertUsageProviderModelTx(tx, delta); err != nil {
+		return err
+	}
 	if err := upsertUsageDownstreamTx(tx, delta); err != nil {
 		return err
 	}
@@ -208,6 +214,18 @@ func applyUsageDeltaTx(tx *sql.Tx, delta monitor.UsagePersistDelta) error {
 // 维度桶由 upsertUsageKeyDimensionsTx 一并写入，供普通用户按名下 Key 隔离。
 // 只有 ingress 事件带 PeerGatewayID，因此本机转发到父网关的 egress 流量
 // 永远不会混进“下游用量”。
+// upsertUsageProviderModelTx 持久化「Provider + 模型」联合维度日桶，供成本 BI 报表直接查询。
+func upsertUsageProviderModelTx(tx *sql.Tx, delta monitor.UsagePersistDelta) error {
+	if delta.ProviderID == "" || delta.Model == "" {
+		return nil
+	}
+	identity, err := json.Marshal([]string{delta.ProviderID, delta.Model})
+	if err != nil {
+		return err
+	}
+	return upsertUsageBucket(tx, delta.Day, "provider_model", string(identity), "", delta, false)
+}
+
 func upsertUsageDownstreamTx(tx *sql.Tx, delta monitor.UsagePersistDelta) error {
 	gatewayID := delta.PeerGatewayID
 	if gatewayID == "" {
@@ -226,6 +244,15 @@ func upsertUsageKeyDimensionsTx(tx *sql.Tx, delta monitor.UsagePersistDelta) err
 			return err
 		}
 		if err := upsertUsageBucket(tx, delta.Day, dimension.kind, string(identity), "", delta, false); err != nil {
+			return err
+		}
+	}
+	if delta.ProviderID != "" && delta.Model != "" {
+		identity, err := json.Marshal([]string{delta.KeyID, delta.ProviderID, delta.Model})
+		if err != nil {
+			return err
+		}
+		if err := upsertUsageBucket(tx, delta.Day, "key_provider_model", string(identity), "", delta, false); err != nil {
 			return err
 		}
 	}
@@ -334,6 +361,7 @@ func (s *Store) LoadUsageSince(since time.Time) (map[string]monitor.UsageDayBuck
 				ByUser:              make(map[string]monitor.UserDayStats),
 				ByProtocol:          make(map[string]monitor.ProtocolDayStats),
 				ByDownstreamGateway: make(map[string]monitor.DownstreamGatewayDayStats),
+				ByProviderModel:     make(map[string]monitor.ProviderModelDayStats),
 			}
 		}
 		stats := monitor.APIKeyDayStats{
@@ -371,6 +399,31 @@ func (s *Store) LoadUsageSince(since time.Time) (map[string]monitor.UsageDayBuck
 			child.TTFTSum = ttftSum
 			child.TTFTCount = ttftCount
 			dayBuckets.ByKey[bucketID] = child
+		case "key_provider_model":
+			var identity []string
+			if err := json.Unmarshal([]byte(bucketID), &identity); err != nil || len(identity) != 3 {
+				return nil, nil, fmt.Errorf("invalid usage key provider_model dimension %q", bucketID)
+			}
+			child := dayBuckets.ByKey[identity[0]]
+			if child.ByProviderModel == nil {
+				child.ByProviderModel = make(map[string]monitor.ProviderModelDayStats)
+			}
+			pmKey := monitor.ProviderModelBucketKey(identity[1], identity[2])
+			child.ByProviderModel[pmKey] = monitor.ProviderModelDayStats{
+				ProviderID: identity[1], Model: identity[2], RequestCount: reqCount, InputTokens: inTok, OutputTokens: outTok,
+				CacheTokens: cacheTok, CacheWriteTokens: cacheWriteTok, CostMicros: costMicros, PricedCount: pricedCount,
+			}
+			dayBuckets.ByKey[identity[0]] = child
+		case "provider_model":
+			var identity []string
+			if err := json.Unmarshal([]byte(bucketID), &identity); err != nil || len(identity) != 2 {
+				return nil, nil, fmt.Errorf("invalid usage provider_model dimension %q", bucketID)
+			}
+			pmKey := monitor.ProviderModelBucketKey(identity[0], identity[1])
+			dayBuckets.ByProviderModel[pmKey] = monitor.ProviderModelDayStats{
+				ProviderID: identity[0], Model: identity[1], RequestCount: reqCount, InputTokens: inTok, OutputTokens: outTok,
+				CacheTokens: cacheTok, CacheWriteTokens: cacheWriteTok, CostMicros: costMicros, PricedCount: pricedCount,
+			}
 		case "key_provider", "key_model", "key_protocol", "key_downstream_gateway":
 			var identity []string
 			if err := json.Unmarshal([]byte(bucketID), &identity); err != nil || len(identity) != 2 {

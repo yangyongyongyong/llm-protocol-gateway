@@ -243,3 +243,78 @@ func TestTodayStatsFromLogsCarriesCost(t *testing.T) {
 		t.Fatalf("per-provider priced count: got %d, want 2", got)
 	}
 }
+
+// TestUsageByProviderModelAndKeyIsolation 验证 Provider×Model 联合维度在总览、
+// 区间、按 Key 隔离视图、别名归并及日志回退重算路径上的准确性。
+func TestUsageByProviderModelAndKeyIsolation(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.Local)
+	yesterday := now.AddDate(0, 0, -1)
+	store := NewStore()
+	events := []UsageEvent{
+		{Time: yesterday, APIKeyID: "k1", APIKeyName: "key-1", UserID: "u1", ProviderID: "p1", Model: "m1",
+			OutputProtocol: "OpenAI Chat", Status: 200, InputTokens: 1000, OutputTokens: 200, CostMicros: 5000, Priced: true, LatencyMs: 30},
+		{Time: now, APIKeyID: "k1", APIKeyName: "key-1", UserID: "u1", ProviderID: "p1", Model: "m1",
+			OutputProtocol: "OpenAI Chat", Status: 200, InputTokens: 500, OutputTokens: 100, CostMicros: 2500, Priced: true, LatencyMs: 20},
+		{Time: now, APIKeyID: "k1", APIKeyName: "key-1", UserID: "u1", ProviderID: "p2", Model: "m1",
+			OutputProtocol: "OpenAI Chat", Status: 200, InputTokens: 300, OutputTokens: 50, CostMicros: 0, Priced: false, LatencyMs: 20},
+		{Time: now, APIKeyID: "k2", APIKeyName: "key-2", UserID: "u2", ProviderID: "p1", Model: "m2",
+			OutputProtocol: "Claude", Status: 200, InputTokens: 400, OutputTokens: 100, CostMicros: 9000, Priced: true, LatencyMs: 20},
+	}
+	for _, ev := range events {
+		store.ApplyUsageEventSync(ev)
+	}
+
+	full := store.UsageStatsRange(now, yesterday, now.Add(24*time.Hour))
+	if full.Range == nil || len(full.Range.ByProviderModel) != 3 {
+		t.Fatalf("expected 3 provider_model rows, got %#v", full.Range)
+	}
+	// 默认按成本降序：p1/m2(9000) -> p1/m1(7500) -> p2/m1(0)
+	if full.Range.ByProviderModel[0].ProviderID != "p1" || full.Range.ByProviderModel[0].Model != "m2" || full.Range.ByProviderModel[0].CostMicros != 9000 {
+		t.Fatalf("unexpected top provider_model row: %#v", full.Range.ByProviderModel[0])
+	}
+	if full.Range.ByProviderModel[1].ProviderID != "p1" || full.Range.ByProviderModel[1].Model != "m1" || full.Range.ByProviderModel[1].CostMicros != 7500 || full.Range.ByProviderModel[1].PricedCount != 2 {
+		t.Fatalf("unexpected second provider_model row: %#v", full.Range.ByProviderModel[1])
+	}
+	if full.Range.ByProviderModel[2].ProviderID != "p2" || full.Range.ByProviderModel[2].Model != "m1" || full.Range.ByProviderModel[2].PricedCount != 0 {
+		t.Fatalf("unexpected unpriced provider_model row: %#v", full.Range.ByProviderModel[2])
+	}
+
+	// 普通用户仅可见 k1：不能混入 k2 的 p1/m2。
+	k1Range := store.UsageStatsRangeForKeys(now, yesterday, now.Add(24*time.Hour), []string{"k1"})
+	if k1Range.Range == nil || len(k1Range.Range.ByProviderModel) != 2 {
+		t.Fatalf("expected 2 provider_model rows for k1, got %#v", k1Range.Range)
+	}
+	for _, row := range k1Range.Range.ByProviderModel {
+		if row.Model == "m2" {
+			t.Fatalf("k1 range leaked k2 model m2: %#v", row)
+		}
+	}
+
+	// 别名归并只能合并同一 Provider 下，绝不能跨 Provider 合并。
+	merged := MergeProviderModelDayStats([]ProviderModelDayStats{
+		{ProviderID: "p1", Model: "qoder-cn/dfmodel", RequestCount: 2, InputTokens: 100, CostMicros: 200, PricedCount: 2},
+		{ProviderID: "p1", Model: "dfmodel", RequestCount: 1, InputTokens: 50, CostMicros: 100, PricedCount: 1},
+		{ProviderID: "p2", Model: "dfmodel", RequestCount: 3, InputTokens: 300, CostMicros: 900, PricedCount: 3},
+	}, func(m string) string {
+		if m == "qoder-cn/dfmodel" {
+			return "dfmodel"
+		}
+		return m
+	})
+	if len(merged) != 2 {
+		t.Fatalf("expected 2 rows after per-provider canonical merge, got %#v", merged)
+	}
+	if merged[0].ProviderID != "p2" || merged[0].CostMicros != 900 || merged[1].ProviderID != "p1" || merged[1].RequestCount != 3 || merged[1].CostMicros != 300 {
+		t.Fatalf("unexpected merged rows: %#v", merged)
+	}
+
+	// 日志回退聚合也要返回同样的 ByProviderModel。
+	fromLogs := AggregateLogsInRange([]RequestLog{
+		{Time: now, ProviderID: "p1", Model: "m1", InputTokens: 10, OutputTokens: 5, CostMicros: 42, Priced: true},
+		{Time: now, ProviderID: "p2", Model: "m1", InputTokens: 20, OutputTokens: 5, Priced: false},
+	}, yesterday, now.Add(24*time.Hour), "test")
+	if len(fromLogs.ByProviderModel) != 2 || fromLogs.ByProviderModel[0].CostMicros != 42 {
+		t.Fatalf("AggregateLogsInRange missing ByProviderModel: %#v", fromLogs.ByProviderModel)
+	}
+}

@@ -68,6 +68,22 @@ func recordKeyUsage(day *usageDayStats, keyID string, event UsageEvent, input, c
 			m.PricedCount++
 		}
 	}
+	if model, ok := NormalizeModelForStats(event.Model); ok {
+		pmKey := ProviderModelBucketKey(provider, model)
+		if child.byProviderModel[pmKey] == nil {
+			child.byProviderModel[pmKey] = &ProviderModelDayStats{ProviderID: provider, Model: model}
+		}
+		pm := child.byProviderModel[pmKey]
+		pm.RequestCount++
+		pm.InputTokens += input
+		pm.OutputTokens += event.OutputTokens
+		pm.CacheTokens += cache
+		pm.CacheWriteTokens += event.CacheWriteTokens
+		pm.CostMicros += event.CostMicros
+		if event.Priced {
+			pm.PricedCount++
+		}
+	}
 	if protocol := event.OutputProtocol; protocol != "" {
 		if child.byProtocol[protocol] == nil {
 			child.byProtocol[protocol] = &ProtocolDayStats{Protocol: protocol}
@@ -127,6 +143,10 @@ func usageDayFromBuckets(b UsageDayBuckets) *usageDayStats {
 	for id, v := range b.ByDownstreamGateway {
 		copied := v
 		day.byDownstream[id] = &copied
+	}
+	for id, v := range b.ByProviderModel {
+		copied := v
+		day.byProviderModel[id] = &copied
 	}
 	return day
 }
@@ -199,6 +219,19 @@ func keyDimensionDays(days map[string]*usageDayStats, keys map[string]struct{}) 
 				d.CostMicros += v.CostMicros
 				d.PricedCount += v.PricedCount
 			}
+			for id, v := range child.byProviderModel {
+				if merged.byProviderModel[id] == nil {
+					merged.byProviderModel[id] = &ProviderModelDayStats{ProviderID: v.ProviderID, Model: v.Model}
+				}
+				pm := merged.byProviderModel[id]
+				pm.RequestCount += v.RequestCount
+				pm.InputTokens += v.InputTokens
+				pm.OutputTokens += v.OutputTokens
+				pm.CacheTokens += v.CacheTokens
+				pm.CacheWriteTokens += v.CacheWriteTokens
+				pm.CostMicros += v.CostMicros
+				pm.PricedCount += v.PricedCount
+			}
 		}
 		selected[date] = merged
 	}
@@ -231,6 +264,7 @@ func keyPeriodDimensions(days map[string]*usageDayStats, from, to time.Time, per
 	_, _, providers, models, _ := mergeUsageDays(days, from, to)
 	period.ByProvider = sortProviderStats(providers)
 	period.ByModel = sortModelDayStats(models)
+	period.ByProviderModel = sortProviderModelDayStats(mergeProviderModelDays(days, from, to))
 	period.ByProtocol = sortProtocolStats(mergeProtocolDays(days, from, to))
 	period.ByDownstreamGateway = sortDownstreamGatewayStats(mergeDownstreamGatewayDays(days, from, to))
 }
